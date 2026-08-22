@@ -14,12 +14,22 @@ pub(crate) struct WordBucket {
     pub pinyin: &'static str,
     /// 拼音按音节切分后的边界位置（如 "nihao" → [2, 5]）。
     pub boundaries: Vec<usize>,
+    /// 简拼：各音节首字母（如 "nihao" → "nh"）。
+    pub initials: String,
+    pub entries: Vec<(u32, &'static str)>,
+}
+
+/// 简拼索引：简拼串 → 按频率排序的词语。
+pub(crate) struct InitialBucket {
+    pub initials: String,
     pub entries: Vec<(u32, &'static str)>,
 }
 
 pub(crate) struct Index {
     pub chars: Vec<CharBucket>,
     pub words: Vec<WordBucket>,
+    /// 简拼索引（按 initials 排序）。
+    pub initials: Vec<InitialBucket>,
 }
 
 fn parse_entries(s: &str) -> Vec<(u32, &str)> {
@@ -85,18 +95,58 @@ fn build_chars(src: &'static str) -> (Vec<CharBucket>, HashSet<&'static str>) {
     (buckets, syllables)
 }
 
+fn initials_of(py: &str, boundaries: &[usize]) -> String {
+    let bytes = py.as_bytes();
+    let mut out = String::new();
+    let mut prev = 0;
+    for &b in boundaries {
+        if b > prev && b <= bytes.len() {
+            out.push(bytes[prev] as char);
+            prev = b;
+        }
+    }
+    out
+}
+
 fn build_words(src: &'static str, syllables: &HashSet<&str>) -> Vec<WordBucket> {
     src.lines()
         .filter_map(|line| {
             let (py, rest) = line.split_once('\t')?;
             let boundaries = segment_boundaries(py, syllables);
+            let initials = initials_of(py, &boundaries);
+            if initials.is_empty() {
+                return None;
+            }
             Some(WordBucket {
                 pinyin: py,
                 boundaries,
+                initials,
                 entries: parse_entries(rest),
             })
         })
         .collect()
+}
+
+fn build_initials(words: &[WordBucket]) -> Vec<InitialBucket> {
+    let mut map: std::collections::HashMap<&str, Vec<(u32, &'static str)>> =
+        std::collections::HashMap::new();
+    for w in words {
+        let e = map.entry(&w.initials).or_default();
+        e.extend(w.entries.iter().copied());
+    }
+    let mut out: Vec<InitialBucket> = map
+        .into_iter()
+        .map(|(k, mut v)| {
+            v.sort_by_key(|(r, _)| *r);
+            v.dedup_by(|a, b| a.1 == b.1);
+            InitialBucket {
+                initials: k.to_owned(),
+                entries: v,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.initials.cmp(&b.initials));
+    out
 }
 
 static INDEX: OnceLock<Index> = OnceLock::new();
@@ -105,6 +155,11 @@ pub(crate) fn index() -> &'static Index {
     INDEX.get_or_init(|| {
         let (chars, syllables) = build_chars(include_str!("../data/chars.txt"));
         let words = build_words(include_str!("../data/words.txt"), &syllables);
-        Index { chars, words }
+        let initials = build_initials(&words);
+        Index {
+            chars,
+            words,
+            initials,
+        }
     })
 }
