@@ -14,7 +14,9 @@ use windows::Win32::UI::TextServices::{
 
 fn log_path() -> std::path::PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(base).join("Verba").join("verba-ime.log")
+    std::path::PathBuf::from(base)
+        .join("Verba")
+        .join("verba-ime.log")
 }
 
 #[test]
