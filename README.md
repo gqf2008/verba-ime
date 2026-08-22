@@ -69,7 +69,7 @@ Verba 的目标是成为三个平台上的「统一输入入口」：**任何表
 ## 快速开始（当前骨架）
 
 ```bash
-git clone https://github.com/<your-name>/verba-ime.git
+git clone https://github.com/gqf2008/verba-ime.git
 cd verba-ime
 cargo build --workspace          # 构建核心与 CLI
 cargo run -p verba-cli -- --help
