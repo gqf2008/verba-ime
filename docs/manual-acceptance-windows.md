@@ -37,13 +37,19 @@
 ### 症状
 在记事本/任意输入框切换到 Verba 后输入 `//`，没有下划线、没有任何效果。
 
-### 根因（2026-08-22 真机联调确认）
-1. **旧 DLL 残留**：`C:\Program Files\Verba\verba_ime_windows.dll` 为早前构建
-   （无键盘 sink 重试修复、无落盘日志）。已加载过旧 DLL 的进程（explorer、此前打开的
-   记事本等）会一直持有旧 DLL → 键盘事件进不到 IME → `//` 静默失效且无日志。
-2. **激活未生效**：Win+Space 只是"把某个输入法加入列表"，**切到 Verba 后必须先确认
-   任务栏输入法指示器显示 "Verba · 拾言输入法"**，否则按键仍走其他输入法（微软拼音等）。
-3. 诊断日志：`%LOCALAPPDATA%\Verba\verba-ime.log`（新 DLL 才有）。
+### 根因（2026-08-22 真机联调确认，晚间修复）
+1. **`OnTestKeyDown` 恒返回 FALSE 导致 `OnKeyDown` 从不被调用**（主因，已修复 `3bfd2a6`）：
+   TSF 仅对"认领"（OnTestKeyDown 返回 TRUE）的按键回调 OnKeyDown；一直返回 FALSE 时，
+   激活与键盘 sink 都正常，但任何按键都进不了状态机 → `//` 与直输完全失效。
+   修复：按状态机认领——Idle 只认领 `/`，组合/提示词/流式/结果态认领全部可打印字符
+   与控制键（Enter/Backspace/Esc）。
+2. **旧 DLL 残留**：`C:\Program Files\Verba\verba_ime_windows.dll` 为早前构建
+   （无键盘 sink 重试修复、无落盘日志）。已加载过旧 DLL 的进程会一直持有旧 DLL，
+   需关闭重开（或注销/重启）才能加载新版本。
+3. **指示器不一定可见**：Windows 11 任务栏输入法指示器可能被折叠/隐藏，看不到指示器
+   不代表 Verba 未激活——日志 `Verba TSF 激活` 即证明已激活；以输入 `//` 是否出现
+   下划线为准。
+4. 诊断日志：`%LOCALAPPDATA%\Verba\verba-ime.log`（新 DLL 才有）。
 
 ### 规范测试步骤（务必按顺序）
 1. **关闭所有记事本窗口**（以及之前测试过的应用）。
