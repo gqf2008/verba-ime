@@ -153,18 +153,14 @@ impl CompositionMachine {
     pub fn preedit(&self) -> String {
         match self.state {
             MachineState::PendingSlash => "/".to_owned(),
-            MachineState::Pinyin => {
-                if self.pinyin_candidates.is_empty() {
-                    self.pinyin_buffer.clone()
+            MachineState::Pinyin => self.pinyin_preedit(),
+            MachineState::Prompt => {
+                if self.pinyin_composing() {
+                    format!("//{}{}", self.prompt, self.pinyin_preedit())
                 } else {
-                    let mut out = self.pinyin_buffer.clone();
-                    for (i, cand) in self.pinyin_candidates.iter().enumerate() {
-                        out.push_str(&format!(" {}.{cand}", i + 1));
-                    }
-                    out
+                    format!("//{}", self.prompt)
                 }
             }
-            MachineState::Prompt => format!("//{}", self.prompt),
             MachineState::Streaming | MachineState::ResultReady => self.result.clone(),
             MachineState::Idle => String::new(),
         }
@@ -205,12 +201,7 @@ impl CompositionMachine {
                 }
             }
             MachineState::Pinyin => self.feed_pinyin_char(c),
-            MachineState::Prompt => {
-                self.prompt.push(c);
-                Action::UpdatePrompt {
-                    preedit: self.preedit(),
-                }
-            }
+            MachineState::Prompt => self.feed_prompt_char(c),
             MachineState::Streaming | MachineState::ResultReady => Action::None,
         }
     }
@@ -252,6 +243,64 @@ impl CompositionMachine {
         Action::CommitImmediate(text)
     }
 
+    /// 提示词态的字符输入：支持拼音组合（字母→候选→选中上屏到提示词）。
+    /// 无候选时按原文提交（保住 `//translate hello` 这类英文提示词流程）。
+    fn feed_prompt_char(&mut self, c: char) -> Action {
+        if self.pinyin_composing() {
+            if c.is_ascii_alphabetic() {
+                self.pinyin_buffer.push(c.to_ascii_lowercase());
+                self.refresh_candidates();
+                return Action::UpdatePrompt {
+                    preedit: self.preedit(),
+                };
+            }
+            if c.is_ascii_digit() && c != '0' {
+                let idx = (c as u8 - b'1') as usize;
+                if let Some(text) = self.pinyin_candidates.get(idx) {
+                    self.prompt.push_str(text);
+                    self.clear_pinyin();
+                    return Action::UpdatePrompt {
+                        preedit: self.preedit(),
+                    };
+                }
+                return Action::None;
+            }
+            if c == ' ' || c == '/' {
+                // 空格/斜杠：提交候选（或原文）后，空格入提示词、斜杠交给 AI 触发判定
+                let text = self.commit_pinyin_text();
+                self.prompt.push_str(&text);
+                self.clear_pinyin();
+                if c == '/' {
+                    // 斜杠在提示词中按字面加入（无特殊触发）
+                    self.prompt.push('/');
+                }
+                return Action::UpdatePrompt {
+                    preedit: self.preedit(),
+                };
+            }
+            // 其它可打印字符：提交拼音 + 追加该字符
+            self.prompt.push_str(&self.commit_pinyin_text());
+            self.prompt.push(c);
+            self.clear_pinyin();
+            return Action::UpdatePrompt {
+                preedit: self.preedit(),
+            };
+        }
+        // 未组合：字母开始拼音；其它字符直接入提示词
+        if c.is_ascii_alphabetic() {
+            self.pinyin_buffer.clear();
+            self.pinyin_buffer.push(c.to_ascii_lowercase());
+            self.refresh_candidates();
+            return Action::UpdatePrompt {
+                preedit: self.preedit(),
+            };
+        }
+        self.prompt.push(c);
+        Action::UpdatePrompt {
+            preedit: self.preedit(),
+        }
+    }
+
     /// 退格。
     pub fn feed_backspace(&mut self) -> Action {
         match self.state {
@@ -276,7 +325,19 @@ impl CompositionMachine {
                 }
             }
             MachineState::Prompt => {
-                if self.prompt.pop().is_some() {
+                if self.pinyin_composing() {
+                    if self.pinyin_buffer.pop().is_some() {
+                        self.refresh_candidates();
+                        if self.pinyin_buffer.is_empty() {
+                            self.clear_pinyin();
+                        }
+                        Action::UpdatePrompt {
+                            preedit: self.preedit(),
+                        }
+                    } else {
+                        Action::None
+                    }
+                } else if self.prompt.pop().is_some() {
                     Action::UpdatePrompt {
                         preedit: self.preedit(),
                     }
@@ -299,12 +360,22 @@ impl CompositionMachine {
                 Action::CommitImmediate(text)
             }
             MachineState::Prompt => {
-                let prompt = std::mem::take(&mut self.prompt);
-                self.state = MachineState::Streaming;
-                self.result.clear();
-                Action::StartLlm {
-                    prompt,
-                    system: None,
+                if self.pinyin_composing() {
+                    // 组合中：先提交拼音（候选或原文）到提示词，不触发 LLM
+                    let text = self.commit_pinyin_text();
+                    self.prompt.push_str(&text);
+                    self.clear_pinyin();
+                    Action::UpdatePrompt {
+                        preedit: self.preedit(),
+                    }
+                } else {
+                    let prompt = std::mem::take(&mut self.prompt);
+                    self.state = MachineState::Streaming;
+                    self.result.clear();
+                    Action::StartLlm {
+                        prompt,
+                        system: None,
+                    }
                 }
             }
             MachineState::Streaming | MachineState::ResultReady => {
@@ -327,6 +398,30 @@ impl CompositionMachine {
                 self.result.clear();
                 Action::Cancel
             }
+        }
+    }
+
+    /// 是否正在拼音组合（缓冲非空）。
+    fn pinyin_composing(&self) -> bool {
+        !self.pinyin_buffer.is_empty()
+    }
+
+    /// 清空拼音缓冲与候选（保留提示词）。
+    fn clear_pinyin(&mut self) {
+        self.pinyin_buffer.clear();
+        self.pinyin_candidates.clear();
+    }
+
+    /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
+    fn pinyin_preedit(&self) -> String {
+        if self.pinyin_candidates.is_empty() {
+            self.pinyin_buffer.clone()
+        } else {
+            let mut out = self.pinyin_buffer.clone();
+            for (i, cand) in self.pinyin_candidates.iter().enumerate() {
+                out.push_str(&format!(" {}.{cand}", i + 1));
+            }
+            out
         }
     }
 
@@ -662,5 +757,96 @@ mod tests {
         assert_eq!(Mode::from_proto_str("bogus"), None);
         assert!(Mode::Normal.accepts_direct_input());
         assert!(!Mode::Ai.accepts_direct_input());
+    }
+
+    #[test]
+    fn prompt_pinyin_commits_chinese() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "nihao".chars() {
+            m.feed_char(c);
+        }
+        assert!(m.pinyin_composing(), "提示词中应处于拼音组合");
+        assert!(
+            m.preedit().contains(" 1."),
+            "preedit 应含内联候选: {:?}",
+            m.preedit()
+        );
+        let a = m.feed_char(' ');
+        assert!(matches!(a, Action::UpdatePrompt { .. }));
+        assert_eq!(
+            m.prompt(),
+            "你好",
+            "提示词应提交中文，实际 {:?}",
+            m.prompt()
+        );
+        assert!(!m.pinyin_composing());
+    }
+
+    #[test]
+    fn prompt_pinyin_enter_commits_then_submits() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "nihao".chars() {
+            m.feed_char(c);
+        }
+        // 第一次 Enter：提交拼音到提示词，不触发 LLM
+        let a1 = m.feed_enter();
+        assert!(
+            matches!(a1, Action::UpdatePrompt { .. }),
+            "组合中 Enter 应先提交拼音: {a1:?}"
+        );
+        assert_eq!(m.prompt(), "你好");
+        // 第二次 Enter：无组合 → 提交 LLM
+        assert_eq!(
+            m.feed_enter(),
+            Action::StartLlm {
+                prompt: "你好".into(),
+                system: None
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_english_fallback_commits_raw() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "translate".chars() {
+            m.feed_char(c);
+        }
+        // "translate" 不是合法拼音 → 无候选 → 空格提交原文
+        assert!(
+            !m.pinyin_composing() || m.pinyin_candidates.is_empty(),
+            "非拼音应无候选"
+        );
+        let _ = m.feed_char(' ');
+        assert_eq!(m.prompt(), "translate");
+        assert_eq!(
+            m.feed_enter(),
+            Action::StartLlm {
+                prompt: "translate".into(),
+                system: None
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_backspace_pops_pinyin_then_prompt() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_backspace(), Action::UpdatePrompt { .. }));
+        assert_eq!(m.pinyin_buffer, "n");
+        m.feed_backspace();
+        assert!(!m.pinyin_composing(), "拼音清空后应退出组合");
+        // 再退格弹提示词
+        m.prompt.push('x');
+        assert!(matches!(m.feed_backspace(), Action::UpdatePrompt { .. }));
+        assert_eq!(m.prompt(), "");
     }
 }

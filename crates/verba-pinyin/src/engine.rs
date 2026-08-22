@@ -74,6 +74,14 @@ impl PinyinEngine {
             }
         }
 
+        // 整句档：连续拼音 DP 切分组合（如 nishishui → 你是谁）。
+        // 分数=频率和 + SENTENCE_PENALTY：真实词典词（含常用短语）排在整句之前，
+        // 整句仅作为非词条句子的兜底。
+        const SENTENCE_PENALTY: u32 = 500;
+        if let Some((score, text)) = self.sentence_candidate(&input) {
+            cands.push((score + SENTENCE_PENALTY, text, CandidateKind::Word));
+        }
+
         cands.sort_by_key(|(r, _, _)| *r);
         let mut seen_text = HashSet::new();
         let mut out = Vec::with_capacity(MAX_CANDIDATES);
@@ -90,6 +98,47 @@ impl PinyinEngine {
             }
         }
         out
+    }
+
+    /// 整句候选：对输入的连续拼音做音节切分 + 动态规划，选出
+    /// 「词（词典优先）+ 单字」频率和最小的组合（如 "nishishui" → 你是谁）。
+    fn sentence_candidate(&self, input: &str) -> Option<(u32, String)> {
+        let idx = data::index();
+        let syllables = segment_syllables(input, &idx.syllables)?;
+        let n = syllables.len();
+        if !(2..=12).contains(&n) {
+            return None;
+        }
+        // best[i] = 第 i 个音节到末尾的最优 (分数, 文本)
+        let mut best: Vec<Option<(u32, String)>> = vec![None; n + 1];
+        best[n] = Some((0, String::new()));
+        for i in (0..n).rev() {
+            let mut best_here: Option<(u32, String)> = None;
+            // 单字（当前音节）
+            if let Some((cr, c)) = top_char(syllables[i], idx) {
+                if let Some((r, t)) = &best[i + 1] {
+                    let cand = (cr + r, format!("{c}{t}"));
+                    if best_here.as_ref().is_none_or(|b| cand.0 < b.0) {
+                        best_here = Some(cand);
+                    }
+                }
+            }
+            // 词典词（跨 2..=6 个音节）
+            let mut joined = String::from(syllables[i]);
+            for j in (i + 1)..n.min(i + 6) {
+                joined.push_str(syllables[j]);
+                if let Some((wr, w)) = best_word(&joined, idx) {
+                    if let Some((r, t)) = &best[j + 1] {
+                        let cand = (wr + r, format!("{w}{t}"));
+                        if best_here.as_ref().is_none_or(|b| cand.0 < b.0) {
+                            best_here = Some(cand);
+                        }
+                    }
+                }
+            }
+            best[i] = best_here;
+        }
+        best[0].clone()
     }
 
     /// 收集单个拼音串的候选（精确 / 边界前缀 / 部分前缀），分数统一加 `penalty`。
@@ -150,6 +199,57 @@ impl PinyinEngine {
         cands
     }
 }
+/// 贪心最长匹配把拼音串切成音节；无法切分返回 None。
+fn segment_syllables<'a>(
+    input: &'a str,
+    syllables: &std::collections::HashSet<&str>,
+) -> Option<Vec<&'a str>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let mut matched = false;
+        for len in (1..=6.min(bytes.len() - pos)).rev() {
+            if let Ok(c) = std::str::from_utf8(&bytes[pos..pos + len]) {
+                if syllables.contains(c) {
+                    out.push(c);
+                    pos += len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// 某音节的最高频单字。
+fn top_char(syllable: &str, idx: &data::Index) -> Option<(u32, char)> {
+    let lo = idx.chars.partition_point(|b| b.pinyin < syllable);
+    idx.chars.get(lo).and_then(|b| {
+        if b.pinyin == syllable {
+            b.entries.first().map(|&(r, c)| (r, c))
+        } else {
+            None
+        }
+    })
+}
+
+/// 某连续拼音串对应的最高频词典词。
+fn best_word(pinyin: &str, idx: &data::Index) -> Option<(u32, &'static str)> {
+    let lo = idx.words.partition_point(|b| b.pinyin < pinyin);
+    idx.words.get(lo).and_then(|b| {
+        if b.pinyin == pinyin {
+            b.entries.first().map(|&(r, w)| (r, w))
+        } else {
+            None
+        }
+    })
+}
+
 /// 归一化输入：去空白、转小写。
 pub fn normalize(input: &str) -> String {
     input

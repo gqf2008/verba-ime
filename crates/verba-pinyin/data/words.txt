@@ -6022,6 +6022,7 @@ buyizhilun	461,不易之论
 buyizhizi	524,不一致字
 buyong	51,不用
 buyongkeqi	583,不用客气
+buyongle	51,不用了
 buyongshuo	51,不用说
 buyongxie	897,不用谢
 buyongzhao	466,不用找
@@ -6083,6 +6084,7 @@ buzhengzhifeng	348,不正之风
 buzhi	97,不只 123,不知 274,不治 437,不支 524,不致 596,不止 600,不值 677,布置 885,不智
 buzhibujue	327,不知不觉
 buzhibuqiu	6632,不忮不求
+buzhidao	123,不知道
 buzhide	600,不值得
 buzhidingdong	1629,不知丁董
 buzhieryu	1301,不治而愈
@@ -20949,6 +20951,7 @@ gongzuorenyuan	200,工作人员
 gongzuori	118,工作日
 gongzuoshi	708,工作室
 gongzuoshijian	135,工作时间
+gongzuoshunli	938,工作顺利
 gongzuotai	388,工作台
 gongzuoweiyuanhui	457,工作委员会
 gongzuozhan	544,工作站
@@ -23577,6 +23580,7 @@ haodai	2905,好歹
 haodang	1864,浩荡
 haodao	82,好道
 haodaxigong	668,好大喜功
+haode	82,好的
 haodi	5521,好睇
 haodian	1730,耗电
 haodong	82,好动
@@ -24308,6 +24312,8 @@ henduoshi	138,很多时
 henei	574,河内
 heneng	828,核能
 henengyuan	828,核能源
+hengaoxingjiandaoni	531,很高兴见到你
+hengaoxingrenshini	531,很高兴认识你
 hengbanfuxiaoxiao	6353,横斑腹小鸮
 hengbanlinying	2902,横斑林莺
 hengbao	1330,横暴
@@ -30966,6 +30972,7 @@ jintian	336,今天
 jintiancun	778,金田村
 jintianhe	6716,金天翮
 jintianqiyi	778,金田起义
+jintiantianqizhenhao	336,今天天气真好
 jintiao	260,金条
 jintie	1454,津贴 1454,紧贴
 jintishi	906,今体诗 906,近体诗
@@ -40596,6 +40603,7 @@ meigonghe	3639,湄公河
 meigu	994,美姑
 meiguan	334,美观
 meiguanxi	216,没关系
+meiguanxila	1194,没关系啦
 meiguhe	994,美姑河
 meigui	2492,玫瑰
 meiguiguo	2492,玫瑰果
@@ -41613,6 +41621,7 @@ mingan	518,命案 1436,敏感
 minganwuzhi	1436,敏感物质
 minganxing	1436,敏感性
 mingbai	286,明白
+mingbaile	286,明白了
 mingbaizhe	1158,明摆着
 mingbao	234,明报
 mingbi	2739,冥币
@@ -43910,6 +43919,7 @@ nichan	1975,逆产 3057,泥铲
 nichang	3609,霓裳 3609,霓裳
 nichen	1975,逆臣
 nicheng	4089,昵称
+nichifanlema	935,你吃饭了吗
 nidao	1499,泥刀
 nidazhuque	2331,拟大朱雀
 nidelan	654,尼德兰
@@ -43992,6 +44002,7 @@ niguxiya	654,尼古西亚
 niguzhizuo	1541,拟古之作
 nihai	1499,泥孩
 nihao	82,你好
+nihaoma	453,你好吗
 nihe	1541,拟合
 nihelu	1346,尼赫鲁
 nihong	3609,霓虹
@@ -44004,6 +44015,7 @@ niji	2804,匿迹
 nijialagua	1827,尼加拉瓜
 nijialapubu	3195,尼加拉瀑布
 nijiang	2626,泥浆
+nijiaoshenmemingzi	393,你叫什么名字
 nijijing	3726,逆戟鲸
 nijin	1499,泥金
 nijing	1975,逆境
@@ -44174,6 +44186,7 @@ nishengzhang	1975,逆生长
 nishentou	2520,逆渗透
 nishi	4448,睨视
 nishiliu	1499,泥石流
+nishishui	648,你是谁
 nishizhen	1975,逆时针
 nishou	1499,泥守
 nishui	1499,泥水 1975,逆水 3291,溺水
@@ -48378,6 +48391,7 @@ qingshanhuqu	918,青山湖区
 qingshanlvshui	1088,青山绿水
 qingshanqu	497,青山区
 qingshanzhou	721,青山州
+qingshaodeng	1373,请稍等
 qingshaonian	497,青少年
 qingshen	497,青神 4542,罄身
 qingshener	4542,罄身儿
@@ -49644,6 +49658,7 @@ quming	323,取名
 qumo	689,取模 1511,驱魔
 qumogangui	1511,驱魔赶鬼
 qumu	689,取模 1066,曲目
+qunali	652,去哪里
 qunao	1336,取闹 2794,屈挠
 qundai	2431,裙带
 qundaicai	2431,裙带菜
@@ -53946,6 +53961,7 @@ shentao	1110,申讨
 shenti	164,身体 227,神体
 shentibufen	164,身体部分
 shentijiancha	731,身体检查
+shentijiankang	979,身体健康
 shentilixing	164,身体力行
 shentizhanghai	1237,身体障害
 shentong	227,神通 1110,申通 1229,神童
@@ -63431,6 +63447,7 @@ wenzong	727,文宗 727,文宗
 wenzui	718,问罪
 wenzuizhishi	718,问罪之师
 wenzuodiaoyutai	2305,稳坐钓鱼台
+woaini	394,我爱你
 wobei	1477,我辈
 wobie	1032,握别
 wobing	1944,卧病
@@ -63471,6 +63488,7 @@ woguo	20,我国
 woguoer	1944,卧果儿
 wohe	2759,涡核
 woheixingxing	3390,倭黑猩猩
+wohenhao	138,我很好
 wohu	1944,卧虎
 wohucanglong	1944,卧虎藏龙 1944,卧虎藏龙
 wojiang	2939,涡桨
@@ -63520,6 +63538,8 @@ wotu	1808,沃土
 wotui	1944,卧推
 wowei	1944,卧位
 wowotou	1962,窝窝头
+woxiangni	99,我想你
+woxihuanni	685,我喜欢你
 woxin	1962,窝心
 woxinchangdan	2167,卧薪尝胆 2167,卧薪尝胆
 woxing	3723,蜗行
@@ -66344,6 +66364,7 @@ xiexian	1786,斜线
 xiexianhao	1786,斜线号
 xiexiao	2116,谢孝
 xiexie	897,谢谢 2715,泄泻 2715,泄泻
+xiexieni	897,谢谢你
 xiexin	448,写信 1463,谢辛 1828,歇心
 xiexinacu	2816,挟细拿粗
 xiexing	2416,谐星 3846,楔形
@@ -67239,6 +67260,7 @@ xinku	1463,辛苦
 xinkuan	807,新款
 xinkuangshenyi	2735,心旷神怡
 xinkuantipan	1893,心宽体胖
+xinkule	1463,辛苦了
 xinla	324,新拉 2420,辛辣
 xinlai	1365,信赖
 xinlaiqujian	1365,信赖区间
@@ -74821,6 +74843,7 @@ zaiji	293,在即 1579,载籍
 zaijia	56,在家 2063,再嫁
 zaijian	242,再见 244,再建
 zaijianquanleida	2417,再见全垒打
+zaijianzaijian	242,再见再见
 zaijiao	191,在教 4056,再醮
 zaijiezaili	1339,再接再厉 4760,再接再砺
 zaijindou	2401,栽筋斗
@@ -74838,9 +74861,11 @@ zailiyong	242,再利用
 zaimin	1349,灾民
 zaiming	977,载明
 zainaer	192,在那儿
+zainali	652,在哪里
 zainan	1349,灾难
 zainanpian	1349,灾难片
 zainanxing	1349,灾难性
+zainar	652,在哪儿
 zainei	175,在内
 zaipang	981,在旁
 zaipei	2401,栽培
@@ -77098,6 +77123,7 @@ zhidaohuanglong	2723,直捣黄龙
 zhidaojiaoshou	968,指导教授
 zhidaoke	1208,指导课
 zhidaole	123,知道了
+zhidaoma	453,知道吗
 zhidaoxianzai	255,直到现在
 zhidaoyuan	343,指导员
 zhidaozhe	343,指导者
@@ -78073,6 +78099,7 @@ zhongweizi	653,中微子
 zhongwen	148,中文
 zhongwenqingwu	501,重文轻武
 zhongwu	142,重物 1004,中午
+zhongwuhao	1004,中午好
 zhongwuqi	501,重武器
 zhongxi	167,中西 216,种系
 zhongxia	1706,仲夏

@@ -15,9 +15,20 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "..", "data")
 
 def fetch(url):
+    # 本地缓存：避免重复抓取与网络抖动
+    cache_dir = os.path.join(BASE, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    name = url.rstrip("/").split("/")[-1]
+    cache_path = os.path.join(cache_dir, name)
+    if os.path.exists(cache_path):
+        with io.open(cache_path, "r", encoding="utf-8") as f:
+            return f.read()
     print("fetch", url)
     with urllib.request.urlopen(url, timeout=30) as r:
-        return r.read().decode("utf-8")
+        data = r.read().decode("utf-8")
+    with io.open(cache_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(data)
+    return data
 
 TONE_MAP = str.maketrans({
     "ā":"a","á":"a","ǎ":"a","à":"a",
@@ -106,6 +117,68 @@ def main():
     for py in word_map:
         word_map[py].sort()
         word_map[py] = word_map[py][:40]  # 每个拼音最多保留 40 个词语
+
+    # ---- 常用短语/句子（CC-CEDICT 不收录的口语高频句，精确命中整句输入） ----
+    CURATED = {
+        "你是谁": "nishishui",
+        "你好吗": "nihaoma",
+        "你吃饭了吗": "nichifanlema",
+        "我很好": "wohenhao",
+        "我爱你": "woaini",
+        "我想你": "woxiangni",
+        "我喜欢你": "woxihuanni",
+        "没关系": "meiguanxi",
+        "没问题": "meiwenti",
+        "不好意思": "buhaoyisi",
+        "不客气": "bukeqi",
+        "谢谢你": "xiexieni",
+        "再见": "zaijian",
+        "请问": "qingwen",
+        "为什么": "weishenme",
+        "怎么办": "zenmeban",
+        "干什么": "ganshenme",
+        "去哪里": "qunali",
+        "在哪儿": "zainar",
+        "在哪里": "zainali",
+        "知道吗": "zhidaoma",
+        "不知道": "buzhidao",
+        "知道了": "zhidaole",
+        "早上好": "zaoshanghao",
+        "中午好": "zhongwuhao",
+        "晚上好": "wanshanghao",
+        "新年快乐": "xinniankuaile",
+        "生日快乐": "shengrikuaile",
+        "身体健康": "shentijiankang",
+        "工作顺利": "gongzuoshunli",
+        "好久不见": "haojiubujian",
+        "很高兴认识你": "hengaoxingrenshini",
+        "再见再见": "zaijianzaijian",
+        "明白了": "mingbaile",
+        "好的": "haode",
+        "可以": "keyi",
+        "不用了": "buyongle",
+        "等一下": "dengyixia",
+        "请稍等": "qingshaodeng",
+        "辛苦了": "xinkule",
+        "加油": "jiayou",
+        "随便": "suibian",
+        "对不起": "duibuqi",
+        "没关系啦": "meiguanxila",
+        "你叫什么名字": "nijiaoshenmemingzi",
+        "很高兴见到你": "hengaoxingjiandaoni",
+        "今天天气真好": "jintiantianqizhenhao",
+    }
+    for word, py in CURATED.items():
+        if not (2 <= len(word) <= 8) or not all(is_cjk(c) for c in word):
+            continue
+        ranks = [char_rank.get(c, 10000 + ord(c)) for c in word]
+        rank = max(ranks)
+        lst = word_map.setdefault(py, [])
+        if not any(w == word for _, w in lst):
+            lst.append((rank, word))
+    for py in word_map:
+        word_map[py].sort()
+        word_map[py] = word_map[py][:40]
 
     # ---- 写出 ----
     def write(name, data):

@@ -26,6 +26,8 @@ pub(crate) struct InitialBucket {
 }
 
 pub(crate) struct Index {
+    /// 合法无调音节集合（来自 chars.txt）。
+    pub syllables: HashSet<&'static str>,
     pub chars: Vec<CharBucket>,
     pub words: Vec<WordBucket>,
     /// 简拼索引（按 initials 排序）。
@@ -157,6 +159,7 @@ pub(crate) fn index() -> &'static Index {
         let words = build_words(include_str!("../data/words.txt"), &syllables);
         let initials = build_initials(&words);
         Index {
+            syllables,
             chars,
             words,
             initials,
