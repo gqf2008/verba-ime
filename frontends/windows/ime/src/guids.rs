@@ -10,4 +10,3 @@ pub const PROFILE_VERBA: GUID = GUID::from_u128(0xa4b8c1d2_3e4f_5a6b_7c8d_9e0f1a
 
 /// 显示名称。
 pub const TEXT_SERVICE_NAME: &str = "Verba · 拾言输入法";
-

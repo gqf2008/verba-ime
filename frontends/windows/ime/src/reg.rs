@@ -6,16 +6,16 @@
 use std::path::PathBuf;
 
 use windows::core::{Error, Result, PCWSTR};
+use windows::Win32::Globalization::LocaleNameToLCID;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
-use windows::Win32::Globalization::LocaleNameToLCID;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE,
-    REG_CREATE_KEY_DISPOSITION, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
@@ -150,7 +150,10 @@ pub fn register_profiles(module_path: &str) -> Result<()> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let module: Vec<u16> = module_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let module: Vec<u16> = module_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let langids = user_lang_ids();
         let mut any_ok = false;
         let mut last_err: Option<windows::core::Error> = None;
@@ -176,11 +179,12 @@ pub fn register_profiles(module_path: &str) -> Result<()> {
         if any_ok {
             Ok(())
         } else {
-            Err(last_err.unwrap_or_else(|| Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32))))
+            Err(last_err.unwrap_or_else(|| {
+                Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32))
+            }))
         }
     }
 }
-
 
 /// 读取用户已安装的输入语言 LANGID 列表（HKCU\Control Panel\International\User Profile\Languages）。
 /// 读取失败时回退常用语言：en-US / zh-CN / zh-TW。
@@ -191,7 +195,10 @@ fn user_lang_ids() -> Vec<u16> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let name: Vec<u16> = "Languages".encode_utf16().chain(std::iter::once(0)).collect();
+        let name: Vec<u16> = "Languages"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut hkey = HKEY::default();
         let opened = RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -203,7 +210,15 @@ fn user_lang_ids() -> Vec<u16> {
         .is_ok();
         if opened {
             let mut size = 0u32;
-            if RegQueryValueExW(hkey, PCWSTR(name.as_ptr()), None, None, None, Some(&mut size)).is_ok()
+            if RegQueryValueExW(
+                hkey,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut size),
+            )
+            .is_ok()
             {
                 let mut buf = vec![0u16; (size as usize).div_ceil(2) + 2];
                 let mut actual = size;

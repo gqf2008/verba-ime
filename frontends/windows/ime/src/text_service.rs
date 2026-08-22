@@ -117,8 +117,9 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
 
     let km: ITfKeystrokeMgr = ptim.cast()?;
     let sink: ITfKeyEventSink = KeyEventSink::new(data.clone()).into();
-    if let Err(e) = unsafe { km.AdviseKeyEventSink(tid, &sink, true) } {
-        log::warn!("AdviseKeyEventSink 失败: {e}");
+    match unsafe { km.AdviseKeyEventSink(tid, &sink, true) } {
+        Ok(()) => log::info!("AdviseKeyEventSink 成功"),
+        Err(e) => log::warn!("AdviseKeyEventSink 失败: {e}"),
     }
     *data.keysink.borrow_mut() = Some(sink);
 
@@ -192,6 +193,7 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        log::info!("OnKeyDown vk=0x{:02X}", wparam.0 as u32);
         if let Ok(ctx) = pic.ok() {
             *self.data.context.borrow_mut() = Some(ctx.clone());
         }
@@ -278,8 +280,10 @@ pub fn handle_key_down(
         return Ok(FALSE);
     }
     let Some(action) = action else {
+        log::info!("key 未处理 vk=0x{vk:02X} ch={ch:?} state={state:?}");
         return Ok(FALSE);
     };
+    log::info!("action={action:?} (state={state:?})");
     drop(machine);
 
     let Some(context) = data.context.borrow().as_ref().cloned() else {

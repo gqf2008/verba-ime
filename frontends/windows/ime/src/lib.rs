@@ -12,6 +12,7 @@
 mod class_factory;
 mod dll;
 mod edit_session;
+mod filelog;
 mod guids;
 mod ipc;
 pub mod reg;
