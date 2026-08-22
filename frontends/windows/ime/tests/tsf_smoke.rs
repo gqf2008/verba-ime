@@ -270,10 +270,22 @@ fn should_claim_key_composition_claims_all() {
         MachineState::ResultReady,
     ] {
         assert!(should_claim_key(st, 0xBF, 0x35 << 16), "state {st:?} slash");
-        assert!(should_claim_key(st, 0x48, 0x23 << 16), "state {st:?} letter");
+        assert!(
+            should_claim_key(st, 0x48, 0x23 << 16),
+            "state {st:?} letter"
+        );
         assert!(should_claim_key(st, 0x0D, 0x1C << 16), "state {st:?} Enter");
-        assert!(should_claim_key(st, 0x08, 0x0E << 16), "state {st:?} Backspace");
-        assert!(!should_claim_key(st, 0x11, 0x1D << 16), "state {st:?} Ctrl 不认领");
-        assert!(!should_claim_key(st, 0x25, 0x4B << 16), "state {st:?} 方向键不认领");
+        assert!(
+            should_claim_key(st, 0x08, 0x0E << 16),
+            "state {st:?} Backspace"
+        );
+        assert!(
+            !should_claim_key(st, 0x11, 0x1D << 16),
+            "state {st:?} Ctrl 不认领"
+        );
+        assert!(
+            !should_claim_key(st, 0x25, 0x4B << 16),
+            "state {st:?} 方向键不认领"
+        );
     }
 }

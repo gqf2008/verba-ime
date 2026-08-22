@@ -319,6 +319,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         _ecwrite: u32,
         _pcomposition: Ref<ITfComposition>,
     ) -> Result<()> {
+        log::info!("OnCompositionTerminated —— 组合被应用终止，状态机重置为 Idle");
         *self.data.composition.borrow_mut() = None;
         *self.data.machine.borrow_mut() = CompositionMachine::new();
         cancel_stream(&self.data);
@@ -492,7 +493,11 @@ fn set_preedit(
     // 先取走引用并释放 borrow，避免 else 分支内 borrow_mut 冲突。
     let existing = data.composition.borrow_mut().take();
     if let Some(comp) = existing {
-        edit_session::update_composition(context, clientid, &comp, text)
+        let r = edit_session::update_composition(context, clientid, &comp, text);
+        // 更新后必须放回引用：否则下次更新会新建组合，
+        // 导致应用终止旧组合 → OnCompositionTerminated → 状态机被重置回 Idle。
+        *data.composition.borrow_mut() = Some(comp);
+        r
     } else {
         let sink: ITfCompositionSink = CompositionSink::new(data.clone()).into();
         let comp = edit_session::start_composition(context, clientid, &sink, text)?;
