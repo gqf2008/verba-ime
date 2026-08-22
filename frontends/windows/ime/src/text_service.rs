@@ -455,7 +455,9 @@ pub fn apply_action(
         | Action::UpdatePrompt { preedit }
         | Action::UpdateResult { preedit } => set_preedit(data, context, clientid, &preedit),
         Action::StartLlm { prompt, system: _ } => {
-            set_preedit(data, context, clientid, "")?;
+            // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
+            // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
+            // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult 替换文本。
             start_llm(data, prompt);
             Ok(())
         }
