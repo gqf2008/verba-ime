@@ -560,6 +560,7 @@ fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<
         let mut rc = RECT::default();
         view.GetTextExt(data.clientid.get(), &range, &mut rc, std::ptr::null_mut())
             .ok()?;
+        log::info!("组合锚点 rect=({},{})-({},{})", rc.left, rc.top, rc.right, rc.bottom);
         Some((rc.left, rc.bottom))
     }
 }
