@@ -112,9 +112,7 @@ fn tsf_commit_and_preedit() {
             Action::CommitImmediate("Hello".into()),
         )
         .expect("commit");
-        let after_commit = read_context_text(&ctx, tid);
-        eprintln!("[test] after commit_text, doc = {:?}", after_commit);
-        assert_eq!(after_commit, "Hello");
+        assert_eq!(read_context_text(&ctx, tid), "Hello");
 
         // 2) // 进入 preedit（组合），随后提交结果
         verba_ime_windows::text_service::apply_action(
@@ -125,10 +123,7 @@ fn tsf_commit_and_preedit() {
             },
         )
         .expect("enter prompt");
-        eprintln!(
-            "[test] after EnterPrompt, doc = {:?}",
-            read_context_text(&ctx, tid)
-        );
+
         assert!(data.composition.borrow().is_some(), "preedit 应有活动组合");
         verba_ime_windows::text_service::apply_action(
             &data,
@@ -138,11 +133,20 @@ fn tsf_commit_and_preedit() {
             },
         )
         .expect("commit result");
-        let actual = read_context_text(&ctx, tid);
-        eprintln!("[test] after CommitResult, doc = {:?}", actual);
-        assert_eq!(actual, "Hello翻译完成");
+        assert_eq!(read_context_text(&ctx, tid), "Hello翻译完成");
 
-        // 3) 普通模式下按 Enter → 不吞键
+        // 3) 真实按键路径：普通模式输入字符 'H'（走 ToUnicodeEx → machine → 上屏）
+        let eaten_h = verba_ime_windows::text_service::handle_key_down(
+            &data,
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_H.0 as u32,
+            0x1E << 16,
+        )
+        .expect("handle_key_down(H)");
+        assert_eq!(eaten_h, true, "普通模式可打印字符应被吞并上屏");
+        let after_h = read_context_text(&ctx, tid);
+        assert_eq!(after_h, "Hello翻译完成h", "ToUnicodeEx 无 Shift 应为小写");
+
+        // 4) 普通模式下按 Enter → 不吞键
         let eaten = verba_ime_windows::text_service::handle_key_down(
             &data,
             windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN.0 as u32,

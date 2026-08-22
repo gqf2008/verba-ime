@@ -44,6 +44,7 @@ impl ITfEditSession_Impl for CommitSession_Impl {
 pub struct CommitCompositionSession {
     pub text: Vec<u16>,
     pub composition: ITfComposition,
+    pub context: ITfContext,
 }
 
 impl ITfEditSession_Impl for CommitCompositionSession_Impl {
@@ -51,6 +52,13 @@ impl ITfEditSession_Impl for CommitCompositionSession_Impl {
         unsafe {
             let range = self.composition.GetRange()?;
             range.SetText(ec, 0, &self.text)?;
+            // 结束组合后把光标移到提交文本末尾（否则选区覆盖提交文本，后续输入会替换它）。
+            range.ShiftStartToRange(ec, &range, TF_ANCHOR_END)?;
+            let selection = [TF_SELECTION {
+                range: ManuallyDrop::new(Some(range)),
+                style: TF_SELECTIONSTYLE::default(),
+            }];
+            self.context.SetSelection(ec, &selection)?;
             self.composition.EndComposition(ec)?;
             Ok(())
         }
@@ -175,6 +183,7 @@ pub fn end_composition(
     let session: ITfEditSession = CommitCompositionSession {
         text,
         composition: composition.clone(),
+        context: context.clone(),
     }
     .into();
     request_sync(context, clientid, &session, TF_ES_SYNC | TF_ES_READWRITE)
