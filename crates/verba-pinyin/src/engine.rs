@@ -111,7 +111,7 @@ impl PinyinEngine {
             }
         }
         let mut wi = wlo;
-        while wi < idx.words.len() && idx.words[wi].pinyin.starts_with(&input) {
+        while wi < idx.words.len() && idx.words[wi].pinyin.starts_with(input) {
             if idx.words[wi].pinyin != input {
                 let boundary = idx.words[wi].boundaries.contains(&input.len());
                 for &(r, w) in &idx.words[wi].entries {
@@ -134,10 +134,14 @@ impl PinyinEngine {
             }
         }
         let mut ci = clo;
-        while ci < idx.chars.len() && idx.chars[ci].pinyin.starts_with(&input) {
+        while ci < idx.chars.len() && idx.chars[ci].pinyin.starts_with(input) {
             if idx.chars[ci].pinyin != input {
                 for &(r, c) in &idx.chars[ci].entries {
-                    cands.push((r + PARTIAL_PENALTY + penalty, c.to_string(), CandidateKind::Char));
+                    cands.push((
+                        r + PARTIAL_PENALTY + penalty,
+                        c.to_string(),
+                        CandidateKind::Char,
+                    ));
                 }
             }
             ci += 1;

@@ -67,20 +67,29 @@ mod tests {
     #[test]
     fn expands_shenme_to_senme() {
         let v = fuzzy_expand("shenme");
-        assert!(v.iter().any(|x| x == "senme"), "shenme 应含 senme 变体: {v:?}");
+        assert!(
+            v.iter().any(|x| x == "senme"),
+            "shenme 应含 senme 变体: {v:?}"
+        );
         assert!(v.iter().any(|x| x == "shenme"));
     }
 
     #[test]
     fn expands_senme_to_shenme() {
         let v = fuzzy_expand("senme");
-        assert!(v.iter().any(|x| x == "shenme"), "senme 应含 shenme 变体: {v:?}");
+        assert!(
+            v.iter().any(|x| x == "shenme"),
+            "senme 应含 shenme 变体: {v:?}"
+        );
     }
 
     #[test]
     fn expands_zhongguo_to_zongguo() {
         let v = fuzzy_expand("zhongguo");
-        assert!(v.iter().any(|x| x == "zongguo"), "zhongguo 应含 zongguo: {v:?}");
+        assert!(
+            v.iter().any(|x| x == "zongguo"),
+            "zhongguo 应含 zongguo: {v:?}"
+        );
     }
 
     #[test]
