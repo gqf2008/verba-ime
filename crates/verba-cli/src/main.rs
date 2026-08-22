@@ -27,6 +27,7 @@ fn main() {
         Some("ai") => cmd_ai(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
+        Some("pinyin") => cmd_pinyin(&args),
         Some(other) => {
             eprintln!("未知命令: {other}（--help 查看用法）");
             1
@@ -45,6 +46,7 @@ fn print_help() {
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
+         verba-cli pinyin <拼音>        查询拼音候选（本地引擎调试）\n  \
          verba-cli --version             版本\n"
     );
 }
@@ -159,4 +161,20 @@ fn cmd_mode(args: &[String]) -> i32 {
         println!("模式: {mode}");
         Ok(())
     })
+}
+
+
+/// `verba-cli pinyin <拼音>`：本地拼音引擎候选查询（不依赖 daemon）。
+fn cmd_pinyin(args: &[String]) -> i32 {
+    let input = args.get(1).map(String::as_str).unwrap_or("");
+    let engine = verba_pinyin::PinyinEngine::new();
+    let cands = engine.lookup(input);
+    if cands.is_empty() {
+        println!("（无候选）");
+    } else {
+        for (i, c) in cands.iter().enumerate() {
+            println!("{}. {} ({:?})", i + 1, c.text, c.kind);
+        }
+    }
+    0
 }
