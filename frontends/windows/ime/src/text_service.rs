@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use verba_core::machine::{Action, CompositionMachine};
+use verba_core::machine::{Action, CompositionMachine, MachineState};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -242,7 +242,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 
 // ---- 按键处理 ----
 
-fn handle_key_down(
+pub fn handle_key_down(
     data: &Rc<TextServiceData>,
     wparam: u32,
     lparam: u32,
@@ -259,6 +259,7 @@ fn handle_key_down(
     };
 
     let mut machine = data.machine.borrow_mut();
+    let state = machine.state();
     let action = if let Some(c) = ch {
         Some(machine.feed_char(c))
     } else if vk == VK_BACK.0 as u32 {
@@ -270,6 +271,12 @@ fn handle_key_down(
     } else {
         None
     };
+    // 空闲状态下 Enter/Backspace/Esc 透传给应用（不吞键）。
+    if state == MachineState::Idle
+        && (vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32)
+    {
+        return Ok(FALSE);
+    }
     let Some(action) = action else {
         return Ok(FALSE);
     };
@@ -300,13 +307,18 @@ fn get_char_for_vk(vk: u32, lparam: u32) -> Option<char> {
     }
 }
 
-fn apply_action(data: &Rc<TextServiceData>, context: &ITfContext, action: Action) -> Result<()> {
+pub fn apply_action(
+    data: &Rc<TextServiceData>,
+    context: &ITfContext,
+    action: Action,
+) -> Result<()> {
     let clientid = data.clientid.get();
     match action {
         Action::None => Ok(()),
         Action::CommitImmediate(text) => {
-            if let Some(comp) = data.composition.borrow().as_ref().cloned() {
-                *data.composition.borrow_mut() = None;
+            // 先取走组合引用并释放 borrow，避免分支内 borrow_mut 冲突。
+            let existing = data.composition.borrow_mut().take();
+            if let Some(comp) = existing {
                 edit_session::end_composition(context, clientid, &comp, &text)
             } else {
                 edit_session::commit_text(context, clientid, &text)
@@ -351,7 +363,9 @@ fn set_preedit(
     clientid: u32,
     text: &str,
 ) -> Result<()> {
-    if let Some(comp) = data.composition.borrow().as_ref().cloned() {
+    // 先取走引用并释放 borrow，避免 else 分支内 borrow_mut 冲突。
+    let existing = data.composition.borrow_mut().take();
+    if let Some(comp) = existing {
         edit_session::update_composition(context, clientid, &comp, text)
     } else {
         let sink: ITfCompositionSink = CompositionSink::new(data.clone()).into();

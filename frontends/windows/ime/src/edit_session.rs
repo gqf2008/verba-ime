@@ -2,12 +2,15 @@
 //!
 //! 采用 TF_ES_SYNC 同步编辑会话。组合起点取当前选区（ITfContext::GetSelection）。
 
+use std::mem::ManuallyDrop;
+
 use windows::core::{implement, Error, Interface, Param, Result};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-    ITfEditSession_Impl, ITfInsertAtSelection, INSERT_TEXT_AT_SELECTION_FLAGS,
-    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY,
+    ITfEditSession_Impl, ITfInsertAtSelection, INSERT_TEXT_AT_SELECTION_FLAGS, TF_ANCHOR_END,
+    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
+    TF_SELECTIONSTYLE,
 };
 
 /// 无组合状态下的直接上屏。
@@ -21,8 +24,16 @@ impl ITfEditSession_Impl for CommitSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
             let ins: ITfInsertAtSelection = self.context.cast()?;
-            let _range =
+            let range =
                 ins.InsertTextAtSelection(ec, INSERT_TEXT_AT_SELECTION_FLAGS(0), &self.text)?;
+            // InsertTextAtSelection 会让选区覆盖插入文本；把光标移到插入文本末尾，
+            // 否则下一次组合会从错误位置开始（实测会替换掉已提交文本）。
+            range.ShiftStartToRange(ec, &range, TF_ANCHOR_END)?;
+            let selection = [TF_SELECTION {
+                range: ManuallyDrop::new(Some(range)),
+                style: TF_SELECTIONSTYLE::default(),
+            }];
+            self.context.SetSelection(ec, &selection)?;
             Ok(())
         }
     }
