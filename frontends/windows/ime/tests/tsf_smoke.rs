@@ -160,3 +160,88 @@ fn tsf_commit_and_preedit() {
         CoUninitialize();
     }
 }
+
+/// 验证「// 发起 AI → 流式 preedit → Enter 上屏」的定时器链路（不经 daemon，直接注入事件）。
+#[test]
+fn tsf_streaming_preedit() {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        assert_eq!(hr.0, 0);
+        let tm: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).expect("ThreadMgr");
+        let tid = tm.Activate().expect("Activate");
+        let doc = tm.CreateDocumentMgr().expect("DocumentMgr");
+        let mut ctx_out: Option<ITfContext> = None;
+        let mut cookie = 0u32;
+        doc.CreateContext(tid, 0, None, &mut ctx_out, &mut cookie)
+            .expect("CreateContext");
+        let ctx = ctx_out.expect("context");
+        doc.Push(&ctx).expect("Push");
+        let _ = tm.SetFocus(&doc);
+
+        let svc_struct = verba_ime_windows::text_service::TextService::new();
+        let data = svc_struct.data.clone();
+        let svc: ITfTextInputProcessor = svc_struct.into();
+        svc.Activate(&tm, tid).expect("Activate");
+        *data.context.borrow_mut() = Some(ctx.clone());
+
+        // 状态机直接进入 Streaming（// 翻译 → Enter），不触发真实 daemon 线程
+        {
+            let mut m = data.machine.borrow_mut();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_char('翻');
+            m.feed_char('译');
+            m.feed_enter();
+            assert!(matches!(
+                m.state(),
+                verba_core::machine::MachineState::Streaming
+            ));
+        }
+
+        // 注入流式事件（定时器路径）
+        {
+            let mut q = data.chunks.lock().unwrap();
+            q.push_back(verba_protos::StreamEvent {
+                id: 1,
+                kind: Some(verba_protos::stream_event::Kind::Chunk(
+                    verba_protos::Chunk { text: "你".into() },
+                )),
+            });
+            q.push_back(verba_protos::StreamEvent {
+                id: 1,
+                kind: Some(verba_protos::stream_event::Kind::Chunk(
+                    verba_protos::Chunk { text: "好".into() },
+                )),
+            });
+            q.push_back(verba_protos::StreamEvent {
+                id: 1,
+                kind: Some(verba_protos::stream_event::Kind::Final(
+                    verba_protos::Final {
+                        text: "你好".into(),
+                    },
+                )),
+            });
+        }
+        data.on_timer();
+        assert_eq!(
+            read_context_text(&ctx, tid),
+            "你好",
+            "流式 preedit 应实时进入组合"
+        );
+
+        // Enter 提交
+        let eaten = verba_ime_windows::text_service::handle_key_down(
+            &data,
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN.0 as u32,
+            0,
+        )
+        .expect("handle_key_down(Enter)");
+        assert_eq!(eaten, true, "流式结果就绪后 Enter 应提交");
+        assert_eq!(read_context_text(&ctx, tid), "你好", "Enter 后结果上屏");
+
+        svc.Deactivate().expect("Deactivate");
+        let _ = tm.Deactivate();
+        CoUninitialize();
+    }
+}

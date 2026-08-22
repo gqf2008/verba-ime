@@ -534,7 +534,7 @@ fn create_timer_window(data: &Rc<TextServiceData>) -> Result<()> {
 }
 
 impl TextServiceData {
-    fn on_timer(&self) {
+    pub fn on_timer(&self) {
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
             q.drain(..).collect()
