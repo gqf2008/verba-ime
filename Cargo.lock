@@ -1825,6 +1825,7 @@ dependencies = [
  "verba-core",
  "verba-daemon",
  "verba-ipc",
+ "verba-pinyin",
  "verba-protos",
 ]
 
@@ -1842,6 +1843,9 @@ dependencies = [
 [[package]]
 name = "verba-core"
 version = "0.1.0"
+dependencies = [
+ "verba-pinyin",
+]
 
 [[package]]
 name = "verba-daemon"
