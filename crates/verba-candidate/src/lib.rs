@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod renderer;
+
 use serde::{Deserialize, Serialize};
 
 /// 主题 token：各端渲染器消费同一套颜色/尺寸。
