@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/verba-core", "crates/verba-cli"]
+members = [
+    "crates/verba-core",
+    "crates/verba-protos",
+    "crates/verba-ipc",
+    "crates/verba-config",
+    "crates/verba-ai",
+    "crates/verba-daemon",
+    "crates/verba-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,3 +24,22 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
+interprocess = { version = "2.4", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+keyring = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
+eventsource-stream = "0.2"
+futures-core = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+tokio-util = { version = "0.7", features = ["rt"] }

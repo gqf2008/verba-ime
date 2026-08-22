@@ -1,0 +1,19 @@
+[package]
+name = "verba-protos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+description = "Verba IPC 协议消息（Protobuf，prost 生成）"
+
+[lints]
+workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

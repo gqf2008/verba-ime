@@ -1,0 +1,23 @@
+[package]
+name = "verba-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba 后台守护进程：承载核心引擎与 AI 能力，通过 IPC 服务前端"
+
+[lints]
+workspace = true
+
+[dependencies]
+verba-protos = { path = "../verba-protos" }
+verba-ipc = { path = "../verba-ipc" }
+verba-config = { path = "../verba-config" }
+verba-ai = { path = "../verba-ai" }
+verba-core = { path = "../verba-core" }
+tokio.workspace = true
+tokio-util.workspace = true
+log.workspace = true
+env_logger.workspace = true
+async-trait = "0.1"
+futures-util.workspace = true

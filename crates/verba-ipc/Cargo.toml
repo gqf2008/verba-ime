@@ -1,0 +1,23 @@
+[package]
+name = "verba-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba IPC：帧编解码 + local_socket（Windows 命名管道 / Unix Socket）client/server"
+
+[lints]
+workspace = true
+
+[dependencies]
+verba-protos = { path = "../verba-protos" }
+prost.workspace = true
+bytes.workspace = true
+interprocess.workspace = true
+tokio.workspace = true
+log.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio.workspace = true

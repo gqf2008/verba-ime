@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package verba;
+
+// ---------------------------------------------------------------------------
+// Verba IPC 协议（M1 范围：LLM 直输链路）
+// 传输：interprocess local_socket（Windows 命名管道 / Unix Domain Socket）
+// 帧：u32 LE 长度前缀 + 本 Protobuf message
+// ---------------------------------------------------------------------------
+
+// ---------- 请求 ----------
+message Request {
+  uint64 id = 1;
+  oneof kind {
+    Ping ping = 10;
+    SetMode set_mode = 11;
+    GetConfig get_config = 12;
+    SetConfig set_config = 13;
+    LlmGenerate llm_generate = 20;
+    LlmCancel llm_cancel = 21;
+  }
+}
+
+message Ping {}
+
+message SetMode {
+  // normal | ai | voice | ocr
+  string mode = 1;
+}
+
+message GetConfig {}
+
+message SetConfig {
+  map<string, string> values = 1;
+}
+
+message LlmGenerate {
+  string prompt = 1;
+  optional string system = 2;
+  optional float temperature = 3;
+  optional int32 max_tokens = 4;
+  bool stream = 5;
+}
+
+message LlmCancel {}
+
+// ---------- 响应 ----------
+message Response {
+  uint64 id = 1;
+  oneof kind {
+    Pong pong = 2;
+    Ok ok = 3;
+    Error error = 4;
+    Text text = 5;
+    Config config = 6;
+  }
+}
+
+message Pong {
+  string version = 1;
+}
+
+message Ok {}
+
+message Error {
+  int32 code = 1;
+  string message = 2;
+}
+
+message Text {
+  string text = 1;
+}
+
+message Config {
+  map<string, string> values = 1;
+}
+
+// ---------- 流式事件（服务端 -> 客户端，按请求 id 关联） ----------
+message StreamEvent {
+  uint64 id = 1;
+  oneof kind {
+    Chunk chunk = 2;
+    Final final = 3;
+    Error error = 4;
+  }
+}
+
+message Chunk {
+  string text = 1;
+}
+
+message Final {
+  string text = 1;
+}

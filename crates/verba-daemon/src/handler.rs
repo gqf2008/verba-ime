@@ -1,0 +1,249 @@
+//! IPC 请求处理器。
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
+use verba_ai::{LlmClient, LlmConfig, LlmRequest};
+use verba_config::{Config, ConfigManager};
+use verba_core::VERSION;
+use verba_ipc::server::{Outbound, RequestHandler};
+use verba_protos::{
+    request, response, stream_event, Chunk, Config as ConfigMsg, Error as ProtoError, Final,
+    Ok as OkMsg, Pong, Response, StreamEvent,
+};
+
+/// 默认 AI 系统提示词（用户未配置时使用）。
+const DEFAULT_AI_SYSTEM: &str =
+    "你是一个输入法里的 AI 助手。回答应简洁、直接，以可上屏的文本输出，不要使用 Markdown。";
+
+pub struct DaemonHandler {
+    mgr: ConfigManager,
+    config: Arc<RwLock<Config>>,
+    llm_config: Arc<RwLock<LlmConfig>>,
+    llm: LlmClient,
+    cancels: Mutex<HashMap<u64, CancellationToken>>,
+}
+
+impl DaemonHandler {
+    pub fn new(mgr: ConfigManager, config: Config, llm_config: LlmConfig, llm: LlmClient) -> Self {
+        Self {
+            mgr,
+            config: Arc::new(RwLock::new(config)),
+            llm_config: Arc::new(RwLock::new(llm_config)),
+            llm,
+            cancels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn config_map(&self) -> HashMap<String, String> {
+        self.config.read().unwrap().to_map()
+    }
+
+    fn llm_snapshot(&self) -> (LlmConfig, String) {
+        // 每次从当前 config 派生，保证 config set 热更新生效；api_key 保留启动时的密钥库值。
+        let cfg = self.config.read().unwrap().clone();
+        let api_key = self.llm_config.read().unwrap().api_key.clone();
+        let mut llm = LlmConfig::new(cfg.llm_base_url.clone(), api_key, cfg.llm_model.clone());
+        llm.temperature = cfg.temperature;
+        llm.max_tokens = cfg.max_tokens;
+        (llm, cfg.ai_system_prompt)
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for DaemonHandler {
+    async fn handle(&self, req: verba_protos::Request, out: Outbound) {
+        let id = req.id;
+        let result = match req.kind {
+            Some(request::Kind::Ping(_)) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Pong(Pong {
+                        version: VERSION.to_owned(),
+                    })),
+                })
+                .await
+            }
+            Some(request::Kind::GetConfig(_)) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Config(ConfigMsg {
+                        values: self.config_map(),
+                    })),
+                })
+                .await
+            }
+            Some(request::Kind::SetConfig(sc)) => {
+                // 所有锁操作在 await 之前完成，避免非 Send 守卫跨 await。
+                let updated: Result<Config, verba_config::ConfigError> = {
+                    let mut guard = self.config.write().unwrap();
+                    let r = guard.apply_map(&sc.values);
+                    drop(guard);
+                    match r {
+                        Ok(()) => Ok(self.config.read().unwrap().clone()),
+                        Err(e) => Err(e),
+                    }
+                };
+                match updated {
+                    Ok(cfg) => {
+                        if let Err(e) = self.mgr.save(&cfg) {
+                            log::warn!("配置保存失败: {e}");
+                        }
+                        out.response(&Response {
+                            id,
+                            kind: Some(response::Kind::Ok(OkMsg {})),
+                        })
+                        .await
+                    }
+                    Err(e) => {
+                        out.response(&Response {
+                            id,
+                            kind: Some(response::Kind::Error(ProtoError {
+                                code: 400,
+                                message: e.to_string(),
+                            })),
+                        })
+                        .await
+                    }
+                }
+            }
+            Some(request::Kind::SetMode(sm)) => {
+                log::info!("模式切换: {}", sm.mode);
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Ok(OkMsg {})),
+                })
+                .await
+            }
+            Some(request::Kind::LlmGenerate(g)) => self.handle_llm_generate(id, g, out).await,
+            Some(request::Kind::LlmCancel(_)) => {
+                let token = self.cancels.lock().unwrap().remove(&id);
+                if let Some(token) = token {
+                    token.cancel();
+                }
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Ok(OkMsg {})),
+                })
+                .await
+            }
+            None => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 400,
+                        message: "空请求".into(),
+                    })),
+                })
+                .await
+            }
+        };
+        if let Err(e) = result {
+            log::warn!("响应写入失败: {e}");
+        }
+    }
+}
+
+impl DaemonHandler {
+    async fn handle_llm_generate(
+        &self,
+        id: u64,
+        g: verba_protos::LlmGenerate,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let token = CancellationToken::new();
+        self.cancels.lock().unwrap().insert(id, token.clone());
+
+        out.response(&Response {
+            id,
+            kind: Some(response::Kind::Ok(OkMsg {})),
+        })
+        .await?;
+
+        let (llm_cfg, config_system) = self.llm_snapshot();
+        let system = g
+            .system
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!config_system.is_empty()).then_some(config_system))
+            .or_else(|| Some(DEFAULT_AI_SYSTEM.to_owned()));
+
+        let req = LlmRequest {
+            prompt: g.prompt,
+            system,
+            temperature: g.temperature,
+            max_tokens: g.max_tokens,
+        };
+
+        match self.llm.stream(&llm_cfg, &req).await {
+            Ok(mut stream) => {
+                let mut failed = false;
+                let mut final_text = String::new();
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        log::info!("LLM 请求 {id} 已取消");
+                    }
+                    _ = async {
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(text) => {
+                                    final_text.push_str(&text);
+                                    if let Err(e) = out
+                                        .event(&StreamEvent {
+                                            id,
+                                            kind: Some(stream_event::Kind::Chunk(Chunk {
+                                                text,
+                                            })),
+                                        })
+                                        .await
+                                    {
+                                        log::warn!("事件写入失败: {e}");
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("LLM 流错误: {e}");
+                                    let _ = out
+                                        .event(&StreamEvent {
+                                            id,
+                                            kind: Some(stream_event::Kind::Error(ProtoError {
+                                                code: 500,
+                                                message: e.to_string(),
+                                            })),
+                                        })
+                                        .await;
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } => {}
+                }
+                if !failed && !token.is_cancelled() {
+                    let _ = out
+                        .event(&StreamEvent {
+                            id,
+                            kind: Some(stream_event::Kind::Final(Final { text: final_text })),
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = out
+                    .event(&StreamEvent {
+                        id,
+                        kind: Some(stream_event::Kind::Error(ProtoError {
+                            code: 502,
+                            message: e.to_string(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+
+        self.cancels.lock().unwrap().remove(&id);
+        Ok(())
+    }
+}

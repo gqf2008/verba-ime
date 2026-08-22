@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Verba 核心引擎：输入状态机与领域模型"
 
 [lints]
 workspace = true
