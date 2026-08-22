@@ -26,7 +26,8 @@ Source: "..\ime\target\release\verba-reg.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "..\..\..\target\release\verba-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Run]
-; 注册输入法（TSF 档案/类别，需管理员）
+; 先注销旧档案（清理早期版本遗留/损坏项），再注册（TSF 档案/类别，需管理员）
+Filename: "{app}\verba-reg.exe"; Parameters: "unregister"; Flags: runhidden
 Filename: "{app}\verba-reg.exe"; Parameters: "register ""{app}\verba_ime_windows.dll"""; Flags: runhidden
 
 [UninstallRun]

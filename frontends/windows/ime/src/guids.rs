@@ -11,5 +11,3 @@ pub const PROFILE_VERBA: GUID = GUID::from_u128(0xa4b8c1d2_3e4f_5a6b_7c8d_9e0f1a
 /// 显示名称。
 pub const TEXT_SERVICE_NAME: &str = "Verba · 拾言输入法";
 
-/// 注册用的语言 ID（en-US；输入法对所有语言可用）。
-pub const LANG_ID: u16 = 0x0409;
