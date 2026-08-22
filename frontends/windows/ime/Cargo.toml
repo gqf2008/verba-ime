@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "verba-ime-windows"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Verba Windows TSF 文本服务前端（输入法 DLL）"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "verba-reg"
+path = "src/bin/verba-reg.rs"
+
+[dependencies]
+verba-core = { path = "../../../crates/verba-core" }
+verba-ipc = { path = "../../../crates/verba-ipc" }
+verba-protos = { path = "../../../crates/verba-protos" }
+log = "0.4"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_TextServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+
+[profile.release]
+opt-level = 2
