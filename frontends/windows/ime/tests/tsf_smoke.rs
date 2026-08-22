@@ -245,3 +245,35 @@ fn tsf_streaming_preedit() {
         CoUninitialize();
     }
 }
+
+#[test]
+fn should_claim_key_idle_only_slash() {
+    use verba_core::machine::MachineState;
+    use verba_ime_windows::text_service::should_claim_key;
+    // Idle：只认领 `/`（VK_OEM_2=0xBF），其它字母/数字不认领（直通）
+    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16));
+    assert!(!should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
+    assert!(!should_claim_key(MachineState::Idle, 0x0D, 0x1C << 16)); // Enter
+    assert!(!should_claim_key(MachineState::Idle, 0x08, 0x0E << 16)); // Backspace
+    assert!(!should_claim_key(MachineState::Idle, 0x11, 0x1D << 16)); // Ctrl
+}
+
+#[test]
+fn should_claim_key_composition_claims_all() {
+    use verba_core::machine::MachineState;
+    use verba_ime_windows::text_service::should_claim_key;
+    // 组合/提示词态：可打印字符 + 控制键都认领
+    for st in [
+        MachineState::PendingSlash,
+        MachineState::Prompt,
+        MachineState::Streaming,
+        MachineState::ResultReady,
+    ] {
+        assert!(should_claim_key(st, 0xBF, 0x35 << 16), "state {st:?} slash");
+        assert!(should_claim_key(st, 0x48, 0x23 << 16), "state {st:?} letter");
+        assert!(should_claim_key(st, 0x0D, 0x1C << 16), "state {st:?} Enter");
+        assert!(should_claim_key(st, 0x08, 0x0E << 16), "state {st:?} Backspace");
+        assert!(!should_claim_key(st, 0x11, 0x1D << 16), "state {st:?} Ctrl 不认领");
+        assert!(!should_claim_key(st, 0x25, 0x4B << 16), "state {st:?} 方向键不认领");
+    }
+}

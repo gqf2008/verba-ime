@@ -203,6 +203,30 @@ impl KeyEventSink {
     }
 }
 
+/// OnTestKeyDown 是否认领按键。
+///
+/// TSF 只在测试阶段返回 TRUE 时才调用 `OnKeyDown`（实测 Notepad-- 等 TSF 应用：
+/// 一直返回 FALSE 会导致 `OnKeyDown` 永远不被调用，`//` 触发与直输全部失效）。
+/// - `Idle`：只认领 `/` 触发键，其余按键直通应用（不吞键、不进 IME）。
+/// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady`：认领全部可打印字符
+///   与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被吞/丢字符。
+/// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
+pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
+    let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
+    match state {
+        MachineState::Idle => get_char_for_vk(vk, lparam) == Some('/'),
+        MachineState::PendingSlash
+        | MachineState::Prompt
+        | MachineState::Streaming
+        | MachineState::ResultReady => {
+            if is_control {
+                return true;
+            }
+            get_char_for_vk(vk, lparam).is_some()
+        }
+    }
+}
+
 impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
     fn OnSetFocus(&self, fforeground: windows::core::BOOL) -> Result<()> {
         unsafe {
@@ -220,15 +244,17 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        let vk = wparam.0 as u32;
+        let state = self.data.machine.borrow().state();
+        let claim = should_claim_key(state, vk, lparam.0 as u32);
         unsafe {
             log::info!(
-                "OnTestKeyDown vk=0x{:02X} scan=0x{:02X} tid={}",
-                wparam.0 as u32,
+                "OnTestKeyDown vk=0x{vk:02X} scan=0x{:02X} state={state:?} claim={claim} tid={}",
                 (lparam.0 as u32 >> 16) & 0xff,
                 GetCurrentThreadId()
             );
         }
-        Ok(FALSE)
+        Ok(claim.into())
     }
     fn OnTestKeyUp(
         &self,
