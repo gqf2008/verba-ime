@@ -9,6 +9,7 @@
 //!
 //! 本 crate 独立于根 workspace（仅 Windows 目标）。
 
+mod candidate_window;
 mod class_factory;
 mod dll;
 mod edit_session;

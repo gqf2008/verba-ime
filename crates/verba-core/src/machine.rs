@@ -76,8 +76,11 @@ pub enum Action {
     EnterPrompt { preedit: String },
     /// 提示词更新，preedit 显示指定文本。
     UpdatePrompt { preedit: String },
-    /// 拼音 preedit 更新（含内联候选，如 `ni 1.你 2.你好`）。
-    UpdatePinyin { preedit: String },
+    /// 拼音 preedit 更新（preedit 为纯拼音，候选单独给前端渲染候选窗）。
+    UpdatePinyin {
+        preedit: String,
+        candidates: Vec<String>,
+    },
     /// 提示词模式下按下 Enter：发起 LLM 生成。
     StartLlm {
         prompt: String,
@@ -182,7 +185,8 @@ impl CompositionMachine {
                     self.pinyin_buffer.push(c.to_ascii_lowercase());
                     self.refresh_candidates();
                     Action::UpdatePinyin {
-                        preedit: self.preedit(),
+                        preedit: self.pinyin_composition_preedit(),
+                        candidates: self.pinyin_candidates.clone(),
                     }
                 } else {
                     Action::CommitImmediate(c.to_string())
@@ -229,7 +233,8 @@ impl CompositionMachine {
             self.pinyin_buffer.push(c.to_ascii_lowercase());
             self.refresh_candidates();
             return Action::UpdatePinyin {
-                preedit: self.preedit(),
+                preedit: self.pinyin_composition_preedit(),
+                candidates: self.pinyin_candidates.clone(),
             };
         }
         if c == ' ' {
@@ -317,7 +322,8 @@ impl CompositionMachine {
                         Action::Cancel
                     } else {
                         Action::UpdatePinyin {
-                            preedit: self.preedit(),
+                            preedit: self.pinyin_composition_preedit(),
+                            candidates: self.pinyin_candidates.clone(),
                         }
                     }
                 } else {
@@ -422,6 +428,16 @@ impl CompositionMachine {
                 out.push_str(&format!(" {}.{cand}", i + 1));
             }
             out
+        }
+    }
+
+    /// 纯拼音组合 preedit（不含内联候选；候选窗接管显示时使用）。
+    /// 提示词态带 `//` 与已提交提示词前缀。
+    pub fn pinyin_composition_preedit(&self) -> String {
+        match self.state {
+            MachineState::Pinyin => self.pinyin_buffer.clone(),
+            MachineState::Prompt => format!("//{}{}", self.prompt, self.pinyin_buffer),
+            _ => String::new(),
         }
     }
 

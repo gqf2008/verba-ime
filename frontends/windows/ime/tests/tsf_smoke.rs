@@ -153,9 +153,10 @@ fn tsf_commit_and_preedit() {
             ctx_text.starts_with("Hello翻译完成"),
             "已提交部分应保持，实际 {ctx_text:?}"
         );
+        // 候选已移入候选窗：preedit 只含拼音
         assert!(
-            ctx_text.contains(" 1."),
-            "preedit 应含内联候选，实际 {ctx_text:?}"
+            !ctx_text.contains(" 1."),
+            "候选应移入候选窗（preedit 不含内联候选），实际 {ctx_text:?}"
         );
         assert!(data.composition.borrow().is_some(), "拼音应有 preedit 组合");
 

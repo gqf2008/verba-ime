@@ -16,6 +16,7 @@ path = "src/bin/verba-reg.rs"
 
 [dependencies]
 verba-core = { path = "../../../crates/verba-core" }
+verba-candidate = { path = "../../../crates/verba-candidate" }
 verba-ipc = { path = "../../../crates/verba-ipc" }
 verba-protos = { path = "../../../crates/verba-protos" }
 log = { version = "0.4", features = ["std"] }

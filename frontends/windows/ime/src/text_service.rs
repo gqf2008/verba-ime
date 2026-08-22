@@ -15,16 +15,17 @@ use std::thread::JoinHandle;
 use verba_core::machine::{Action, CompositionMachine, MachineState};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
-use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfKeyEventSink,
-    ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor, ITfTextInputProcessorEx,
-    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
+    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor,
+    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
+    ITfThreadMgr,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, RegisterClassW,
@@ -52,6 +53,7 @@ pub struct TextServiceData {
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
     pub chunks: Arc<Mutex<VecDeque<StreamEvent>>>,
+    pub candidate_window: RefCell<Option<crate::candidate_window::CandidateWindow>>,
     pub stream_request_id: Arc<AtomicU64>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
@@ -70,6 +72,7 @@ impl TextServiceData {
             keysink_advised: Cell::new(false),
             timer_hwnd: Cell::new(None),
             chunks: Arc::new(Mutex::new(VecDeque::new())),
+            candidate_window: RefCell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_thread: RefCell::new(None),
             control: RefCell::new(None),
@@ -152,6 +155,12 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
+    // 候选窗（懒创建：失败不影响激活）
+    if data.candidate_window.borrow().is_none() {
+        if let Ok(cw) = crate::candidate_window::CandidateWindow::new() {
+            *data.candidate_window.borrow_mut() = Some(cw);
+        }
+    }
     unsafe {
         log::info!(
             "Verba TSF 激活, clientid={tid} tid={} sink_immediate={}",
@@ -458,6 +467,7 @@ pub fn apply_action(
     match action {
         Action::None => Ok(()),
         Action::CommitImmediate(text) => {
+            hide_candidate_window(data);
             // 先取走组合引用并释放 borrow，避免分支内 borrow_mut 冲突。
             let existing = data.composition.borrow_mut().take();
             if let Some(comp) = existing {
@@ -468,8 +478,15 @@ pub fn apply_action(
         }
         Action::EnterPrompt { preedit }
         | Action::UpdatePrompt { preedit }
-        | Action::UpdateResult { preedit }
-        | Action::UpdatePinyin { preedit } => set_preedit(data, context, clientid, &preedit),
+        | Action::UpdateResult { preedit } => set_preedit(data, context, clientid, &preedit),
+        Action::UpdatePinyin {
+            preedit,
+            candidates,
+        } => {
+            set_preedit(data, context, clientid, &preedit)?;
+            update_candidate_window(data, context, &candidates);
+            Ok(())
+        }
         Action::StartLlm { prompt, system: _ } => {
             // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
             // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
@@ -479,6 +496,7 @@ pub fn apply_action(
         }
         Action::ResultReady => Ok(()),
         Action::CommitResult { text } => {
+            hide_candidate_window(data);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 edit_session::end_composition(context, clientid, &comp, &text)?;
             }
@@ -486,6 +504,7 @@ pub fn apply_action(
             Ok(())
         }
         Action::Cancel => {
+            hide_candidate_window(data);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 edit_session::end_composition(context, clientid, &comp, "")?;
             }
@@ -493,12 +512,55 @@ pub fn apply_action(
             Ok(())
         }
         Action::LlmFailed { message } => {
+            hide_candidate_window(data);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 edit_session::end_composition(context, clientid, &comp, "")?;
             }
             log::warn!("LLM 失败: {message}");
             Ok(())
         }
+    }
+}
+
+/// 更新候选窗：有候选则显示在组合光标下方，否则隐藏。
+fn update_candidate_window(
+    data: &Rc<TextServiceData>,
+    context: &ITfContext,
+    candidates: &[String],
+) {
+    let mut borrow = data.candidate_window.borrow_mut();
+    let Some(cw) = borrow.as_mut() else {
+        return;
+    };
+    if candidates.is_empty() {
+        cw.hide();
+        return;
+    }
+    let mut ctrl =
+        verba_candidate::CandidateWindowController::new(verba_candidate::Theme::default());
+    ctrl.set_candidates(candidates.to_vec());
+    ctrl.show();
+    let (x, y) = caret_screen_pos(data, context).unwrap_or((0, 0));
+    cw.update(&ctrl, x, y);
+}
+
+/// 隐藏候选窗（提交/取消时）。
+fn hide_candidate_window(data: &Rc<TextServiceData>) {
+    let mut borrow = data.candidate_window.borrow_mut();
+    if let Some(cw) = borrow.as_mut() {
+        cw.hide();
+    }
+}
+
+/// 组合范围在屏幕上的坐标（候选窗锚点：组合下方）。
+fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32)> {
+    unsafe {
+        let view: ITfContextView = context.GetActiveView().ok()?;
+        let range = data.composition.borrow().as_ref()?.GetRange().ok()?;
+        let mut rc = RECT::default();
+        view.GetTextExt(data.clientid.get(), &range, &mut rc, std::ptr::null_mut())
+            .ok()?;
+        Some((rc.left, rc.bottom))
     }
 }
 
