@@ -221,7 +221,8 @@ impl DaemonHandler {
                         }
                     } => {}
                 }
-                if !failed && !token.is_cancelled() {
+                // 取消时也补发 Final，保证客户端流线程能退出阻塞读。
+                if !failed {
                     let _ = out
                         .event(&StreamEvent {
                             id,
