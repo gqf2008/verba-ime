@@ -2,6 +2,7 @@
 //!
 //! 状态流转：
 //! ```text
+//! Idle --字母--> Pinyin --(Space/数字/Enter 选候选)--> 提交中文
 //! Idle --'/'--> PendingSlash --'/'--> Prompt --Enter--> Streaming --(流完)--> ResultReady --Enter--> Idle
 //!   ^                |                 |                                              |
 //!   |                +-- 其它字符: 提交 "/x"                                            |
@@ -52,6 +53,8 @@ impl Mode {
 pub enum MachineState {
     /// 空闲：普通直输。
     Idle,
+    /// 拼音组合中（缓冲区见 [`CompositionMachine::pinyin_buffer`]）。
+    Pinyin,
     /// 已输入一个 `/`，等待第二个 `/` 或其它字符。
     PendingSlash,
     /// AI 提示词输入中（`//` 已消费）。
@@ -73,6 +76,8 @@ pub enum Action {
     EnterPrompt { preedit: String },
     /// 提示词更新，preedit 显示指定文本。
     UpdatePrompt { preedit: String },
+    /// 拼音 preedit 更新（含内联候选，如 `ni 1.你 2.你好`）。
+    UpdatePinyin { preedit: String },
     /// 提示词模式下按下 Enter：发起 LLM 生成。
     StartLlm {
         prompt: String,
@@ -102,10 +107,16 @@ impl std::str::FromStr for Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionMachine {
     state: MachineState,
+    /// 拼音组合缓冲（小写无调）。
+    pinyin_buffer: String,
+    /// 当前拼音候选（由引擎查询得到，供选择/展示）。
+    pinyin_candidates: Vec<String>,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
     result: String,
+    /// 拼音引擎。
+    engine: verba_pinyin::PinyinEngine,
 }
 
 impl Default for CompositionMachine {
@@ -118,8 +129,11 @@ impl CompositionMachine {
     pub fn new() -> Self {
         Self {
             state: MachineState::Idle,
+            pinyin_buffer: String::new(),
+            pinyin_candidates: Vec::new(),
             prompt: String::new(),
             result: String::new(),
+            engine: verba_pinyin::PinyinEngine::new(),
         }
     }
 
@@ -139,6 +153,17 @@ impl CompositionMachine {
     pub fn preedit(&self) -> String {
         match self.state {
             MachineState::PendingSlash => "/".to_owned(),
+            MachineState::Pinyin => {
+                if self.pinyin_candidates.is_empty() {
+                    self.pinyin_buffer.clone()
+                } else {
+                    let mut out = self.pinyin_buffer.clone();
+                    for (i, cand) in self.pinyin_candidates.iter().enumerate() {
+                        out.push_str(&format!(" {}.{cand}", i + 1));
+                    }
+                    out
+                }
+            }
             MachineState::Prompt => format!("//{}", self.prompt),
             MachineState::Streaming | MachineState::ResultReady => self.result.clone(),
             MachineState::Idle => String::new(),
@@ -153,6 +178,15 @@ impl CompositionMachine {
                     self.state = MachineState::PendingSlash;
                     Action::UpdatePrompt {
                         preedit: "/".to_owned(),
+                    }
+                } else if c.is_ascii_alphabetic() {
+                    // 字母开始拼音组合
+                    self.state = MachineState::Pinyin;
+                    self.pinyin_buffer.clear();
+                    self.pinyin_buffer.push(c.to_ascii_lowercase());
+                    self.refresh_candidates();
+                    Action::UpdatePinyin {
+                        preedit: self.preedit(),
                     }
                 } else {
                     Action::CommitImmediate(c.to_string())
@@ -170,6 +204,7 @@ impl CompositionMachine {
                     Action::CommitImmediate(format!("/{c}"))
                 }
             }
+            MachineState::Pinyin => self.feed_pinyin_char(c),
             MachineState::Prompt => {
                 self.prompt.push(c);
                 Action::UpdatePrompt {
@@ -180,6 +215,43 @@ impl CompositionMachine {
         }
     }
 
+    /// 拼音状态下的字符输入。
+    fn feed_pinyin_char(&mut self, c: char) -> Action {
+        if c == '/' {
+            // 提交当前拼音，再进入 AI 触发
+            let text = self.commit_pinyin_text();
+            self.reset_pinyin();
+            self.state = MachineState::PendingSlash;
+            return Action::CommitImmediate(text);
+        }
+        if c.is_ascii_digit() && c != '0' {
+            let idx = (c as u8 - b'1') as usize;
+            if let Some(text) = self.pinyin_candidates.get(idx) {
+                let text = text.clone();
+                self.reset_pinyin();
+                return Action::CommitImmediate(text);
+            }
+            // 候选不存在：忽略该数字（不吞后文）
+            return Action::None;
+        }
+        if c.is_ascii_alphabetic() {
+            self.pinyin_buffer.push(c.to_ascii_lowercase());
+            self.refresh_candidates();
+            return Action::UpdatePinyin {
+                preedit: self.preedit(),
+            };
+        }
+        if c == ' ' {
+            let text = self.commit_pinyin_text();
+            self.reset_pinyin();
+            return Action::CommitImmediate(text);
+        }
+        // 其它可打印字符：提交候选 0 + 该字符，避免吞字
+        let text = format!("{}{c}", self.commit_pinyin_text());
+        self.reset_pinyin();
+        Action::CommitImmediate(text)
+    }
+
     /// 退格。
     pub fn feed_backspace(&mut self) -> Action {
         match self.state {
@@ -187,6 +259,21 @@ impl CompositionMachine {
             MachineState::PendingSlash => {
                 self.state = MachineState::Idle;
                 Action::Cancel
+            }
+            MachineState::Pinyin => {
+                if self.pinyin_buffer.pop().is_some() {
+                    self.refresh_candidates();
+                    if self.pinyin_buffer.is_empty() {
+                        self.reset_pinyin();
+                        Action::Cancel
+                    } else {
+                        Action::UpdatePinyin {
+                            preedit: self.preedit(),
+                        }
+                    }
+                } else {
+                    Action::None
+                }
             }
             MachineState::Prompt => {
                 if self.prompt.pop().is_some() {
@@ -206,6 +293,11 @@ impl CompositionMachine {
     pub fn feed_enter(&mut self) -> Action {
         match self.state {
             MachineState::Idle | MachineState::PendingSlash => Action::None,
+            MachineState::Pinyin => {
+                let text = self.commit_pinyin_text();
+                self.reset_pinyin();
+                Action::CommitImmediate(text)
+            }
             MachineState::Prompt => {
                 let prompt = std::mem::take(&mut self.prompt);
                 self.state = MachineState::Streaming;
@@ -229,11 +321,39 @@ impl CompositionMachine {
             MachineState::Idle => Action::None,
             _ => {
                 self.state = MachineState::Idle;
+                self.pinyin_buffer.clear();
+                self.pinyin_candidates.clear();
                 self.prompt.clear();
                 self.result.clear();
                 Action::Cancel
             }
         }
+    }
+
+    /// 当前拼音提交文本：有候选取候选 0，否则取原始缓冲。
+    fn commit_pinyin_text(&self) -> String {
+        if let Some(first) = self.pinyin_candidates.first() {
+            first.clone()
+        } else {
+            self.pinyin_buffer.clone()
+        }
+    }
+
+    /// 重置拼音状态回 Idle。
+    fn reset_pinyin(&mut self) {
+        self.state = MachineState::Idle;
+        self.pinyin_buffer.clear();
+        self.pinyin_candidates.clear();
+    }
+
+    /// 用当前缓冲刷新候选。
+    fn refresh_candidates(&mut self) {
+        self.pinyin_candidates = self
+            .engine
+            .lookup(&self.pinyin_buffer)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
     }
 
     /// LLM 流式增量。
@@ -280,6 +400,7 @@ impl fmt::Display for MachineState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Idle => "idle",
+            Self::Pinyin => "pinyin",
             Self::PendingSlash => "pending-slash",
             Self::Prompt => "prompt",
             Self::Streaming => "streaming",
@@ -293,9 +414,114 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_input_commits_immediately() {
+    fn letters_start_pinyin_composition() {
         let mut m = CompositionMachine::new();
-        assert_eq!(m.feed_char('h'), Action::CommitImmediate("h".into()));
+        let a = m.feed_char('h');
+        assert!(
+            matches!(a, Action::UpdatePinyin { .. }),
+            "字母应进入拼音组合，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin);
+        assert!(
+            m.preedit().starts_with('h'),
+            "preedit 应显示拼音，实际 {:?}",
+            m.preedit()
+        );
+    }
+
+    #[test]
+    fn punctuation_and_digits_commit_directly_in_idle() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(m.feed_char('.'), Action::CommitImmediate(".".into()));
+        assert_eq!(m.feed_char('5'), Action::CommitImmediate("5".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_space_commits_first_candidate() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.state(), MachineState::Pinyin);
+        let first = m.commit_pinyin_text();
+        assert_eq!(first, "你", "ni 首选应为 你，实际 {first:?}");
+        let a = m.feed_char(' ');
+        assert_eq!(a, Action::CommitImmediate("你".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_digit_selects_candidate() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        // 候选索引 1（第二个）
+        if m.pinyin_candidates.len() > 1 {
+            let expected = m.pinyin_candidates[1].clone();
+            let a = m.feed_char('2');
+            assert_eq!(a, Action::CommitImmediate(expected));
+            assert_eq!(m.state(), MachineState::Idle);
+        }
+    }
+
+    #[test]
+    fn pinyin_full_word_commits() {
+        let mut m = CompositionMachine::new();
+        for c in "nihao".chars() {
+            m.feed_char(c);
+        }
+        assert_eq!(m.commit_pinyin_text(), "你好");
+        let a = m.feed_char(' ');
+        assert_eq!(a, Action::CommitImmediate("你好".into()));
+    }
+
+    #[test]
+    fn pinyin_backspace_pops_and_cancels_when_empty() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_backspace(), Action::UpdatePinyin { .. }));
+        assert_eq!(m.state(), MachineState::Pinyin);
+        assert_eq!(m.feed_backspace(), Action::Cancel);
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_slash_commits_then_ai_trigger() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char('/'), Action::CommitImmediate("你".into()));
+        assert_eq!(m.state(), MachineState::PendingSlash);
+        m.feed_char('/');
+        assert_eq!(m.state(), MachineState::Prompt);
+    }
+
+    #[test]
+    fn pinyin_enter_commits_and_escape_cancels() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_enter(), Action::CommitImmediate("你".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+
+        let mut m2 = CompositionMachine::new();
+        m2.feed_char('n');
+        m2.feed_char('i');
+        assert_eq!(m2.feed_escape(), Action::Cancel);
+        assert_eq!(m2.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_punctuation_commits_candidate_plus_char() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        let a = m.feed_char(',');
+        assert!(
+            matches!(a, Action::CommitImmediate(_)),
+            "标点应提交候选+标点，实际 {a:?}"
+        );
         assert_eq!(m.state(), MachineState::Idle);
     }
 

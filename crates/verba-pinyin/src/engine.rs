@@ -26,7 +26,7 @@ pub struct Candidate {
 pub const MAX_CANDIDATES: usize = 9;
 
 /// 拼音引擎（无状态；数据在首次使用时解析并缓存）。
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PinyinEngine;
 
 impl PinyinEngine {
