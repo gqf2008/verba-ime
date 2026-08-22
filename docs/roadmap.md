@@ -1,0 +1,79 @@
+# 路线图
+
+> 更新：2026-08-22 · 当前状态：**M0 进行中**
+> 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
+
+## 里程碑总览
+
+| 阶段 | 主题 | 交付物 / 验收 | 依赖 |
+| --- | --- | --- | --- |
+| M0 | 地基 | 仓库骨架、Cargo workspace、CI、verba-cli、core 状态机雏形 | — |
+| M1 | Windows 垂直切片 | Windows TSF 前端 + LLM 远程直输：安装输入法 → 打字上屏 → `//` 唤起 AI → 流式上屏 | M0 |
+| M2 | 三端齐平 | macOS IMK、Linux Fcitx5 / IBus 前端，直输 + LLM 与 M1 对齐 | M1 |
+| M3 | 多模态 | OCR（截图）与 ASR（语音）在至少一个平台跑通，其余平台跟进 | M1 / M2 |
+| M4 | 体验打磨 | TTS、候选窗口、Tauri 设置面板、性能预算、隐私开关 | M3 |
+| M5 | 中文引擎 | 评估并（可选）集成 librime，支持拼音 / 五笔等方案 | M4 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营 | M5 |
+
+## M0 详细任务（进行中）
+
+- [x] 命名与品牌定稿（Verba · 拾言，见 [naming.md](naming.md)）
+- [x] 架构与技术选型文档（[architecture.md](architecture.md)）
+- [x] 仓库骨架 + Cargo workspace + AGENTS.md
+- [ ] CI：cargo check / test / clippy / fmt 三平台 matrix
+- [ ] verba-core：模式状态机 + composition 缓冲 + 命令路由（含测试）
+- [ ] verba-protos / verba-ipc：回环打通（含测试）
+- [ ] verba-cli：命令驱动 core（模拟前端）
+
+## M1 详细任务（Windows 垂直切片）
+
+- [ ] verba-ai：LLM provider（OpenAI 兼容，SSE 流式）
+- [ ] verba-config：配置读写 + keyring 密钥
+- [ ] Windows TSF 前端：注册、上屏、preedit、最小候选
+- [ ] daemon 与 TSF 的 IPC 打通
+- [ ] `//` 进入 AI 模式 → 流式 preedit → Enter 上屏
+- [ ] Inno Setup 安装脚本 + Windows 手动验收清单
+- [ ] 隐私提示（远程 LLM 数据出境说明）
+
+## M2 详细任务（macOS / Linux）
+
+- [ ] macOS IMK 前端（Swift 薄壳 + IPC，Unix Socket）
+- [ ] Linux Fcitx5 插件（C++ shim + Rust 核心）
+- [ ] Linux IBus / Wayland 兼容（imekit 评估）
+- [ ] 三端功能对齐矩阵 + 各端手动验收清单
+
+## M3 详细任务（多模态）
+
+- [ ] OCR provider：本地 PaddleOCR（ONNX）+ 平台原生（Windows.Media.Ocr / Vision）
+- [ ] 截图链路：权限、选区、预览、OCR 结果上屏
+- [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
+- [ ] 语音链路：快捷键、录音、流式转写、上屏
+
+## M4 详细任务（体验）
+
+- [ ] TTS provider：系统 TTS / edge-tts / Piper（可选）
+- [ ] 候选窗口样式与交互（分页、主题、皮肤）
+- [ ] Tauri 设置面板（服务商配置、快捷键、隐私开关）
+- [ ] 性能与内存预算达标（见 architecture §8）
+- [ ] 日志脱敏与崩溃上报（本地）
+
+## M5 详细任务（中文引擎，评估后决定）
+
+- [ ] 调研 librime 嵌入方案（Weasel / Squirrel / fcitx5-rime 参考）
+- [ ] 集成决策：librime 动态库 or 独立 schema 进程
+- [ ] 拼音 / 五笔方案加载、候选融合（Rime 候选 + AI 候选）
+
+## 风险与开放问题
+
+- **平台审核与签名**：macOS 公证、Windows SmartScreen 需要证书与流程，提前规划。
+- **Wayland 碎片化**：不同合成器对 `zwp_input_method_v2` 支持不一（GNOME 需 IBus），需多后端。
+- **本地模型体积 / 性能**：whisper.cpp 模型 75MB+，PaddleOCR 10MB+；首次下载与按需加载策略。
+- **LLM 成本与延迟**：远程调用不可控，需超时 / 取消 / 失败重试策略。
+- **权限复杂度**：macOS 录屏 / 麦克风 TCC；Linux 不同桌面权限模型。
+- **同类竞争**：讯飞、百度输入法已有 AI 功能；素言输入法（离线语音 + 截图）是近期最接近的竞品——差异化主打「开源 + 三平台 + 可插拔服务商」。
+
+## 变更记录
+
+| 日期 | 变更 |
+| --- | --- |
+| 2026-08-22 | 初版：M0-M6 里程碑与任务分解 |
