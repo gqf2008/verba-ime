@@ -60,11 +60,12 @@
 
 ## M5 详细任务（中文引擎）
 
-- [x] 内置轻量拼音引擎（`verba-pinyin`：hanzi_db 字频 + CC-CEDICT 词库，音节切分、频率排序、前缀补全）
-- [x] Windows 前端拼音组合：字母进拼音、内联候选、数字/空格选候选上屏（2026-08-22）
+- [x] 内置轻量拼音引擎（`verba-pinyin`：hanzi_db 字频 + CC-CEDICT 词库，音节切分、频率排序、前缀补全、模糊音、简拼、整句 DP、提示词拼音）
+- [x] Windows 前端拼音组合：字母进拼音、内联候选、数字/空格选候选上屏、`//` 提示词内拼音输中文（2026-08-22）
+- [x] 选型评估：[中文引擎选型与集成评估](chinese-engine-evaluation.md)——结论：librime FFI > 重写，默认自研 + librime 可选（daemon 内 spike）
 - [ ] 候选窗口样式与交互（分页、主题）——从内联候选升级为独立候选窗（M4 候选窗口）
-- [ ] 调研 librime 嵌入方案（Weasel / Squirrel / fcitx5-rime 参考）：五笔、模糊音、Rime 词库生态
-- [ ] 候选融合（Rime 候选 + AI 候选）
+- [ ] librime-sys spike（daemon 内，Windows）：验证拼音整句（octagram）+ 五笔方案加载
+- [ ] 候选融合（词库候选 + LLM 候选，IPC 协议扩展）
 
 ## 风险与开放问题
 
