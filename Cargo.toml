@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/verba-core", "crates/verba-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Verba Contributors"]
+repository = "https://github.com/<your-name>/verba-ime"
+rust-version = "1.85"
+
+# 多 crate 项目兜底：默认禁止 unsafe，白名单 crate 可在其 Cargo.toml 单独放开。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
