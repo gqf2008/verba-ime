@@ -214,7 +214,22 @@ impl KeyEventSink {
 pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     match state {
-        MachineState::Idle => get_char_for_vk(vk, lparam) == Some('/'),
+        MachineState::Idle => match get_char_for_vk(vk, lparam) {
+            // 认领 `/`（AI 触发）与字母（进入拼音组合）
+            Some(c) => c == '/' || c.is_ascii_alphabetic(),
+            None => false,
+        },
+        MachineState::Pinyin => {
+            if is_control {
+                // Enter/Backspace/Esc：拼音态由状态机处理
+                return true;
+            }
+            match get_char_for_vk(vk, lparam) {
+                // 拼音态认领：字母（缓冲）、数字（选候选）、空格（选首选）、`/`（提交+AI）
+                Some(c) => c == '/' || c.is_ascii_alphabetic() || c.is_ascii_digit() || c == ' ',
+                None => false,
+            }
+        }
         MachineState::PendingSlash
         | MachineState::Prompt
         | MachineState::Streaming
@@ -453,7 +468,8 @@ pub fn apply_action(
         }
         Action::EnterPrompt { preedit }
         | Action::UpdatePrompt { preedit }
-        | Action::UpdateResult { preedit } => set_preedit(data, context, clientid, &preedit),
+        | Action::UpdateResult { preedit }
+        | Action::UpdatePinyin { preedit } => set_preedit(data, context, clientid, &preedit),
         Action::StartLlm { prompt, system: _ } => {
             // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
             // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。

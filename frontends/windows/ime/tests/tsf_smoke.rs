@@ -135,25 +135,51 @@ fn tsf_commit_and_preedit() {
         .expect("commit result");
         assert_eq!(read_context_text(&ctx, tid), "Hello翻译完成");
 
-        // 3) 真实按键路径：普通模式输入字符 'H'（走 ToUnicodeEx → machine → 上屏）
+        // 3) 真实按键路径：字母 'H' 进入拼音组合（被吞、进 preedit，不直接上屏）
         let eaten_h = verba_ime_windows::text_service::handle_key_down(
             &data,
             windows::Win32::UI::Input::KeyboardAndMouse::VK_H.0 as u32,
             0x1E << 16,
         )
         .expect("handle_key_down(H)");
-        assert_eq!(eaten_h, true, "普通模式可打印字符应被吞并上屏");
-        let after_h = read_context_text(&ctx, tid);
-        assert_eq!(after_h, "Hello翻译完成h", "ToUnicodeEx 无 Shift 应为小写");
+        assert_eq!(eaten_h, true, "普通模式字母应被吞并进入拼音组合");
+        assert_eq!(
+            data.machine.borrow().state(),
+            verba_core::machine::MachineState::Pinyin,
+            "字母应进入拼音态"
+        );
+        let ctx_text = read_context_text(&ctx, tid);
+        assert!(
+            ctx_text.starts_with("Hello翻译完成"),
+            "已提交部分应保持，实际 {ctx_text:?}"
+        );
+        assert!(
+            ctx_text.contains(" 1."),
+            "preedit 应含内联候选，实际 {ctx_text:?}"
+        );
+        assert!(data.composition.borrow().is_some(), "拼音应有 preedit 组合");
 
-        // 4) 普通模式下按 Enter → 不吞键
+        // 4) 拼音态按 Esc → 取消（回 Idle）
+        let eaten_esc = verba_ime_windows::text_service::handle_key_down(
+            &data,
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u32,
+            0,
+        )
+        .expect("handle_key_down(Esc)");
+        assert_eq!(eaten_esc, true, "拼音态 Esc 应被吞并取消组合");
+        assert_eq!(
+            data.machine.borrow().state(),
+            verba_core::machine::MachineState::Idle
+        );
+
+        // 5) Idle 下按 Enter → 不吞键
         let eaten = verba_ime_windows::text_service::handle_key_down(
             &data,
             windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN.0 as u32,
             0,
         )
         .expect("handle_key_down");
-        assert_eq!(eaten, false, "普通模式 Enter 不应被吞");
+        assert_eq!(eaten, false, "Idle 下 Enter 不应被吞");
 
         svc.Deactivate().expect("Deactivate");
         let _ = tm.Deactivate();
@@ -247,15 +273,36 @@ fn tsf_streaming_preedit() {
 }
 
 #[test]
-fn should_claim_key_idle_only_slash() {
+fn should_claim_key_idle_slash_and_letters() {
     use verba_core::machine::MachineState;
     use verba_ime_windows::text_service::should_claim_key;
-    // Idle：只认领 `/`（VK_OEM_2=0xBF），其它字母/数字不认领（直通）
-    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16));
-    assert!(!should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
+    // Idle：认领 `/`（AI 触发）与字母（进入拼音组合）；数字/空格/控制键不认领（直通）
+    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16)); // '/'
+    assert!(should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
+    assert!(!should_claim_key(MachineState::Idle, 0x32, 0x03 << 16)); // '2'
+    assert!(!should_claim_key(MachineState::Idle, 0x20, 0x39 << 16)); // Space
     assert!(!should_claim_key(MachineState::Idle, 0x0D, 0x1C << 16)); // Enter
     assert!(!should_claim_key(MachineState::Idle, 0x08, 0x0E << 16)); // Backspace
     assert!(!should_claim_key(MachineState::Idle, 0x11, 0x1D << 16)); // Ctrl
+}
+
+#[test]
+fn should_claim_key_pinyin_claims_letters_digits_space() {
+    use verba_core::machine::MachineState;
+    use verba_ime_windows::text_service::should_claim_key;
+    // 拼音态：字母/数字/空格/控制键都认领；方向键不认领
+    assert!(should_claim_key(MachineState::Pinyin, 0x48, 0x23 << 16)); // 'h'
+    assert!(should_claim_key(MachineState::Pinyin, 0x32, 0x03 << 16)); // '2'
+    assert!(should_claim_key(MachineState::Pinyin, 0x20, 0x39 << 16)); // Space
+    assert!(should_claim_key(MachineState::Pinyin, 0x08, 0x0E << 16)); // Backspace
+    assert!(should_claim_key(MachineState::Pinyin, 0x0D, 0x1C << 16)); // Enter
+    assert!(!should_claim_key(MachineState::Pinyin, 0x25, 0x4B << 16)); // 方向键
+    assert!(!should_claim_key(MachineState::Pinyin, 0x11, 0x1D << 16)); // Ctrl
+                                                                        // Idle：字母与 `/` 认领，数字/空格不认领
+    assert!(should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
+    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16)); // '/'
+    assert!(!should_claim_key(MachineState::Idle, 0x32, 0x03 << 16)); // '2'
+    assert!(!should_claim_key(MachineState::Idle, 0x20, 0x39 << 16)); // Space
 }
 
 #[test]
