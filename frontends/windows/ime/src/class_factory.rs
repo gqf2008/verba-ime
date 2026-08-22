@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::core::{implement, Error, IUnknown, Interface, Ref, Result, GUID};
 use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_NOINTERFACE};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::Win32::UI::TextServices::ITfTextInputProcessor;
+use windows::Win32::UI::TextServices::{ITfTextInputProcessor, ITfTextInputProcessorEx};
 
 use crate::dll;
 use crate::text_service::TextService;
@@ -35,9 +35,13 @@ impl IClassFactory_Impl for VerbaClassFactory_Impl {
         if riid.is_null() || ppvobject.is_null() {
             return Err(Error::from_hresult(E_NOINTERFACE));
         }
-        // 放行 IUnknown（CoCreateInstance 常先请求）与 ITfTextInputProcessor（TSF 基接口）。
+        // 放行 IUnknown（CoCreateInstance 常先请求）与 TIP 基接口
+        // （现代 Windows 可能直接请求 ITfTextInputProcessorEx）。
         let requested = unsafe { *riid };
-        if requested != ITfTextInputProcessor::IID && requested != IUnknown::IID {
+        if requested != ITfTextInputProcessor::IID
+            && requested != ITfTextInputProcessorEx::IID
+            && requested != IUnknown::IID
+        {
             return Err(Error::from_hresult(E_NOINTERFACE));
         }
 

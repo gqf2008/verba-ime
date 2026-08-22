@@ -41,7 +41,10 @@ pub unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *
         // DLL_PROCESS_ATTACH
         let _ = DLL_MODULE.set(module.0 as usize);
         crate::filelog::init();
-        log::info!("Verba IME DLL 加载, module={module:?}");
+        log::info!(
+            "Verba IME DLL 加载, module={module:?} exe={:?}",
+            std::env::current_exe().map(|p| p.to_string_lossy().into_owned())
+        );
     }
     1 // TRUE
 }

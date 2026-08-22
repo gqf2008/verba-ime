@@ -17,6 +17,7 @@ use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_ESCAPE, VK_RETURN,
 };
@@ -144,18 +145,27 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     data.clientid.set(tid);
 
     // 挂键盘 sink：Activate 时可能尚无前台上下文导致失败，定时器会重试。
-    try_advise_keysink(data);
+    let sink_ok = try_advise_keysink(data);
 
     if let Ok(ctx) = unsafe { ptim.GetFocus() }.and_then(|d| unsafe { d.GetBase() }) {
         *data.context.borrow_mut() = Some(ctx);
     }
 
     create_timer_window(data)?;
-    log::info!("Verba TSF 激活, clientid={tid}");
+    unsafe {
+        log::info!(
+            "Verba TSF 激活, clientid={tid} tid={} sink_immediate={}",
+            GetCurrentThreadId(),
+            sink_ok
+        );
+    }
     Ok(())
 }
 
 fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
+    unsafe {
+        log::info!("Verba TSF 停用, tid={}", GetCurrentThreadId());
+    }
     if let Some(hwnd) = data.timer_hwnd.take() {
         unsafe {
             let _ = DestroyWindow(hwnd);
@@ -194,15 +204,30 @@ impl KeyEventSink {
 }
 
 impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
-    fn OnSetFocus(&self, _fforeground: windows::core::BOOL) -> Result<()> {
+    fn OnSetFocus(&self, fforeground: windows::core::BOOL) -> Result<()> {
+        unsafe {
+            log::info!(
+                "KeySink OnSetFocus fg={} tid={}",
+                fforeground.as_bool(),
+                GetCurrentThreadId()
+            );
+        }
         Ok(())
     }
     fn OnTestKeyDown(
         &self,
         _pic: Ref<ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
+        wparam: WPARAM,
+        lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        unsafe {
+            log::info!(
+                "OnTestKeyDown vk=0x{:02X} scan=0x{:02X} tid={}",
+                wparam.0 as u32,
+                (lparam.0 as u32 >> 16) & 0xff,
+                GetCurrentThreadId()
+            );
+        }
         Ok(FALSE)
     }
     fn OnTestKeyUp(
@@ -219,7 +244,14 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
-        log::info!("OnKeyDown vk=0x{:02X}", wparam.0 as u32);
+        unsafe {
+            log::info!(
+                "OnKeyDown vk=0x{:02X} scan=0x{:02X} tid={}",
+                wparam.0 as u32,
+                (lparam.0 as u32 >> 16) & 0xff,
+                GetCurrentThreadId()
+            );
+        }
         if let Ok(ctx) = pic.ok() {
             *self.data.context.borrow_mut() = Some(ctx.clone());
         }
