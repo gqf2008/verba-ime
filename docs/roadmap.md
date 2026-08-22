@@ -34,7 +34,7 @@
 - [x] `//` 进入 AI 模式 → 流式 preedit → Enter 上屏（代码完成）
 - [x] Inno Setup 安装脚本 + [Windows 手动验收清单](manual-acceptance-windows.md)
 - [x] 隐私提示（[docs/privacy.md](privacy.md)）
-- [ ] **真机验收**：需管理员安装（TSF 档案注册）+ 交互会话逐项验证（清单见上）
+- [ ] **真机验收**：需管理员安装（TSF 档案注册）+ 交互会话逐项验证（清单见上）。当前「直输上屏 / `//` preedit / 流式 preedit / Enter 提交 / 空闲态不吞键 / 激活注销」均已有 TSF API 层自动化测试覆盖（frontends/windows/ime 的 tsf_smoke），真机仅剩系统注册与交互冒烟。
 
 ## M2 详细任务（macOS / Linux）
 
