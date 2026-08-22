@@ -40,6 +40,13 @@ use crate::ipc;
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
+const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
+
+/// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
+struct CandidatePosRetry {
+    context: ITfContext,
+    attempts_left: u32,
+}
 
 /// 共享状态（TSF 线程独占；`chunks` 由流线程写入，用 Mutex 保护）。
 pub struct TextServiceData {
@@ -54,6 +61,8 @@ pub struct TextServiceData {
     timer_hwnd: Cell<Option<HWND>>,
     pub chunks: Arc<Mutex<VecDeque<StreamEvent>>>,
     pub candidate_window: RefCell<Option<crate::candidate_window::CandidateWindow>>,
+    /// 候选窗锚点重试（GetTextExt 返回 TS_E_NOLAYOUT 时，由定时器稍后重试精确定位）。
+    candidate_pending_pos: RefCell<Option<CandidatePosRetry>>,
     pub stream_request_id: Arc<AtomicU64>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
@@ -73,6 +82,7 @@ impl TextServiceData {
             timer_hwnd: Cell::new(None),
             chunks: Arc::new(Mutex::new(VecDeque::new())),
             candidate_window: RefCell::new(None),
+            candidate_pending_pos: RefCell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_thread: RefCell::new(None),
             control: RefCell::new(None),
@@ -195,6 +205,7 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
     *data.threadmgr.borrow_mut() = None;
     *data.context.borrow_mut() = None;
     *data.composition.borrow_mut() = None;
+    *data.candidate_pending_pos.borrow_mut() = None;
     *data.machine.borrow_mut() = CompositionMachine::new();
     Ok(())
 }
@@ -344,7 +355,9 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         _pcomposition: Ref<ITfComposition>,
     ) -> Result<()> {
         log::info!("OnCompositionTerminated —— 组合被应用终止，状态机重置为 Idle");
+        hide_candidate_window(&self.data);
         *self.data.composition.borrow_mut() = None;
+        *self.data.candidate_pending_pos.borrow_mut() = None;
         *self.data.machine.borrow_mut() = CompositionMachine::new();
         cancel_stream(&self.data);
         Ok(())
@@ -534,18 +547,36 @@ fn update_candidate_window(
     };
     if candidates.is_empty() {
         cw.hide();
+        data.candidate_pending_pos.borrow_mut().take();
         return;
     }
     let mut ctrl =
         verba_candidate::CandidateWindowController::new(verba_candidate::Theme::default());
     ctrl.set_candidates(candidates.to_vec());
     ctrl.show();
-    let (x, y) = caret_screen_pos(data, context).unwrap_or((0, 0));
-    cw.update(&ctrl, x, y);
+    match caret_screen_pos(data, context) {
+        Some((x, y)) => {
+            log::info!("候选窗显示 ({x},{y})");
+            data.candidate_pending_pos.borrow_mut().take();
+            cw.update(&ctrl, x, y);
+        }
+        None => {
+            // 布局未就绪（TS_E_NOLAYOUT）：先用视图屏幕区域粗定位显示，
+            // 同时安排定时器重试精确定位。
+            let (fx, fy) = view_screen_pos(context).unwrap_or((0, 0));
+            log::info!("候选窗粗定位 ({fx},{fy})，等待组合布局就绪后重试");
+            cw.update(&ctrl, fx, fy);
+            *data.candidate_pending_pos.borrow_mut() = Some(CandidatePosRetry {
+                context: context.clone(),
+                attempts_left: CANDIDATE_POS_RETRY_TICKS,
+            });
+        }
+    }
 }
 
 /// 隐藏候选窗（提交/取消时）。
 fn hide_candidate_window(data: &Rc<TextServiceData>) {
+    data.candidate_pending_pos.borrow_mut().take();
     let mut borrow = data.candidate_window.borrow_mut();
     if let Some(cw) = borrow.as_mut() {
         cw.hide();
@@ -555,14 +586,77 @@ fn hide_candidate_window(data: &Rc<TextServiceData>) {
 /// 组合范围在屏幕上的坐标（候选窗锚点：组合下方）。
 fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32)> {
     unsafe {
-        let view: ITfContextView = context.GetActiveView().ok()?;
-        let range = data.composition.borrow().as_ref()?.GetRange().ok()?;
+        let view: ITfContextView = match context.GetActiveView() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("候选锚点 GetActiveView 失败: {e}");
+                return None;
+            }
+        };
+        let Some(comp) = data.composition.borrow().as_ref().cloned() else {
+            log::warn!("候选锚点无组合引用");
+            return None;
+        };
+        let range = match comp.GetRange() {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("候选锚点 GetRange 失败: {e}");
+                return None;
+            }
+        };
         let mut rc = RECT::default();
-        view.GetTextExt(data.clientid.get(), &range, &mut rc, std::ptr::null_mut())
-            .ok()?;
-        log::info!("组合锚点 rect=({},{})-({},{})", rc.left, rc.top, rc.right, rc.bottom);
-        Some((rc.left, rc.bottom))
+        match view.GetTextExt(data.clientid.get(), &range, &mut rc, std::ptr::null_mut()) {
+            Ok(()) => {
+                log::info!(
+                    "组合锚点 rect=({},{})-({},{})",
+                    rc.left,
+                    rc.top,
+                    rc.right,
+                    rc.bottom
+                );
+                Some((rc.left, rc.bottom))
+            }
+            Err(e) => {
+                // TS_E_NOLAYOUT(0x80040205)：组合刚更新、应用尚未重算布局，稍后由定时器重试。
+                log::warn!(
+                    "候选锚点 GetTextExt 失败: {e}（TS_E_NOLAYOUT=0x80040205 表示布局未就绪）"
+                );
+                None
+            }
+        }
     }
+}
+
+/// 视图屏幕区域（粗定位兜底：候选窗出现在应用文本区左上角下方）。
+fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32)> {
+    unsafe {
+        let view: ITfContextView = context.GetActiveView().ok()?;
+        let rc = view.GetScreenExt().ok()?;
+        Some((rc.left, rc.top + 8))
+    }
+}
+
+/// 定时器重试：组合布局就绪后把候选窗精确移动到组合锚点。
+fn retry_candidate_pos(data: &Rc<TextServiceData>) {
+    // 先取出重试状态（避免持有 RefMut 时再 take 造成二次可变借用）。
+    let Some(mut p) = data.candidate_pending_pos.borrow_mut().take() else {
+        return;
+    };
+    if p.attempts_left == 0 {
+        log::warn!("候选窗精确定位重试次数耗尽，保持视图区域粗定位");
+        return;
+    }
+    p.attempts_left -= 1;
+    let context = p.context.clone();
+    if let Some((x, y)) = caret_screen_pos(data, &context) {
+        log::info!("候选窗重试定位成功 ({x},{y})");
+        if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
+            cw.move_to(x, y);
+        }
+        return;
+    }
+    // 布局仍未就绪：放回重试状态，等待下一拍。
+    *data.candidate_pending_pos.borrow_mut() = Some(p);
 }
 
 fn set_preedit(
@@ -747,10 +841,14 @@ fn create_timer_window(data: &Rc<TextServiceData>) -> Result<()> {
 
 impl TextServiceData {
     pub fn on_timer(&self) {
+        let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
+            return;
+        };
         // 持续重试挂载键盘 sink（Activate 时可能失败）
-        if let Some(rc) = self.self_rc.borrow().as_ref().cloned() {
-            try_advise_keysink(&rc);
-        }
+        try_advise_keysink(&rc);
+        // 候选窗：组合布局就绪后重试精确定位
+        retry_candidate_pos(&rc);
+
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
             q.drain(..).collect()
@@ -759,9 +857,6 @@ impl TextServiceData {
             return;
         }
         let Some(context) = self.context.borrow().as_ref().cloned() else {
-            return;
-        };
-        let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
             return;
         };
         let clientid = self.clientid.get();
