@@ -5,7 +5,7 @@
 //! macOS PingFang / Linux Noto CJK），无需打包字体。
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Stroke};
+use tiny_skia::{Color, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke};
 
 use crate::{CandidateWindowController, Theme};
 
@@ -100,15 +100,14 @@ impl CpuCandidateRenderer {
         }
     }
 
-    /// 在 (x, y) 画一行文字（cosmic-text 排版 + swash 字形栅格化，逐像素写入）。
+    /// 在 (x, y) 画一行文字（cosmic-text 排版 + swash 字形栅格化，
+    /// 经 tiny-skia source-over 合成到背景，输出全不透明）。
     fn draw_text(&mut self, pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: Color, size: f32) {
-        let (r, g, b, _) = (
+        let (r8, g8, b8) = (
             (color.red() * 255.0) as u8,
             (color.green() * 255.0) as u8,
             (color.blue() * 255.0) as u8,
-            (color.alpha() * 255.0) as u8,
         );
-        let base = cosmic_text::Color::rgb(r, g, b);
         let metrics = Metrics::new(size, size * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(pixmap.width() as f32), None);
@@ -117,32 +116,40 @@ impl CpuCandidateRenderer {
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let pg = glyph.physical((0.0, 0.0), 1.0);
-                let origin_x = x + pg.x as f32;
-                let origin_y = y + run.line_y + pg.y as f32;
-                self.swash.with_pixels(&mut self.font_system, pg.cache_key, base, |px, py, argb| {
-                    set_pixel(pixmap, origin_x as i32 + px, origin_y as i32 + py, argb.0);
-                });
+                let Some(img) = self.swash.get_image_uncached(&mut self.font_system, pg.cache_key) else {
+                    continue;
+                };
+                let gw = img.placement.width;
+                let gh = img.placement.height;
+                if gw == 0 || gh == 0 {
+                    continue;
+                }
+                // Mask 内容：data 为 alpha 蒙版（1 字节/像素），按文字色着色
+                let mask = &img.data[..(gw as usize * gh as usize)];
+                let mut gp = match Pixmap::new(gw, gh) {
+                    Some(gp) => gp,
+                    None => continue,
+                };
+                for (i, &a) in mask.iter().enumerate() {
+                    gp.pixels_mut()[i] = tiny_skia::PremultipliedColorU8::from_rgba(
+                        r8.wrapping_mul(a) / 255,
+                        g8.wrapping_mul(a) / 255,
+                        b8.wrapping_mul(a) / 255,
+                        a,
+                    )
+                    .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+                }
+                let gx = (x + pg.x as f32 + img.placement.left as f32).round() as i32;
+                let gy = (y + run.line_y + pg.y as f32 + img.placement.top as f32).round() as i32;
+                let paint = PixmapPaint {
+                    opacity: color.alpha(),
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    ..PixmapPaint::default()
+                };
+                pixmap.draw_pixmap(gx, gy, gp.as_ref(), &paint, tiny_skia::Transform::identity(), None);
             }
         }
     }
-}
-
-/// 把一个 ARGB 像素写入 tiny-skia Pixmap（转为预乘 RGBA）。
-fn set_pixel(pixmap: &mut Pixmap, x: i32, y: i32, argb: u32) {
-    let w = pixmap.width() as i32;
-    let h = pixmap.height() as i32;
-    if x < 0 || y < 0 || x >= w || y >= h {
-        return;
-    }
-    let a = (argb >> 24) & 0xFF;
-    let r = (argb >> 16) & 0xFF;
-    let g = (argb >> 8) & 0xFF;
-    let b = argb & 0xFF;
-    let pr = (r * a / 255) as u8;
-    let pg = (g * a / 255) as u8;
-    let pb = (b * a / 255) as u8;
-    pixmap.pixels_mut()[(y * w + x) as usize] =
-        tiny_skia::PremultipliedColorU8::from_rgba(pr, pg, pb, a as u8).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
 }
 
 fn parse_color(s: &str) -> Option<Color> {
