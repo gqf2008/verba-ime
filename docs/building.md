@@ -26,6 +26,18 @@ cargo run -p verba-cli -- --help
 
 ## 平台前端构建（M1 起逐步补充）
 
+### Windows 安装包（Inno Setup）
+1. 构建产物：
+   - 前端（DLL + 注册工具）：`cd frontends/windows/ime && cargo build --release`
+   - daemon：根目录 `cargo build -p verba-daemon --release`
+2. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
+3. 编译：
+   ```powershell
+   cd frontends/windows/installer
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" verba-ime.iss
+   ```
+   产物：`frontends/windows/installer/output/verba-ime-setup.exe`（需管理员运行安装）。
+
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
 - **macOS**：Xcode 工程或 SPM 构建 `.appex` → 装入 `~/Library/Input Methods` → Developer ID 签名 + 公证。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
