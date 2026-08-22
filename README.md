@@ -3,7 +3,7 @@
 > **声、像、思、音，皆成文字。**
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
-> 项目状态：**规划中（Planning）** · 架构与技术选型已定稿，仓库骨架已就位，按 [路线图](docs/roadmap.md) 逐步实现。
+> 项目状态：**M1（Windows 垂直切片）开发中** · 共享核心（IPC/LLM/daemon/CLI）完成，Windows TSF 前端代码完成并通过 COM 激活冒烟；真机验收待管理员安装后逐项验证（见 [Windows 手动验收清单](docs/manual-acceptance-windows.md)）。
 
 ---
 

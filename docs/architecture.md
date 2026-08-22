@@ -95,10 +95,16 @@
 
 ## 5. IPC 协议（草案）
 
-- 传输：Windows NamedPipe `\\.\pipe\verba-<uid>`；macOS / Linux Unix Socket `$XDG_RUNTIME_DIR/verba.sock`（回退 `/tmp/verba.sock`）。
+- 传输：Windows NamedPipe（interprocess local_socket，名称 `verba-ime`）；macOS / Linux Unix Socket。
 - 编码：Protobuf（`verba-protos`），u32 LE 长度前缀分帧。
 - 模型：`Request { id, oneof }` / `Response { id, oneof }`，`StreamEvent { id, chunk }` 支持流式（LLM token、ASR 增量）。
 - 消息清单草案见 [protocol.md](protocol.md)。
+
+### Windows 命名管道实测约束（2026-08-22，interprocess 2.4）
+- `set_nonblocking`（PIPE_NOWAIT）会把「无数据」与「对端关闭」混淆 → 客户端禁用。
+- `try_clone` 出的第二句柄读分帧数据会出现假 EOF → 客户端禁用。
+- 结论：**客户端单句柄、单线程顺序读写**；需要并行读时（LLM 流式）另起线程持独立连接，daemon 按全局请求 id 取消。
+- 客户端超时用「后台读线程 + std mpsc `recv_timeout`」实现（早期版本），后简化为「服务端协议保证必有响应/终帧（Final/Error，取消也补发）→ 阻塞读安全」。
 
 ## 6. AI 能力编排（verba-ai）
 
@@ -170,6 +176,11 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 | [Rime / librime](https://github.com/rime/librime) | 中文输入引擎，M5 集成对象 |
 | 素言 SuYan 输入法 | 同类产品（RIME 系、离线语音、截图），体验参考 |
 
+## 12. 开放问题（实现中决策）
+
+> M1 已解决：Windows 前端采用 windows 0.62 + `#[implement]`；因 `ITfThreadMgr` 未导出 `AdviseSink`，
+> 不挂 ThreadMgrEventSink，改为 Activate 时直接 `AdviseKeyEventSink`、`OnKeyDown` 带回 context。
+> TSF 档案/类别注册需管理员（安装程序/verba-reg 提权路径）。
 ## 12. 开放问题（实现中决策）
 
 1. 中文拼音引擎：M5 是否集成 librime？（倾向：集成，复用 Rime 词库生态）

@@ -27,13 +27,14 @@
 
 ## M1 详细任务（Windows 垂直切片）
 
-- [ ] verba-ai：LLM provider（OpenAI 兼容，SSE 流式）
-- [ ] verba-config：配置读写 + keyring 密钥
-- [ ] Windows TSF 前端：注册、上屏、preedit、最小候选
-- [ ] daemon 与 TSF 的 IPC 打通
-- [ ] `//` 进入 AI 模式 → 流式 preedit → Enter 上屏
-- [ ] Inno Setup 安装脚本 + Windows 手动验收清单
-- [ ] 隐私提示（远程 LLM 数据出境说明）
+- [x] verba-ai：LLM provider（OpenAI 兼容，SSE 流式）
+- [x] verba-config：配置读写 + keyring 密钥
+- [x] Windows TSF 前端（windows 0.62）：注册（HKCU CLSID）、上屏、preedit、流式；COM 实例化与 Activate/Deactivate 冒烟通过
+- [x] daemon 与 TSF 的 IPC 打通（daemon 自动拉起 + 流线程）
+- [x] `//` 进入 AI 模式 → 流式 preedit → Enter 上屏（代码完成）
+- [x] Inno Setup 安装脚本 + [Windows 手动验收清单](manual-acceptance-windows.md)
+- [x] 隐私提示（[docs/privacy.md](privacy.md)）
+- [ ] **真机验收**：需管理员安装（TSF 档案注册）+ 交互会话逐项验证（清单见上）
 
 ## M2 详细任务（macOS / Linux）
 
