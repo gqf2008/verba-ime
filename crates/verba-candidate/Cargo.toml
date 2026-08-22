@@ -1,0 +1,16 @@
+[package]
+name = "verba-candidate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba 候选窗口共享逻辑：候选列表、分页、选择、主题（纯 Rust，跨平台）"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
