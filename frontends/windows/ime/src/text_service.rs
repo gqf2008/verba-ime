@@ -48,6 +48,7 @@ pub struct TextServiceData {
     pub composition: RefCell<Option<ITfComposition>>,
     pub machine: RefCell<CompositionMachine>,
     keysink: RefCell<Option<ITfKeyEventSink>>,
+    keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
     pub chunks: Arc<Mutex<VecDeque<StreamEvent>>>,
     pub stream_request_id: Arc<AtomicU64>,
@@ -65,6 +66,7 @@ impl TextServiceData {
             composition: RefCell::new(None),
             machine: RefCell::new(CompositionMachine::new()),
             keysink: RefCell::new(None),
+            keysink_advised: Cell::new(false),
             timer_hwnd: Cell::new(None),
             chunks: Arc::new(Mutex::new(VecDeque::new())),
             stream_request_id: Arc::new(AtomicU64::new(0)),
@@ -111,17 +113,38 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
     }
 }
 
+/// 尝试挂载键盘 sink；成功则置位。Activate 时可能尚无前台上下文，定时器会持续重试。
+fn try_advise_keysink(data: &Rc<TextServiceData>) -> bool {
+    if data.keysink_advised.get() {
+        return true;
+    }
+    let Some(tm) = data.threadmgr.borrow().as_ref().cloned() else {
+        return false;
+    };
+    let Ok(km) = tm.cast::<ITfKeystrokeMgr>() else {
+        return false;
+    };
+    let sink: ITfKeyEventSink = KeyEventSink::new(data.clone()).into();
+    match unsafe { km.AdviseKeyEventSink(data.clientid.get(), &sink, true) } {
+        Ok(()) => {
+            *data.keysink.borrow_mut() = Some(sink);
+            data.keysink_advised.set(true);
+            log::info!("键盘 sink 已挂载");
+            true
+        }
+        Err(e) => {
+            log::warn!("键盘 sink 挂载失败: {e}");
+            false
+        }
+    }
+}
+
 fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Result<()> {
     *data.threadmgr.borrow_mut() = Some(ptim.clone());
     data.clientid.set(tid);
 
-    let km: ITfKeystrokeMgr = ptim.cast()?;
-    let sink: ITfKeyEventSink = KeyEventSink::new(data.clone()).into();
-    match unsafe { km.AdviseKeyEventSink(tid, &sink, true) } {
-        Ok(()) => log::info!("AdviseKeyEventSink 成功"),
-        Err(e) => log::warn!("AdviseKeyEventSink 失败: {e}"),
-    }
-    *data.keysink.borrow_mut() = Some(sink);
+    // 挂键盘 sink：Activate 时可能尚无前台上下文导致失败，定时器会重试。
+    try_advise_keysink(data);
 
     if let Ok(ctx) = unsafe { ptim.GetFocus() }.and_then(|d| unsafe { d.GetBase() }) {
         *data.context.borrow_mut() = Some(ctx);
@@ -139,14 +162,17 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
         }
     }
     *data.self_rc.borrow_mut() = None;
-    if let Some(tm) = data.threadmgr.borrow().as_ref().cloned() {
-        if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
-            unsafe {
-                let _ = km.UnadviseKeyEventSink(data.clientid.get());
+    if data.keysink_advised.get() {
+        if let Some(tm) = data.threadmgr.borrow().as_ref().cloned() {
+            if let Ok(km) = tm.cast::<ITfKeystrokeMgr>() {
+                unsafe {
+                    let _ = km.UnadviseKeyEventSink(data.clientid.get());
+                }
             }
         }
     }
     *data.keysink.borrow_mut() = None;
+    data.keysink_advised.set(false);
     *data.threadmgr.borrow_mut() = None;
     *data.context.borrow_mut() = None;
     *data.composition.borrow_mut() = None;
@@ -306,8 +332,46 @@ fn get_char_for_vk(vk: u32, lparam: u32) -> Option<char> {
         if n > 0 {
             char::from_u32(chars[0] as u32)
         } else {
-            None
+            // 兜底：常用符号的直接映射（无 Shift），确保 // 触发键在任何布局下可识别
+            oem_fallback_char(vk)
         }
+    }
+}
+
+/// ToUnicodeEx 失败时的常用符号兜底（美国/多数布局的未加 Shift 字符）。
+fn oem_fallback_char(vk: u32) -> Option<char> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+        VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_SPACE, VK_TAB,
+    };
+    if vk == VK_OEM_2.0 as u32 {
+        Some('/')
+    } else if vk == VK_OEM_PERIOD.0 as u32 {
+        Some('.')
+    } else if vk == VK_OEM_COMMA.0 as u32 {
+        Some(',')
+    } else if vk == VK_OEM_MINUS.0 as u32 {
+        Some('-')
+    } else if vk == VK_OEM_PLUS.0 as u32 {
+        Some('=')
+    } else if vk == VK_OEM_1.0 as u32 {
+        Some(';')
+    } else if vk == VK_OEM_3.0 as u32 {
+        Some('`')
+    } else if vk == VK_OEM_4.0 as u32 {
+        Some('[')
+    } else if vk == VK_OEM_5.0 as u32 {
+        Some('\\')
+    } else if vk == VK_OEM_6.0 as u32 {
+        Some(']')
+    } else if vk == VK_OEM_7.0 as u32 {
+        Some('\'')
+    } else if vk == VK_SPACE.0 as u32 {
+        Some(' ')
+    } else if vk == VK_TAB.0 as u32 {
+        Some('\t')
+    } else {
+        None
     }
 }
 
@@ -539,6 +603,10 @@ fn create_timer_window(data: &Rc<TextServiceData>) -> Result<()> {
 
 impl TextServiceData {
     pub fn on_timer(&self) {
+        // 持续重试挂载键盘 sink（Activate 时可能失败）
+        if let Some(rc) = self.self_rc.borrow().as_ref().cloned() {
+            try_advise_keysink(&rc);
+        }
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
             q.drain(..).collect()
