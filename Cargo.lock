@@ -1875,6 +1875,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "verba-pinyin"
+version = "0.1.0"
+
+[[package]]
 name = "verba-protos"
 version = "0.1.0"
 dependencies = [
