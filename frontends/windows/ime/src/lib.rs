@@ -19,4 +19,4 @@ pub mod reg;
 pub mod text_service;
 
 pub use dll::{DllGetClassObject, DllRegisterServer, DllUnregisterServer};
-pub use guids::CLSID_VERBA_TEXT_SERVICE;
+pub use guids::{CLSID_VERBA_TEXT_SERVICE, PROFILE_VERBA};
