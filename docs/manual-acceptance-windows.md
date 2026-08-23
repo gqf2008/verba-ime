@@ -116,11 +116,12 @@
 
 > 目标：验证可选 Rime 引擎（daemon 内 librime）：拼音/五笔候选经 `RimeCandidates` 协议回流候选窗。
 > 状态：CLI 端到端已通过（`nishishui`→你是谁、`wqvb`→你好），前端融合待实机确认。
+> 行为（59a4bd9 起）：内置词库始终即时显示，Rime 候选经去重后**尾部追加**，不再按 engine 抑制内置。
 > 前置：`verba-cli config set engine=rime rime_schema=luna_pinyin_simp`；
 > daemon 同目录 `rime/` 已部署 rime.dll + data（与 CLSID 指向的部署目录同路径，脚本自动检测）。
 
 ## Rime 拼音
-- [ ] 输入 `nishishui` 停顿约 0.5s → 候选窗出现 Rime 候选「你是谁 / 你是 / 妳是…」
+- [ ] 输入 `nishishui` → 候选窗**即时**出现内置「你是谁 / 你是说…」，停顿约 0.5s 后**尾部追加** Rime「你是 / 妳是 / 逆势…」（重复项只留一份）
 - [ ] 按数字/翻页可选 Rime 候选上屏
 - [ ] 整句：输入 `jintianwanshangchishenme` → Rime 首候选「今天晚上吃什么」
 
