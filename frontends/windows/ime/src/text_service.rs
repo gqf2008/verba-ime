@@ -1492,17 +1492,18 @@ impl TextServiceData {
         let clientid = self.clientid.get();
 
         let mut machine = self.machine.borrow_mut();
+        // 合并 chunk 预编辑：每个胶子只调一次 set_preedit，降低 TSF 回调压力。
+        let mut pending_preedit: Option<String> = None;
         for evt in events {
             match evt.kind {
                 Some(stream_event::Kind::Chunk(ch)) => {
                     if let Action::UpdateResult { preedit } = machine.on_llm_chunk(&ch.text) {
-                        let _ = set_preedit(&rc, &context, clientid, &preedit);
+                        pending_preedit = Some(preedit);
                     }
                 }
                 Some(stream_event::Kind::Final(_)) => {
                     machine.on_llm_done();
-                    let result = machine.result().to_owned();
-                    let _ = set_preedit(&rc, &context, clientid, &result);
+                    pending_preedit = Some(machine.result().to_owned());
                 }
                 Some(stream_event::Kind::Candidates(c)) => {
                     if let Action::UpdatePinyin {
@@ -1512,6 +1513,10 @@ impl TextServiceData {
                         ..
                     } = machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done)
                     {
+                        // 先刷干容尽的 chunk 预编辑，再显示候选。
+                        if let Some(p) = pending_preedit.take() {
+                            let _ = set_preedit(&rc, &context, clientid, &p);
+                        }
                         let _ = set_preedit(&rc, &context, clientid, &preedit);
                         update_candidate_window(&rc, &context, &preedit, &candidates, page);
                     }
@@ -1525,6 +1530,9 @@ impl TextServiceData {
                 }
                 None => {}
             }
+        }
+        if let Some(p) = pending_preedit {
+            let _ = set_preedit(&rc, &context, clientid, &p);
         }
     }
 
