@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "verba-librime-sys-spike"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "librime-sys spike：验证预编译 rime.dll（拼音 + 五笔方案加载），daemon 集成前置评估"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

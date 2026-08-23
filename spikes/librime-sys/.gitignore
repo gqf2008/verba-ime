@@ -1,0 +1,3 @@
+# vendor/ 含第三方二进制（Weasel 预编译 rime.dll + Rime 数据），不入库。
+vendor/
+target/

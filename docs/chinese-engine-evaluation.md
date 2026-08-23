@@ -55,9 +55,32 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 
 ## 6. 下一步任务（M5）
 
-- [ ] 构建 librime-sys spike（Windows，daemon 内），验证拼音整句 + 五笔方案（延后：需预编译
-      rime.dll 或全量编译 librime，环境风险高；待候选融合实机验收后单独做）
+- [x] 构建 librime-sys spike（Windows，daemon 外先验证 FFI）：预编译 rime.dll（librime nightly
+      msvc-x64）+ 拼音 luna_pinyin + 五笔 wubi86 均跑通（2026-08-23，见 [spike](../spikes/librime-sys/README.md)）
+- [ ] daemon 内集成（`config 引擎=builtin|rime`）：把 spike 的 FFI 封装成 `verba-librime` crate，
+      按引擎开关切换；octagram n-gram 数据另配后再评估整句质量
 - [ ] 对比自研 vs librime：整句准确率采样（50 句日常对话）
 - [x] 候选窗（独立窗口、分页、主题）（2026-08-23 实机验收通过 + 代码完成）
 - [x] 候选融合（词库 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`，mock 端到端冒烟通过，
       待实机验收）（2026-08-23）
+
+## 7. librime-sys spike 结果（2026-08-23）
+
+> 仓库内可复现：`spikes/librime-sys`（独立 workspace，`fetch-vendor.ps1` 拉取第三方二进制）。
+
+| 验证项 | 结果 |
+| --- | --- |
+| 预编译 rime.dll（librime nightly `Windows-msvc-x64`）Rust FFI 加载 | ✅ 动态加载（LoadLibrary/GetProcAddress） |
+| RimeInitialize + 首次部署（StartMaintenance/JoinMaintenanceThread） | ✅ 9 个方案编译成功 |
+| 拼音 luna_pinyin：`nishishui` | ✅ 上屏「你是誰」（默认繁体；luna_pinyin_simp 为简体） |
+| 拼音整句：`jintianwanshangchishenme` | ✅ 上屏「今天晚上喫什麼」 |
+| 五笔 wubi86：`wqvb`（你=wq 好=vb） | ✅ 上屏「你好」 |
+| octagram（n-gram 整句） | ⚠️ 未验证：预编译包未捆绑 octagram 数据，需另配 |
+
+**FFI 踩坑**（已在 spike README 记录）：
+1. librime 1.17 的 `RimeSessionId` 是 `uintptr_t`（64 位），Rust 侧须用 `usize`，`i32` 会截断。
+2. 本机 GNU 工具链下 `raw-dylib` 不可靠（垃圾返回值 + 退出访问违规），改用动态加载。
+3. Weasel 0.17.4 安装包的 rime.dll 是 x86；x64 需取 librime 官方 release 的 msvc-x64 包。
+
+**决策更新**：spike 证明「预编译 rime.dll + Rust FFI」路线可行，daemon 集成（引擎开关）价值明确；
+但默认仍建议 `verba-pinyin`（体积/复杂度低），librime 作为可选增强（五笔/注音/仓颉生态用户）。
