@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::os::windows::process::CommandExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1132,22 +1133,14 @@ fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
     let results = Arc::clone(&data.trigger_results);
     let _ = std::thread::spawn(move || {
         let outcome = match kind {
-            TriggerKind::Ocr => {
-                let shot = match capture_primary_screen() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("截图失败: {e}");
-                        return;
-                    }
-                };
-                match ipc::ensure_daemon() {
-                    Ok(mut client) => client.ocr_recognize(&shot.bmp),
-                    Err(e) => {
-                        log::warn!("连接 daemon 失败: {e}");
-                        return;
-                    }
+            TriggerKind::Ocr => match run_region_ocr() {
+                Ok(Some(text)) => Ok(text),
+                Ok(None) => return, // 用户取消选区
+                Err(e) => {
+                    log::warn!("选区 OCR 失败，回退全屏: {e}");
+                    ocr_full_screen()
                 }
-            }
+            },
             TriggerKind::Asr => {
                 let wav = match record_seconds(ASR_RECORD_SECONDS) {
                     Ok(w) => w,
@@ -1157,7 +1150,7 @@ fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
                     }
                 };
                 match ipc::ensure_daemon() {
-                    Ok(mut client) => client.asr_transcribe(&wav),
+                    Ok(mut client) => client.asr_transcribe(&wav).map_err(|e| e.to_string()),
                     Err(e) => {
                         log::warn!("连接 daemon 失败: {e}");
                         return;
@@ -1174,6 +1167,49 @@ fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
             Err(e) => log::warn!("{kind:?} 失败: {e}"),
         }
     });
+}
+
+/// 子进程调用 verba-trigger region-ocr：选区拖选 → OCR，stdout 为识别文本。
+/// Ok(Some(text)) 识别成功；Ok(None) 用户取消；Err 失败。
+fn run_region_ocr() -> std::result::Result<Option<String>, String> {
+    let exe = match crate::reg::dll_path() {
+        Ok(p) => {
+            let candidate = p.with_file_name("verba-trigger.exe");
+            if candidate.exists() {
+                candidate
+            } else {
+                return Err(format!(
+                    "未找到 verba-trigger.exe（{}）",
+                    candidate.display()
+                ));
+            }
+        }
+        Err(e) => return Err(format!("定位 DLL 目录失败: {e}")),
+    };
+    let out = std::process::Command::new(&exe)
+        .arg("region-ocr")
+        // CREATE_NO_WINDOW：隐藏控制台窗口，遮罩 GUI 照常显示。
+        .creation_flags(0x08000000)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("启动 verba-trigger 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("region-ocr 退出码: {:?}", out.status.code()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
+/// 全屏截图 → daemon OCR（选区失败时的回退路径）。
+fn ocr_full_screen() -> std::result::Result<String, String> {
+    let shot = capture_primary_screen().map_err(|e| e.to_string())?;
+    let mut client = ipc::ensure_daemon().map_err(|e| format!("连接 daemon 失败: {e}"))?;
+    client.ocr_recognize(&shot.bmp).map_err(|e| e.to_string())
 }
 
 /// 后台 TTS 合成（daemon）+ 播放（rodio），完成后仅记日志。

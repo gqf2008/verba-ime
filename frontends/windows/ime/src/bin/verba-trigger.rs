@@ -285,7 +285,7 @@ fn cmd_region_shot(args: &[String]) -> i32 {
             0
         }
         Ok(None) => {
-            println!("已取消");
+            eprintln!("已取消");
             0
         }
         Err(e) => {
@@ -301,7 +301,7 @@ fn cmd_region_ocr(args: &[String]) -> i32 {
     let shot = match region_capture(args) {
         Ok(Some(s)) => s,
         Ok(None) => {
-            println!("已取消");
+            eprintln!("已取消");
             return 0;
         }
         Err(e) => {

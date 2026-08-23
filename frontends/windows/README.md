@@ -26,10 +26,10 @@
 
 ## 触发热键与命令（TSF 内）
 
-- **Ctrl+Alt+O**：全屏截图 → daemon OCR（`config ocr_provider`）→ 识别文本上屏。
+- **Ctrl+Alt+O**（或 `//截图`）：选区截图（半透明遮罩拖选，Esc/右键取消）→ daemon OCR → 识别文本上屏；子进程调 `verba-trigger region-ocr`，失败回退全屏。
 - **Ctrl+Alt+M**：麦克风录音 3s → daemon ASR（`config asr_provider`）→ 识别文本上屏。
 - **`//朗读 <文本>`**：TTS 合成（`config tts_provider`）并播放，不落盘文本。
-- **`//截图`**：同 Ctrl+Alt+O。**`//听写`**：同 Ctrl+Alt+M。
+- **`//听写`**：同 Ctrl+Alt+M（录音 3s → ASR 上屏）。
 
 上屏/播放异步完成（后台线程采集 → 结果经 TSF 定时器提交），不会卡住按键处理。
 
