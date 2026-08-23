@@ -8,7 +8,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{define_class, MainThreadOnly};
-use objc2_foundation::{NSObject, NSObjectProtocol};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 use objc2_input_method_kit::{IMKInputController, IMKStateSetting};
 
 #[derive(Debug, Default)]
@@ -31,15 +31,24 @@ define_class!(
         #[unsafe(method(activateServer:))]
         fn activate_server(&self, _sender: Option<&AnyObject>) {
             self.ivars().engine_ok = crate::MacIme::connect().is_ok();
-            log::info!(
-                "[VerbaIMK] activateServer, engine={}",
-                self.ivars().engine_ok
-            );
+            log::info!("[VerbaIMK] activateServer, engine={}", self.ivars().engine_ok);
         }
 
         #[unsafe(method(deactivateServer:))]
         fn deactivate_server(&self, _sender: Option<&AnyObject>) {
             log::info!("[VerbaIMK] deactivateServer");
+        }
+    }
+
+    // SAFETY: 覆盖父类（NSObjectIMKServerInput 类别）的 inputText:client:。
+    impl VerbaIMKController {
+        #[unsafe(method(inputText:client:))]
+        fn input_text(&self, string: Option<&NSString>, _sender: Option<&AnyObject>) -> bool {
+            if let Some(s) = string {
+                log::info!("[VerbaIMK] inputText: {}", s.to_string());
+            }
+            // TODO(ci/macos): 把按键交给 verba-core 状态机 → 取候选/上屏。
+            true
         }
     }
 );
