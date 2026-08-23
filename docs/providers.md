@@ -7,7 +7,7 @@
 
 | 方案 | 类型 | 说明 | Rust 接入 | 评价 |
 | --- | --- | --- | --- | --- |
-| RapidOCR / PaddleOCR（PP-OCRv4） | 本地 | 中文最强开源 OCR，det + rec + cls 小模型约 10-20MB | ONNX Runtime（`ort` crate）；本机 `x86_64-pc-windows-gnu`（无 MSVC）无 `ort` 预编译，故经 Python 子进程调 `rapidocr_onnxruntime`（`ocr_provider=rapid`，2026-08-23 实机 OK） | ✅ 默认本地方案 |
+| RapidOCR / PaddleOCR（PP-OCRv4） | 本地 | 中文最强开源 OCR，det + rec + cls 小模型约 10-20MB | ONNX Runtime（`ort` crate）；本机 `x86_64-pc-windows-gnu`（无 MSVC）无 `ort` 预编译，故经 Python 常驻子进程调 `rapidocr_onnxruntime`（`ocr_provider=rapid`，2026-08-23 实机 OK；模型只加载一次，热调用 ~0.5s） | ✅ 默认本地方案 |
 | PaddleOCR-VL / DeepSeek-OCR | 本地 | 新式 VLM OCR，效果好、模型大（GB 级） | `ort` / candle | 备选，视硬件 |
 | Windows.Media.Ocr | 系统 | Win10+ 内置 OCR，多语言 | `windows` crate | ✅ Windows 快速路径 |
 | Apple Vision（VNRecognizeTextRequest） | 系统 | macOS 原生 OCR，质量好 | Swift / ObjC（或 objc2） | ✅ macOS 快速路径 |

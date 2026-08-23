@@ -1,46 +1,113 @@
-//! RapidOCR 本地识别：PaddleOCR + ONNXRuntime（经 Python 子进程）。
+//! RapidOCR 本地识别：PaddleOCR + ONNXRuntime（经常驻 Python 子进程）。
 //!
 //! 本机 Rust 工具链为 `x86_64-pc-windows-gnu`（无 MSVC），`ort` 无 windows-gnu 预编译，
 //! 故不走 Rust `ort` 绑定，而是调用用户侧 Python `rapidocr_onnxruntime`（同算法、同模型，
 //! 中文识别强于 Windows.Media.Ocr）。
 //!
-//! Python 解释器按 `ocr_rapid_python` 配置 → `VERBA_RAPIDOCR_PYTHON` 环境变量 →
-//! `{data_dir}/venv-ocr/Scripts/python.exe`（Windows）/ `bin/python`（unix）→ PATH `python` 依次解析。
-//! 模型由 `rapidocr_onnxruntime` 首次运行自动下载（PP-OCRv4，约 10-20MB）。
+//! - 常驻单进程：把模型加载一次、复用于多次识别，避免每次调用冷启动（~1.5s→热调用 ~0.4s）。
+//! - 帧协议：stdin 写 `u32 LE 长度 + 图像字节`；stdout 读 `u32 LE 长度 + 识别文本`。
+//!   Python 侧所有库/日志输出重定向到 stderr，防止污染帧流；异常回 `ERROR:<msg>` 帧。
+//! - Python 解释器按 `ocr_rapid_python` 配置 → `VERBA_RAPIDOCR_PYTHON` 环境变量 →
+//!   `{data_dir}/venv-ocr/Scripts/python.exe`（Windows）/ `bin/python`（unix）→ PATH `python` 依次解析。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use verba_ai::OcrProvider;
 
 use crate::OcrError;
 
-/// 嵌入的 Python 辅助脚本（读取图像文件，打识别结果到 stdout）。
+/// 嵌入的常驻 Python 服务脚本。
 const HELPER_SCRIPT: &str = r#"# -*- coding: utf-8 -*-
-import sys
+import os, sys, struct, tempfile, time
+
+# 库/日志的 print() 全部重定向到 stderr，避免污染帧协议（stdout 只写帧）。
+_orig_stdout = sys.stdout.fileno()
+sys.stdout = sys.stderr
+OUT = os.fdopen(os.dup(_orig_stdout), 'wb', buffering=0)
+
+def _read_exact(n):
+    data = b''
+    while len(data) < n:
+        chunk = sys.stdin.buffer.read(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception as e:
+    print("rapidocr_onnxruntime \u672a\u5b89\u88c5: %s" % e, file=sys.stderr)
+    sys.exit(3)
+
+ocr = RapidOCR()
+
+def _frame(text):
+    data = text.encode('utf-8')
+    OUT.write(struct.pack('<I', len(data)) + data)
+    OUT.flush()
 
 def main():
-    if len(sys.argv) < 2:
-        print("missing image path", file=sys.stderr)
-        sys.exit(2)
-    img = sys.argv[1]
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except Exception as e:
-        print("rapidocr_onnxruntime 未安装: %s" % e, file=sys.stderr)
-        sys.exit(3)
-    ocr = RapidOCR()
-    result, _ = ocr(img)
-    if result:
-        lines = [str(item[1]) for item in result]
-        print("\n".join(lines))
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(_orig_stdout, os.O_BINARY)
+    while True:
+        hdr = _read_exact(4)
+        if hdr is None:
+            break
+        (n,) = struct.unpack('<I', hdr)
+        img = _read_exact(n)
+        if img is None:
+            break
+        tmp = None
+        try:
+            tmp = tempfile.mktemp(suffix='.bmp')
+            with open(tmp, 'wb') as f:
+                f.write(img)
+            result, _ = ocr(tmp)
+            text = '\n'.join(str(item[1]) for item in result) if result else ''
+        except Exception as e:
+            text = 'ERROR:' + str(e)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        _frame(text)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
 "#;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// 常驻 OCR 进程：stdin/stdout 双管道。
+struct RapidProcess {
+    python: String,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
 
-/// RapidOCR 识别器（每次识别调用一次 Python 子进程）。
+impl Drop for RapidProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 全局共享的常驻 OCR 进程（按 python 路径复用；进程退出自动重启）。
+static RAPID_POOL: OnceLock<Mutex<Option<RapidProcess>>> = OnceLock::new();
+
+#[inline]
+fn pool() -> &'static Mutex<Option<RapidProcess>> {
+    RAPID_POOL.get_or_init(|| Mutex::new(None))
+}
+
+/// RapidOCR 识别器。
 #[derive(Debug, Clone, Default)]
 pub struct RapidOcr {
     python: Option<String>,
@@ -85,11 +152,11 @@ impl RapidOcr {
     }
 
     /// 确保辅助脚本已写入临时目录并返回其路径。
-    fn helper_path() -> Result<std::path::PathBuf, OcrError> {
+    fn helper_path() -> Result<PathBuf, OcrError> {
         let dir = std::env::temp_dir().join("verba-ocr");
         std::fs::create_dir_all(&dir)
             .map_err(|e| OcrError::Rapid(format!("创建临时目录失败: {e}")))?;
-        let path = dir.join("rapidocr_helper.py");
+        let path = dir.join("rapidocr_server.py");
         if !path.exists() {
             std::fs::write(&path, HELPER_SCRIPT)
                 .map_err(|e| OcrError::Rapid(format!("写 helper 失败: {e}")))?;
@@ -97,33 +164,85 @@ impl RapidOcr {
         Ok(path)
     }
 
-    /// 写图像到临时文件并调用 Python 识别。
+    /// 常驻识别：spawn_blocking 内完成帧读写（阻塞 IO，不占 async runtime）。
     async fn run(&self, image: &[u8]) -> Result<String, OcrError> {
         let python = self.resolve_python()?;
-        let helper = Self::helper_path()?;
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let img_path =
-            std::env::temp_dir().join(format!("verba-ocr-{}-{}.bmp", std::process::id(), id));
-        std::fs::write(&img_path, image)
-            .map_err(|e| OcrError::Rapid(format!("写图像失败: {e}")))?;
-        let output = tokio::process::Command::new(&python)
-            .arg(&helper)
-            .arg(&img_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
+        let helper = Self::helper_path()?.to_string_lossy().into_owned();
+        let img = image.to_vec();
+        tokio::task::spawn_blocking(move || process_image(&python, &helper, &img))
             .await
-            .map_err(|e| OcrError::Rapid(format!("启动 python 失败: {e}")))?;
-        let _ = std::fs::remove_file(&img_path);
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(OcrError::Rapid(format!(
-                "RapidOCR 失败: {}",
-                if err.is_empty() { "未知".into() } else { err }
-            )));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .map_err(|e| OcrError::Rapid(format!("OCR 线程失败: {e}")))?
     }
+}
+
+/// 在常驻进程中完成一次识别（含必要时的重启）。
+fn process_image(python: &str, helper: &str, image: &[u8]) -> Result<String, OcrError> {
+    let mut guard = pool()
+        .lock()
+        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
+    let should_spawn = match guard.as_mut() {
+        Some(p) => p.python != python || !matches!(p.child.try_wait(), Ok(None)),
+        None => true,
+    };
+    if should_spawn {
+        *guard = Some(spawn_process(python, helper)?);
+    }
+    let proc = guard.as_mut().expect("spawn 后必有进程");
+    let text = exchange(proc, image)?;
+    if let Some(err) = text.strip_prefix("ERROR:") {
+        return Err(OcrError::Rapid(err.to_owned()));
+    }
+    Ok(text)
+}
+
+/// 启动常驻 Python OCR 进程。
+fn spawn_process(python: &str, helper: &str) -> Result<RapidProcess, OcrError> {
+    let mut child = Command::new(python)
+        .arg("-u")
+        .arg(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| OcrError::Rapid(format!("启动 Python OCR 进程失败: {e}")))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| OcrError::Rapid("获取 OCR stdin 失败".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| OcrError::Rapid("获取 OCR stdout 失败".into()))?;
+    Ok(RapidProcess {
+        python: python.to_owned(),
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+/// 写图像帧、读文本帧。
+fn exchange(proc: &mut RapidProcess, image: &[u8]) -> Result<String, OcrError> {
+    proc.stdin
+        .write_all(&(image.len() as u32).to_le_bytes())
+        .map_err(|e| OcrError::Rapid(format!("写图像头失败: {e}")))?;
+    proc.stdin
+        .write_all(image)
+        .map_err(|e| OcrError::Rapid(format!("写图像失败: {e}")))?;
+    proc.stdin
+        .flush()
+        .map_err(|e| OcrError::Rapid(format!("刷新 stdin 失败: {e}")))?;
+
+    let mut rlen = [0u8; 4];
+    proc.stdout
+        .read_exact(&mut rlen)
+        .map_err(|e| OcrError::Rapid(format!("读响应长度失败: {e}")))?;
+    let len = u32::from_le_bytes(rlen) as usize;
+    let mut buf = vec![0u8; len];
+    proc.stdout
+        .read_exact(&mut buf)
+        .map_err(|e| OcrError::Rapid(format!("读响应失败: {e}")))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 impl OcrProvider for RapidOcr {
