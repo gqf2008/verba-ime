@@ -55,7 +55,9 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 
 ## 6. 下一步任务（M5）
 
-- [ ] 构建 librime-sys spike（Windows，daemon 内），验证拼音整句 + 五笔方案
+- [ ] 构建 librime-sys spike（Windows，daemon 内），验证拼音整句 + 五笔方案（延后：需预编译
+      rime.dll 或全量编译 librime，环境风险高；待候选融合实机验收后单独做）
 - [ ] 对比自研 vs librime：整句准确率采样（50 句日常对话）
-- [ ] 候选窗（独立窗口、分页、主题）
-- [ ] 候选融合（词库 + LLM 候选，IPC 协议扩展）
+- [x] 候选窗（独立窗口、分页、主题）（2026-08-23 实机验收通过 + 代码完成）
+- [x] 候选融合（词库 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`，mock 端到端冒烟通过，
+      待实机验收）（2026-08-23）
