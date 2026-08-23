@@ -141,7 +141,7 @@ pub struct Config {
     /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
     #[serde(default = "default_rime_schema")]
     pub rime_schema: String,
-    /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（后续）| …
+    /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（微软在线神经音色）| …
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
     /// TTS 语音名（如 edge 的 zh-CN-XiaoxiaoNeural；mock 忽略）。
@@ -269,9 +269,9 @@ impl Config {
                 }
                 "rime_schema" => self.rime_schema = v.clone(),
                 "tts_provider" => {
-                    if v != "mock" {
+                    if v != "mock" && v != "edge" {
                         return Err(ConfigError::InvalidValue(format!(
-                            "tts_provider 仅支持 mock（edge 等开发中）: {k}={v}"
+                            "tts_provider 仅支持 mock|edge: {k}={v}"
                         )));
                     }
                     self.tts_provider = v.clone();

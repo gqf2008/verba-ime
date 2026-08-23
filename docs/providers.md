@@ -46,7 +46,7 @@
 | --- | --- | --- | --- | --- |
 | 系统 TTS | 系统 | SAPI5 / AVSpeechSynthesizer / espeak-ng | 平台 API | ✅ 零成本离线兜底 |
 | Piper | 本地 | 离线神经 TTS，中文模型可用、延迟低 | `piper-rs` / 子进程 | ✅ 推荐离线神经音色 |
-| edge-tts | 在线 | 微软 Edge 神经音色（非官方接口），免费、音色好 | HTTP / WS | ✅ 推荐在线免费音色 |
+| edge-tts | 在线 | 微软 Edge 神经音色（非官方接口），免费、音色好 | WS（Rust 已实现，2026-08-23 实机 OK） | ✅ 推荐在线免费音色 |
 | OpenAI TTS | 云端 | 音色自然、按字符计费 | HTTP | 可选 |
 | Azure / 讯飞 | 云端 | 企业级、可定制音色 | HTTP | 可选 |
 

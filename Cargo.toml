@@ -49,3 +49,7 @@ log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

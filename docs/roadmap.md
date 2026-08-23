@@ -3,7 +3,7 @@
 > 更新：2026-08-23 · 当前状态：**M5 已收口**（2026-08-23 实机 OK：候选窗即时内置 + Rime 去重追加，
 > 验收清单逐项勾选，见 manual-acceptance-windows.md）。
 > 下一批：**M3 多模态 + M4 TTS 的 Rust 核心**（provider 抽象 + daemon 路由 + IPC + CLI，全部本机可验证）。
-> 已开工（2026-08-23）：TTS mock + OCR mock/Windows.Media.Ocr + ASR mock 端到端——`verba-cli tts`/`verba-cli ocr`/`verba-cli asr` 通过；edge/Piper 系统 TTS 与 whisper.cpp 跟进。
+> 已开工（2026-08-23）：TTS mock/edge-tts + OCR mock/Windows.Media.Ocr + ASR mock 端到端——`verba-cli tts`/`verba-cli ocr`/`verba-cli asr` 通过，edge-tts 实机出真实 MP3；Piper/系统 TTS 与 whisper.cpp 跟进。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -62,7 +62,8 @@
 
 - [ ] TTS provider：系统 TTS / edge-tts / Piper（可选）
   - [x] **mock**（确定性 WAV，2026-08-23：`verba-tts` crate + IPC `TtsSynthesize`/`Audio` + daemon 路由 + `verba-cli tts`，CLI/验收通过）
-  - [ ] edge-tts（网络） / 系统 TTS（Windows SAPI） / Piper（本地）
+  - [x] **edge-tts**（微软 Edge 在线神经音色，2026-08-23 实机验证：`verba-tts` Edge provider 接入（WSS + SSML + Sec-MS-GEC 签名），`verba-cli tts` 出真实 MP3，`voice` 可覆盖，默认 zh-CN-XiaoxiaoNeural）
+- [ ] 系统 TTS（Windows SAPI）/ Piper（本地）
 - [x] 候选窗口样式与交互（分页、主题、皮肤）（随 M5 完成，2026-08-23 实机验收）
 - [ ] Tauri 设置面板（服务商配置、快捷键、隐私开关）
 - [ ] 性能与内存预算达标（见 architecture §8）
@@ -105,3 +106,4 @@
 | 2026-08-23 | M5 实机验收收口（候选窗即时内置 + Rime 追加）；M4 TTS mock provider 接入（`verba-tts` + IPC TtsSynthesize/Audio + daemon 路由 + CLI + 验收） |
 | 2026-08-23 | M3 OCR 接入（`verba-ocr` + IPC OcrRecognize + daemon 路由 + CLI + 验收；mock 确定性 + Windows.Media.Ocr 本地识别实机验证） |
 | 2026-08-23 | M3 ASR 接入（`verba-asr` + IPC AsrTranscribe + daemon 路由 + CLI + 验收；mock 确定性；whisper.cpp 待接入） |
+| 2026-08-23 | M4 TTS edge-tts 接入（`verba-tts` Edge provider：WSS + SSML + Sec-MS-GEC，`verba-cli tts` 实机出 MP3；mock 仍为默认） |

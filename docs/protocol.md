@@ -103,8 +103,8 @@ message Candidates {
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：`config 引擎=rime` 时前端把拼音/五笔码发到 daemon，daemon 内 librime
   查询候选并一次性回 `Candidates`（`done=true`）；`rime_schema` 配置方案。
-- **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`；daemon 按
-  `config tts_provider` 选择 provider（当前 `mock`，产出确定性 WAV），一次性回 `Audio`。
+- **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`（默认 zh-CN-XiaoxiaoNeural）；daemon 按
+  `config tts_provider` 选择 provider（`mock` 确定性 WAV / `edge` 微软在线神经音色 MP3），一次性回 `Audio`。
 - **OcrRecognize**：`image` 图像字节；daemon 按 `config ocr_provider` 选择 provider（`mock` 确定性 /
   `windows` = Windows.Media.Ocr 本地识别），一次性回 `Text`（整段文字，多行以换行拼接）。
 - **AsrTranscribe**：`audio` 音频字节；daemon 按 `config asr_provider` 选择 provider（当前 `mock` 确定性），一次性回 `Text`。

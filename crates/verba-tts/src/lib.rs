@@ -1,10 +1,11 @@
 //! Verba TTS 能力：文字 → 语音音频。
 //!
-//! M4 落地：provider 由 config `tts_provider` 选择（当前 mock；edge/Piper/系统 TTS 后续）。
+//! M4 落地：provider 由 config `tts_provider` 选择（mock 确定性 / edge 微软在线神经音色；Piper/系统 TTS 后续）。
 //! 每个 provider 实现 `verba_ai::TtsProvider`，`TtsClient` 按配置分发并统一返回音频字节。
 
 #![forbid(unsafe_code)]
 
+pub mod edge;
 pub mod mock;
 pub mod wav;
 
@@ -13,15 +14,21 @@ use std::str::FromStr;
 use thiserror::Error;
 use verba_ai::{TtsAudio, TtsProvider};
 
+pub use edge::EdgeTts;
 pub use mock::MockTts;
+
+/// 默认 TTS 语音（edge：中文女声晓晓）。
+pub const DEFAULT_VOICE: &str = "zh-CN-XiaoxiaoNeural";
 
 /// TTS 错误。
 #[derive(Debug, Error)]
 pub enum TtsError {
-    #[error("未知 TTS provider: {0}（当前支持 mock）")]
+    #[error("未知 TTS provider: {0}（当前支持 mock|edge）")]
     UnknownProvider(String),
     #[error("文本为空")]
     EmptyText,
+    #[error("edge-tts 错误: {0}")]
+    Edge(String),
 }
 
 /// 已实现的 TTS provider。
@@ -29,6 +36,8 @@ pub enum TtsError {
 pub enum TtsProviderKind {
     /// 本地 mock：确定性 WAV 合成（开发/验收）。
     Mock,
+    /// 微软 Edge 在线神经音色（真实联网，MP3）。
+    Edge,
 }
 
 impl FromStr for TtsProviderKind {
@@ -37,6 +46,7 @@ impl FromStr for TtsProviderKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "" | "mock" => Ok(Self::Mock),
+            "edge" => Ok(Self::Edge),
             other => Err(TtsError::UnknownProvider(other.to_owned())),
         }
     }
@@ -50,12 +60,15 @@ pub struct TtsClient {
 }
 
 impl TtsClient {
-    /// 按配置创建（provider: mock|…；voice 为语音名，mock 忽略）。
+    /// 按配置创建（provider: mock|edge；voice 为语音名，edge 空语音回退默认中文女声，mock 忽略）。
     pub fn from_config(provider: &str, voice: &str) -> Result<Self, TtsError> {
-        Ok(Self {
-            provider: provider.parse()?,
-            voice: voice.to_owned(),
-        })
+        let provider: TtsProviderKind = provider.parse()?;
+        let voice = if voice.is_empty() && provider == TtsProviderKind::Edge {
+            DEFAULT_VOICE.to_owned()
+        } else {
+            voice.to_owned()
+        };
+        Ok(Self { provider, voice })
     }
 
     /// 合成文本 → 音频字节。
@@ -65,6 +78,7 @@ impl TtsClient {
         }
         match &self.provider {
             TtsProviderKind::Mock => MockTts::new().synthesize(text).await,
+            TtsProviderKind::Edge => EdgeTts::new(self.voice.clone()).synthesize(text).await,
         }
     }
 
@@ -120,16 +134,19 @@ mod tests {
             "".parse::<TtsProviderKind>().unwrap(),
             TtsProviderKind::Mock
         );
-        assert!("edge".parse::<TtsProviderKind>().is_err(), "edge 未实现");
+        assert_eq!(
+            "edge".parse::<TtsProviderKind>().unwrap(),
+            TtsProviderKind::Edge
+        );
+        assert!("piper".parse::<TtsProviderKind>().is_err(), "piper 未实现");
     }
 
     #[tokio::test]
     async fn client_rejects_empty_text() {
         let c = TtsClient::from_config("mock", "").unwrap();
         assert!(matches!(c.synthesize("  ").await, Err(TtsError::EmptyText)));
-        assert!(matches!(
-            TtsClient::from_config("edge", ""),
-            Err(TtsError::UnknownProvider(_))
-        ));
+        let e = TtsClient::from_config("edge", "").unwrap();
+        assert!(matches!(e.synthesize("  ").await, Err(TtsError::EmptyText)));
+        assert_eq!(e.voice(), DEFAULT_VOICE, "edge 空语音应回退默认中文女声");
     }
 }

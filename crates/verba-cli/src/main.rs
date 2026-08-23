@@ -50,7 +50,7 @@ fn print_help() {
          verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
          verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
-         verba-cli tts <文本> [输出]  TTS 合成音频并写文件（config tts_provider）\n  \
+         verba-cli tts <文本> [输出] [语音]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
          verba-cli asr <音频>          ASR 转写音频并打印文字（config asr_provider）\n  \
          verba-cli config                查看配置\n  \
@@ -180,16 +180,17 @@ fn cmd_rime(args: &[String]) -> i32 {
     })
 }
 
-/// `verba-cli tts <文本> [输出文件]`：daemon TTS 合成（provider 由 config tts_provider 决定）。
+/// `verba-cli tts <文本> [输出文件] [语音]`：daemon TTS 合成（provider 由 config tts_provider 决定）。
 fn cmd_tts(args: &[String]) -> i32 {
     let text = args.get(1).cloned().unwrap_or_default();
     if text.is_empty() {
-        eprintln!("用法: verba-cli tts <文本> [输出文件]");
+        eprintln!("用法: verba-cli tts <文本> [输出文件] [语音]");
         return 1;
     }
     let out = args.get(2).cloned();
+    let voice = args.get(3).cloned();
     with_client(|c| {
-        let (format, data) = c.tts_synthesize(&text, None)?;
+        let (format, data) = c.tts_synthesize(&text, voice.as_deref())?;
         match out {
             Some(path) => {
                 std::fs::write(&path, &data)?;
