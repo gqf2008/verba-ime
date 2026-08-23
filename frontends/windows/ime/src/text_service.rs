@@ -611,9 +611,7 @@ pub fn apply_action(
             // 与普通 `//` LLM 命令一致：不结束组合、不重置状态机，保持流式输出。
             if cmd == "看图" {
                 log::info!("看图命令（vision）");
-                let eye_rect = eye_rect_for(data, context);
-                let image = eye_vision_image(eye_rect);
-                start_llm(data, prompt, None, image);
+                start_llm(data, prompt, eye_rect_for(data, context), true);
                 return Ok(());
             }
             let kind = if cmd == "截图" {
@@ -639,13 +637,7 @@ pub fn apply_action(
             let (eye_enabled, eye_mode) =
                 load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
             let use_vision = eye_enabled && eye_mode == "vision";
-            let vision = if use_vision {
-                eye_vision_image(eye_rect)
-            } else {
-                None
-            };
-            let ocr_rect = if use_vision { None } else { eye_rect };
-            start_llm(data, prompt, ocr_rect, vision);
+            start_llm(data, prompt, eye_rect, use_vision);
             Ok(())
         }
         Action::ResultReady => Ok(()),
@@ -873,7 +865,7 @@ fn start_llm(
     data: &Rc<TextServiceData>,
     prompt: String,
     eye_rect: Option<(i32, i32, i32, i32)>,
-    vision: Option<(String, Vec<u8>)>,
+    use_vision: bool,
 ) {
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
@@ -885,25 +877,31 @@ fn start_llm(
                 return;
             }
         };
-        // 眼睛：指令前自动捕捉光标上方屏幕 → OCR，作为 LLM 上下文注入 system。
-        // vision 模式（`//看图` / eye_mode=vision）直接交给 LLM 图像，不再走 OCR。
+        // 眼睛：指令前捕捉光标上方屏幕。use_vision=true 时（`//看图` / eye_mode=vision）
+        // 在工作线程内截图→PNG 直接交给 LLM；否则 OCR 转文字注入 system。
         let mut system: Option<String> = None;
-        if vision.is_none() {
-            if let Some((rx, ry, rw, rh)) = eye_rect {
-                match run_region_ocr_rect(rx, ry, rw, rh) {
-                    Ok(Some(text)) if !text.is_empty() => {
-                        log::info!("眼睛区域已捕捉, ocr_len={}", text.chars().count());
-                        system = Some(format!(
-                            "{AI_SYSTEM_BASE}\n\n【眼睛内容：光标上方屏幕】\n{text}"
-                        ));
-                    }
-                    Ok(_) => log::debug!("眼睛区域无识别文本"),
-                    Err(e) => log::warn!("眼睛区域 OCR 失败: {e}"),
+        let mut image: Option<(String, Vec<u8>)> = None;
+        if use_vision {
+            if let Some(img) = eye_vision_image(eye_rect) {
+                log::info!("眼睛区域 vision 捕捉成功, bytes={}", img.1.len());
+                image = Some(img);
+            } else {
+                log::warn!("眼睛区域 vision 捕捉失败");
+            }
+        } else if let Some((rx, ry, rw, rh)) = eye_rect {
+            match run_region_ocr_rect(rx, ry, rw, rh) {
+                Ok(Some(text)) if !text.is_empty() => {
+                    log::info!("眼睛区域已捕捉, ocr_len={}", text.chars().count());
+                    system = Some(format!(
+                        "{AI_SYSTEM_BASE}\n\n【眼睛内容：光标上方屏幕】\n{text}"
+                    ));
                 }
+                Ok(_) => log::debug!("眼睛区域无识别文本"),
+                Err(e) => log::warn!("眼睛区域 OCR 失败: {e}"),
             }
         }
 
-        let image_ref = vision.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
+        let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
         let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref) {
             Ok(id) => id,
             Err(e) => {
