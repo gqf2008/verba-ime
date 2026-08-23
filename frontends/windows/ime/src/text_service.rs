@@ -19,9 +19,13 @@ use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR,
-    VK_RETURN,
+    GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_ESCAPE,
+    VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN,
 };
+
+use crate::capture::capture_primary_screen;
+use crate::play::play_audio;
+use crate::record::record_seconds;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
     ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor,
@@ -43,6 +47,8 @@ const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
 const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
 const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿后发起 LLM 候选融合请求
+/// 听写 / ASR 热键录音时长（秒）。
+const ASR_RECORD_SECONDS: f32 = 3.0;
 
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
@@ -57,6 +63,12 @@ struct PendingCandidateReq {
     ticks: u32,
 }
 
+/// 触发任务（截图 OCR / 录音 ASR）结果。
+pub enum TriggerResult {
+    /// 识别文本（上屏）。
+    Text(String),
+}
+
 /// 共享状态（TSF 线程独占；`chunks` 由流线程写入，用 Mutex 保护）。
 pub struct TextServiceData {
     self_rc: RefCell<Option<Rc<TextServiceData>>>,
@@ -69,6 +81,8 @@ pub struct TextServiceData {
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
     pub chunks: Arc<Mutex<VecDeque<StreamEvent>>>,
+    /// 触发任务（截图 OCR / 录音 ASR）结果，定时器消费并上屏。
+    pub trigger_results: Arc<Mutex<VecDeque<TriggerResult>>>,
     pub candidate_window: RefCell<Option<crate::candidate_window::CandidateWindow>>,
     /// 候选窗锚点重试（GetTextExt 返回 TS_E_NOLAYOUT 时，由定时器稍后重试精确定位）。
     candidate_pending_pos: RefCell<Option<CandidatePosRetry>>,
@@ -108,6 +122,7 @@ impl TextServiceData {
             keysink_advised: Cell::new(false),
             timer_hwnd: Cell::new(None),
             chunks: Arc::new(Mutex::new(VecDeque::new())),
+            trigger_results: Arc::new(Mutex::new(VecDeque::new())),
             candidate_window: RefCell::new(None),
             candidate_pending_pos: RefCell::new(None),
             candidate_theme: RefCell::new(verba_candidate::Theme::default()),
@@ -272,6 +287,10 @@ impl KeyEventSink {
 ///   与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被吞/丢字符。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
+    // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
+    if state == MachineState::Idle && is_trigger_hotkey(vk) {
+        return true;
+    }
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
     match state {
@@ -423,6 +442,12 @@ pub fn handle_key_down(
     if data.context.borrow().is_none() {
         return Ok(FALSE);
     }
+    // 触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）：异步采集识别，结果经定时器上屏。
+    if let Some(kind) = trigger_kind_for_vk(wparam) {
+        log::info!("触发热键: {kind:?}");
+        trigger_async(data, kind);
+        return Ok(TRUE);
+    }
     let vk = wparam;
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
@@ -565,6 +590,38 @@ pub fn apply_action(
             Ok(())
         }
         Action::StartLlm { prompt, system: _ } => {
+            // 多模态命令路由：
+            // - `//朗读 <文本>` → TTS 合成并播放（不落盘文本）
+            // - `//截图` → 全屏截图 OCR，识别文本上屏
+            // - `//听写` → 录音 ASR，识别文本上屏
+            // 均以「结束当前组合 + 重置状态机」收尾；采集/合成/播放异步完成。
+            let cmd = prompt.trim();
+            if cmd.starts_with("朗读") {
+                let text = tts_text_of(cmd);
+                log::info!("朗读命令: text={text}");
+                if let Some(comp) = data.composition.borrow_mut().take() {
+                    let _ = edit_session::end_composition(context, clientid, &comp, "");
+                }
+                *data.machine.borrow_mut() = CompositionMachine::new();
+                start_tts_play(text);
+                return Ok(());
+            }
+            let kind = if cmd == "截图" {
+                Some(TriggerKind::Ocr)
+            } else if cmd == "听写" {
+                Some(TriggerKind::Asr)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                log::info!("触发命令: {kind:?}");
+                if let Some(comp) = data.composition.borrow_mut().take() {
+                    let _ = edit_session::end_composition(context, clientid, &comp, "");
+                }
+                *data.machine.borrow_mut() = CompositionMachine::new();
+                trigger_async(data, kind);
+                return Ok(());
+            }
             // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
             // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
             // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult 替换文本。
@@ -1034,6 +1091,123 @@ fn prewarm_daemon(data: &Rc<TextServiceData>) {
     });
 }
 
+// ---- 多模态触发（截图 OCR / 录音 ASR / 朗读 TTS） ----
+
+/// 触发热键判定（需 Ctrl+Alt 修饰）：Ctrl+Alt+O = 截图 OCR，Ctrl+Alt+M = 录音 ASR。
+fn is_trigger_hotkey(vk: u32) -> bool {
+    if vk != VK_O.0 as u32 && vk != VK_M.0 as u32 {
+        return false;
+    }
+    unsafe {
+        (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            && (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
+    }
+}
+
+/// 触发热键 → 任务类型。
+fn trigger_kind_for_vk(vk: u32) -> Option<TriggerKind> {
+    if !is_trigger_hotkey(vk) {
+        return None;
+    }
+    if vk == VK_O.0 as u32 {
+        Some(TriggerKind::Ocr)
+    } else if vk == VK_M.0 as u32 {
+        Some(TriggerKind::Asr)
+    } else {
+        None
+    }
+}
+
+/// 触发任务类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerKind {
+    /// 截图 OCR。
+    Ocr,
+    /// 录音 ASR。
+    Asr,
+}
+
+/// 后台执行触发任务（采集 + daemon 识别），结果入队由定时器上屏。
+fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
+    let results = Arc::clone(&data.trigger_results);
+    let _ = std::thread::spawn(move || {
+        let outcome = match kind {
+            TriggerKind::Ocr => {
+                let shot = match capture_primary_screen() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("截图失败: {e}");
+                        return;
+                    }
+                };
+                match ipc::ensure_daemon() {
+                    Ok(mut client) => client.ocr_recognize(&shot.bmp),
+                    Err(e) => {
+                        log::warn!("连接 daemon 失败: {e}");
+                        return;
+                    }
+                }
+            }
+            TriggerKind::Asr => {
+                let wav = match record_seconds(ASR_RECORD_SECONDS) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::warn!("录音失败: {e}");
+                        return;
+                    }
+                };
+                match ipc::ensure_daemon() {
+                    Ok(mut client) => client.asr_transcribe(&wav),
+                    Err(e) => {
+                        log::warn!("连接 daemon 失败: {e}");
+                        return;
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(text) => {
+                if !text.trim().is_empty() {
+                    results.lock().unwrap().push_back(TriggerResult::Text(text));
+                }
+            }
+            Err(e) => log::warn!("{kind:?} 失败: {e}"),
+        }
+    });
+}
+
+/// 后台 TTS 合成（daemon）+ 播放（rodio），完成后仅记日志。
+fn start_tts_play(text: String) {
+    let _ = std::thread::spawn(move || {
+        let mut client = match ipc::ensure_daemon() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("朗读：连接 daemon 失败: {e}");
+                return;
+            }
+        };
+        match client.tts_synthesize(&text, None) {
+            Ok((format, bytes)) => match play_audio(&bytes) {
+                Ok(()) => log::info!(
+                    "朗读完成: text={text} format={format} bytes={}",
+                    bytes.len()
+                ),
+                Err(e) => log::warn!("朗读播放失败: {e}"),
+            },
+            Err(e) => log::warn!("朗读合成失败: {e}"),
+        }
+    });
+}
+
+/// `//朗读 xxx` → 提取朗读文本（去前缀与分隔符）。
+fn tts_text_of(prompt: &str) -> String {
+    prompt
+        .trim_start_matches("朗读")
+        .trim_start_matches(|c| ":： \t".contains(c))
+        .trim()
+        .to_owned()
+}
+
 // ---- 定时器窗口 ----
 
 /// # Safety
@@ -1130,6 +1304,8 @@ impl TextServiceData {
         retry_candidate_pos(&rc);
         // 候选融合：输入停顿后发起 LLM 候选请求
         maybe_fire_candidate_request(&rc);
+        // 触发任务（截图 OCR / 录音 ASR）结果上屏
+        self.drain_trigger_results();
 
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
@@ -1178,5 +1354,59 @@ impl TextServiceData {
                 None => {}
             }
         }
+    }
+
+    /// 消费触发任务（截图 OCR / 录音 ASR）结果并上屏。
+    fn drain_trigger_results(&self) {
+        let results: Vec<String> = {
+            let mut q = self.trigger_results.lock().unwrap();
+            q.drain(..)
+                .map(|r| match r {
+                    TriggerResult::Text(t) => t,
+                })
+                .collect()
+        };
+        if results.is_empty() {
+            return;
+        }
+        let Some(context) = self.context.borrow().as_ref().cloned() else {
+            return;
+        };
+        let clientid = self.clientid.get();
+        for text in results {
+            match edit_session::commit_text(&context, clientid, &text) {
+                Ok(()) => log::info!("触发结果上屏: chars={}", text.chars().count()),
+                Err(e) => log::warn!("触发结果上屏失败: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tts_text_of_strips_command_prefix() {
+        assert_eq!(tts_text_of("朗读你好"), "你好");
+        assert_eq!(tts_text_of("朗读 你好世界"), "你好世界");
+        assert_eq!(tts_text_of("朗读：你好"), "你好");
+        assert_eq!(tts_text_of("朗读: 你好"), "你好");
+        assert_eq!(tts_text_of("朗读"), "");
+    }
+
+    #[test]
+    fn trigger_kind_requires_modifier_but_maps_vk() {
+        // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
+        assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
+        assert_eq!(trigger_kind_for_vk(VK_M.0 as u32), None);
+    }
+
+    #[test]
+    fn prompt_routing_classifies_commands() {
+        assert!("朗读 你好".trim().starts_with("朗读"));
+        assert_eq!("截图".trim(), "截图");
+        assert_eq!("听写".trim(), "听写");
+        assert_ne!("翻译：你好".trim(), "截图");
     }
 }

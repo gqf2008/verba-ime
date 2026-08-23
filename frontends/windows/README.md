@@ -20,4 +20,16 @@
 - `verba-trigger tts <文本> [输出] [语音]`：TTS 合成存文件（`config tts_provider`）。
 - `verba-trigger speak <文本> [语音]`：TTS 合成并播放（rodio，支持 MP3 / WAV）。
 
-能力模块：`capture`（截图）、`record`（录音）、`play`（播放）均在 DLL crate 内，后续 TSF 热键直接复用。
+能力模块：`capture`（截图）、`record`（录音）、`play`（播放）均在 DLL crate 内，TSF 热键/命令已直接复用。
+
+## 触发热键与命令（TSF 内）
+
+- **Ctrl+Alt+O**：全屏截图 → daemon OCR（`config ocr_provider`）→ 识别文本上屏。
+- **Ctrl+Alt+M**：麦克风录音 3s → daemon ASR（`config asr_provider`）→ 识别文本上屏。
+- **`//朗读 <文本>`**：TTS 合成（`config tts_provider`）并播放，不落盘文本。
+- **`//截图`**：同 Ctrl+Alt+O。**`//听写`**：同 Ctrl+Alt+M。
+
+上屏/播放异步完成（后台线程采集 → 结果经 TSF 定时器提交），不会卡住按键处理。
+
+> 部署：新 DLL 构建到新 target 目录（如 `target_dev15`），并把 HKCU CLSID `InprocServer32` 指向新 DLL；
+> 切回旧版只需改回 `target_dev14`。重新打开输入法应用（如记事本）后生效。

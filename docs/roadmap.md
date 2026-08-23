@@ -2,7 +2,7 @@
 
 > 更新：2026-08-23 · 当前状态：**M5 已收口**（2026-08-23 实机 OK：候选窗即时内置 + Rime 去重追加，
 > 验收清单逐项勾选，见 manual-acceptance-windows.md）。
-> 下一批：**前端触发链路**（TSF 热键 → 截图 OCR / 录音 ASR / 朗读 TTS → 上屏/播放）；触发能力模块与 `verba-trigger` 工具已就绪（2026-08-23 实机端到端验证）。
+> 下一批：**前端触发链路**已接线（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR / `//朗读` `//截图` `//听写`，2026-08-23 待实机验收）；后续：选区截图、设置面板、whisper/Piper/系统 TTS。
 > 已开工（2026-08-23）：TTS mock/edge-tts + OCR mock/Windows.Media.Ocr + ASR mock 端到端——`verba-cli tts`/`verba-cli ocr`/`verba-cli asr` 通过，edge-tts 实机出真实 MP3；Piper/系统 TTS 与 whisper.cpp 跟进。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
@@ -53,12 +53,16 @@
   - [x] **Windows.Media.Ocr**（2026-08-23 实机验证：英文识别 OK；中文需装 OCR 语言包，代码优先 zh-Hans-CN 并有回退）
   - [ ] PaddleOCR ONNX（跨平台本地）
 - [ ] 截图链路：权限、选区、预览、OCR 结果上屏
-  - [x] **触发能力地基**（2026-08-23：`verba-trigger` 全屏截图→BMP→daemon OCR 端到端实机验证，Windows.Media.Ocr 真识别；选区/预览/热键接线待做）
+  - [x] **触发能力地基**（2026-08-23：`verba-trigger` 全屏截图→BMP→daemon OCR 端到端实机验证，Windows.Media.Ocr 真识别）
+  - [x] **TSF 热键/`//截图` 命令接线**（2026-08-23：Ctrl+Alt+O 或 `//截图` → 截图 OCR 结果上屏；待实机验收）
+  - [ ] 选区截图：选区预览窗口、区域选取
 - [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
   - [x] **mock**（确定性，2026-08-23：`verba-asr` crate + IPC `AsrTranscribe` + daemon 路由 + `verba-cli asr`）
   - [ ] whisper.cpp（whisper-rs，本地模型）
 - [ ] 语音链路：快捷键、录音、流式转写、上屏
-  - [x] **触发能力地基**（2026-08-23：`verba-trigger` 麦克风录音→WAV→daemon ASR、TTS 合成→播放（rodio）端到端实机验证；TSF 热键/流式转写待做）
+  - [x] **触发能力地基**（2026-08-23：`verba-trigger` 麦克风录音→WAV→daemon ASR、TTS 合成→播放（rodio）端到端实机验证）
+  - [x] **TSF 热键/`//听写` `//朗读` 命令接线**（2026-08-23：Ctrl+Alt+M 或 `//听写` → 录音 ASR 上屏；`//朗读 <文本>` → TTS 播放；待实机验收）
+  - [ ] 流式转写：边录边出字
 
 ## M4 详细任务（体验）
 
@@ -110,3 +114,4 @@
 | 2026-08-23 | M3 ASR 接入（`verba-asr` + IPC AsrTranscribe + daemon 路由 + CLI + 验收；mock 确定性；whisper.cpp 待接入） |
 | 2026-08-23 | M4 TTS edge-tts 接入（`verba-tts` Edge provider：WSS + SSML + Sec-MS-GEC，`verba-cli tts` 实机出 MP3；mock 仍为默认） |
 | 2026-08-23 | 前端触发能力地基（`verba-trigger`：截图→OCR / 录音→ASR / TTS→播放，capture/record/play 模块 + CLI，端到端实机验证） |
+| 2026-08-23 | TSF 触发接线（Ctrl+Alt+O/M 热键 + `//朗读` `//截图` `//听写` 命令；新 DLL target_dev15，待实机验收） |
