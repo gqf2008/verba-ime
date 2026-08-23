@@ -47,7 +47,6 @@ impl Default for Theme {
             corner_radius: default_corner_radius(),
         }
     }
-
 }
 
 impl Theme {

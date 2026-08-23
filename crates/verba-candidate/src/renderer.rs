@@ -55,9 +55,13 @@ impl CpuCandidateRenderer {
 
         // 背景（圆角：角部透明，配合窗口圆角区域裁切）
         let bg = parse_color(&theme.background).unwrap_or(Color::WHITE);
-        if let Some(bg_path) =
-            rounded_rect_path(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0, theme.corner_radius as f32)
-        {
+        if let Some(bg_path) = rounded_rect_path(
+            0.5,
+            0.5,
+            width as f32 - 1.0,
+            height as f32 - 1.0,
+            theme.corner_radius as f32,
+        ) {
             let mut bg_paint = Paint::default();
             bg_paint.set_color(bg);
             pixmap.fill_path(
@@ -74,9 +78,13 @@ impl CpuCandidateRenderer {
         // 边框（圆角描边）
         let border =
             parse_color(&theme.border_color).unwrap_or(Color::from_rgba8(0xCC, 0xCC, 0xCC, 0xFF));
-        if let Some(stroke_path) =
-            rounded_rect_path(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0, theme.corner_radius as f32)
-        {
+        if let Some(stroke_path) = rounded_rect_path(
+            0.5,
+            0.5,
+            width as f32 - 1.0,
+            height as f32 - 1.0,
+            theme.corner_radius as f32,
+        ) {
             let mut paint = Paint::default();
             paint.set_color(border);
             pixmap.stroke_path(

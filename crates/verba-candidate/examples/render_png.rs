@@ -42,9 +42,6 @@ fn main() {
     let mut writer = encoder.write_header().expect("PNG 头");
     writer.write_image_data(&out.pixels).expect("写像素");
     drop(writer);
-    println!(
-        "已渲染候选窗: {}x{} → {}",
-        out.width, out.height, path
-    );
+    println!("已渲染候选窗: {}x{} → {}", out.width, out.height, path);
     std::io::stdout().flush().unwrap();
 }

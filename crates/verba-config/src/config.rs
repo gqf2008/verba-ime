@@ -362,7 +362,10 @@ mod tests {
         assert_eq!(cand.font_size, 18);
         assert_eq!(cand.corner_radius, 0);
         // 未覆盖的字段仍取预设值
-        assert_eq!(cand.text_color, verba_candidate::Theme::default().text_color);
+        assert_eq!(
+            cand.text_color,
+            verba_candidate::Theme::default().text_color
+        );
     }
 
     #[test]
