@@ -108,6 +108,17 @@ impl OcrClient {
     pub fn provider(&self) -> &OcrProviderKind {
         &self.provider
     }
+
+    /// 预热：provider 为 rapid 时预加载常驻 OCR 进程（后台加载模型），其它 provider 为空操作。
+    pub fn warmup(&self) -> Result<(), OcrError> {
+        match &self.provider {
+            OcrProviderKind::Rapid => {
+                let py = self.rapid_python.clone().unwrap_or_default();
+                RapidOcr::with_python(py).warmup()
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

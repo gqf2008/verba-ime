@@ -11,9 +11,11 @@
 //!   `{data_dir}/venv-ocr/Scripts/python.exe`（Windows）/ `bin/python`（unix）→ PATH `python` 依次解析。
 
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 use verba_ai::OcrProvider;
 
@@ -83,6 +85,9 @@ def main():
 if __name__ == '__main__':
     main()
 "#;
+
+/// 单次识别超时：常驻 Python 进程挂起时杀死它，免得卡死 daemon 池。
+const OCR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 常驻 OCR 进程：stdin/stdout 双管道。
 struct RapidProcess {
@@ -164,6 +169,13 @@ impl RapidOcr {
         Ok(path)
     }
 
+    /// 预热常驻 OCR 进程（后台加载模型），不执行识别。
+    pub fn warmup(&self) -> Result<(), OcrError> {
+        let python = self.resolve_python()?;
+        let helper = Self::helper_path()?.to_string_lossy().into_owned();
+        ensure_warmed(&python, &helper)
+    }
+
     /// 常驻识别：spawn_blocking 内完成帧读写（阻塞 IO，不占 async runtime）。
     async fn run(&self, image: &[u8]) -> Result<String, OcrError> {
         let python = self.resolve_python()?;
@@ -176,10 +188,12 @@ impl RapidOcr {
 }
 
 /// 在常驻进程中完成一次识别（含必要时的重启）。
-fn process_image(python: &str, helper: &str, image: &[u8]) -> Result<String, OcrError> {
-    let mut guard = pool()
-        .lock()
-        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
+/// 确保常驻进程已启动或重启（按 python 路径复用）。
+fn ensure_spawned(
+    guard: &mut Option<RapidProcess>,
+    python: &str,
+    helper: &str,
+) -> Result<(), OcrError> {
     let should_spawn = match guard.as_mut() {
         Some(p) => p.python != python || !matches!(p.child.try_wait(), Ok(None)),
         None => true,
@@ -187,6 +201,23 @@ fn process_image(python: &str, helper: &str, image: &[u8]) -> Result<String, Ocr
     if should_spawn {
         *guard = Some(spawn_process(python, helper)?);
     }
+    Ok(())
+}
+
+/// 预热：仅确保常驻进程已启动（后台加载模型），不发送识别。
+fn ensure_warmed(python: &str, helper: &str) -> Result<(), OcrError> {
+    let mut guard = pool()
+        .lock()
+        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
+    ensure_spawned(&mut guard, python, helper)
+}
+
+/// 在常驻进程中完成一次识别（含必要时的重启）。
+fn process_image(python: &str, helper: &str, image: &[u8]) -> Result<String, OcrError> {
+    let mut guard = pool()
+        .lock()
+        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
+    ensure_spawned(&mut guard, python, helper)?;
     let proc = guard.as_mut().expect("spawn 后必有进程");
     let text = exchange(proc, image)?;
     if let Some(err) = text.strip_prefix("ERROR:") {
@@ -233,6 +264,25 @@ fn exchange(proc: &mut RapidProcess, image: &[u8]) -> Result<String, OcrError> {
         .flush()
         .map_err(|e| OcrError::Rapid(format!("刷新 stdin 失败: {e}")))?;
 
+    // 看门狗：超时杀死 Python 进程，令读取返回 EOF，释放池锁。
+    let pid = proc.child.id();
+    let (tx, rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || match rx.recv_timeout(OCR_TIMEOUT) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            log::warn!("RapidOCR 超时，终止常驻进程 pid={pid}");
+            kill_pid(pid);
+        }
+    });
+
+    let result = read_response(proc);
+    let _ = tx.send(());
+    let _ = watchdog.join();
+    result
+}
+
+/// 读取应答帧（文本）。
+fn read_response(proc: &mut RapidProcess) -> Result<String, OcrError> {
     let mut rlen = [0u8; 4];
     proc.stdout
         .read_exact(&mut rlen)
@@ -243,6 +293,26 @@ fn exchange(proc: &mut RapidProcess, image: &[u8]) -> Result<String, OcrError> {
         .read_exact(&mut buf)
         .map_err(|e| OcrError::Rapid(format!("读响应失败: {e}")))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 终止进程（Windows 用 taskkill，其它平台用 kill）。
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .creation_flags(0x08000000)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 impl OcrProvider for RapidOcr {
