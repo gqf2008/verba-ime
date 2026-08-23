@@ -79,7 +79,7 @@ unsafe impl Send for WriteBack {}
 /// # SAFETY
 /// `TF_ES_SYNC` 保证 `DoEditSession` 在 `RequestEditSession` 返回前完成，
 /// 因此 `out` 指向的栈值在会话执行期间存活（与 `WriteBack` 同理）。
-pub struct WriteBackPos(pub *mut Option<(i32, i32)>);
+pub struct WriteBackPos(pub *mut Option<(i32, i32, i32)>);
 // SAFETY: 见上，同步会话期间唯一访问。
 unsafe impl Send for WriteBackPos {}
 
@@ -100,7 +100,8 @@ impl ITfEditSession_Impl for QueryAnchorSession_Impl {
             let mut clipped = windows::core::BOOL::default();
             match view.GetTextExt(ec, &range, &mut rc, &mut clipped) {
                 Ok(()) => {
-                    *self.out.0 = Some((rc.left, rc.bottom));
+                    // (x, top, bottom)：候选窗默认在下方，放不下可翻到上方。
+                    *self.out.0 = Some((rc.left, rc.top, rc.bottom));
                 }
                 Err(e) => {
                     log::warn!("会话内 GetTextExt 失败: {e}");
@@ -116,8 +117,8 @@ pub fn query_composition_anchor(
     context: &ITfContext,
     clientid: u32,
     composition: &ITfComposition,
-) -> Result<Option<(i32, i32)>> {
-    let mut out: Option<(i32, i32)> = None;
+) -> Result<Option<(i32, i32, i32)>> {
+    let mut out: Option<(i32, i32, i32)> = None;
     let session: ITfEditSession = QueryAnchorSession {
         composition: composition.clone(),
         context: context.clone(),

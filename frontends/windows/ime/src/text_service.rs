@@ -555,17 +555,22 @@ fn update_candidate_window(
     ctrl.set_candidates(candidates.to_vec());
     ctrl.show();
     match caret_screen_pos(data, context) {
-        Some((x, y)) => {
-            log::info!("候选窗显示 ({x},{y})");
+        Some(anchor) => {
+            log::info!("候选窗显示 锚点=({},{},{})", anchor.0, anchor.1, anchor.2);
             data.candidate_pending_pos.borrow_mut().take();
-            cw.update(&ctrl, x, y);
+            cw.update(&ctrl, anchor);
         }
         None => {
             // 布局未就绪（TS_E_NOLAYOUT）：先用视图屏幕区域粗定位显示，
             // 同时安排定时器重试精确定位。
-            let (fx, fy) = view_screen_pos(context).unwrap_or((0, 0));
-            log::info!("候选窗粗定位 ({fx},{fy})，等待组合布局就绪后重试");
-            cw.update(&ctrl, fx, fy);
+            let fallback = view_screen_pos(context).unwrap_or((0, 0, 0));
+            log::info!(
+                "候选窗粗定位 锚点=({},{},{})，等待组合布局就绪后重试",
+                fallback.0,
+                fallback.1,
+                fallback.2
+            );
+            cw.update(&ctrl, fallback);
             *data.candidate_pending_pos.borrow_mut() = Some(CandidatePosRetry {
                 context: context.clone(),
                 attempts_left: CANDIDATE_POS_RETRY_TICKS,
@@ -588,15 +593,15 @@ fn hide_candidate_window(data: &Rc<TextServiceData>) {
 /// 注意：`ITfContextView::GetTextExt` 的第一个参数必须是**编辑会话的 edit cookie
 /// （ec）**，不能传 clientid（实测传 clientid 返回 E_INVALIDARG 0x80070057）。
 /// 因此锚点查询必须放进只读同步编辑会话内执行。
-fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32)> {
+fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32, i32)> {
     let Some(comp) = data.composition.borrow().as_ref().cloned() else {
         log::warn!("候选锚点无组合引用");
         return None;
     };
     match edit_session::query_composition_anchor(context, data.clientid.get(), &comp) {
-        Ok(Some((x, y))) => {
-            log::info!("组合锚点 ({x},{y})");
-            Some((x, y))
+        Ok(Some(anchor)) => {
+            log::info!("组合锚点 rect=({},{},{})", anchor.0, anchor.1, anchor.2);
+            Some(anchor)
         }
         Ok(None) => {
             // TS_E_NOLAYOUT(0x80040205)：组合刚更新、应用尚未重算布局，稍后由定时器重试。
@@ -611,11 +616,11 @@ fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<
 }
 
 /// 视图屏幕区域（粗定位兜底：候选窗出现在应用文本区左上角下方）。
-fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32)> {
+fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32, i32)> {
     unsafe {
         let view: ITfContextView = context.GetActiveView().ok()?;
         let rc = view.GetScreenExt().ok()?;
-        Some((rc.left, rc.top + 8))
+        Some((rc.left, rc.top, rc.top + 8))
     }
 }
 
@@ -631,10 +636,15 @@ fn retry_candidate_pos(data: &Rc<TextServiceData>) {
     }
     p.attempts_left -= 1;
     let context = p.context.clone();
-    if let Some((x, y)) = caret_screen_pos(data, &context) {
-        log::info!("候选窗重试定位成功 ({x},{y})");
+    if let Some(anchor) = caret_screen_pos(data, &context) {
+        log::info!(
+            "候选窗重试定位成功 锚点=({},{},{})",
+            anchor.0,
+            anchor.1,
+            anchor.2
+        );
         if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
-            cw.move_to(x, y);
+            cw.move_to(anchor);
         }
         return;
     }
