@@ -638,13 +638,18 @@ fn update_candidate_window(
     }
 }
 
-/// 从配置文件加载候选相关配置（主题 + 引擎）；失败保留当前值。
+/// 从配置文件加载候选相关配置（主题 + 引擎 + Rime 方案）；失败保留当前值。
 fn reload_candidate_config(data: &Rc<TextServiceData>) {
     match load_candidate_config() {
         Ok((theme, engine, schema)) => {
             *data.candidate_theme.borrow_mut() = theme;
             *data.candidate_engine.borrow_mut() = engine.clone();
             *data.candidate_rime_schema.borrow_mut() = schema.clone();
+            // engine=rime 时抑制内置词库候选：词库候选全部来自 daemon 的 Rime，
+            // 避免长句被内置引擎（整句弱）的候选污染候选窗。
+            if let Ok(mut machine) = data.machine.try_borrow_mut() {
+                machine.set_dictionary_enabled(engine != "rime");
+            }
             log::info!("候选配置已加载（engine={engine} schema={schema}）");
         }
         Err(e) => log::warn!("候选配置加载失败: {e}"),

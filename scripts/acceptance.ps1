@@ -4,26 +4,20 @@
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$dllDir = Join-Path $root "frontends\windows\ime\target_dev12\release"
-$cli = Join-Path $dllDir "verba-cli.exe"
-$daemonExe = Join-Path $dllDir "verba-daemon.exe"
 $mockPort = 8765
 $env:VERBA_API_KEY = "sk-mock"
 $clsid = "{7C2D4E6A-1F3B-4A9E-8C5D-2F6B9A0E3D51}"
+# 从 HKCU CLSID 动态定位当前部署 DLL 目录（跨 target_dev* 鲁棒）
+$dll = (Get-ItemProperty "HKCU:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction Stop)."(default)"
+$dllDir = Split-Path -Parent $dll
+$cli = Join-Path $dllDir "verba-cli.exe"
+$daemonExe = Join-Path $dllDir "verba-daemon.exe"
 
 Write-Output "==== 1) 部署态核对 ===="
-$dll = Join-Path $dllDir "verba_ime_windows.dll"
 foreach ($f in @($dll, $daemonExe, $cli)) {
     if (-not (Test-Path $f)) { throw "缺失: $f" }
 }
-Write-Output "产物齐备: DLL/daemon/cli"
-
-$regVal = (Get-ItemProperty "HKCU:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue)."(default)"
-if ($regVal -ne $dll) {
-    Write-Warning "HKCU CLSID 未指向 target_dev12（当前: $regVal）——请确认使用新 DLL"
-} else {
-    Write-Output "HKCU CLSID 指向 target_dev12 ✅"
-}
+Write-Output "产物齐备: DLL/daemon/cli（$dllDir）"
 # 注册表分裂检查：HKLM CLSID 若指向旧安装版，需 HKCU 优先才生效（HKCU\Software\Classes 优先于 HKLM）
 $hklmVal = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue)."(default)"
 if ($hklmVal -and $hklmVal -ne $dll) {

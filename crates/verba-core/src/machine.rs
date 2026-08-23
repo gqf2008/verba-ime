@@ -131,6 +131,8 @@ pub struct CompositionMachine {
     pinyin_candidates: Vec<String>,
     /// 已发起 LLM 候选请求的拼音（避免同一拼音重复请求）。
     last_candidates_request: Option<String>,
+    /// 是否启用内置词库候选（engine=rime 时关闭：词库候选来自 daemon 的 Rime）。
+    dictionary_enabled: bool,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
     /// AI 提示词（不含 `//` 前缀）。
@@ -156,6 +158,7 @@ impl CompositionMachine {
             llm_candidates: Vec::new(),
             pinyin_candidates: Vec::new(),
             last_candidates_request: None,
+            dictionary_enabled: true,
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
@@ -540,15 +543,27 @@ impl CompositionMachine {
         self.pinyin_page = 0;
     }
 
-    /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧 LLM 候选）。
+    /// 设置是否启用内置词库候选（engine=rime 时由前端关闭，候选全部来自 daemon Rime）。
+    pub fn set_dictionary_enabled(&mut self, enabled: bool) {
+        self.dictionary_enabled = enabled;
+        if !enabled {
+            self.dictionary_candidates.clear();
+            self.fuse_candidates();
+        }
+    }
+
+    /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧 LLM/远程候选）。
     fn refresh_candidates(&mut self) {
         self.pinyin_page = 0;
-        self.dictionary_candidates = self
-            .engine
-            .lookup(&self.pinyin_buffer)
-            .into_iter()
-            .map(|c| c.text)
-            .collect();
+        self.dictionary_candidates = if self.dictionary_enabled {
+            self.engine
+                .lookup(&self.pinyin_buffer)
+                .into_iter()
+                .map(|c| c.text)
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.llm_candidates.clear();
         self.fuse_candidates();
     }
@@ -1220,6 +1235,33 @@ mod tests {
         assert!(full.len() > fused.len(), "融合后应更多候选");
         let key = (rel as u8 + b'1') as char;
         assert_eq!(m.feed_char(key), Action::CommitImmediate("你是".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn rime_mode_disables_dictionary_candidates() {
+        let mut m = CompositionMachine::new();
+        m.set_dictionary_enabled(false);
+        // 内置词库被抑制：首候选为空，等 Rime 候选到达
+        let a = m.feed_char('n');
+        match a {
+            Action::UpdatePinyin { candidates, .. } => {
+                assert!(
+                    candidates.is_empty(),
+                    "内置词库应被抑制，实际 {candidates:?}"
+                );
+            }
+            other => panic!("应进入拼音，实际 {other:?}"),
+        }
+        // Rime 候选融合后去重、可数字选择上屏
+        let _ = m.on_llm_candidates("n", &["你好".into(), "你是".into()], false);
+        match m.on_llm_candidates("n", &["你".into()], true) {
+            Action::UpdatePinyin { candidates, .. } => {
+                assert_eq!(candidates, ["你好", "你是", "你"]);
+            }
+            other => panic!("应融合 Rime 候选，实际 {other:?}"),
+        }
+        assert_eq!(m.feed_char('1'), Action::CommitImmediate("你好".into()));
         assert_eq!(m.state(), MachineState::Idle);
     }
 
