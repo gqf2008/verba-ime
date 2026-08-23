@@ -543,7 +543,9 @@ impl CompositionMachine {
         self.pinyin_page = 0;
     }
 
-    /// 设置是否启用内置词库候选（engine=rime 时由前端关闭，候选全部来自 daemon Rime）。
+    /// 设置是否启用内置词库候选（生产恒为 true：59a4bd9 起前端不再按 engine 关闭，
+    /// 候选窗始终即时显示内置词库，Rime/LLM 候选经 on_llm_candidates 去重追加；此接口仅
+    /// 供测试覆盖抑制机制，误用会导致候选窗在远程候选返回前一直空白）。
     pub fn set_dictionary_enabled(&mut self, enabled: bool) {
         self.dictionary_enabled = enabled;
         if !enabled {
@@ -555,8 +557,9 @@ impl CompositionMachine {
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧 LLM/远程候选）。
     fn refresh_candidates(&mut self) {
         self.pinyin_page = 0;
-        // 仅 Pinyin 态抑制内置词库（engine=rime 时候选窗只显示 Rime 候选）；
-        // Prompt 态（// 提示词拼音转中文）保留内置词库内联候选，避免回归。
+        // 始终启用内置词库：打字即有即时候选，Rime/LLM 候选作为追加增强
+        // （勿按 engine 关闭——候选窗会在远程候选返回前一直空白，实机体验差）。
+        // Prompt 态（// 提示词拼音转中文）同样保留内置内联候选。
         self.dictionary_candidates =
             if self.dictionary_enabled || self.state != MachineState::Pinyin {
                 self.engine
@@ -1196,6 +1199,32 @@ mod tests {
             m.on_llm_candidates("n", &["你是".into()], true),
             Action::None
         );
+    }
+
+    #[test]
+    fn default_builtin_instant_and_rime_appended() {
+        // 回归（59a4bd9）：engine=rime 曾按 engine 抑制内置词库，导致候选窗在 Rime
+        // 查询返回前一直空白（实机「没有候选窗口、候选词出现慢」）。默认（dictionary_enabled
+        // 恒为 true）必须打字即出内置候选，Rime 候选到达后去重追加到尾部，而非替换/等待。
+        let mut m = CompositionMachine::new();
+        // 打字即时有内置候选（不等 Rime 返回）
+        let dict = match m.feed_char('n') {
+            Action::UpdatePinyin { candidates, .. } => candidates,
+            other => panic!("应进入拼音，实际 {other:?}"),
+        };
+        assert!(!dict.is_empty(), "内置词库应即时返回候选，实际 {dict:?}");
+        // Rime 候选到达：已在词库的「你」去重，新候选「你是」追加到尾部
+        match m.on_llm_candidates("n", &["你".into(), "你是".into()], true) {
+            Action::UpdatePinyin { candidates, .. } => {
+                assert_eq!(candidates.len(), dict.len() + 1, "应只追加「你是」");
+                assert_eq!(&candidates[..dict.len()], &dict[..]);
+                assert_eq!(candidates[dict.len()], "你是");
+            }
+            other => panic!("Rime 融合应追加候选，实际 {other:?}"),
+        }
+        // 数字选择仍可选中内置首候选
+        assert_eq!(m.feed_char('1'), Action::CommitImmediate(dict[0].clone()));
+        assert_eq!(m.state(), MachineState::Idle);
     }
 
     #[test]
