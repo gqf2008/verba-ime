@@ -6,18 +6,46 @@ pub mod handler;
 
 pub use handler::DaemonHandler;
 
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use verba_ai::{LlmClient, LlmConfig};
 use verba_config::{ApiKeyStore, ConfigManager, VerbaDirs};
 use verba_ipc::DEFAULT_SOCKET_NAME;
 
+/// 日志 tee：同时写 stderr 与文件（便于故障诊断）。
+struct TeeLog {
+    file: Mutex<std::fs::File>,
+}
+
+impl Write for TeeLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write(buf);
+        let mut f = self.file.lock().unwrap();
+        let n = f.write(buf)?;
+        let _ = f.flush();
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
 /// 前台运行 daemon（阻塞直到退出）。
 pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let dirs = VerbaDirs::locate()?;
     dirs.ensure()?;
+    let log_path = dirs.log_dir().join("verba-daemon.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(TeeLog {
+            file: Mutex::new(log_file),
+        })))
+        .init();
     let mgr = ConfigManager::new(dirs);
     let config = mgr.load()?;
 

@@ -34,6 +34,7 @@ fn main() {
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
+        Some("diag") => cmd_diag(&args),
         Some(other) => {
             eprintln!("未知命令: {other}（--help 查看用法）");
             1
@@ -59,6 +60,7 @@ fn print_help() {
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
          verba-cli pinyin <拼音>        查询拼音候选（本地引擎调试）\n  \
+         verba-cli diag                 诊断：daemon 健康/配置/日志尾/相关进程\n  \
          verba-cli --version             版本\n"
     );
 }
@@ -390,4 +392,98 @@ fn cmd_pinyin(args: &[String]) -> i32 {
         }
     }
     0
+}
+/// `verba-cli diag`：输出 daemon 健康、关键配置、日志尾、相关进程，便于故障定位。
+fn cmd_diag(_args: &[String]) -> i32 {
+    println!("== Verba 诊断 ==");
+    let dirs = match verba_config::VerbaDirs::locate() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("无法定位数据目录: {e}");
+            return 1;
+        }
+    };
+    println!("数据目录: {}", dirs.data_dir().display());
+
+    match VerbaClient::connect() {
+        Ok(mut c) => match c.ping() {
+            Ok(ver) => {
+                println!("daemon: 在线 v{ver}");
+                if let Ok(cfg) = c.get_config() {
+                    let get = |k: &str| cfg.get(k).cloned().unwrap_or_default();
+                    for k in [
+                        "llm_base_url",
+                        "llm_model",
+                        "llm_vision_model",
+                        "engine",
+                        "rime_schema",
+                        "ocr_provider",
+                        "ocr_rapid_python",
+                        "asr_provider",
+                        "tts_provider",
+                        "eye_enabled",
+                        "eye_mode",
+                    ] {
+                        println!("{k} = {}", get(k));
+                    }
+                }
+            }
+            Err(e) => println!("daemon: ping 失败（{e}）"),
+        },
+        Err(e) => println!("daemon: 未连接（{e}）（可先运行 `verba-cli daemon`）"),
+    }
+
+    print_log(&dirs.log_dir().join("verba-daemon.log"), "daemon 日志");
+    let ilog = std::env::var("LOCALAPPDATA")
+        .map(|p| std::path::PathBuf::from(format!("{p}\\Verba\\verba-ime.log")))
+        .unwrap_or_default();
+    print_log(&ilog, "输入法日志");
+    print_procs();
+    0
+}
+
+fn print_log(p: &std::path::Path, label: &str) {
+    println!("== {label}: {} ==", p.display());
+    match std::fs::read_to_string(p) {
+        Ok(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(40);
+            for l in &lines[start..] {
+                println!("{l}");
+            }
+        }
+        Err(e) => println!("(无法读取: {e})"),
+    }
+}
+
+fn print_procs() {
+    println!("== 相关进程（verba/python） ==");
+    #[cfg(windows)]
+    {
+        if let Ok(out) = std::process::Command::new("tasklist")
+            .arg("/FO")
+            .arg("CSV")
+            .arg("/NH")
+            .stdout(std::process::Stdio::piped())
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut found = false;
+            for line in text.lines() {
+                if line.to_lowercase().contains("verba")
+                    || line.to_lowercase().contains("python.exe")
+                {
+                    println!("{line}");
+                    found = true;
+                }
+            }
+            if !found {
+                println!("(未发现）");
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        println!("(非 Windows，暂不列举进程)");
+    }
 }
