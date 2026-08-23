@@ -555,15 +555,18 @@ impl CompositionMachine {
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧 LLM/远程候选）。
     fn refresh_candidates(&mut self) {
         self.pinyin_page = 0;
-        self.dictionary_candidates = if self.dictionary_enabled {
-            self.engine
-                .lookup(&self.pinyin_buffer)
-                .into_iter()
-                .map(|c| c.text)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // 仅 Pinyin 态抑制内置词库（engine=rime 时候选窗只显示 Rime 候选）；
+        // Prompt 态（// 提示词拼音转中文）保留内置词库内联候选，避免回归。
+        self.dictionary_candidates =
+            if self.dictionary_enabled || self.state != MachineState::Pinyin {
+                self.engine
+                    .lookup(&self.pinyin_buffer)
+                    .into_iter()
+                    .map(|c| c.text)
+                    .collect()
+            } else {
+                Vec::new()
+            };
         self.llm_candidates.clear();
         self.fuse_candidates();
     }
@@ -1263,6 +1266,34 @@ mod tests {
         }
         assert_eq!(m.feed_char('1'), Action::CommitImmediate("你好".into()));
         assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn rime_mode_keeps_prompt_pinyin_dictionary() {
+        // engine=rime（词库抑制）时：Pinyin 态无内置候选，但 // 提示词拼音仍用内置内联候选。
+        let mut m = CompositionMachine::new();
+        m.set_dictionary_enabled(false);
+        // Pinyin 态：无内置候选
+        match m.feed_char('n') {
+            Action::UpdatePinyin { candidates, .. } => assert!(candidates.is_empty()),
+            other => panic!("应进入拼音，实际 {other:?}"),
+        }
+        m.feed_escape();
+        // Prompt 态：//nihao → 有内置内联候选
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "nihao".chars() {
+            m.feed_char(c);
+        }
+        assert!(m.pinyin_composing());
+        assert!(
+            m.preedit().contains("你好"),
+            "Prompt 态应保留内置内联候选，实际 {:?}",
+            m.preedit()
+        );
+        // 空格提交内置候选到提示词（而非拼音原文）
+        assert!(matches!(m.feed_char(' '), Action::UpdatePrompt { .. }));
+        assert_eq!(m.prompt(), "你好");
     }
 
     #[test]
