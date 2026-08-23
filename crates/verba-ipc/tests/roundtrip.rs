@@ -6,8 +6,8 @@ use std::time::Duration;
 use verba_ipc::server::{serve, Outbound, RequestHandler};
 use verba_ipc::{ConnectWait, VerbaClient};
 use verba_protos::{
-    request, response, stream_event, Chunk, Error as ProtoError, Final, Ok as OkMsg, Pong, Request,
-    Response, StreamEvent,
+    request, response, stream_event, Chunk, Error as ProtoError, Final, LlmGenerate, Ok as OkMsg,
+    Pong, Request, Response, StreamEvent,
 };
 
 fn unique_name(tag: &str) -> String {
@@ -163,4 +163,77 @@ async fn api_key_set_roundtrip() {
     client.set_api_key("").expect("set_api_key 清空成功");
     server.abort();
     let _ = server.await;
+}
+/// 捕获 LLM 生成请求的 handler（验证多模态 image 字段回环）。
+struct CapturingHandler {
+    captured: std::sync::Arc<std::sync::Mutex<Option<LlmGenerate>>>,
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for CapturingHandler {
+    async fn handle(&self, req: Request, out: Outbound) {
+        match req.kind {
+            Some(request::Kind::LlmGenerate(g)) => {
+                *self.captured.lock().unwrap() = Some(g.clone());
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+                let _ = out
+                    .event(&StreamEvent {
+                        id: req.id,
+                        kind: Some(stream_event::Kind::Final(Final { text: "ok".into() })),
+                    })
+                    .await;
+            }
+            _ => {
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 1,
+                            message: "not implemented".into(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_vision_image_roundtrip() {
+    let name = unique_name("vision");
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<LlmGenerate>));
+    let handler = Arc::new(CapturingHandler {
+        captured: captured.clone(),
+    });
+    let server_name = name.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(&server_name, handler).await;
+    });
+
+    let mut client = connect_with_retry(&name, Duration::from_secs(5));
+    let img = b"\x89PNG fake vision bytes".to_vec();
+    let id = client
+        .llm_start("看图", None, None, None, Some(("image/png", &img)))
+        .expect("llm_start image");
+    loop {
+        let evt = client.next_event(id).expect("next_event");
+        if matches!(evt.kind, Some(stream_event::Kind::Final(_))) {
+            break;
+        }
+    }
+    server.abort();
+    let _ = server.await;
+
+    let got = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler 应收到 LlmGenerate");
+    assert_eq!(got.image.as_deref(), Some(img.as_slice()));
+    assert_eq!(got.image_mime.as_deref(), Some("image/png"));
 }
