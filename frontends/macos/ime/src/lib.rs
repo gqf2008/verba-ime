@@ -4,6 +4,8 @@
 //! daemon 连接与状态机复用（verba-ipc / verba-core），供 Swift IMK 通过 FFI / 子进程调用。
 //! 为便于 CI 编译验证，当前仅依赖跨平台 crates，不直接依赖 macOS 框架。
 
+mod ffi;
+
 use verba_ipc::VerbaClient;
 
 /// macOS 前端句柄：持有到 daemon 的连接。
@@ -14,8 +16,7 @@ pub struct MacIme {
 impl MacIme {
     /// 连接 daemon（Unix socket / 命名管道，跨平台复用 verba-ipc）。
     pub fn connect() -> std::io::Result<Self> {
-        let client =
-            VerbaClient::connect().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let client = VerbaClient::connect().map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(Self { client })
     }
 
