@@ -55,7 +55,8 @@
 - [ ] 截图链路：权限、选区、预览、OCR 结果上屏
   - [x] **触发能力地基**（2026-08-23：`verba-trigger` 全屏截图→BMP→daemon OCR 端到端实机验证，Windows.Media.Ocr 真识别）
   - [x] **TSF 热键/`//截图` 命令接线**（2026-08-23：Ctrl+Alt+O 或 `//截图` → 截图 OCR 结果上屏；待实机验收）
-  - [ ] 选区截图：选区预览窗口、区域选取
+  - [x] **选区截图（工具层）**（2026-08-23：`verba-trigger region-shot/region-ocr`，交互拖选 + `--rect` 脚本化；`--rect` 实机验证，交互拖选待验收）
+  - [ ] TSF 内接线：`//截图` / Ctrl+Alt+O 改用选区（子进程调用 verba-trigger）
 - [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
   - [x] **mock**（确定性，2026-08-23：`verba-asr` crate + IPC `AsrTranscribe` + daemon 路由 + `verba-cli asr`）
   - [ ] whisper.cpp（whisper-rs，本地模型）
@@ -115,3 +116,4 @@
 | 2026-08-23 | M4 TTS edge-tts 接入（`verba-tts` Edge provider：WSS + SSML + Sec-MS-GEC，`verba-cli tts` 实机出 MP3；mock 仍为默认） |
 | 2026-08-23 | 前端触发能力地基（`verba-trigger`：截图→OCR / 录音→ASR / TTS→播放，capture/record/play 模块 + CLI，端到端实机验证） |
 | 2026-08-23 | TSF 触发接线（Ctrl+Alt+O/M 热键 + `//朗读` `//截图` `//听写` 命令；新 DLL target_dev15，待实机验收） |
+| 2026-08-23 | 选区截图工具（`verba-trigger region-shot/region-ocr`：半透明遮罩拖选 + 选区 BitBlt + OCR；`--rect` 脚本化；TSF 内接线待做） |

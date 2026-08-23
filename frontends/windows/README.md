@@ -14,6 +14,8 @@
 `verba-trigger` 是 Windows 触发能力入口（与 DLL 同包构建），供手动验证与后续 TSF 热键接线复用：
 
 - `verba-trigger shot [输出.bmp]`：截取主屏全屏（BitBlt → 32bpp top-down BMP，零依赖编码）。
+- `verba-trigger region-shot [--rect x,y,w,h] [输出.bmp]`：选区截图（半透明遮罩拖选；Esc/右键取消；`--rect` 脚本化）。
+- `verba-trigger region-ocr [--rect x,y,w,h] [输出.txt]`：选区 → daemon OCR。
 - `verba-trigger ocr [输出.txt]`：截图 → daemon OCR（`config ocr_provider`：mock / windows）。
 - `verba-trigger mic [秒=3] [输出.wav]`：麦克风录音（cpal → 16bit PCM WAV）。
 - `verba-trigger asr [秒=3]`：录音 → daemon ASR（`config asr_provider`）。

@@ -6,7 +6,10 @@
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HGDIOBJ, HORZRES, SRCCOPY, VERTRES,
+    HDC, HGDIOBJ, HORZRES, SRCCOPY, VERTRES,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::TriggerError;
@@ -19,7 +22,28 @@ pub struct ScreenShot {
     pub bmp: Vec<u8>,
 }
 
-/// 截取主屏全屏。
+/// 虚拟屏幕边界（多显示器并集，原点可能为负）。
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualScreen {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// 查询虚拟屏幕边界。
+pub fn virtual_screen() -> VirtualScreen {
+    unsafe {
+        VirtualScreen {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    }
+}
+
+/// 截取主屏全屏（主显示器原点为 0,0）。
 pub fn capture_primary_screen() -> Result<ScreenShot, TriggerError> {
     unsafe {
         let screen = GetDC(None);
@@ -28,27 +52,61 @@ pub fn capture_primary_screen() -> Result<ScreenShot, TriggerError> {
         }
         let width = GetDeviceCaps(Some(screen), HORZRES);
         let height = GetDeviceCaps(Some(screen), VERTRES);
-        if width <= 0 || height <= 0 {
-            let _ = ReleaseDC(None, screen);
-            return Err(TriggerError::Capture(format!(
-                "屏幕尺寸非法: {width}x{height}"
-            )));
-        }
+        let result = capture_from(screen, 0, 0, width, height);
+        let _ = ReleaseDC(None, screen);
+        result
+    }
+}
 
+/// 截取屏幕上的矩形区域（虚拟屏幕坐标，自动裁剪到屏内）。
+pub fn capture_region(x: i32, y: i32, width: i32, height: i32) -> Result<ScreenShot, TriggerError> {
+    if width <= 0 || height <= 0 {
+        return Err(TriggerError::Capture(format!(
+            "选区尺寸非法: {width}x{height}"
+        )));
+    }
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return Err(TriggerError::Capture("GetDC 失败".into()));
+        }
+        let vs = virtual_screen();
+        let x1 = x.max(vs.x);
+        let y1 = y.max(vs.y);
+        let x2 = (x + width).min(vs.x + vs.width);
+        let y2 = (y + height).min(vs.y + vs.height);
+        let w = x2 - x1;
+        let h = y2 - y1;
+        let result = if w <= 0 || h <= 0 {
+            Err(TriggerError::Capture("选区在屏幕外".into()))
+        } else {
+            capture_from(screen, x1, y1, w, h)
+        };
+        let _ = ReleaseDC(None, screen);
+        result
+    }
+}
+
+/// 从屏幕 DC 抓取指定虚拟屏幕区域（核心实现，调用方负责 ReleaseDC）。
+fn capture_from(
+    screen: HDC,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<ScreenShot, TriggerError> {
+    unsafe {
         let mem = CreateCompatibleDC(Some(screen));
         if mem.is_invalid() {
-            let _ = ReleaseDC(None, screen);
             return Err(TriggerError::Capture("CreateCompatibleDC 失败".into()));
         }
         let bmp = CreateCompatibleBitmap(screen, width, height);
         if bmp.is_invalid() {
             let _ = DeleteDC(mem);
-            let _ = ReleaseDC(None, screen);
             return Err(TriggerError::Capture("CreateCompatibleBitmap 失败".into()));
         }
-
         let old: HGDIOBJ = SelectObject(mem, HGDIOBJ(bmp.0));
-        BitBlt(mem, 0, 0, width, height, Some(screen), 0, 0, SRCCOPY)
+        BitBlt(mem, 0, 0, width, height, Some(screen), x, y, SRCCOPY)
             .map_err(|e| TriggerError::Capture(format!("BitBlt 失败: {e}")))?;
 
         let row_bytes = (width as usize) * 4;
@@ -75,11 +133,9 @@ pub fn capture_primary_screen() -> Result<ScreenShot, TriggerError> {
             DIB_RGB_COLORS,
         );
 
-        // 恢复并释放 GDI 对象。
         let _ = SelectObject(mem, old);
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DeleteDC(mem);
-        let _ = ReleaseDC(None, screen);
 
         if lines != height {
             return Err(TriggerError::Capture(format!(

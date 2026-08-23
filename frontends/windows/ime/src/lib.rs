@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod play;
 pub mod record;
 pub mod reg;
+pub mod selection;
 pub mod text_service;
 
 pub use dll::{DllGetClassObject, DllRegisterServer, DllUnregisterServer};

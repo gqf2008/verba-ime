@@ -3,9 +3,11 @@
 //! 能力模块（capture / record / play）供后续 TSF 热键接线复用；
 //! 本工具用于手动验证与脚本化冒烟。
 
-use verba_ime_windows::capture::capture_primary_screen;
+use verba_ime_windows::capture::{capture_primary_screen, capture_region};
 use verba_ime_windows::play::play_audio;
 use verba_ime_windows::record::record_seconds;
+use verba_ime_windows::selection::select_region;
+use verba_ime_windows::TriggerError;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,6 +21,8 @@ fn main() {
             0
         }
         Some("shot") => cmd_shot(&args),
+        Some("region-shot") => cmd_region_shot(&args),
+        Some("region-ocr") => cmd_region_ocr(&args),
         Some("ocr") => cmd_ocr(&args),
         Some("mic") => cmd_mic(&args),
         Some("asr") => cmd_asr(&args),
@@ -37,6 +41,8 @@ fn print_help() {
         "Verba 触发工具（Windows）\n\
          用法:\n  \
          verba-trigger shot [输出.bmp]        截取主屏全屏为 BMP\n  \
+         verba-trigger region-shot [--rect x,y,w,h] [输出.bmp]  选区截图（交互拖选；--rect 脚本化）\n  \
+         verba-trigger region-ocr [--rect x,y,w,h] [输出.txt]   选区 → daemon OCR\n  \
          verba-trigger ocr [输出.txt]         截图 → daemon OCR → 打印/写文件\n  \
          verba-trigger mic [秒=3] [输出.wav]   录制麦克风为 WAV\n  \
          verba-trigger asr [秒=3]             录音 → daemon ASR → 打印\n  \
@@ -214,6 +220,115 @@ fn cmd_speak(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("播放失败: {e}");
+            1
+        }
+    }
+}
+
+/// 解析 --rect x,y,w,h（虚拟屏幕坐标），未提供返回 None。
+fn parse_rect(args: &[String]) -> Option<(i32, i32, i32, i32)> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--rect" {
+            if let Some(s) = it.next() {
+                let parts: Vec<i32> = s.split(",").filter_map(|p| p.trim().parse().ok()).collect();
+                if parts.len() == 4 {
+                    return Some((parts[0], parts[1], parts[2], parts[3]));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 取输出路径（跳过 --rect 及其值）。
+fn region_output_path(args: &[String]) -> Option<String> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--rect" {
+            it.next();
+        } else if !a.starts_with("--") {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
+/// 选区截图：--rect 脚本化，否则交互拖选（Esc/右键取消 → Ok(None)）。
+fn region_capture(
+    args: &[String],
+) -> Result<Option<verba_ime_windows::capture::ScreenShot>, TriggerError> {
+    match parse_rect(args) {
+        Some((x, y, w, h)) => capture_region(x, y, w, h).map(Some),
+        None => match select_region()? {
+            Some(r) => capture_region(r.x, r.y, r.width, r.height).map(Some),
+            None => Ok(None),
+        },
+    }
+}
+
+/// `region-shot [--rect x,y,w,h] [输出.bmp]`：选区截图存 BMP。
+fn cmd_region_shot(args: &[String]) -> i32 {
+    let out = region_output_path(args).unwrap_or_else(|| "region.bmp".into());
+    match region_capture(args) {
+        Ok(Some(shot)) => {
+            if let Err(e) = std::fs::write(&out, &shot.bmp) {
+                eprintln!("写文件失败 {out}: {e}");
+                return 1;
+            }
+            println!(
+                "已截图 {out}（{}x{} bmp={} bytes）",
+                shot.width,
+                shot.height,
+                shot.bmp.len()
+            );
+            0
+        }
+        Ok(None) => {
+            println!("已取消");
+            0
+        }
+        Err(e) => {
+            eprintln!("截图失败: {e}");
+            1
+        }
+    }
+}
+
+/// `region-ocr [--rect x,y,w,h] [输出.txt]`：选区截图 → daemon OCR。
+fn cmd_region_ocr(args: &[String]) -> i32 {
+    let out = region_output_path(args);
+    let shot = match region_capture(args) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("已取消");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("截图失败: {e}");
+            return 1;
+        }
+    };
+    let mut client = match connect_daemon() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("连接 daemon 失败: {e}");
+            return 1;
+        }
+    };
+    match client.ocr_recognize(&shot.bmp) {
+        Ok(text) => {
+            println!("{text}");
+            if let Some(path) = out {
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("写文件失败 {path}: {e}");
+                    return 1;
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("OCR 失败: {e}");
             1
         }
     }
