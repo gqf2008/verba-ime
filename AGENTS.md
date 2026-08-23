@@ -7,7 +7,7 @@ Verba · 拾言输入法：开源跨平台多模态 AI 输入法（OCR / ASR / L
 ## 目录约定
 - `crates/` — Rust workspace：`verba-core`（引擎/状态机）、`verba-ai`（能力 provider）、`verba-protos`（IPC 协议）、`verba-ipc`（IPC 传输）、`verba-config`（配置/密钥）、`verba-daemon`（后台进程）、`verba-cli`（调试 CLI）
 - `frontends/` — 各平台输入法前端：`windows/`（TSF）、`macos/`（IMK）、`linux/`（Fcitx5/IBus/Wayland）
-- `apps/` — 设置面板等桌面应用（Tauri）
+- `apps/` — 设置面板等桌面应用（Slint 1.17）
 - `docs/` — 架构、路线图、协议、服务商矩阵、构建、品牌文档
 - `assets/` — 图标与品牌资源
 

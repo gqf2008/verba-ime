@@ -22,7 +22,7 @@
 
 1. **平台前端（frontends）**：各平台输入法壳，负责注册、按键捕获、preedit / 候选展示、上屏。
 2. **核心引擎（daemon）**：输入状态机 + AI 能力编排 + 配置 + 任务队列，独立进程运行。
-3. **设置与辅助（apps / cli）**：Tauri 设置面板、verba-cli 调试工具。
+3. **设置与辅助（apps / cli）**：Slint 设置面板（apps/settings）、verba-cli 调试工具。
 
 ```
 ┌─────────────┐ ┌─────────────┐ ┌──────────────────────┐
@@ -139,7 +139,7 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 
 - 配置文件：`%APPDATA%/Verba/config.toml`、`~/Library/Application Support/Verba/config.toml`、`~/.config/verba/config.toml`。
 - API Key 不入配置文件，走系统密钥库（`keyring` crate：Windows DPAPI / macOS Keychain / Linux Secret Service）。
-- 设置面板（Tauri）读写同一配置，热生效。
+- 设置面板（apps/settings，Slint 1.17）读写同一配置，热生效；API Key 经 IPC `ApiKeySet` 写系统密钥库并热更新。
 
 ## 8. 性能预算（目标）
 
@@ -172,7 +172,7 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 | 项目 | 借鉴点 |
 | --- | --- |
 | [imekit](https://github.com/SergioRibera/imekit) | Rust 跨平台 IME 协议库；Linux Wayland / IBus / XIM 后端 |
-| [khiin-rs](https://github.com/aiongg/khiin-rs) | Rust TSF 工程范式、Protobuf IPC、Tauri 设置面板 |
+| [khiin-rs](https://github.com/aiongg/khiin-rs) | Rust TSF 工程范式、Protobuf IPC |
 | [fcitx5-afrim](https://github.com/fodydev/fcitx5-afrim) | Rust 编写原生 Fcitx5 插件（corrosion + C++ shim） |
 | [Rime / librime](https://github.com/rime/librime) | 中文输入引擎，M5 集成对象 |
 | 素言 SuYan 输入法 | 同类产品（RIME 系、离线语音、截图），体验参考 |

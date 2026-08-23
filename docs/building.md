@@ -11,8 +11,8 @@
   - Linux：Fcitx5 dev（`fcitx5-dev`）、CMake、ECM、corrosion（Fcitx5 插件）；IBus / Wayland 后端走 Rust crate。
 - AI 能力（按需）：
   - OCR：ONNX Runtime（`ort` crate 自动拉取或系统安装）。
-  - ASR：whisper.cpp（`whisper-rs`，模型首次运行时下载）。
-  - TTS：系统 TTS 零依赖；edge-tts / Piper 视实现选择。
+  - ASR：默认在线（OpenAI 兼容 `audio/transcriptions`，复用 LLM base_url+key）；whisper.cpp / audio.cpp 本地可选。
+  - TTS：默认在线（edge-tts / OpenAI 兼容 `audio/speech`）；系统 TTS / Piper / audio.cpp 本地可选。
 
 ## 构建核心与 CLI
 
@@ -23,6 +23,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p verba-cli -- --help
 ```
+
+## 设置面板（apps/settings，Slint 1.17）
+
+- Slint 版本线说明：crates.io 无 0.17，用户所说的 `slint-0.17.x` 即 `1.17.x`，固定 `=1.17.1`。
+- 运行：`cargo run -p verba-settings`（需 daemon 在跑：`verba-cli daemon`）。
+- 密钥经 IPC `ApiKeySet` 写系统密钥库（需 keyring 平台后端已启用，见 workspace Cargo.toml）。
 
 ## 平台前端构建（M1 起逐步补充）
 

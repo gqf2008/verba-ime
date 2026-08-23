@@ -1,9 +1,8 @@
 # 路线图
 
-> 更新：2026-08-23 · 当前状态：**M5 已收口**（2026-08-23 实机 OK：候选窗即时内置 + Rime 去重追加，
-> 验收清单逐项勾选，见 manual-acceptance-windows.md）。
-> 下一批：**多模态触发已全接线**（选区截图 OCR / 录音 ASR / 朗读 TTS，2026-08-23 待实机验收）；后续：whisper 真 ASR（子进程）、Tauri 设置面板、Piper/系统 TTS。
-> 已开工（2026-08-23）：TTS mock/edge-tts + OCR mock/Windows.Media.Ocr + ASR mock 端到端——`verba-cli tts`/`verba-cli ocr`/`verba-cli asr` 通过，edge-tts 实机出真实 MP3；Piper/系统 TTS 与 whisper.cpp 跟进。
+> 更新：2026-08-23 · 当前状态：**多模态在线 provider + Slint 设置面板已落地**（ASR/TTS 走「联网」：OpenAI 兼容
+> audio/transcriptions + audio/speech；设置面板 apps/settings 用 Slint 1.17 替代 Tauri）。后续：audio.cpp 本地
+> ASR/TTS（子进程）可选接入、Piper/系统 TTS 跟进。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -14,7 +13,7 @@
 | M1 | Windows 垂直切片 | Windows TSF 前端 + LLM 远程直输：安装输入法 → 打字上屏 → `//` 唤起 AI → 流式上屏 | M0 |
 | M2 | 三端齐平 | macOS IMK、Linux Fcitx5 / IBus 前端，直输 + LLM 与 M1 对齐 | M1 |
 | M3 | 多模态 | OCR（截图）与 ASR（语音）在至少一个平台跑通，其余平台跟进 | M1 / M2 |
-| M4 | 体验打磨 | TTS、候选窗口、Tauri 设置面板、性能预算、隐私开关 | M3 |
+| M4 | 体验打磨 | TTS（在线）、候选窗口、Slint 设置面板、性能预算、隐私开关 | M3 |
 | M5 | 中文引擎 | 内置轻量拼音引擎已落地（`verba-pinyin`）；继续评估 librime（五笔 / 模糊音 / Rime 生态） | M4 |
 | M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营 | M5 |
 
@@ -59,7 +58,8 @@
   - [x] **TSF 内接线**（2026-08-23：`//截图` / Ctrl+Alt+O 改为调 `verba-trigger region-ocr` 选区拖选 → OCR 上屏，失败回退全屏；新 DLL target_dev16，待实机验收）
 - [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
   - [x] **mock**（确定性，2026-08-23：`verba-asr` crate + IPC `AsrTranscribe` + daemon 路由 + `verba-cli asr`）
-  - [ ] whisper.cpp（whisper-rs，本地模型）
+  - [x] **openai 在线**（OpenAI 兼容 `audio/transcriptions`，复用 LLM base_url+key；config `asr_provider=openai` + `asr_model`/`asr_base_url`，2026-08-23）
+  - [ ] whisper.cpp（whisper-rs，本地模型）/ audio.cpp 子进程（本地，可选）
 - [ ] 语音链路：快捷键、录音、流式转写、上屏
   - [x] **触发能力地基**（2026-08-23：`verba-trigger` 麦克风录音→WAV→daemon ASR、TTS 合成→播放（rodio）端到端实机验证）
   - [x] **TSF 热键/`//听写` `//朗读` 命令接线**（2026-08-23：Ctrl+Alt+M 或 `//听写` → 录音 ASR 上屏；`//朗读 <文本>` → TTS 播放；待实机验收）
@@ -70,9 +70,10 @@
 - [ ] TTS provider：系统 TTS / edge-tts / Piper（可选）
   - [x] **mock**（确定性 WAV，2026-08-23：`verba-tts` crate + IPC `TtsSynthesize`/`Audio` + daemon 路由 + `verba-cli tts`，CLI/验收通过）
   - [x] **edge-tts**（微软 Edge 在线神经音色，2026-08-23 实机验证：`verba-tts` Edge provider 接入（WSS + SSML + Sec-MS-GEC 签名），`verba-cli tts` 出真实 MP3，`voice` 可覆盖，默认 zh-CN-XiaoxiaoNeural）
-- [ ] 系统 TTS（Windows SAPI）/ Piper（本地）
+- [x] **openai 在线 TTS**（OpenAI 兼容 `audio/speech`，复用 LLM base_url+key；config `tts_provider=openai` + `tts_model`/`tts_base_url`/`tts_voice`，2026-08-23）
+- [ ] 系统 TTS（Windows SAPI）/ Piper（本地）/ audio.cpp 子进程（本地，可选）
 - [x] 候选窗口样式与交互（分页、主题、皮肤）（随 M5 完成，2026-08-23 实机验收）
-- [ ] Tauri 设置面板（服务商配置、快捷键、隐私开关）
+- [x] Slint 1.17 设置面板（`apps/settings`：LLM/多模态/引擎/快捷键/隐私，GetConfig/SetConfig/ApiKeySet IPC 热生效；2026-08-23）
 - [ ] 性能与内存预算达标（见 architecture §8）
 - [ ] 日志脱敏与崩溃上报（本地）
 
@@ -118,3 +119,6 @@
 | 2026-08-23 | TSF 触发接线（Ctrl+Alt+O/M 热键 + `//朗读` `//截图` `//听写` 命令；新 DLL target_dev15，待实机验收） |
 | 2026-08-23 | 选区截图工具（`verba-trigger region-shot/region-ocr`：半透明遮罩拖选 + 选区 BitBlt + OCR；`--rect` 脚本化） |
 | 2026-08-23 | TSF 选区接线（`//截图` / Ctrl+Alt+O 子进程调 region-ocr，选区拖选 OCR 上屏，失败回退全屏；新 DLL target_dev16） |
+| 2026-08-23 | 在线 ASR/TTS provider（OpenAI 兼容 `audio/transcriptions` + `audio/speech`，复用 LLM base_url+key；config 新增 `asr_base_url`/`asr_model`/`tts_base_url`/`tts_model`） |
+| 2026-08-23 | 修复 keyring 未启用平台后端（默认 mock 内存存储不跨进程）——启用 windows-native/apple-native/linux-native-sync-persistent |
+| 2026-08-23 | Slint 1.17 设置面板 `apps/settings`（替代 Tauri：LLM/多模态/引擎/快捷键/隐私 + GetConfig/SetConfig/ApiKeySet IPC 热生效；`verba-cli key` 查看/设置/清除密钥） |
