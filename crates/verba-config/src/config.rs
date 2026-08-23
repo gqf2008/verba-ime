@@ -17,6 +17,8 @@ const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com/v1";
 const DEFAULT_LLM_MODEL: &str = "deepseek-chat";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_MAX_TOKENS: i32 = 1024;
+const DEFAULT_ASR_MODEL: &str = "whisper-1";
+const DEFAULT_TTS_MODEL: &str = "tts-1";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -141,7 +143,7 @@ pub struct Config {
     /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
     #[serde(default = "default_rime_schema")]
     pub rime_schema: String,
-    /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（微软在线神经音色）| …
+    /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（微软在线神经音色）| openai（OpenAI 兼容在线音色）| …
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
     /// TTS 语音名（如 edge 的 zh-CN-XiaoxiaoNeural；mock 忽略）。
@@ -150,9 +152,21 @@ pub struct Config {
     /// OCR provider：mock（默认，确定性）| windows（Windows.Media.Ocr 本地识别）。
     #[serde(default = "default_ocr_provider")]
     pub ocr_provider: String,
-    /// ASR provider：mock（默认，确定性）| whisper（whisper.cpp，开发中）。
+    /// ASR provider：mock（默认，确定性）| openai（OpenAI 兼容在线转写）。
     #[serde(default = "default_asr_provider")]
     pub asr_provider: String,
+    /// ASR 在线端点基址（openai provider；空 = 复用 llm_base_url）。
+    #[serde(default)]
+    pub asr_base_url: String,
+    /// ASR 在线模型名（openai provider；默认 whisper-1）。
+    #[serde(default = "default_asr_model")]
+    pub asr_model: String,
+    /// TTS 在线端点基址（openai provider；空 = 复用 llm_base_url）。
+    #[serde(default)]
+    pub tts_base_url: String,
+    /// TTS 在线模型名（openai provider；默认 tts-1）。
+    #[serde(default = "default_tts_model")]
+    pub tts_model: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -183,6 +197,13 @@ fn default_asr_provider() -> String {
     "mock".to_owned()
 }
 
+fn default_asr_model() -> String {
+    DEFAULT_ASR_MODEL.to_owned()
+}
+fn default_tts_model() -> String {
+    DEFAULT_TTS_MODEL.to_owned()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -198,6 +219,10 @@ impl Default for Config {
             tts_voice: String::new(),
             ocr_provider: default_ocr_provider(),
             asr_provider: default_asr_provider(),
+            asr_base_url: String::new(),
+            asr_model: default_asr_model(),
+            tts_base_url: String::new(),
+            tts_model: default_tts_model(),
         }
     }
 }
@@ -217,6 +242,10 @@ impl Config {
         map.insert("tts_voice".into(), self.tts_voice.clone());
         map.insert("ocr_provider".into(), self.ocr_provider.clone());
         map.insert("asr_provider".into(), self.asr_provider.clone());
+        map.insert("asr_base_url".into(), self.asr_base_url.clone());
+        map.insert("asr_model".into(), self.asr_model.clone());
+        map.insert("tts_base_url".into(), self.tts_base_url.clone());
+        map.insert("tts_model".into(), self.tts_model.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -269,9 +298,9 @@ impl Config {
                 }
                 "rime_schema" => self.rime_schema = v.clone(),
                 "tts_provider" => {
-                    if v != "mock" && v != "edge" {
+                    if v != "mock" && v != "edge" && v != "openai" {
                         return Err(ConfigError::InvalidValue(format!(
-                            "tts_provider 仅支持 mock|edge: {k}={v}"
+                            "tts_provider 仅支持 mock|edge|openai: {k}={v}"
                         )));
                     }
                     self.tts_provider = v.clone();
@@ -286,13 +315,17 @@ impl Config {
                     self.ocr_provider = v.clone();
                 }
                 "asr_provider" => {
-                    if v != "mock" {
+                    if v != "mock" && v != "openai" {
                         return Err(ConfigError::InvalidValue(format!(
-                            "asr_provider 仅支持 mock（whisper 开发中）: {k}={v}"
+                            "asr_provider 仅支持 mock|openai: {k}={v}"
                         )));
                     }
                     self.asr_provider = v.clone();
                 }
+                "asr_base_url" => self.asr_base_url = v.clone(),
+                "asr_model" => self.asr_model = v.clone(),
+                "tts_base_url" => self.tts_base_url = v.clone(),
+                "tts_model" => self.tts_model = v.clone(),
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
                 "theme.text_color" => self.theme.text_color = Some(v.clone()),
@@ -373,6 +406,17 @@ impl ApiKeyStore {
         entry
             .set_password(key)
             .map_err(|e| ConfigError::Keyring(e.to_string()))
+    }
+
+    /// 删除 API Key（密钥不存在时视为成功，幂等）。
+    pub fn clear() -> Result<(), ConfigError> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .map_err(|e| ConfigError::Keyring(e.to_string()))?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(ConfigError::Keyring(e.to_string())),
+        }
     }
 
     /// 删除 API Key。
@@ -520,5 +564,48 @@ mod tests {
         std::env::set_var(ENV_API_KEY, "sk-test-env");
         assert_eq!(ApiKeyStore::get().unwrap(), Some("sk-test-env".into()));
         std::env::remove_var(ENV_API_KEY);
+    }
+
+    #[test]
+    fn online_modal_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        let mut map = HashMap::new();
+        map.insert("asr_provider".into(), "openai".into());
+        map.insert("asr_base_url".into(), "https://asr.example.com/v1".into());
+        map.insert("asr_model".into(), "whisper-1".into());
+        map.insert("tts_provider".into(), "openai".into());
+        map.insert("tts_base_url".into(), "https://tts.example.com/v1".into());
+        map.insert("tts_model".into(), "tts-1-hd".into());
+        cfg.apply_map(&map).unwrap();
+        assert_eq!(cfg.asr_provider, "openai");
+        assert_eq!(cfg.asr_base_url, "https://asr.example.com/v1");
+        assert_eq!(cfg.asr_model, "whisper-1");
+        assert_eq!(cfg.tts_provider, "openai");
+        assert_eq!(cfg.tts_base_url, "https://tts.example.com/v1");
+        assert_eq!(cfg.tts_model, "tts-1-hd");
+        let out = cfg.to_map();
+        assert_eq!(out.get("asr_model").map(String::as_str), Some("whisper-1"));
+        assert_eq!(out.get("tts_model").map(String::as_str), Some("tts-1-hd"));
+        let def = Config::default();
+        assert_eq!(def.asr_model, "whisper-1");
+        assert_eq!(def.tts_model, "tts-1");
+        assert!(def.asr_base_url.is_empty());
+    }
+
+    #[test]
+    fn provider_whitelist_rejects_unknown() {
+        let mut cfg = Config::default();
+        let mut map = HashMap::new();
+        map.insert("tts_provider".into(), "piper".into());
+        assert!(matches!(
+            cfg.apply_map(&map),
+            Err(ConfigError::InvalidValue(_))
+        ));
+        let mut map = HashMap::new();
+        map.insert("asr_provider".into(), "whisper".into());
+        assert!(matches!(
+            cfg.apply_map(&map),
+            Err(ConfigError::InvalidValue(_))
+        ));
     }
 }

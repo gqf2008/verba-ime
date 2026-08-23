@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use verba_ai::{LlmClient, LlmConfig, LlmRequest};
-use verba_config::{Config, ConfigManager};
+use verba_config::{ApiKeyStore, Config, ConfigManager};
 use verba_core::VERSION;
 use verba_ipc::server::{Outbound, RequestHandler};
 use verba_librime::{RimeConfig, RimeEngine};
 use verba_protos::{
-    request, response, stream_event, Audio as AudioMsg, Candidates, Chunk, Config as ConfigMsg,
-    Error as ProtoError, Final, LlmCandidates, Ok as OkMsg, Pong, Response, StreamEvent,
+    request, response, stream_event, ApiKeySet, Audio as AudioMsg, Candidates, Chunk,
+    Config as ConfigMsg, Error as ProtoError, Final, LlmCandidates, Ok as OkMsg, Pong, Response,
+    StreamEvent,
 };
 
 /// 默认 AI 系统提示词（用户未配置时使用）。
@@ -133,6 +134,7 @@ impl RequestHandler for DaemonHandler {
             Some(request::Kind::TtsSynthesize(g)) => self.handle_tts_synthesize(id, g, out).await,
             Some(request::Kind::OcrRecognize(g)) => self.handle_ocr_recognize(id, g, out).await,
             Some(request::Kind::AsrTranscribe(g)) => self.handle_asr_transcribe(id, g, out).await,
+            Some(request::Kind::ApiKeySet(g)) => self.handle_api_key_set(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
                 let token = self.cancels.lock().unwrap().remove(&id);
                 if let Some(token) = token {
@@ -445,16 +447,33 @@ impl DaemonHandler {
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
         // 锁在 await 前释放，避免非 Send 守卫跨 await。
-        let (provider, voice) = {
+        let (provider, voice, model, base_url) = {
             let cfg = self.config.read().unwrap();
             let voice = g
                 .voice
                 .clone()
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| cfg.tts_voice.clone());
-            (cfg.tts_provider.clone(), voice)
+            let base_url = if cfg.tts_base_url.is_empty() {
+                cfg.llm_base_url.clone()
+            } else {
+                cfg.tts_base_url.clone()
+            };
+            (
+                cfg.tts_provider.clone(),
+                voice,
+                cfg.tts_model.clone(),
+                base_url,
+            )
         };
-        let client = match verba_tts::TtsClient::from_config(&provider, &voice) {
+        let api_key = self.llm_config.read().unwrap().api_key.clone();
+        let client = match verba_tts::TtsClient::from_config(
+            &provider,
+            &voice,
+            &base_url,
+            api_key.as_deref(),
+            &model,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 out.response(&Response {
@@ -555,8 +574,22 @@ impl DaemonHandler {
         g: verba_protos::AsrTranscribe,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
-        let provider = self.config.read().unwrap().asr_provider.clone();
-        let client = match verba_asr::AsrClient::from_config(&provider) {
+        let (provider, model, base_url) = {
+            let cfg = self.config.read().unwrap();
+            let base_url = if cfg.asr_base_url.is_empty() {
+                cfg.llm_base_url.clone()
+            } else {
+                cfg.asr_base_url.clone()
+            };
+            (cfg.asr_provider.clone(), cfg.asr_model.clone(), base_url)
+        };
+        let api_key = self.llm_config.read().unwrap().api_key.clone();
+        let client = match verba_asr::AsrClient::from_config(
+            &provider,
+            &base_url,
+            api_key.as_deref(),
+            &model,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 out.response(&Response {
@@ -581,6 +614,43 @@ impl DaemonHandler {
                 out.response(&Response {
                     id,
                     kind: Some(response::Kind::Text(verba_protos::Text { text })),
+                })
+                .await
+            }
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 500,
+                        message: e.to_string(),
+                    })),
+                })
+                .await
+            }
+        }
+    }
+
+    /// 设置/清除 API Key：写系统密钥库并热更新 daemon 内存（空字符串 = 删除）。
+    async fn handle_api_key_set(
+        &self,
+        id: u64,
+        g: ApiKeySet,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let result: Result<(), verba_config::ConfigError> = if g.key.is_empty() {
+            ApiKeyStore::clear()
+        } else {
+            ApiKeyStore::set(&g.key)
+        };
+        match result {
+            Ok(()) => {
+                {
+                    let mut guard = self.llm_config.write().unwrap();
+                    guard.api_key = if g.key.is_empty() { None } else { Some(g.key) };
+                }
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Ok(OkMsg {})),
                 })
                 .await
             }

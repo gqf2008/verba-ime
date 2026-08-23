@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Verba ASR 能力：语音 → 文字（mock / whisper.cpp 等 provider）"
+description = "Verba ASR 能力：语音 → 文字（mock / openai 在线等 provider）"
 
 [lints]
 workspace = true
@@ -13,6 +13,9 @@ workspace = true
 verba-ai = { path = "../verba-ai" }
 thiserror.workspace = true
 log.workspace = true
+reqwest.workspace = true
+serde_json = "1"
 
 [dev-dependencies]
+tiny_http = "0.12"
 tokio.workspace = true
