@@ -434,6 +434,19 @@ impl DaemonHandler {
         }
     }
 
+    /// 后台预热 Rime 引擎（engine=rime 时由 daemon 启动调用）：提前触发首次部署，
+    /// 使首次候选查询免于等待部署（2-5 秒），避免用户误以为无反应。
+    pub fn warmup_rime(&self) {
+        let engine = self.config.read().unwrap().engine.clone();
+        if engine != "rime" {
+            return;
+        }
+        match self.rime_query(|_| Ok(())) {
+            Ok(()) => log::info!("Rime 引擎预热完成"),
+            Err(e) => log::warn!("Rime 引擎预热失败（首次查询时会重试）: {e}"),
+        }
+    }
+
     /// 惰性加载并串行执行 Rime 查询（无 await，锁不跨异步点）。
     fn rime_query<T>(
         &self,
