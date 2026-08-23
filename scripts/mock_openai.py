@@ -57,6 +57,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
+        # 多模态 vision：请求中带 image_url（颜色认出单元格/「图片」）
+        if "image_url" in body:
+            reply = "【多模态 vision】收到图像，请说明你看到了什么 ✅"
+            for i in range(0, len(reply), 2):
+                chunk = reply[i : i + 2]
+                payload = json.dumps(
+                    {"choices": [{"delta": {"content": chunk}}]}, ensure_ascii=False
+                )
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(0.01)
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
         # 候选融合：提示词含「拼音：」时按行流式返回候选
         if "拼音：" in body:
             for line in CANDIDATES:

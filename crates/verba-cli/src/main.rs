@@ -93,13 +93,51 @@ where
 }
 
 fn cmd_ai(args: &[String]) -> i32 {
-    let prompt = args.get(1).cloned().unwrap_or_default();
+    let mut image: Option<(String, Vec<u8>)> = None;
+    let mut prompt = String::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--image" => {
+                let path = match args.get(i + 1) {
+                    Some(p) => p.clone(),
+                    None => {
+                        eprintln!("--image 需要一个文件路径");
+                        return 1;
+                    }
+                };
+                i += 2;
+                match std::fs::read(&path) {
+                    Ok(d) => image = Some(("image/png".to_owned(), d)),
+                    Err(e) => {
+                        eprintln!("读取图像失败: {e}");
+                        return 1;
+                    }
+                }
+            }
+            "--mime" => {
+                let mime = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+                if let Some((_, d)) = &image {
+                    image = Some((mime, d.clone()));
+                }
+            }
+            _ => {
+                if !prompt.is_empty() {
+                    prompt.push(' ');
+                }
+                prompt.push_str(&args[i]);
+                i += 1;
+            }
+        }
+    }
     if prompt.is_empty() {
-        eprintln!("用法: verba-cli ai <prompt>");
+        eprintln!("用法: verba-cli ai [--image <文件>] <prompt>");
         return 1;
     }
+    let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
     with_client(|c| {
-        let id = c.llm_start(&prompt, None, None, None, None)?;
+        let id = c.llm_start(&prompt, None, None, None, image_ref)?;
         loop {
             let evt = c.next_event(id)?;
             match evt.kind {
