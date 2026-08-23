@@ -426,6 +426,26 @@ fn cmd_diag(_args: &[String]) -> i32 {
                     ] {
                         println!("{k} = {}", get(k));
                     }
+                    if get("ocr_provider") == "rapid" {
+                        let d = dirs.data_dir();
+                        let win = d.join("venv-ocr").join("Scripts").join("python.exe");
+                        let unix = d.join("venv-ocr").join("bin").join("python");
+                        let ready = win.exists() || unix.exists();
+                        let shown = if win.exists() {
+                            win.display().to_string()
+                        } else if unix.exists() {
+                            unix.display().to_string()
+                        } else {
+                            d.join("venv-ocr").display().to_string()
+                        };
+                        println!(
+                            "rapid python: {shown} (存在: {})",
+                            if ready { "是" } else { "否" }
+                        );
+                        if let Ok(env) = std::env::var("VERBA_RAPIDOCR_PYTHON") {
+                            println!("env VERBA_RAPIDOCR_PYTHON = {env}");
+                        }
+                    }
                 }
             }
             Err(e) => println!("daemon: ping 失败（{e}）"),
