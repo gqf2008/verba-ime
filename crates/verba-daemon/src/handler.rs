@@ -10,13 +10,19 @@ use verba_config::{Config, ConfigManager};
 use verba_core::VERSION;
 use verba_ipc::server::{Outbound, RequestHandler};
 use verba_protos::{
-    request, response, stream_event, Chunk, Config as ConfigMsg, Error as ProtoError, Final,
-    Ok as OkMsg, Pong, Response, StreamEvent,
+    request, response, stream_event, Candidates, Chunk, Config as ConfigMsg, Error as ProtoError,
+    Final, LlmCandidates, Ok as OkMsg, Pong, Response, StreamEvent,
 };
 
 /// 默认 AI 系统提示词（用户未配置时使用）。
 const DEFAULT_AI_SYSTEM: &str =
     "你是一个输入法里的 AI 助手。回答应简洁、直接，以可上屏的文本输出，不要使用 Markdown。";
+
+/// 候选融合系统提示词：只输出候选本身，便于按行解析。
+const CANDIDATE_SYSTEM: &str = "你是输入法智能候选生成器。根据用户输入的拼音串生成中文候选。只输出候选本身，每行一个；不要编号、不要序号、不要标点、不要任何解释或前后缀。";
+
+/// 候选融合单次请求上限。
+const CANDIDATE_MAX: usize = 6;
 
 pub struct DaemonHandler {
     mgr: ConfigManager,
@@ -118,6 +124,7 @@ impl RequestHandler for DaemonHandler {
                 .await
             }
             Some(request::Kind::LlmGenerate(g)) => self.handle_llm_generate(id, g, out).await,
+            Some(request::Kind::LlmCandidates(g)) => self.handle_llm_candidates(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
                 let token = self.cancels.lock().unwrap().remove(&id);
                 if let Some(token) = token {
@@ -246,5 +253,167 @@ impl DaemonHandler {
 
         self.cancels.lock().unwrap().remove(&id);
         Ok(())
+    }
+
+    /// 候选融合：请求 LLM 为拼音补充候选，按行流式解析并增量推送
+    /// `Candidates` 事件（去重 + 去编号），结束（含取消）时补发 `done=true`。
+    async fn handle_llm_candidates(
+        &self,
+        id: u64,
+        g: verba_protos::LlmCandidates,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let token = CancellationToken::new();
+        self.cancels.lock().unwrap().insert(id, token.clone());
+
+        out.response(&Response {
+            id,
+            kind: Some(response::Kind::Ok(OkMsg {})),
+        })
+        .await?;
+
+        let (llm_cfg, _) = self.llm_snapshot();
+        let max = (g.max_candidates as usize).clamp(1, CANDIDATE_MAX);
+        let dict_line = if g.dictionary.is_empty() {
+            "（无）".to_owned()
+        } else {
+            g.dictionary.join("、")
+        };
+        let prompt = format!(
+            "拼音：{}\n已有词库候选：{}\n请补充生成最多 {max} 个与拼音匹配、更符合语境的候选。",
+            g.pinyin, dict_line
+        );
+        let req = LlmRequest {
+            prompt,
+            system: Some(CANDIDATE_SYSTEM.to_owned()),
+            temperature: Some(0.3),
+            max_tokens: Some(128),
+        };
+
+        match self.llm.stream(&llm_cfg, &req).await {
+            Ok(mut stream) => {
+                let mut buf = String::new();
+                let mut emitted: Vec<String> = Vec::new();
+                let mut failed = false;
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        log::info!("候选请求 {id} 已取消");
+                    }
+                    _ = async {
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(text) => {
+                                    buf.push_str(&text);
+                                    while let Some(pos) = buf.find('\n') {
+                                        let line: String = buf.drain(..=pos).collect();
+                                        if let Err(e) = self
+                                            .emit_candidate(&out, id, &g, &mut emitted, max, &line)
+                                            .await
+                                        {
+                                            log::warn!("候选事件写入失败: {e}");
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("LLM 流错误: {e}");
+                                    let _ = out
+                                        .event(&StreamEvent {
+                                            id,
+                                            kind: Some(stream_event::Kind::Error(ProtoError {
+                                                code: 500,
+                                                message: e.to_string(),
+                                            })),
+                                        })
+                                        .await;
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // 冲刷末尾无换行行
+                        if !failed && !buf.trim().is_empty() {
+                            let line = std::mem::take(&mut buf);
+                            if let Err(e) = self.emit_candidate(&out, id, &g, &mut emitted, max, &line).await
+                            {
+                                log::warn!("候选事件写入失败: {e}");
+                            }
+                        }
+                    } => {}
+                }
+                // 结束事件：即使取消也补发，保证客户端流线程能退出阻塞读。
+                if !failed {
+                    let _ = out
+                        .event(&StreamEvent {
+                            id,
+                            kind: Some(stream_event::Kind::Candidates(Candidates {
+                                pinyin: g.pinyin.clone(),
+                                candidates: vec![],
+                                done: true,
+                            })),
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = out
+                    .event(&StreamEvent {
+                        id,
+                        kind: Some(stream_event::Kind::Error(ProtoError {
+                            code: 502,
+                            message: e.to_string(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+
+        self.cancels.lock().unwrap().remove(&id);
+        Ok(())
+    }
+
+    /// 清洗一行 LLM 输出为候选并增量推送（去空行/编号前缀/与词库及已发候选去重）。
+    async fn emit_candidate(
+        &self,
+        out: &Outbound,
+        id: u64,
+        g: &LlmCandidates,
+        emitted: &mut Vec<String>,
+        max: usize,
+        raw: &str,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let mut line = raw.trim();
+        // 去常见编号前缀：`1. 你好` / `1、你好` / `1）你好`
+        for pat in [".", "、", ")", "）", ":"] {
+            if let Some(rest) = line
+                .strip_prefix(|c: char| c.is_ascii_digit())
+                .and_then(|_| line.split_once(pat))
+            {
+                line = rest.1.trim();
+                break;
+            }
+        }
+        if line.is_empty() || line.len() < 2 || line.is_ascii() {
+            // 跳过空行 / 单字符 / 纯英文（拼音原样不算候选）
+            return Ok(());
+        }
+        if emitted.contains(&line.to_owned()) || g.dictionary.iter().any(|d| d == line) {
+            return Ok(());
+        }
+        if emitted.len() >= max {
+            return Ok(());
+        }
+        let cand = line.to_owned();
+        emitted.push(cand.clone());
+        out.event(&StreamEvent {
+            id,
+            kind: Some(stream_event::Kind::Candidates(Candidates {
+                pinyin: g.pinyin.clone(),
+                candidates: vec![cand],
+                done: false,
+            })),
+        })
+        .await
     }
 }

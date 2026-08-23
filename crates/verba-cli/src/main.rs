@@ -25,6 +25,7 @@ fn main() {
             Ok(())
         }),
         Some("ai") => cmd_ai(&args),
+        Some("candidates") => cmd_candidates(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -42,7 +43,8 @@ fn print_help() {
          用法:\n  \
          verba-cli daemon                前台运行后台守护进程\n  \
          verba-cli ping                  健康检查\n  \
-         verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \
+         verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
+         verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -106,7 +108,40 @@ fn cmd_ai(args: &[String]) -> i32 {
                         message: e.message,
                     });
                 }
-                None => {}
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `verba-cli candidates <拼音>`：请求 LLM 为拼音补充候选（模拟候选融合链路）。
+fn cmd_candidates(args: &[String]) -> i32 {
+    let pinyin = args.get(1).cloned().unwrap_or_default();
+    if pinyin.is_empty() {
+        eprintln!("用法: verba-cli candidates <拼音>");
+        return 1;
+    }
+    with_client(|c| {
+        let id = c.llm_candidates_start(&pinyin, &[], 6)?;
+        loop {
+            let evt = c.next_event(id)?;
+            match evt.kind {
+                Some(stream_event::Kind::Candidates(cands)) => {
+                    for cand in &cands.candidates {
+                        println!("候选({}): {cand}", cands.pinyin);
+                    }
+                    if cands.done {
+                        break;
+                    }
+                }
+                Some(stream_event::Kind::Error(e)) => {
+                    return Err(IpcError::Server {
+                        code: e.code,
+                        message: e.message,
+                    });
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -162,7 +197,6 @@ fn cmd_mode(args: &[String]) -> i32 {
         Ok(())
     })
 }
-
 
 /// `verba-cli pinyin <拼音>`：本地拼音引擎候选查询（不依赖 daemon）。
 fn cmd_pinyin(args: &[String]) -> i32 {

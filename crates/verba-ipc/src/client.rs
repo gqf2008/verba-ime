@@ -21,7 +21,7 @@ use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream as Lo
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
-    request, response, LlmCancel, LlmGenerate, Ping, Request, Response, StreamEvent,
+    request, response, LlmCancel, LlmCandidates, LlmGenerate, Ping, Request, Response, StreamEvent,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -111,6 +111,51 @@ impl VerbaClient {
         loop {
             let frame = self.read_frame_blocking()?;
             // 注意：protobuf 解码宽容，须先按 Response 解码（事件帧解码为 Response 会失败）。
+            if let Ok(resp) = Response::decode(frame.as_slice()) {
+                if resp.id != id {
+                    return Err(IpcError::Protocol("响应 id 不匹配".into()));
+                }
+                match resp.kind {
+                    Some(response::Kind::Ok(_)) => return Ok(id),
+                    Some(response::Kind::Error(e)) => {
+                        return Err(IpcError::Server {
+                            code: e.code,
+                            message: e.message,
+                        });
+                    }
+                    _ => return Err(IpcError::Protocol("期望 Ok 响应".into())),
+                }
+            }
+            if let Ok(evt) = StreamEvent::decode(frame.as_slice()) {
+                if evt.id == id {
+                    self.pending_events.push_back(evt);
+                }
+                continue;
+            }
+            return Err(IpcError::Protocol("无法解码响应".into()));
+        }
+    }
+
+    /// 发起候选融合：请求 LLM 为拼音补充候选，返回请求 id；
+    /// 服务端以 Ok 确认后开始推送 `Candidates` 事件（done=true 结束）。
+    pub fn llm_candidates_start(
+        &mut self,
+        pinyin: &str,
+        dictionary: &[String],
+        max_candidates: i32,
+    ) -> Result<u64, IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::LlmCandidates(LlmCandidates {
+                pinyin: pinyin.to_owned(),
+                dictionary: dictionary.to_vec(),
+                max_candidates,
+            })),
+        };
+        self.write_request(&req)?;
+        loop {
+            let frame = self.read_frame_blocking()?;
             if let Ok(resp) = Response::decode(frame.as_slice()) {
                 if resp.id != id {
                     return Err(IpcError::Protocol("响应 id 不匹配".into()));

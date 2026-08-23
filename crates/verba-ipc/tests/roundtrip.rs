@@ -132,6 +132,7 @@ async fn llm_stream_roundtrip() {
             Some(stream_event::Kind::Chunk(c)) => parts.push(c.text),
             Some(stream_event::Kind::Final(_)) => break,
             Some(stream_event::Kind::Error(e)) => panic!("服务端错误: {e:?}"),
+            Some(stream_event::Kind::Candidates(_)) => panic!("LLM 流不应出现候选事件"),
             None => panic!("空事件"),
         }
     }

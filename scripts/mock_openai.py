@@ -10,14 +10,38 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+# 候选融合模式：拼音串 -> 补充候选（每行一个，带编号便于验证去编号逻辑）。
+CANDIDATES = [
+    "1. 你是谁呀",
+    "2. 你是谁啊",
+    "3. 你就是你",
+    "4. 谁是你",
+    "5. 你是谁呢",
+]
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        body = self.rfile.read(length).decode("utf-8", "replace")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+
+        # 候选融合：提示词含「拼音：」时按行流式返回候选
+        if "拼音：" in body:
+            for line in CANDIDATES:
+                payload = json.dumps(
+                    {"choices": [{"delta": {"content": line + "\n"}}]},
+                    ensure_ascii=False,
+                )
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(0.05)
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
 
         reply = "你好，我是本地 Mock LLM。Verba 输入法链路已打通 ✅"
         for i in range(0, len(reply), 2):

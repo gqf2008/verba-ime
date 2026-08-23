@@ -7,7 +7,7 @@
 
 pub mod machine;
 
-pub use machine::{Action, CompositionMachine, MachineState, Mode};
+pub use machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState, Mode};
 
 /// 当前核心版本。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

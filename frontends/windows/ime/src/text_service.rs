@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use verba_core::machine::{Action, CompositionMachine, MachineState};
+use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -42,11 +42,19 @@ const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
 const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
+const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿后发起 LLM 候选融合请求
 
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
     context: ITfContext,
     attempts_left: u32,
+}
+
+/// 待触发的候选融合请求（防抖中，pinyin 变更时重置计时）。
+struct PendingCandidateReq {
+    pinyin: String,
+    dictionary: Vec<String>,
+    ticks: u32,
 }
 
 /// 共享状态（TSF 线程独占；`chunks` 由流线程写入，用 Mutex 保护）。
@@ -69,7 +77,13 @@ pub struct TextServiceData {
     /// 配置文件上次 mtime（用于热更新检测）。
     theme_config_mtime: Cell<Option<std::time::SystemTime>>,
     pub stream_request_id: Arc<AtomicU64>,
+    /// 在途候选融合请求 id（0 = 无）。
+    pub candidate_request_id: Arc<AtomicU64>,
+    /// 待触发的候选融合请求（防抖中）。
+    candidate_req_pending: RefCell<Option<PendingCandidateReq>>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
+    /// 候选融合请求线程句柄。
+    candidate_thread: RefCell<Option<JoinHandle<()>>>,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
 }
 
@@ -91,7 +105,10 @@ impl TextServiceData {
             candidate_theme: RefCell::new(verba_candidate::Theme::default()),
             theme_config_mtime: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
+            candidate_request_id: Arc::new(AtomicU64::new(0)),
+            candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
+            candidate_thread: RefCell::new(None),
             control: RefCell::new(None),
         }
     }
@@ -506,6 +523,7 @@ pub fn apply_action(
         Action::None => Ok(()),
         Action::CommitImmediate(text) => {
             hide_candidate_window(data);
+            cancel_candidate_request(data);
             // 先取走组合引用并释放 borrow，避免分支内 borrow_mut 冲突。
             let existing = data.composition.borrow_mut().take();
             if let Some(comp) = existing {
@@ -521,9 +539,11 @@ pub fn apply_action(
             preedit,
             candidates,
             page,
+            llm_request,
         } => {
             set_preedit(data, context, clientid, &preedit)?;
             update_candidate_window(data, context, &candidates, page);
+            schedule_candidate_request(data, llm_request);
             Ok(())
         }
         Action::StartLlm { prompt, system: _ } => {
@@ -536,6 +556,7 @@ pub fn apply_action(
         Action::ResultReady => Ok(()),
         Action::CommitResult { text } => {
             hide_candidate_window(data);
+            cancel_candidate_request(data);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 edit_session::end_composition(context, clientid, &comp, &text)?;
             }
@@ -796,6 +817,8 @@ fn push_chunk(chunks: &Arc<Mutex<VecDeque<StreamEvent>>>, id: u64, kind: stream_
 }
 
 fn cancel_stream(data: &Rc<TextServiceData>) {
+    // 候选融合请求一并取消
+    cancel_candidate_request(data);
     let id = data.stream_request_id.load(Ordering::SeqCst);
     if id == 0 {
         return;
@@ -807,6 +830,105 @@ fn cancel_stream(data: &Rc<TextServiceData>) {
     if let Some(c) = client.as_mut() {
         let _ = c.llm_cancel(id);
     }
+}
+
+/// 取消在途候选融合请求（发起新请求 / 提交 / 取消组合时调用）。
+fn cancel_candidate_request(data: &Rc<TextServiceData>) {
+    data.candidate_req_pending.borrow_mut().take();
+    let id = data.candidate_request_id.swap(0, Ordering::SeqCst);
+    if id == 0 {
+        return;
+    }
+    let mut client = data.control.borrow_mut();
+    if client.is_none() {
+        *client = ipc::try_connect().ok();
+    }
+    if let Some(c) = client.as_mut() {
+        let _ = c.llm_cancel(id);
+    }
+}
+
+/// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
+fn schedule_candidate_request(
+    data: &Rc<TextServiceData>,
+    req: Option<LlmCandidateRequest>,
+) {
+    if let Some(r) = req {
+        *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
+            pinyin: r.pinyin,
+            dictionary: r.dictionary,
+            ticks: 0,
+        });
+    }
+}
+
+/// 候选融合防抖触发：输入停顿 DEBOUNCE_TICKS 个周期后才发起 LLM 候选请求。
+fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
+    let fire = {
+        let mut pending = data.candidate_req_pending.borrow_mut();
+        match pending.as_mut() {
+            None => false,
+            Some(req) => {
+                req.ticks += 1;
+                req.ticks >= CANDIDATE_REQ_DEBOUNCE_TICKS
+            }
+        }
+    };
+    if fire {
+        let req = data.candidate_req_pending.borrow_mut().take().expect("存在");
+        start_llm_candidates(data, req.pinyin, req.dictionary);
+    }
+}
+
+/// 发起候选融合请求（后台线程；增量候选经 chunks 队列回流 on_timer 合并展示）。
+fn start_llm_candidates(data: &Rc<TextServiceData>, pinyin: String, dictionary: Vec<String>) {
+    log::info!(
+        "候选融合请求: pinyin={pinyin} dict_count={}",
+        dictionary.len()
+    );
+    cancel_candidate_request(data);
+    let chunks = Arc::clone(&data.chunks);
+    let request_id = Arc::clone(&data.candidate_request_id);
+    let handle = std::thread::spawn(move || {
+        let mut client = match ipc::ensure_daemon() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("候选融合无法连接 daemon: {e}");
+                return;
+            }
+        };
+        let id = match client.llm_candidates_start(&pinyin, &dictionary, 6) {
+            Ok(id) => id,
+            Err(e) => {
+                log::warn!("候选融合启动失败: {e}");
+                return;
+            }
+        };
+        request_id.store(id, Ordering::SeqCst);
+        loop {
+            match client.next_event(id) {
+                Ok(evt) => {
+                    let done = matches!(
+                        evt.kind,
+                        Some(stream_event::Kind::Candidates(ref c)) if c.done
+                    ) || matches!(evt.kind, Some(stream_event::Kind::Error(_)));
+                    if let Ok(mut q) = chunks.lock() {
+                        q.push_back(evt);
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("候选融合连接中断: {e}");
+                    break;
+                }
+            }
+        }
+        // 仅当仍是本次请求时才清 id，避免误清新请求
+        let _ = request_id.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    });
+    *data.candidate_thread.borrow_mut() = Some(handle);
 }
 
 // ---- 定时器窗口 ----
@@ -903,6 +1025,8 @@ impl TextServiceData {
         maybe_reload_candidate_theme(&rc);
         // 候选窗：组合布局就绪后重试精确定位
         retry_candidate_pos(&rc);
+        // 候选融合：输入停顿后发起 LLM 候选请求
+        maybe_fire_candidate_request(&rc);
 
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
@@ -928,6 +1052,18 @@ impl TextServiceData {
                     machine.on_llm_done();
                     let result = machine.result().to_owned();
                     let _ = set_preedit(&rc, &context, clientid, &result);
+                }
+                Some(stream_event::Kind::Candidates(c)) => {
+                    if let Action::UpdatePinyin {
+                        preedit,
+                        candidates,
+                        page,
+                        ..
+                    } = machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done)
+                    {
+                        let _ = set_preedit(&rc, &context, clientid, &preedit);
+                        update_candidate_window(&rc, &context, &candidates, page);
+                    }
                 }
                 Some(stream_event::Kind::Error(e)) => {
                     if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
