@@ -28,7 +28,7 @@ Copy-Item (Join-Path $tmp "rime\dist\include\rime_api.h") (Join-Path $vendor "in
 $weaselUrl = "https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.17.4.0-installer.exe"
 Invoke-WebRequest -Uri $weaselUrl -OutFile (Join-Path $tmp "weasel.exe") -UseBasicParsing
 & $7z x (Join-Path $tmp "weasel.exe") ("-o" + (Join-Path $tmp "weasel")) -y | Out-Null
-Get-ChildItem (Join-Path $tmp "weasel\data") -File | Copy-Item -Destination $dataDir -Force
+Get-ChildItem (Join-Path $tmp "weasel\data") | Copy-Item -Destination $dataDir -Recurse -Force
 
 # 3) wubi86 五笔
 foreach ($f in @("wubi86.schema.yaml", "wubi86.dict.yaml")) {

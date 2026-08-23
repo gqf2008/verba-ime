@@ -19,6 +19,7 @@ message Request {
     LlmGenerate llm_generate = 20;
     LlmCancel llm_cancel = 21;
     LlmCandidates llm_candidates = 22;
+    RimeCandidates rime_candidates = 23;
   }
 }
 
@@ -49,6 +50,13 @@ message LlmCancel {}
 message LlmCandidates {
   string pinyin = 1;
   repeated string dictionary = 2;
+  int32 max_candidates = 3;
+}
+
+// 可选 Rime 引擎（config 引擎=rime）：查询拼音/五笔候选（daemon 内 librime）。
+message RimeCandidates {
+  string input = 1;
+  string schema = 2;
   int32 max_candidates = 3;
 }
 

@@ -57,9 +57,10 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 
 - [x] 构建 librime-sys spike（Windows，daemon 外先验证 FFI）：预编译 rime.dll（librime nightly
       msvc-x64）+ 拼音 luna_pinyin + 五笔 wubi86 均跑通（2026-08-23，见 [spike](../spikes/librime-sys/README.md)）
-- [ ] daemon 内集成（`config 引擎=builtin|rime`）：把 spike 的 FFI 封装成 `verba-librime` crate，
-      按引擎开关切换；octagram n-gram 数据另配后再评估整句质量
-- [ ] 对比自研 vs librime：整句准确率采样（50 句日常对话）
+- [x] daemon 内集成（`config 引擎=builtin|rime`）：`verba-librime` crate（动态加载 rime.dll）+
+      IPC `RimeCandidates` + `rime_schema`（luna_pinyin_simp/wubi86）+ 前端 engine=rime 融合
+      （2026-08-23，CLI 端到端验证：`nishishui`→你是谁、`wqvb`(五笔)→你好；待实机验收）
+- [ ] 对比自研 vs librime：整句准确率采样（50 句日常对话）——依赖 octagram n-gram 数据另配
 - [x] 候选窗（独立窗口、分页、主题）（2026-08-23 实机验收通过 + 代码完成）
 - [x] 候选融合（词库 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`，mock 端到端冒烟通过，
       待实机验收）（2026-08-23）
@@ -82,5 +83,8 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 2. 本机 GNU 工具链下 `raw-dylib` 不可靠（垃圾返回值 + 退出访问违规），改用动态加载。
 3. Weasel 0.17.4 安装包的 rime.dll 是 x86；x64 需取 librime 官方 release 的 msvc-x64 包。
 
-**决策更新**：spike 证明「预编译 rime.dll + Rust FFI」路线可行，daemon 集成（引擎开关）价值明确；
-但默认仍建议 `verba-pinyin`（体积/复杂度低），librime 作为可选增强（五笔/注音/仓颉生态用户）。
+**决策更新**：spike + daemon 集成证明「预编译 rime.dll + Rust FFI」路线可行且已可用——
+`config 引擎=rime` 即可切换 Rime（拼音/五笔），默认仍为 `builtin`（verba-pinyin，体积/复杂度低）。
+librime 定位为可选增强（五笔/注音/仓颉生态用户）。部署注意：
+- rime.dll（x64 ~4MB）与 `data/`（含 opencc，~10MB）随 daemon 同目录 `rime/` 分发；
+- 首次查询触发一次部署（编译 schema/词典，数秒）；octagram n-gram 数据未捆绑，另配后评估整句质量。

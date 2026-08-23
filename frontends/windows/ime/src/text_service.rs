@@ -74,6 +74,10 @@ pub struct TextServiceData {
     candidate_pending_pos: RefCell<Option<CandidatePosRetry>>,
     /// 候选窗主题（随配置热更新）。
     candidate_theme: RefCell<verba_candidate::Theme>,
+    /// 中文引擎（builtin|rime，随配置热更新；rime 时向 daemon 请求 Rime 候选）。
+    candidate_engine: RefCell<String>,
+    /// Rime 方案（engine=rime 时，如 luna_pinyin_simp / wubi86）。
+    candidate_rime_schema: RefCell<String>,
     /// 配置文件上次 mtime（用于热更新检测）。
     theme_config_mtime: Cell<Option<std::time::SystemTime>>,
     pub stream_request_id: Arc<AtomicU64>,
@@ -103,6 +107,8 @@ impl TextServiceData {
             candidate_window: RefCell::new(None),
             candidate_pending_pos: RefCell::new(None),
             candidate_theme: RefCell::new(verba_candidate::Theme::default()),
+            candidate_engine: RefCell::new("builtin".into()),
+            candidate_rime_schema: RefCell::new("luna_pinyin_simp".into()),
             theme_config_mtime: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
@@ -189,8 +195,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
-    // 候选窗主题：从配置文件加载（失败保留默认，不影响激活）
-    reload_candidate_theme(data);
+    // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
+    reload_candidate_config(data);
     // 候选窗（懒创建：失败不影响激活）
     if data.candidate_window.borrow().is_none() {
         if let Ok(cw) = crate::candidate_window::CandidateWindow::new() {
@@ -275,8 +281,12 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
                 // 拼音态认领：字母（缓冲）、数字（选候选）、空格（选首选）、`/`（提交+AI）、
                 // `-`/`=`（翻页）
                 Some(c) => {
-                    c == '/' || c.is_ascii_alphabetic() || c.is_ascii_digit() || c == ' '
-                        || c == '-' || c == '='
+                    c == '/'
+                        || c.is_ascii_alphabetic()
+                        || c.is_ascii_digit()
+                        || c == ' '
+                        || c == '-'
+                        || c == '='
                 }
                 None => false,
             }
@@ -628,30 +638,33 @@ fn update_candidate_window(
     }
 }
 
-/// 加载候选窗主题（从配置文件；失败保留当前主题）。
-fn reload_candidate_theme(data: &Rc<TextServiceData>) {
-    match load_candidate_theme() {
-        Ok(theme) => {
+/// 从配置文件加载候选相关配置（主题 + 引擎）；失败保留当前值。
+fn reload_candidate_config(data: &Rc<TextServiceData>) {
+    match load_candidate_config() {
+        Ok((theme, engine, schema)) => {
             *data.candidate_theme.borrow_mut() = theme;
-            log::info!("候选窗主题已加载");
+            *data.candidate_engine.borrow_mut() = engine.clone();
+            *data.candidate_rime_schema.borrow_mut() = schema.clone();
+            log::info!("候选配置已加载（engine={engine} schema={schema}）");
         }
-        Err(e) => log::warn!("候选窗主题加载失败: {e}"),
+        Err(e) => log::warn!("候选配置加载失败: {e}"),
     }
     data.theme_config_mtime.set(config_mtime());
 }
 
-/// 定时器热更新：配置文件 mtime 变化时重载主题。
-fn maybe_reload_candidate_theme(data: &Rc<TextServiceData>) {
+/// 定时器热更新：配置文件 mtime 变化时重载主题与引擎。
+fn maybe_reload_candidate_config(data: &Rc<TextServiceData>) {
     if config_mtime() != data.theme_config_mtime.get() {
-        reload_candidate_theme(data);
+        reload_candidate_config(data);
     }
 }
 
-fn load_candidate_theme() -> std::result::Result<verba_candidate::Theme, String> {
+fn load_candidate_config() -> std::result::Result<(verba_candidate::Theme, String, String), String>
+{
     let dirs = verba_config::VerbaDirs::locate().map_err(|e| e.to_string())?;
     let mgr = verba_config::ConfigManager::new(dirs);
     let cfg = mgr.load().map_err(|e| e.to_string())?;
-    Ok(cfg.theme.to_candidate_theme())
+    Ok((cfg.theme.to_candidate_theme(), cfg.engine, cfg.rime_schema))
 }
 
 fn config_mtime() -> Option<std::time::SystemTime> {
@@ -849,10 +862,7 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
 }
 
 /// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
-fn schedule_candidate_request(
-    data: &Rc<TextServiceData>,
-    req: Option<LlmCandidateRequest>,
-) {
+fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandidateRequest>) {
     if let Some(r) = req {
         *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
             pinyin: r.pinyin,
@@ -875,9 +885,54 @@ fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
         }
     };
     if fire {
-        let req = data.candidate_req_pending.borrow_mut().take().expect("存在");
-        start_llm_candidates(data, req.pinyin, req.dictionary);
+        let req = data
+            .candidate_req_pending
+            .borrow_mut()
+            .take()
+            .expect("存在");
+        let engine = data.candidate_engine.borrow().clone();
+        if engine == "rime" {
+            let schema = data.candidate_rime_schema.borrow().clone();
+            start_rime_candidates(data, req.pinyin, schema);
+        } else {
+            start_llm_candidates(data, req.pinyin, req.dictionary);
+        }
     }
+}
+
+/// 发起 Rime 候选查询（engine=rime 时；一次性返回候选，经 chunks 队列回流合并展示）。
+/// Rime 查询为本地同步调用，未使用候选请求 id（cancel_candidate_request 仅清理 pending）。
+fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: String) {
+    log::info!("Rime 候选请求: pinyin={pinyin} schema={schema}");
+    cancel_candidate_request(data);
+    let chunks = Arc::clone(&data.chunks);
+    let handle = std::thread::spawn(move || {
+        let mut client = match ipc::ensure_daemon() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Rime 候选无法连接 daemon: {e}");
+                return;
+            }
+        };
+        let cands = match client.rime_candidates(&pinyin, &schema, 9) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Rime 候选查询失败: {e}");
+                return;
+            }
+        };
+        if let Ok(mut q) = chunks.lock() {
+            q.push_back(StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin,
+                    candidates: cands,
+                    done: true,
+                })),
+            });
+        }
+    });
+    *data.candidate_thread.borrow_mut() = Some(handle);
 }
 
 /// 发起候选融合请求（后台线程；增量候选经 chunks 队列回流 on_timer 合并展示）。
@@ -1021,8 +1076,8 @@ impl TextServiceData {
         };
         // 持续重试挂载键盘 sink（Activate 时可能失败）
         try_advise_keysink(&rc);
-        // 候选窗主题：配置文件变更时热更新
-        maybe_reload_candidate_theme(&rc);
+        // 候选窗主题/引擎：配置文件变更时热更新
+        maybe_reload_candidate_config(&rc);
         // 候选窗：组合布局就绪后重试精确定位
         retry_candidate_pos(&rc);
         // 候选融合：输入停顿后发起 LLM 候选请求

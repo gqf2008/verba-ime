@@ -78,8 +78,9 @@
 > 目标：验证「拼音候选窗：跟随光标 + 避让 + 分页 + 主题/皮肤 + LLM 候选融合」。
 > 状态：M5 候选窗主体已实机验收通过（2026-08-23，Notepad--）；分页/主题/融合待复测确认。
 > 前置：已加载 `target_dev12` 新 DLL（关闭重开测试应用），mock LLM 运行中
-> （`python scripts/mock_openai.py 8765`），配置 `%APPDATA%\Verba\config.toml` 指向
-> `llm_base_url = 'http://127.0.0.1:8765/v1'`、`llm_model = 'mock'`。
+> （`python scripts/mock_openai.py 8765`），配置 `%APPDATA%\verba\Verba\config\config.toml` 指向
+> `llm_base_url = 'http://127.0.0.1:8765/v1'`、`llm_model = 'mock'`（实际配置路径以
+> `verba-cli config` 输出为准）。
 
 ## 拼音候选窗（基础）
 - [ ] 输入 `n` → 候选窗出现在光标正下方，9 项/页，底部页码脚「1/3」
@@ -93,6 +94,7 @@
 ## 主题/皮肤
 - [ ] `config.toml` 加 `[theme] preset = "dark"` 保存 → 候选窗自动变深色（热更新，无需重启）
 - [ ] 可加 `background`/`font_size`/`corner_radius` 等键逐项覆盖（键名见 verba-config ThemeConfig）
+      （配置文件路径用 `verba-cli config` 查看；主题键走 `config set theme.*` 或直接编辑）
 
 ## 候选融合（LLM 候选）
 - [ ] 输入 `nishishui` 后停顿约 0.5s → 候选窗尾部**追加** LLM 候选
@@ -103,3 +105,28 @@
 
 ## 判定
 - 候选窗跟随光标、能翻页、主题热更新、LLM 候选尾部追加且可选 → M5 收口。
+
+---
+
+# Windows 手动验收清单（M5 Rime 引擎，engine=rime）
+
+> 目标：验证可选 Rime 引擎（daemon 内 librime）：拼音/五笔候选经 `RimeCandidates` 协议回流候选窗。
+> 状态：CLI 端到端已通过（`nishishui`→你是谁、`wqvb`→你好），前端融合待实机确认。
+> 前置：`verba-cli config set engine=rime rime_schema=luna_pinyin_simp`；
+> daemon 同目录 `rime/` 已部署 rime.dll + data（target_dev12 已就绪）。
+
+## Rime 拼音
+- [ ] 输入 `nishishui` 停顿约 0.5s → 候选窗出现 Rime 候选「你是谁 / 你是 / 妳是…」
+- [ ] 按数字/翻页可选 Rime 候选上屏
+- [ ] 整句：输入 `jintianwanshangchishenme` → Rime 首候选「今天晚上吃什么」
+
+## Rime 五笔（wubi86）
+- [ ] `verba-cli config set rime_schema=wubi86` 后，输入五笔码 `wqvb` → 候选「你好 / 您好」；
+      `aaaa` → 「工」
+- [ ] 切回拼音：`verba-cli config set rime_schema=luna_pinyin_simp`
+
+## 回退
+- [ ] `verba-cli config set engine=builtin` → 恢复内置 verba-pinyin + LLM 候选融合
+
+## 判定
+- engine=rime 时候选窗出现 Rime 候选、五笔码可出字、engine=builtin 恢复原行为 → Rime 集成收口。

@@ -26,6 +26,7 @@ fn main() {
         }),
         Some("ai") => cmd_ai(&args),
         Some("candidates") => cmd_candidates(&args),
+        Some("rime") => cmd_rime(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -45,6 +46,7 @@ fn print_help() {
          verba-cli ping                  健康检查\n  \
          verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
+         verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -142,6 +144,30 @@ fn cmd_candidates(args: &[String]) -> i32 {
                     });
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `verba-cli rime <输入> [方案]`：查询 daemon 内 Rime 引擎候选（需 engine=rime）。
+fn cmd_rime(args: &[String]) -> i32 {
+    let input = args.get(1).cloned().unwrap_or_default();
+    if input.is_empty() {
+        eprintln!("用法: verba-cli rime <输入> [方案]");
+        return 1;
+    }
+    let schema = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "luna_pinyin_simp".into());
+    with_client(|c| {
+        let cands = c.rime_candidates(&input, &schema, 9)?;
+        if cands.is_empty() {
+            println!("（无候选）");
+        } else {
+            for (i, c) in cands.iter().enumerate() {
+                println!("{}. {c}", i + 1);
             }
         }
         Ok(())

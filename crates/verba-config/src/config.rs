@@ -135,6 +135,12 @@ pub struct Config {
     /// 候选窗主题。
     #[serde(default)]
     pub theme: ThemeConfig,
+    /// 中文引擎：builtin（默认，verba-pinyin）| rime（可选，daemon 内 librime）。
+    #[serde(default = "default_engine")]
+    pub engine: String,
+    /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
+    #[serde(default = "default_rime_schema")]
+    pub rime_schema: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -149,6 +155,12 @@ fn default_temperature() -> f32 {
 fn default_max_tokens() -> i32 {
     DEFAULT_MAX_TOKENS
 }
+fn default_engine() -> String {
+    "builtin".to_owned()
+}
+fn default_rime_schema() -> String {
+    "luna_pinyin_simp".to_owned()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -159,6 +171,8 @@ impl Default for Config {
             max_tokens: default_max_tokens(),
             ai_system_prompt: String::new(),
             theme: ThemeConfig::default(),
+            engine: default_engine(),
+            rime_schema: default_rime_schema(),
         }
     }
 }
@@ -172,6 +186,8 @@ impl Config {
         map.insert("temperature".into(), self.temperature.to_string());
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
+        map.insert("engine".into(), self.engine.clone());
+        map.insert("rime_schema".into(), self.rime_schema.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -214,6 +230,15 @@ impl Config {
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
                 "ai_system_prompt" => self.ai_system_prompt = v.clone(),
+                "engine" => {
+                    if v != "builtin" && v != "rime" {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "engine 仅支持 builtin|rime: {k}={v}"
+                        )));
+                    }
+                    self.engine = v.clone();
+                }
+                "rime_schema" => self.rime_schema = v.clone(),
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
                 "theme.text_color" => self.theme.text_color = Some(v.clone()),

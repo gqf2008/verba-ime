@@ -15,6 +15,7 @@ verba-ipc = { path = "../verba-ipc" }
 verba-config = { path = "../verba-config" }
 verba-ai = { path = "../verba-ai" }
 verba-core = { path = "../verba-core" }
+verba-librime = { path = "../verba-librime" }
 tokio.workspace = true
 tokio-util.workspace = true
 log.workspace = true

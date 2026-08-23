@@ -9,6 +9,7 @@ use verba_ai::{LlmClient, LlmConfig, LlmRequest};
 use verba_config::{Config, ConfigManager};
 use verba_core::VERSION;
 use verba_ipc::server::{Outbound, RequestHandler};
+use verba_librime::{RimeConfig, RimeEngine};
 use verba_protos::{
     request, response, stream_event, Candidates, Chunk, Config as ConfigMsg, Error as ProtoError,
     Final, LlmCandidates, Ok as OkMsg, Pong, Response, StreamEvent,
@@ -30,6 +31,8 @@ pub struct DaemonHandler {
     llm_config: Arc<RwLock<LlmConfig>>,
     llm: LlmClient,
     cancels: Mutex<HashMap<u64, CancellationToken>>,
+    /// 可选 Rime 引擎（config 引擎=rime 时惰性加载；串行化访问）。
+    rime: Mutex<Option<RimeEngine>>,
 }
 
 impl DaemonHandler {
@@ -40,6 +43,7 @@ impl DaemonHandler {
             llm_config: Arc::new(RwLock::new(llm_config)),
             llm,
             cancels: Mutex::new(HashMap::new()),
+            rime: Mutex::new(None),
         }
     }
 
@@ -125,6 +129,7 @@ impl RequestHandler for DaemonHandler {
             }
             Some(request::Kind::LlmGenerate(g)) => self.handle_llm_generate(id, g, out).await,
             Some(request::Kind::LlmCandidates(g)) => self.handle_llm_candidates(id, g, out).await,
+            Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
                 let token = self.cancels.lock().unwrap().remove(&id);
                 if let Some(token) = token {
@@ -373,6 +378,82 @@ impl DaemonHandler {
         Ok(())
     }
 
+    /// Rime 引擎候选（config 引擎=rime）：一次性推送 `Candidates` 事件（done=true）。
+    async fn handle_rime_candidates(
+        &self,
+        id: u64,
+        g: verba_protos::RimeCandidates,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let engine = self.config.read().unwrap().engine.clone();
+        if engine != "rime" {
+            out.response(&Response {
+                id,
+                kind: Some(response::Kind::Error(ProtoError {
+                    code: 400,
+                    message: "中文引擎未启用 rime（verba-cli config set engine=rime 后重试）"
+                        .into(),
+                })),
+            })
+            .await?;
+            return Ok(());
+        }
+        let max = (g.max_candidates as usize).clamp(1, 27);
+        let schema = if g.schema.is_empty() {
+            "luna_pinyin_simp"
+        } else {
+            g.schema.as_str()
+        };
+        match self.rime_query(|e| e.candidates(&g.input, schema, max)) {
+            Ok(cands) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Ok(OkMsg {})),
+                })
+                .await?;
+                out.event(&StreamEvent {
+                    id,
+                    kind: Some(stream_event::Kind::Candidates(Candidates {
+                        pinyin: g.input.clone(),
+                        candidates: cands.into_iter().map(|c| c.text).collect(),
+                        done: true,
+                    })),
+                })
+                .await
+            }
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 502,
+                        message: e,
+                    })),
+                })
+                .await
+            }
+        }
+    }
+
+    /// 惰性加载并串行执行 Rime 查询（无 await，锁不跨异步点）。
+    fn rime_query<T>(
+        &self,
+        f: impl FnOnce(&RimeEngine) -> Result<T, verba_librime::RimeError>,
+    ) -> Result<T, String> {
+        let mut guard = self.rime.lock().unwrap();
+        if guard.is_none() {
+            let (dll, shared, user) = rime_paths();
+            log::info!(
+                "Rime 引擎加载: dll={} shared={} user={}",
+                dll.display(),
+                shared.display(),
+                user.display()
+            );
+            let cfg = RimeConfig::load(&dll, &shared, &user);
+            *guard = Some(RimeEngine::new(&cfg).map_err(|e| e.to_string())?);
+        }
+        f(guard.as_ref().expect("已加载")).map_err(|e| e.to_string())
+    }
+
     /// 清洗一行 LLM 输出为候选并增量推送（去空行/编号前缀/与词库及已发候选去重）。
     async fn emit_candidate(
         &self,
@@ -416,4 +497,28 @@ impl DaemonHandler {
         })
         .await
     }
+}
+
+/// Rime 资源定位：环境变量优先，缺省取 daemon 同目录 `rime/` 下
+/// `rime.dll`、`data/`、`user_data/`。
+fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let from_env = || -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let d = std::env::var("VERBA_RIME_DLL").ok()?;
+        let s = std::env::var("VERBA_RIME_SHARED").ok()?;
+        let u = std::env::var("VERBA_RIME_USER").ok()?;
+        Some((d.into(), s.into(), u.into()))
+    };
+    if let Some(paths) = from_env() {
+        return paths;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_owned()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let rime_dir = exe_dir.join("rime");
+    (
+        rime_dir.join("rime.dll"),
+        rime_dir.join("data"),
+        rime_dir.join("user_data"),
+    )
 }

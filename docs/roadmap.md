@@ -1,7 +1,7 @@
 # 路线图
 
-> 更新：2026-08-23 · 当前状态：**M5 收尾**（M1 已实机验收；M5 拼音引擎/独立候选窗/分页/主题/候选融合已完成，
-> 剩 librime-sys spike 与实机验收）
+> 更新：2026-08-23 · 当前状态：**M5 收尾**（M1 已实机验收；M5 拼音引擎/独立候选窗/分页/主题/候选融合/
+> librime spike + daemon 集成均已完成；剩实机验收与 octagram 整句评估）
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -67,7 +67,11 @@
 - [x] 独立候选窗（跟随光标 + 智能避让）——tiny-skia 自绘置顶弹窗，锚点取组合屏幕坐标（只读编辑会话内 GetTextExt），默认正下方、放不下翻上方、水平防越界（2026-08-23 实机验收通过）
 - [x] 候选窗分页（9→27 候选，`-`/`=` 与 PageUp/PageDown 翻页、页码脚）与主题/皮肤（light/dark 预设 + 逐项覆盖、圆角、配置热更新）（2026-08-23）
 - [x] librime-sys spike（Windows）：预编译 rime.dll FFI 验证——拼音 luna_pinyin + 五笔 wubi86
-  跑通（octagram 数据未捆绑，另配后再评估）；daemon 集成（引擎开关）待下一批
+  跑通（octagram 数据未捆绑，另配后再评估）（2026-08-23）
+- [x] librime daemon 集成：`verba-librime` crate（动态加载 rime.dll，拼音/五笔候选）+ IPC
+  `RimeCandidates` + `config 引擎=builtin|rime` + `rime_schema`（luna_pinyin_simp/wubi86）；
+  CLI `verba-cli rime` 端到端验证通过（你是谁/你好），前端 engine=rime 时请求并融合 rime 候选
+  （2026-08-23，待实机验收）
 - [x] 候选融合（词库候选 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`；
   拼音态停顿 320ms 后请求，增量合并去重、按拼音校验过期结果；mock 端到端冒烟通过，
   待实机验收）（2026-08-23）

@@ -2218,6 +2218,7 @@ dependencies = [
  "verba-config",
  "verba-core",
  "verba-ipc",
+ "verba-librime",
  "verba-protos",
 ]
 
@@ -2233,6 +2234,14 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "verba-protos",
+]
+
+[[package]]
+name = "verba-librime"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

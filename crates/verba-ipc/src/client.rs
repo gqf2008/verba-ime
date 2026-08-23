@@ -21,7 +21,8 @@ use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream as Lo
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
-    request, response, LlmCancel, LlmCandidates, LlmGenerate, Ping, Request, Response, StreamEvent,
+    request, response, stream_event, LlmCancel, LlmCandidates, LlmGenerate, Ping, Request,
+    Response, RimeCandidates, StreamEvent,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -176,6 +177,70 @@ impl VerbaClient {
                     self.pending_events.push_back(evt);
                 }
                 continue;
+            }
+            return Err(IpcError::Protocol("无法解码响应".into()));
+        }
+    }
+
+    /// 查询 Rime 引擎候选（config 引擎=rime）：同步返回候选列表（一个
+    /// `Candidates` 事件，`done=true` 结束）。
+    pub fn rime_candidates(
+        &mut self,
+        input: &str,
+        schema: &str,
+        max_candidates: i32,
+    ) -> Result<Vec<String>, IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::RimeCandidates(RimeCandidates {
+                input: input.to_owned(),
+                schema: schema.to_owned(),
+                max_candidates,
+            })),
+        };
+        self.write_request(&req)?;
+        let mut out = Vec::new();
+        loop {
+            let frame = self.read_frame_blocking()?;
+            // 事件帧优先：protobuf 宽松解码下，Candidates 事件可能被 Response::decode
+            // 误判为 field 5 的 Text（同为 length-delimited message）。
+            if let Ok(evt) = StreamEvent::decode(frame.as_slice()) {
+                if evt.id != id {
+                    self.pending_events.push_back(evt);
+                    continue;
+                }
+                match evt.kind {
+                    Some(stream_event::Kind::Candidates(c)) => {
+                        out.extend(c.candidates);
+                        if c.done {
+                            return Ok(out);
+                        }
+                    }
+                    Some(stream_event::Kind::Error(e)) => {
+                        return Err(IpcError::Server {
+                            code: e.code,
+                            message: e.message,
+                        });
+                    }
+                    // Ok 响应在 StreamEvent 宽松解码下表现为空 Final，忽略继续读。
+                    _ => continue,
+                }
+            }
+            if let Ok(resp) = Response::decode(frame.as_slice()) {
+                if resp.id != id {
+                    return Err(IpcError::Protocol("响应 id 不匹配".into()));
+                }
+                match resp.kind {
+                    Some(response::Kind::Ok(_)) => continue,
+                    Some(response::Kind::Error(e)) => {
+                        return Err(IpcError::Server {
+                            code: e.code,
+                            message: e.message,
+                        });
+                    }
+                    _ => return Err(IpcError::Protocol("期望 Ok 响应".into())),
+                }
             }
             return Err(IpcError::Protocol("无法解码响应".into()));
         }

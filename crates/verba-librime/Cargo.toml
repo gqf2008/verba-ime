@@ -1,0 +1,15 @@
+[package]
+name = "verba-librime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "可选中文引擎（Rime）：daemon 内动态加载 rime.dll（Windows），其他平台 stub"
+
+# 本 crate 需要 FFI 动态加载，仅此处放开 unsafe（其余 crate 维持 workspace forbid）
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
