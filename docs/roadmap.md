@@ -40,9 +40,11 @@
 
 ## M2 详细任务（macOS / Linux）
 
-- [ ] macOS IMK 前端（Swift 薄壳 + IPC，Unix Socket）
-- [ ] Linux Fcitx5 插件（C++ shim + Rust 核心）
-- [ ] Linux IBus / Wayland 兼容（imekit 评估）
+- [x] **共享 Rust 核心跨平台验证**（2026-08-23：CI check 矩阵 windows/macos/ubuntu 建设与测试共享核心（crates + apps/settings）；Rust 核心仅有 Windows 额外 crate 用 `cfg(windows)` 隔离，本质可跨平台。
+- [x] **macOS IMK 前端骨架（Rust 工程壳）**（2026-08-23：`frontends/macos/ime`，跨平台依赖 verba-core/ipc，`MacIme::connect`/`ping` + `#[cfg(target_os=macos)] init_imk` 占位，CI `frontend-macos` 在 macos-latest 构建验证）
+- [ ] macOS IMK 薄壳（Swift/ObjC 接 InputMethodKit）：需 macOS 真机、待接入
+- [ ] Linux Fcitx5 插件（C++ shim + Rust 核心）—— **低优先（用户确认）**
+- [ ] Linux IBus / Wayland 兼容（imekit 评估）—— 低优先
 - [ ] 三端功能对齐矩阵 + 各端手动验收清单
 
 ## M3 详细任务（多模态）

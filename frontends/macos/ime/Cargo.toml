@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "verba-ime-macos"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Verba macOS IMK 前端（Rust 引擎壳）：连接 daemon + 复用 verba-core 状态机"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "verba-mac"
+path = "src/main.rs"
+
+[dependencies]
+verba-core = { path = "../../../crates/verba-core" }
+verba-ipc = { path = "../../../crates/verba-ipc" }
+verba-protos = { path = "../../../crates/verba-protos" }
+verba-config = { path = "../../../crates/verba-config" }
+log = { version = "0.4", features = ["std"] }
