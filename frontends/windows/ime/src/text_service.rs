@@ -653,11 +653,8 @@ fn reload_candidate_config(data: &Rc<TextServiceData>) {
             *data.candidate_theme.borrow_mut() = theme;
             *data.candidate_engine.borrow_mut() = engine.clone();
             *data.candidate_rime_schema.borrow_mut() = schema.clone();
-            // engine=rime 时抑制内置词库候选：词库候选全部来自 daemon 的 Rime，
-            // 避免长句被内置引擎（整句弱）的候选污染候选窗。
-            if let Ok(mut machine) = data.machine.try_borrow_mut() {
-                machine.set_dictionary_enabled(engine != "rime");
-            }
+            // 始终启用内置词库候选：打字立刻有即时反馈，rime 融合作为追加增强。
+            // （勿按 engine 关闭内置——会导致候选窗在 rime 查询返回前一直空白，体验差。）
             log::info!("候选配置已加载（engine={engine} schema={schema}）");
         }
         Err(e) => log::warn!("候选配置加载失败: {e}"),
