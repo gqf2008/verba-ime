@@ -1,0 +1,144 @@
+import { Button, ComboBox, GroupBox, LineEdit, ScrollView, TextEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component SettingsWindow inherits Window {
+    title: "Verba · 拾言输入法 — 设置";
+    width: 800px;
+    height: 680px;
+
+    // ---------- 状态 ----------
+    in-out property <string> status-text: "正在连接 daemon…";
+    in-out property <string> version-text: "";
+
+    // ---------- LLM（远程） ----------
+    in-out property <string> llm-base-url;
+    in-out property <string> llm-model;
+    in-out property <string> temperature;
+    in-out property <string> max-tokens;
+    in-out property <string> ai-system-prompt;
+    in-out property <string> api-key-state: "未设置";
+    in-out property <string> api-key-input: "";
+
+    // ---------- 多模态 ----------
+    in-out property <int> ocr-provider-index: 0;
+    in-out property <int> asr-provider-index: 0;
+    in-out property <string> asr-base-url;
+    in-out property <string> asr-model;
+    in-out property <int> tts-provider-index: 0;
+    in-out property <string> tts-base-url;
+    in-out property <string> tts-model;
+    in-out property <string> tts-voice;
+
+    // ---------- 引擎 / 候选 ----------
+    in-out property <int> engine-index: 0;
+    in-out property <string> rime-schema;
+    in-out property <int> theme-index: 0;
+
+    // ---------- 回调 ----------
+    callback save();
+    callback refresh();
+    callback set-api-key(string);
+    callback clear-api-key();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalBox {
+            alignment: space-between;
+            HorizontalBox {
+                spacing: 8px;
+                Text { text: "Verba · 拾言输入法"; font-size: 18px; font-weight: 700; }
+                Text { text: version-text; color: #888888; vertical-alignment: center; }
+            }
+            Button { text: "重新加载"; clicked => { root.refresh(); } }
+        }
+
+        ScrollView {
+            VerticalBox {
+                spacing: 12px;
+                padding: 2px;
+
+                GroupBox {
+                    title: "LLM（远程，统一 OpenAI 兼容接口）";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        HorizontalBox { spacing: 8px; Text { text: "Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-base-url; placeholder-text: "https://api.deepseek.com/v1"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-model; placeholder-text: "deepseek-chat"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "温度"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.temperature; placeholder-text: "0.7"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "最大 Tokens"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.max-tokens; placeholder-text: "1024"; } }
+                        Text { text: "AI 系统提示词"; }
+                        TextEdit { text <=> root.ai-system-prompt; height: 64px; placeholder-text: "留空使用默认：输入法 AI 助手，回答简洁、可上屏，不用 Markdown"; }
+                        Text { text: "API Key"; }
+                        LineEdit { text <=> root.api-key-input; input-type: InputType.password; placeholder-text: "输入新密钥后点「保存密钥」（留空不修改）"; }
+                        HorizontalBox {
+                            alignment: space-between;
+                            Text { text: api-key-state; vertical-alignment: center; color: #666666; }
+                            HorizontalBox {
+                                spacing: 8px;
+                                Button { text: "保存密钥"; clicked => { root.set-api-key(root.api-key-input); } }
+                                Button { text: "清除密钥"; clicked => { root.clear-api-key(); } }
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "多模态（OCR / ASR / TTS）";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        HorizontalBox { spacing: 8px; Text { text: "OCR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "windows（Windows 本地识别）"]; current-index <=> root.ocr-provider-index; } }
+                        HorizontalBox { spacing: 8px; Text { text: "ASR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "openai（在线转写）"]; current-index <=> root.asr-provider-index; } }
+                        HorizontalBox { spacing: 8px; Text { text: "ASR Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "ASR 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-model; placeholder-text: "whisper-1"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "TTS"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "edge（微软在线音色）", "openai（OpenAI 兼容音色）"]; current-index <=> root.tts-provider-index; } }
+                        HorizontalBox { spacing: 8px; Text { text: "TTS Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "TTS 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-model; placeholder-text: "tts-1"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "TTS 音色"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-voice; placeholder-text: "edge: zh-CN-XiaoxiaoNeural / openai: alloy"; } }
+                    }
+                }
+
+                GroupBox {
+                    title: "中文引擎 / 候选窗";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        HorizontalBox { spacing: 8px; Text { text: "中文引擎"; width: 130px; vertical-alignment: center; } ComboBox { model: ["builtin（内置拼音）", "rime（Rime 引擎，需部署 rime/）"]; current-index <=> root.engine-index; } }
+                        HorizontalBox { spacing: 8px; Text { text: "Rime 方案"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.rime-schema; placeholder-text: "luna_pinyin_simp / wubi86"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "候选窗主题"; width: 130px; vertical-alignment: center; } ComboBox { model: ["light（浅色）", "dark（深色）"]; current-index <=> root.theme-index; } }
+                    }
+                }
+
+                GroupBox {
+                    title: "快捷键（当前内置，后续可配置）";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 4px;
+                        Text { text: "Ctrl+Alt+O：选区截图 → OCR 上屏"; }
+                        Text { text: "Ctrl+Alt+M：录音 → ASR 听写上屏"; }
+                        Text { text: "//朗读 文本   //截图   //听写"; }
+                        Text { text: "// 前缀进入 AI 模式（LLM 流式，Enter 上屏）"; }
+                    }
+                }
+
+                GroupBox {
+                    title: "隐私与说明";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 4px;
+                        Text { text: "LLM / 在线 ASR / 在线 TTS 会把文本或音频发送到你配置的远程服务商。"; wrap: word-wrap; }
+                        Text { text: "API Key 存入系统密钥库（keyring），config.toml 不保存明文。"; wrap: word-wrap; }
+                        Text { text: "mock / windows OCR 等本地 provider 不联网。"; wrap: word-wrap; }
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            alignment: space-between;
+            Text { text: status-text; vertical-alignment: center; color: #666666; }
+            Button { text: "保存设置"; primary: true; clicked => { root.save(); } }
+        }
+    }
+}

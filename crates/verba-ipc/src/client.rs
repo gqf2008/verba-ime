@@ -21,8 +21,8 @@ use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream as Lo
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
-    request, response, stream_event, AsrTranscribe, LlmCancel, LlmCandidates, LlmGenerate,
-    OcrRecognize, Ping, Request, Response, RimeCandidates, StreamEvent, TtsSynthesize,
+    request, response, stream_event, ApiKeySet, AsrTranscribe, LlmCancel, LlmCandidates,
+    LlmGenerate, OcrRecognize, Ping, Request, Response, RimeCandidates, StreamEvent, TtsSynthesize,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -420,6 +420,27 @@ impl VerbaClient {
                 message: e.message,
             }),
             _ => Err(IpcError::Protocol("期望 Text 响应".into())),
+        }
+    }
+
+    /// 设置/清除 API Key（空字符串 = 删除）：写系统密钥库并热更新 daemon 内存，
+    /// 无需重启 daemon 即可让 LLM / 在线 ASR / 在线 TTS 生效。
+    pub fn set_api_key(&mut self, key: &str) -> Result<(), IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::ApiKeySet(ApiKeySet {
+                key: key.to_owned(),
+            })),
+        };
+        let resp = self.request(req)?;
+        match resp.kind {
+            Some(response::Kind::Ok(_)) => Ok(()),
+            Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                code: e.code,
+                message: e.message,
+            }),
+            _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
         }
     }
 

@@ -30,6 +30,7 @@ fn main() {
         Some("tts") => cmd_tts(&args),
         Some("ocr") => cmd_ocr(&args),
         Some("asr") => cmd_asr(&args),
+        Some("key") => cmd_key(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -53,6 +54,7 @@ fn print_help() {
          verba-cli tts <文本> [输出] [语音]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
          verba-cli asr <音频>          ASR 转写音频并打印文字（config asr_provider）\n  \
+         verba-cli key [值]             查看/设置/清除 API Key（值省略查看；clear 清除）\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -244,6 +246,47 @@ fn cmd_asr(args: &[String]) -> i32 {
         println!("{text}");
         Ok(())
     })
+}
+
+/// `verba-cli key [值]`：查看/设置/清除 API Key。
+/// - 无参：打印当前密钥状态（不泄露明文，掩码末 4 位）。
+/// - `clear`：清除密钥（经 daemon 写密钥库 + 热更新内存）。
+/// - 其它值：设置密钥（经 daemon，同设置面板路径）。
+fn cmd_key(args: &[String]) -> i32 {
+    match args.get(1).map(String::as_str) {
+        None => match verba_config::ApiKeyStore::get() {
+            Ok(Some(k)) if !k.is_empty() => {
+                let tail: String = k
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                println!("已设置（…{tail}）");
+                0
+            }
+            Ok(_) => {
+                println!("未设置（可用 VERBA_API_KEY 环境变量）");
+                0
+            }
+            Err(e) => {
+                eprintln!("密钥读取失败: {e}");
+                1
+            }
+        },
+        Some("clear") => with_client(|c| {
+            c.set_api_key("")?;
+            println!("密钥已清除");
+            Ok(())
+        }),
+        Some(value) => with_client(|c| {
+            c.set_api_key(value)?;
+            println!("密钥已设置");
+            Ok(())
+        }),
+    }
 }
 
 fn cmd_config(args: &[String]) -> i32 {

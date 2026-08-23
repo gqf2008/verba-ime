@@ -1,0 +1,26 @@
+[package]
+name = "verba-settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba 设置面板（Slint 1.17 跨平台桌面 UI）"
+
+[lints.rust]
+unsafe_code = "deny"
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# 说明：Slint 生成代码带 #[allow(unsafe_code)]，与工作区 forbid 冲突，故本 crate 不继承工作区 lints。
+
+[dependencies]
+slint = "=1.17.1"
+verba-ipc = { path = "../../crates/verba-ipc" }
+verba-config = { path = "../../crates/verba-config" }
+verba-core = { path = "../../crates/verba-core" }
+log.workspace = true
+env_logger.workspace = true
+
+[build-dependencies]
+slint-build = "=1.17.1"
+

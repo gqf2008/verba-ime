@@ -23,6 +23,7 @@ message Request {
     TtsSynthesize tts_synthesize = 24;
     OcrRecognize ocr_recognize = 25;
     AsrTranscribe asr_transcribe = 26;
+    ApiKeySet api_key_set = 27;
   }
 }
 
@@ -113,9 +114,15 @@ message OcrRecognize {
   bytes image = 1;
 }
 
-// ASR（语音 → 文字）：provider 由 config asr_provider 决定（mock|whisper…）。
+// ASR（语音 → 文字）：provider 由 config asr_provider 决定（mock|openai…）。
 message AsrTranscribe {
   bytes audio = 1;
+}
+
+// 设置/清除 API Key（空字符串 = 删除）：写系统密钥库并热更新 daemon 内存，
+// 无需重启 daemon 即可让 LLM / 在线 ASR / 在线 TTS 生效。
+message ApiKeySet {
+  string key = 1;
 }
 
 // ---------- 流式事件（服务端 -> 客户端，按请求 id 关联） ----------

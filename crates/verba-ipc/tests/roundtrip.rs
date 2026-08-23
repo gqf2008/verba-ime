@@ -81,6 +81,14 @@ impl RequestHandler for TestHandler {
                     })
                     .await;
             }
+            Some(request::Kind::ApiKeySet(_)) => {
+                let _ = out
+                    .response(&Response {
+                        id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+            }
             _ => {
                 let _ = out
                     .response(&Response {
@@ -137,6 +145,22 @@ async fn llm_stream_roundtrip() {
         }
     }
     assert_eq!(parts, ["你", "好", "世界"]);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_set_roundtrip() {
+    let name = unique_name("apikey");
+    let handler = Arc::new(TestHandler);
+    let server_name = name.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(&server_name, handler).await;
+    });
+
+    let mut client = connect_with_retry(&name, Duration::from_secs(5));
+    client.set_api_key("sk-test").expect("set_api_key 成功");
+    client.set_api_key("").expect("set_api_key 清空成功");
     server.abort();
     let _ = server.await;
 }
