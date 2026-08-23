@@ -77,6 +77,8 @@
 - [x] 候选窗口样式与交互（分页、主题、皮肤）（随 M5 完成，2026-08-23 实机验收）
 - [x] Slint 1.17 设置面板（`apps/settings`：LLM/多模态/引擎/快捷键/隐私，GetConfig/SetConfig/ApiKeySet IPC 热生效；2026-08-23）
 - [ ] 性能与内存预算达标（见 architecture §8）
+- [x] AI 模式多轮上下文（2026-08-23：`ai_context_turns` + LlmRequest.history + daemon 会话历史 + `//重置` 清空 + 设置面板可配；端到端验证第2轮携带历史）
+- [x] 诊断与日志（2026-08-23：daemon 写 `data/logs/verba-daemon.log`；`verba-cli diag` 输出健康/关键配置/日志尾/相关进程/rapid 就绪状态）
 - [ ] 日志脱敏与崩溃上报（本地）
 
 ## M5 详细任务（中文引擎）

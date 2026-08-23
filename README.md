@@ -4,7 +4,7 @@
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
 > 项目状态：**M1/M5 已实机验收**（Windows TSF + LLM 直输 + 中文引擎：Rime/候选窗/融合）；
-> 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock/edge-tts + OCR mock/Windows.Media.Ocr/rapid（RapidOCR）+ ASR mock/openai 已端到端通；新增「眼睛」——`//` 指令自动捕捉光标上方屏幕，OCR 或多模态 vision 喂给 LLM。Piper/whisper.cpp 跟进）。
+> 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock/edge-tts + OCR mock/Windows.Media.Ocr/rapid（RapidOCR） + ASR mock/openai 已端到端通；「眼睛」——`//` 指令自动捕捉光标上方屏幕，OCR 或多模态 vision 喂给 LLM；AI 模式支持多轮上下文（`//重置` 清空）。`verba-cli diag` 一键诊断（健康/配置/日志尾/进程）。Piper/whisper.cpp 跟进）。
 > 见 [Windows 手动验收清单](docs/manual-acceptance-windows.md) 与 [路线图](docs/roadmap.md)。
 
 ---
@@ -26,7 +26,7 @@ Verba 的目标是成为三个平台上的「统一输入入口」：**任何表
 | --- | --- |
 | 🖼️ OCR | 截图选区域 / 剪贴板图片 / 图片文件 → 文字上屏；`//看图` / 眼睛 vision 直接把屏幕区域交给多模态 LLM 理解与提取 |
 | 🎙️ ASR | 全局快捷键唤起语音输入 → 实时转写 → 上屏 |
-| 🤖 LLM（远程） | 输入法内 AI 模式：翻译、润色、续写、总结、自定义 Prompt，流式输出 |
+| 🤖 LLM（远程） | 输入法内 AI 模式：翻译、润色、续写、总结、自定义 Prompt，流式输出；多轮上下文（`ai_context_turns`，`//重置` 清空） |
 | 🔊 TTS | 朗读选中文本 / 候选词，可配置上屏自动朗读 |
 | ⌨️ 输入 | 英文直输 + 标点 + 快捷指令；中文拼音引擎列入路线图（可选集成 librime） |
 | ⚙️ 配置 | 统一设置面板（Slint 跨平台），AI 服务商可插拔，密钥系统密钥库安全存储 |
