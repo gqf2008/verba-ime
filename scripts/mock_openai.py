@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Mock OpenAI 兼容 SSE 服务，用于本地开发/冒烟测试。
+"""Mock OpenAI 兼容服务，用于本地开发/冒烟测试。
 
 用法: python mock_openai.py [port]   （默认 8765）
-POST /v1/chat/completions 返回流式 SSE（带简单 echo 逻辑）。
+- POST /v1/chat/completions：流式 SSE（候选融合按「拼音：」提示词返回候选行）
+- POST /v1/audio/transcriptions：在线 ASR 识别文本
+- POST /v1/audio/speech：在线 TTS MP3 字节
 """
 import json
 import sys
@@ -22,6 +24,32 @@ CANDIDATES = [
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        # 在线 ASR：POST /v1/audio/transcriptions（multipart），返回识别文本。
+        if self.path.endswith("/audio/transcriptions"):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)  # 消费 multipart body
+            payload = json.dumps(
+                {"text": "你好世界，我是 Mock ASR"}, ensure_ascii=False
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        # 在线 TTS：POST /v1/audio/speech（JSON），返回 MP3 字节。
+        if self.path.endswith("/audio/speech"):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)  # 消费 JSON body
+            audio = b"ID3\x04" + b"mock-tts-mp3" * 16
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio)))
+            self.end_headers()
+            self.wfile.write(audio)
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8", "replace")
         self.send_response(200)

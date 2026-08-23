@@ -105,8 +105,28 @@ try {
     Remove-Item -LiteralPath $asrAudio -Force -ErrorAction SilentlyContinue
     Write-Output "asr <wav> -> mock 文本 OK（$asrText）"
 
-    & $cli config set rime_schema=luna_pinyin_simp | Out-Null
-    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock + ocr_provider=mock + asr_provider=mock）"
+
+    Write-Output "==== 9) 在线 ASR（openai provider，指向本地 mock 端点） ===="
+    & $cli config set asr_provider=openai asr_base_url=http://127.0.0.1:$mockPort/v1 asr_model=whisper-1 | Out-Null
+    $asrOnlineWav = Join-Path $env:TEMP "verba-asr-online.wav"
+    Set-Content -LiteralPath $asrOnlineWav -Value "fake-wav-bytes" -Encoding Ascii
+    $asrOnline = & $cli asr $asrOnlineWav
+    if ($asrOnline -notmatch "Mock ASR") { throw "在线 ASR 未返回预期文本: $asrOnline" }
+    Remove-Item -LiteralPath $asrOnlineWav -Force -ErrorAction SilentlyContinue
+    Write-Output "asr(openai) -> $asrOnline OK"
+
+    Write-Output "==== 10) 在线 TTS（openai provider，指向本地 mock 端点） ===="
+    & $cli config set tts_provider=openai tts_base_url=http://127.0.0.1:$mockPort/v1 tts_model=tts-1 tts_voice=alloy | Out-Null
+    $ttsOnline = Join-Path $env:TEMP "verba-tts-online.mp3"
+    & $cli tts "你好" $ttsOnline | Out-Null
+    $obytes = [System.IO.File]::ReadAllBytes($ttsOnline)
+    $omagic = [System.Text.Encoding]::ASCII.GetString($obytes[0..3])
+    if ($omagic -ne "ID3") { throw "在线 TTS 输出非 MP3（$omagic）" }
+    Remove-Item -LiteralPath $ttsOnline -Force -ErrorAction SilentlyContinue
+    Write-Output "tts(openai) -> MP3 OK（$($obytes.Length) bytes）"
+
+    & $cli config set rime_schema=luna_pinyin_simp tts_provider=mock ocr_provider=mock asr_provider=mock tts_base_url= tts_voice= asr_base_url= | Out-Null
+    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts/ocr/asr=mock + 在线端点清空）"
 }
 finally {
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
