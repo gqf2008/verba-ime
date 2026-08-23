@@ -40,6 +40,21 @@ pub struct Theme {
     /// horizontal 布局的窗口最大宽度。
     #[serde(default = "default_max_width_horizontal")]
     pub max_width_horizontal: u32,
+    /// 候选块内左右留白（horizontal）。
+    #[serde(default = "default_item_padding")]
+    pub item_padding: u32,
+    /// 页码脚高度（仅多页时占用）。
+    #[serde(default = "default_footer_height")]
+    pub footer_height: u32,
+    /// 拼音组合头文字色（如 `#888888`）。
+    #[serde(default = "default_header_text_color")]
+    pub header_text_color: String,
+    /// 分隔线颜色（拼音头/页码脚下）。
+    #[serde(default = "default_separator_color")]
+    pub separator_color: String,
+    /// 弱化文字色（页码脚）。
+    #[serde(default = "default_muted_color")]
+    pub muted_color: String,
 }
 
 fn default_corner_radius() -> u32 {
@@ -60,6 +75,21 @@ fn default_gap() -> u32 {
 fn default_max_width_horizontal() -> u32 {
     560
 }
+fn default_item_padding() -> u32 {
+    4
+}
+fn default_footer_height() -> u32 {
+    18
+}
+fn default_header_text_color() -> String {
+    "#888888".to_owned()
+}
+fn default_separator_color() -> String {
+    "#E0E0E0".to_owned()
+}
+fn default_muted_color() -> String {
+    "#888888".to_owned()
+}
 impl Default for Theme {
     fn default() -> Self {
         Self {
@@ -79,6 +109,11 @@ impl Default for Theme {
             header_height: default_header_height(),
             gap: default_gap(),
             max_width_horizontal: default_max_width_horizontal(),
+            item_padding: default_item_padding(),
+            footer_height: default_footer_height(),
+            header_text_color: default_header_text_color(),
+            separator_color: default_separator_color(),
+            muted_color: default_muted_color(),
         }
     }
 }
@@ -103,6 +138,11 @@ impl Theme {
             header_height: default_header_height(),
             gap: default_gap(),
             max_width_horizontal: default_max_width_horizontal(),
+            item_padding: default_item_padding(),
+            footer_height: default_footer_height(),
+            header_text_color: default_header_text_color(),
+            separator_color: default_separator_color(),
+            muted_color: default_muted_color(),
         }
     }
 }

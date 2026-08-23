@@ -13,11 +13,6 @@ use tiny_skia::{Color, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke};
 
 use crate::{CandidateWindowController, Theme};
 
-/// 分页页码脚高度（仅多页时占用）。
-const FOOTER_HEIGHT: u32 = 18;
-/// 候选块内左右留白（horizontal）。
-const ITEM_PAD: u32 = 4;
-
 /// 渲染结果：RGBA（预乘）像素缓冲。
 pub struct RenderedCandidateWindow {
     pub width: u32,
@@ -65,7 +60,7 @@ impl CpuCandidateRenderer {
 
     fn footer_height(ctrl: &CandidateWindowController) -> u32 {
         if ctrl.total_pages() > 1 {
-            FOOTER_HEIGHT
+            ctrl.theme().footer_height
         } else {
             0
         }
@@ -126,7 +121,8 @@ impl CpuCandidateRenderer {
             return;
         }
         let theme = ctrl.theme();
-        let muted = Color::from_rgba8(0x88, 0x88, 0x88, 0xFF);
+        let muted =
+            parse_color(&theme.muted_color).unwrap_or(Color::from_rgba8(0x88, 0x88, 0x88, 0xFF));
         let size = theme.font_size as f32;
         let ty = (header_h as f32 - size * 1.3) / 2.0;
         self.draw_text(
@@ -138,7 +134,10 @@ impl CpuCandidateRenderer {
             size,
         );
         let mut line_paint = Paint::default();
-        line_paint.set_color(Color::from_rgba8(0xE0, 0xE0, 0xE0, 0xFF));
+        line_paint.set_color(
+            parse_color(&theme.separator_color)
+                .unwrap_or(Color::from_rgba8(0xE0, 0xE0, 0xE0, 0xFF)),
+        );
         if let Some(r) = tiny_skia::Rect::from_xywh(1.0, header_h as f32, width as f32 - 2.0, 1.0) {
             pixmap.fill_rect(r, &line_paint, tiny_skia::Transform::identity(), None);
         }
@@ -154,7 +153,8 @@ impl CpuCandidateRenderer {
         footer_h: u32,
     ) {
         let theme = ctrl.theme();
-        let muted = Color::from_rgba8(0x88, 0x88, 0x88, 0xFF);
+        let muted =
+            parse_color(&theme.muted_color).unwrap_or(Color::from_rgba8(0x88, 0x88, 0x88, 0xFF));
         let mut line_paint = Paint::default();
         line_paint.set_color(muted);
         if let Some(r) = tiny_skia::Rect::from_xywh(1.0, y, width as f32 - 2.0, 1.0) {
@@ -168,7 +168,6 @@ impl CpuCandidateRenderer {
         self.draw_text(pixmap, &page_label, x, ty, muted, size);
     }
 
-    /// horizontal：拼音头 + 横向候选行 + 页码脚（微软拼音/手心风格）。
     /// horizontal：拼音头 + 横向候选行 + 页码脚（微软拼音/手心风格）。
     fn render_horizontal(&mut self, ctrl: &CandidateWindowController) -> RenderedCandidateWindow {
         let theme = ctrl.theme();
@@ -198,7 +197,7 @@ impl CpuCandidateRenderer {
         for (idx, text) in items.iter().enumerate() {
             let is_selected = ctrl.selected_index() == Some(idx);
             let tw = self.text_width(text, font_size);
-            let block_w = tw + ITEM_PAD as f32 * 2.0;
+            let block_w = tw + theme.item_padding as f32 * 2.0;
             if x + block_w > limit {
                 self.draw_text(&mut pixmap, "…", x + 4.0, line_top, text_fg, font_size);
                 break;
@@ -227,7 +226,7 @@ impl CpuCandidateRenderer {
             self.draw_text(
                 &mut pixmap,
                 text,
-                x + ITEM_PAD as f32,
+                x + theme.item_padding as f32,
                 line_top,
                 c,
                 font_size,
@@ -442,7 +441,7 @@ pub fn window_size(ctrl: &CandidateWindowController) -> (u32, u32) {
         0
     };
     let footer = if ctrl.total_pages() > 1 {
-        FOOTER_HEIGHT
+        ctrl.theme().footer_height
     } else {
         0
     };

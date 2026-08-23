@@ -78,6 +78,21 @@ pub struct ThemeConfig {
     /// horizontal 窗口最大宽度（px）。
     #[serde(default)]
     pub max_width_horizontal: Option<u32>,
+    /// 候选块内左右留白（horizontal，px）。
+    #[serde(default)]
+    pub item_padding: Option<u32>,
+    /// 页码脚高度（多页时，px）。
+    #[serde(default)]
+    pub footer_height: Option<u32>,
+    /// 拼音组合头文字色（`#RRGGBB`）。
+    #[serde(default)]
+    pub header_text_color: Option<String>,
+    /// 分隔线颜色（`#RRGGBB`）。
+    #[serde(default)]
+    pub separator_color: Option<String>,
+    /// 弱化文字色（页码脚，`#RRGGBB`）。
+    #[serde(default)]
+    pub muted_color: Option<String>,
 }
 
 fn default_theme_preset() -> String {
@@ -100,6 +115,11 @@ impl Default for ThemeConfig {
             header_height: None,
             gap: None,
             max_width_horizontal: None,
+            item_padding: None,
+            footer_height: None,
+            header_text_color: None,
+            separator_color: None,
+            muted_color: None,
         }
     }
 }
@@ -146,6 +166,21 @@ impl ThemeConfig {
         }
         if let Some(v) = self.max_width_horizontal {
             t.max_width_horizontal = v;
+        }
+        if let Some(v) = self.item_padding {
+            t.item_padding = v;
+        }
+        if let Some(v) = self.footer_height {
+            t.footer_height = v;
+        }
+        if let Some(v) = &self.header_text_color {
+            t.header_text_color = v.clone();
+        }
+        if let Some(v) = &self.separator_color {
+            t.separator_color = v.clone();
+        }
+        if let Some(v) = &self.muted_color {
+            t.muted_color = v.clone();
         }
         t
     }
@@ -318,6 +353,21 @@ impl Config {
         if let Some(v) = self.theme.max_width_horizontal {
             map.insert("theme.max_width_horizontal".into(), v.to_string());
         }
+        if let Some(v) = self.theme.item_padding {
+            map.insert("theme.item_padding".into(), v.to_string());
+        }
+        if let Some(v) = self.theme.footer_height {
+            map.insert("theme.footer_height".into(), v.to_string());
+        }
+        if let Some(v) = &self.theme.header_text_color {
+            map.insert("theme.header_text_color".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.separator_color {
+            map.insert("theme.separator_color".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.muted_color {
+            map.insert("theme.muted_color".into(), v.clone());
+        }
         map
     }
 
@@ -419,6 +469,21 @@ impl Config {
                             .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
                     );
                 }
+                "theme.item_padding" => {
+                    self.theme.item_padding = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.footer_height" => {
+                    self.theme.footer_height = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.header_text_color" => self.theme.header_text_color = Some(v.clone()),
+                "theme.separator_color" => self.theme.separator_color = Some(v.clone()),
+                "theme.muted_color" => self.theme.muted_color = Some(v.clone()),
                 other => return Err(ConfigError::UnknownKey(other.to_owned())),
             }
         }
@@ -593,12 +658,22 @@ mod tests {
         map.insert("theme.header_height".into(), "26".into());
         map.insert("theme.gap".into(), "12".into());
         map.insert("theme.max_width_horizontal".into(), "600".into());
+        map.insert("theme.item_padding".into(), "6".into());
+        map.insert("theme.footer_height".into(), "20".into());
+        map.insert("theme.header_text_color".into(), "#777777".into());
+        map.insert("theme.separator_color".into(), "#DADADA".into());
+        map.insert("theme.muted_color".into(), "#999999".into());
         cfg.apply_map(&map).unwrap();
         assert_eq!(cfg.theme.layout.as_deref(), Some("horizontal"));
         assert_eq!(cfg.theme.show_preedit, Some(true));
         assert_eq!(cfg.theme.header_height, Some(26));
         assert_eq!(cfg.theme.gap, Some(12));
         assert_eq!(cfg.theme.max_width_horizontal, Some(600));
+        assert_eq!(cfg.theme.item_padding, Some(6));
+        assert_eq!(cfg.theme.footer_height, Some(20));
+        assert_eq!(cfg.theme.header_text_color.as_deref(), Some("#777777"));
+        assert_eq!(cfg.theme.separator_color.as_deref(), Some("#DADADA"));
+        assert_eq!(cfg.theme.muted_color.as_deref(), Some("#999999"));
         let out = cfg.to_map();
         assert_eq!(
             out.get("theme.layout").map(String::as_str),
@@ -618,6 +693,11 @@ mod tests {
         assert_eq!(cand.header_height, 26);
         assert_eq!(cand.gap, 12);
         assert_eq!(cand.max_width_horizontal, 600);
+        assert_eq!(cand.item_padding, 6);
+        assert_eq!(cand.footer_height, 20);
+        assert_eq!(cand.header_text_color, "#777777");
+        assert_eq!(cand.separator_color, "#DADADA");
+        assert_eq!(cand.muted_color, "#999999");
     }
 
     #[test]
