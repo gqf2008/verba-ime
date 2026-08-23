@@ -617,7 +617,7 @@ pub fn apply_action(
                 return Ok(());
             }
             let kind = if cmd == "截图" {
-                Some(TriggerKind::Ocr)
+                Some(TriggerKind::OcrFullScreen)
             } else if cmd == "听写" {
                 Some(TriggerKind::Asr)
             } else {
@@ -1170,8 +1170,10 @@ fn trigger_kind_for_vk(vk: u32) -> Option<TriggerKind> {
 /// 触发任务类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TriggerKind {
-    /// 截图 OCR。
+    /// 选区截图 OCR（Ctrl+Alt+O，交互拖选）。
     Ocr,
+    /// 全屏截图 OCR（`//截图`，无遴罩）。
+    OcrFullScreen,
     /// 录音 ASR。
     Asr,
 }
@@ -1189,6 +1191,7 @@ fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
                     ocr_full_screen()
                 }
             },
+            TriggerKind::OcrFullScreen => ocr_full_screen(),
             TriggerKind::Asr => {
                 let wav = match record_seconds(ASR_RECORD_SECONDS) {
                     Ok(w) => w,
