@@ -16,9 +16,7 @@ use crate::{CandidateWindowController, Theme};
 /// 分页页码脚高度（仅多页时占用）。
 const FOOTER_HEIGHT: u32 = 18;
 /// 候选块内左右留白（horizontal）。
-const ITEM_PAD: u32 = 6;
-/// 候选序号字号缩放（相对正文）。
-const NUM_SCALE: f32 = 0.72;
+const ITEM_PAD: u32 = 4;
 
 /// 渲染结果：RGBA（预乘）像素缓冲。
 pub struct RenderedCandidateWindow {
@@ -129,7 +127,7 @@ impl CpuCandidateRenderer {
         }
         let theme = ctrl.theme();
         let muted = Color::from_rgba8(0x88, 0x88, 0x88, 0xFF);
-        let size = (theme.font_size as f32 * 0.9).max(11.0);
+        let size = theme.font_size as f32;
         let ty = (header_h as f32 - size * 1.3) / 2.0;
         self.draw_text(
             pixmap,
@@ -171,6 +169,7 @@ impl CpuCandidateRenderer {
     }
 
     /// horizontal：拼音头 + 横向候选行 + 页码脚（微软拼音/手心风格）。
+    /// horizontal：拼音头 + 横向候选行 + 页码脚（微软拼音/手心风格）。
     fn render_horizontal(&mut self, ctrl: &CandidateWindowController) -> RenderedCandidateWindow {
         let theme = ctrl.theme();
         let items = ctrl.page_items();
@@ -192,25 +191,22 @@ impl CpuCandidateRenderer {
 
         let item_y = pad + header;
         let font_size = theme.font_size as f32;
-        let num_size = (font_size * NUM_SCALE).max(9.0);
         let line_top = item_y as f32 + (theme.item_height as f32 - font_size * 1.3) / 2.0;
         let mut x = pad as f32;
         let limit = width as f32 - pad as f32;
 
         for (idx, text) in items.iter().enumerate() {
             let is_selected = ctrl.selected_index() == Some(idx);
-            let label = format!("{}.", idx + 1);
-            let nw = self.text_width(&label, num_size);
             let tw = self.text_width(text, font_size);
-            let block_w = nw + tw + ITEM_PAD as f32 * 2.0;
+            let block_w = tw + ITEM_PAD as f32 * 2.0;
             if x + block_w > limit {
-                self.draw_text(&mut pixmap, "…", x, line_top, text_fg, font_size);
+                self.draw_text(&mut pixmap, "…", x + 4.0, line_top, text_fg, font_size);
                 break;
             }
             if is_selected {
                 let sel_r = (theme.corner_radius as f32).min(8.0);
                 if let Some(rect) = rounded_rect_path(
-                    x - ITEM_PAD as f32,
+                    x,
                     item_y as f32,
                     block_w,
                     theme.item_height as f32 - 1.0,
@@ -228,16 +224,14 @@ impl CpuCandidateRenderer {
                 }
             }
             let c = if is_selected { sel_fg } else { text_fg };
-            let num_alpha = if is_selected { 170 } else { 140 };
-            let num_c = Color::from_rgba8(
-                (c.red() * 255.0) as u8,
-                (c.green() * 255.0) as u8,
-                (c.blue() * 255.0) as u8,
-                num_alpha,
+            self.draw_text(
+                &mut pixmap,
+                text,
+                x + ITEM_PAD as f32,
+                line_top,
+                c,
+                font_size,
             );
-            let num_top = line_top + (font_size * 1.3 - num_size * 1.3) / 2.0;
-            self.draw_text(&mut pixmap, &label, x, num_top, num_c, num_size);
-            self.draw_text(&mut pixmap, text, x + nw, line_top, c, font_size);
             x += block_w + theme.gap as f32;
         }
 
@@ -353,7 +347,9 @@ impl CpuCandidateRenderer {
         buffer.set_size(&mut self.font_system, Some(pixmap.width() as f32), None);
         buffer.set_text(&mut self.font_system, text, Attrs::new(), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
-        for run in buffer.layout_runs() {
+        let runs: Vec<_> = buffer.layout_runs().collect();
+        let first_line_y = runs.first().map(|run| run.line_y).unwrap_or(0.0);
+        for run in &runs {
             for glyph in run.glyphs {
                 let pg = glyph.physical((0.0, 0.0), 1.0);
                 let Some(img) = self
@@ -382,7 +378,9 @@ impl CpuCandidateRenderer {
                     .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
                 }
                 let gx = (x + pg.x as f32 + img.placement.left as f32).round() as i32;
-                let gy = (y + run.line_y + pg.y as f32 + img.placement.top as f32).round() as i32;
+                let gy = (y + (run.line_y - first_line_y) + pg.y as f32 + img.placement.top as f32
+                    - size * 0.5)
+                    .round() as i32;
                 let paint = PixmapPaint {
                     opacity: color.alpha(),
                     blend_mode: tiny_skia::BlendMode::SourceOver,
