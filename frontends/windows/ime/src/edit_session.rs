@@ -5,12 +5,12 @@
 use std::mem::ManuallyDrop;
 
 use windows::core::{implement, Error, Interface, Param, Result};
-use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{E_FAIL, RECT};
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-    ITfEditSession_Impl, ITfInsertAtSelection, INSERT_TEXT_AT_SELECTION_FLAGS, TF_ANCHOR_END,
-    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
-    TF_SELECTIONSTYLE,
+    ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfContextView,
+    ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, INSERT_TEXT_AT_SELECTION_FLAGS,
+    TF_ANCHOR_END, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
 
 /// 无组合状态下的直接上屏。
@@ -73,6 +73,60 @@ impl ITfEditSession_Impl for CommitCompositionSession_Impl {
 pub struct WriteBack(pub *mut Option<ITfComposition>);
 // SAFETY: 见上，同步会话期间唯一访问。
 unsafe impl Send for WriteBack {}
+
+/// 锚点坐标回写（候选窗位置查询）。
+///
+/// # SAFETY
+/// `TF_ES_SYNC` 保证 `DoEditSession` 在 `RequestEditSession` 返回前完成，
+/// 因此 `out` 指向的栈值在会话执行期间存活（与 `WriteBack` 同理）。
+pub struct WriteBackPos(pub *mut Option<(i32, i32)>);
+// SAFETY: 见上，同步会话期间唯一访问。
+unsafe impl Send for WriteBackPos {}
+
+/// 只读会话：查询组合范围在屏幕上的坐标（`ITfContextView::GetTextExt` 需要有效 edit cookie `ec`）。
+#[implement(ITfEditSession)]
+pub struct QueryAnchorSession {
+    pub composition: ITfComposition,
+    pub context: ITfContext,
+    pub out: WriteBackPos,
+}
+
+impl ITfEditSession_Impl for QueryAnchorSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            let view: ITfContextView = self.context.GetActiveView()?;
+            let range = self.composition.GetRange()?;
+            let mut rc = RECT::default();
+            let mut clipped = windows::core::BOOL::default();
+            match view.GetTextExt(ec, &range, &mut rc, &mut clipped) {
+                Ok(()) => {
+                    *self.out.0 = Some((rc.left, rc.bottom));
+                }
+                Err(e) => {
+                    log::warn!("会话内 GetTextExt 失败: {e}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 在只读同步编辑会话内查询组合锚点（候选窗应出现在组合下方）。
+pub fn query_composition_anchor(
+    context: &ITfContext,
+    clientid: u32,
+    composition: &ITfComposition,
+) -> Result<Option<(i32, i32)>> {
+    let mut out: Option<(i32, i32)> = None;
+    let session: ITfEditSession = QueryAnchorSession {
+        composition: composition.clone(),
+        context: context.clone(),
+        out: WriteBackPos(&mut out),
+    }
+    .into();
+    request_sync(context, clientid, &session, TF_ES_SYNC | TF_ES_READ)?;
+    Ok(out)
+}
 
 /// 新建组合并设置 preedit 文本。
 #[implement(ITfEditSession)]

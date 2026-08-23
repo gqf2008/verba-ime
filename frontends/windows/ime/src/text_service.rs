@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use verba_core::machine::{Action, CompositionMachine, MachineState};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
-use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -584,45 +584,28 @@ fn hide_candidate_window(data: &Rc<TextServiceData>) {
 }
 
 /// 组合范围在屏幕上的坐标（候选窗锚点：组合下方）。
+///
+/// 注意：`ITfContextView::GetTextExt` 的第一个参数必须是**编辑会话的 edit cookie
+/// （ec）**，不能传 clientid（实测传 clientid 返回 E_INVALIDARG 0x80070057）。
+/// 因此锚点查询必须放进只读同步编辑会话内执行。
 fn caret_screen_pos(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32)> {
-    unsafe {
-        let view: ITfContextView = match context.GetActiveView() {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("候选锚点 GetActiveView 失败: {e}");
-                return None;
-            }
-        };
-        let Some(comp) = data.composition.borrow().as_ref().cloned() else {
-            log::warn!("候选锚点无组合引用");
-            return None;
-        };
-        let range = match comp.GetRange() {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("候选锚点 GetRange 失败: {e}");
-                return None;
-            }
-        };
-        let mut rc = RECT::default();
-        match view.GetTextExt(data.clientid.get(), &range, &mut rc, std::ptr::null_mut()) {
-            Ok(()) => {
-                log::info!(
-                    "组合锚点 rect=({},{})-({},{})",
-                    rc.left,
-                    rc.top,
-                    rc.right,
-                    rc.bottom
-                );
-                Some((rc.left, rc.bottom))
-            }
-            Err(e) => {
-                // TS_E_NOLAYOUT(0x80040205)：组合刚更新、应用尚未重算布局，稍后由定时器重试。
-                log::warn!(
-                    "候选锚点 GetTextExt 失败: {e}（TS_E_NOLAYOUT=0x80040205 表示布局未就绪）"
-                );
-                None
-            }
+    let Some(comp) = data.composition.borrow().as_ref().cloned() else {
+        log::warn!("候选锚点无组合引用");
+        return None;
+    };
+    match edit_session::query_composition_anchor(context, data.clientid.get(), &comp) {
+        Ok(Some((x, y))) => {
+            log::info!("组合锚点 ({x},{y})");
+            Some((x, y))
+        }
+        Ok(None) => {
+            // TS_E_NOLAYOUT(0x80040205)：组合刚更新、应用尚未重算布局，稍后由定时器重试。
+            log::warn!("候选锚点会话未返回结果（布局未就绪 TS_E_NOLAYOUT=0x80040205），稍后重试");
+            None
+        }
+        Err(e) => {
+            log::warn!("候选锚点只读会话失败: {e}");
+            None
         }
     }
 }
