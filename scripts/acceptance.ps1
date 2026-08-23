@@ -20,9 +20,25 @@ Write-Output "产物齐备: DLL/daemon/cli"
 
 $regVal = (Get-ItemProperty "HKCU:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue)."(default)"
 if ($regVal -ne $dll) {
-    Write-Warning "CLSID 未指向 target_dev12（当前: $regVal）——请确认使用新 DLL"
+    Write-Warning "HKCU CLSID 未指向 target_dev12（当前: $regVal）——请确认使用新 DLL"
 } else {
-    Write-Output "CLSID 指向 target_dev12 ✅"
+    Write-Output "HKCU CLSID 指向 target_dev12 ✅"
+}
+# 注册表分裂检查：HKLM CLSID 若指向旧安装版，需 HKCU 优先才生效（HKCU\Software\Classes 优先于 HKLM）
+$hklmVal = (Get-ItemProperty "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue)."(default)"
+if ($hklmVal -and $hklmVal -ne $dll) {
+    Write-Warning "HKLM CLSID 指向旧安装版（$hklmVal）。HKCU 优先所以 dev DLL 生效；若卸载/清理 HKCU 会退回旧版。"
+}
+# TSF 档案检查：语言栏可见性依赖 HKLM TIP LanguageProfile（zh-CN 0x0804 / zh-TW 0x0404 / en-US 0x0409）
+$prof = "HKLM:\SOFTWARE\Microsoft\CTF\TIP\$clsid\LanguageProfile"
+$ok = @()
+foreach ($lang in @("0x00000804", "0x00000404", "0x00000409")) {
+    if (Test-Path (Join-Path $prof $lang)) { $ok += $lang }
+}
+if ($ok.Count -ge 2) {
+    Write-Output "TSF 档案已注册（$($ok -join ', ')）——语言栏可见 ✅"
+} else {
+    Write-Warning "TSF 档案缺失（仅 $($ok -join ', ')）——语言栏可能看不到输入法；请管理员运行 verba-reg register <dll>"
 }
 
 $rimeDir = Join-Path $dllDir "rime"
