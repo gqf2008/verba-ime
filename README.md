@@ -4,7 +4,7 @@
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
 > 项目状态：**M1/M5 已实机验收**（Windows TSF + LLM 直输 + 中文引擎：Rime/候选窗/融合）；
-> 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock 已端到端通，OCR/ASR 跟进）。
+> 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock + OCR mock/Windows.Media.Ocr 已端到端通，ASR 跟进）。
 > 见 [Windows 手动验收清单](docs/manual-acceptance-windows.md) 与 [路线图](docs/roadmap.md)。
 
 ---

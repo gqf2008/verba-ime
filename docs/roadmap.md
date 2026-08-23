@@ -3,7 +3,7 @@
 > 更新：2026-08-23 · 当前状态：**M5 已收口**（2026-08-23 实机 OK：候选窗即时内置 + Rime 去重追加，
 > 验收清单逐项勾选，见 manual-acceptance-windows.md）。
 > 下一批：**M3 多模态 + M4 TTS 的 Rust 核心**（provider 抽象 + daemon 路由 + IPC + CLI，全部本机可验证）。
-> 已开工（2026-08-23）：TTS mock provider 端到端——`verba-cli tts` 产出合法 WAV；edge/Piper/系统 TTS 与 OCR/ASR 跟进。
+> 已开工（2026-08-23）：TTS mock + OCR mock/Windows.Media.Ocr 端到端——`verba-cli tts`/`verba-cli ocr` 通过；edge/Piper 系统 TTS 与 ASR 跟进。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -49,6 +49,9 @@
 ## M3 详细任务（多模态）
 
 - [ ] OCR provider：本地 PaddleOCR（ONNX）+ 平台原生（Windows.Media.Ocr / Vision）
+  - [x] **mock**（确定性，2026-08-23：`verba-ocr` crate + IPC `OcrRecognize` + daemon 路由 + `verba-cli ocr`）
+  - [x] **Windows.Media.Ocr**（2026-08-23 实机验证：英文识别 OK；中文需装 OCR 语言包，代码优先 zh-Hans-CN 并有回退）
+  - [ ] PaddleOCR ONNX（跨平台本地）
 - [ ] 截图链路：权限、选区、预览、OCR 结果上屏
 - [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
 - [ ] 语音链路：快捷键、录音、流式转写、上屏
@@ -98,3 +101,4 @@
 | --- | --- |
 | 2026-08-22 | 初版：M0-M6 里程碑与任务分解 |
 | 2026-08-23 | M5 实机验收收口（候选窗即时内置 + Rime 追加）；M4 TTS mock provider 接入（`verba-tts` + IPC TtsSynthesize/Audio + daemon 路由 + CLI + 验收） |
+| 2026-08-23 | M3 OCR 接入（`verba-ocr` + IPC OcrRecognize + daemon 路由 + CLI + 验收；mock 确定性 + Windows.Media.Ocr 本地识别实机验证） |
