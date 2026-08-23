@@ -195,6 +195,9 @@ pub struct Config {
     /// 模型名。
     #[serde(default = "default_llm_model")]
     pub llm_model: String,
+    /// 多模态 vision 模型名（在 llm_base_url 上）；为空则复用 llm_model（仅文本）。`//看图`/eye_mode=vision 时使用。
+    #[serde(default)]
+    pub llm_vision_model: String,
     /// 采样温度。
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -222,6 +225,9 @@ pub struct Config {
     /// OCR provider：mock（默认，确定性）| windows（Windows.Media.Ocr 本地识别）。
     #[serde(default = "default_ocr_provider")]
     pub ocr_provider: String,
+    /// rapid provider 的 Python 解释器路径；为空则自动探测（data_dir/venv-ocr/Scripts/python.exe → PATH python）。
+    #[serde(default)]
+    pub ocr_rapid_python: String,
     /// ASR provider：mock（默认，确定性）| openai（OpenAI 兼容在线转写）。
     #[serde(default = "default_asr_provider")]
     pub asr_provider: String,
@@ -249,6 +255,9 @@ pub struct Config {
     /// 眼睛区域距光标组合的偏移（正值=向上）。
     #[serde(default = "default_eye_offset")]
     pub eye_offset_y: i32,
+    /// 眼睛喂给 LLM 的方式：ocr（默认，本地/在线 OCR → 文字）| vision（直接发图给多模态 LLM）。
+    #[serde(default = "default_eye_mode")]
+    pub eye_mode: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -298,11 +307,16 @@ fn default_eye_offset() -> i32 {
     0
 }
 
+fn default_eye_mode() -> String {
+    "ocr".to_owned()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             llm_base_url: default_llm_base_url(),
             llm_model: default_llm_model(),
+            llm_vision_model: String::new(),
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             ai_system_prompt: String::new(),
@@ -312,6 +326,7 @@ impl Default for Config {
             tts_provider: default_tts_provider(),
             tts_voice: String::new(),
             ocr_provider: default_ocr_provider(),
+            ocr_rapid_python: String::new(),
             asr_provider: default_asr_provider(),
             asr_base_url: String::new(),
             asr_model: default_asr_model(),
@@ -321,6 +336,7 @@ impl Default for Config {
             eye_width: default_eye_width(),
             eye_height: default_eye_height(),
             eye_offset_y: default_eye_offset(),
+            eye_mode: default_eye_mode(),
         }
     }
 }
@@ -331,6 +347,7 @@ impl Config {
         let mut map = HashMap::new();
         map.insert("llm_base_url".into(), self.llm_base_url.clone());
         map.insert("llm_model".into(), self.llm_model.clone());
+        map.insert("llm_vision_model".into(), self.llm_vision_model.clone());
         map.insert("temperature".into(), self.temperature.to_string());
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
@@ -339,6 +356,7 @@ impl Config {
         map.insert("tts_provider".into(), self.tts_provider.clone());
         map.insert("tts_voice".into(), self.tts_voice.clone());
         map.insert("ocr_provider".into(), self.ocr_provider.clone());
+        map.insert("ocr_rapid_python".into(), self.ocr_rapid_python.clone());
         map.insert("asr_provider".into(), self.asr_provider.clone());
         map.insert("asr_base_url".into(), self.asr_base_url.clone());
         map.insert("asr_model".into(), self.asr_model.clone());
@@ -348,6 +366,7 @@ impl Config {
         map.insert("eye_width".into(), self.eye_width.to_string());
         map.insert("eye_height".into(), self.eye_height.to_string());
         map.insert("eye_offset_y".into(), self.eye_offset_y.to_string());
+        map.insert("eye_mode".into(), self.eye_mode.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -420,6 +439,7 @@ impl Config {
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
                 "ai_system_prompt" => self.ai_system_prompt = v.clone(),
+                "llm_vision_model" => self.llm_vision_model = v.clone(),
                 "engine" => {
                     if v != "builtin" && v != "rime" {
                         return Err(ConfigError::InvalidValue(format!(
@@ -439,13 +459,14 @@ impl Config {
                 }
                 "tts_voice" => self.tts_voice = v.clone(),
                 "ocr_provider" => {
-                    if v != "mock" && v != "windows" {
+                    if v != "mock" && v != "windows" && v != "rapid" {
                         return Err(ConfigError::InvalidValue(format!(
-                            "ocr_provider 仅支持 mock|windows: {k}={v}"
+                            "ocr_provider 仅支持 mock|windows|rapid: {k}={v}"
                         )));
                     }
                     self.ocr_provider = v.clone();
                 }
+                "ocr_rapid_python" => self.ocr_rapid_python = v.clone(),
                 "asr_provider" => {
                     if v != "mock" && v != "openai" {
                         return Err(ConfigError::InvalidValue(format!(
@@ -477,6 +498,14 @@ impl Config {
                     self.eye_offset_y = v
                         .parse()
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
+                "eye_mode" => {
+                    if v != "ocr" && v != "vision" {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "eye_mode 仅支持 ocr|vision: {k}={v}"
+                        )));
+                    }
+                    self.eye_mode = v.clone();
                 }
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
@@ -784,6 +813,33 @@ mod tests {
         let out = cfg.to_map();
         assert_eq!(out.get("eye_enabled").map(String::as_str), Some("false"));
         assert_eq!(out.get("eye_width").map(String::as_str), Some("800"));
+    }
+
+    #[test]
+    fn ai_vision_and_rapid_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.eye_mode, "ocr");
+        assert_eq!(cfg.llm_vision_model, "");
+        assert_eq!(cfg.ocr_rapid_python, "");
+        let mut map = HashMap::new();
+        map.insert("eye_mode".into(), "vision".into());
+        map.insert("llm_vision_model".into(), "qwen2.5-vl".into());
+        map.insert("ocr_provider".into(), "rapid".into());
+        map.insert("ocr_rapid_python".into(), "C:\\py\\python.exe".into());
+        cfg.apply_map(&map).unwrap();
+        assert_eq!(cfg.eye_mode, "vision");
+        assert_eq!(cfg.llm_vision_model, "qwen2.5-vl");
+        assert_eq!(cfg.ocr_provider, "rapid");
+        assert_eq!(cfg.ocr_rapid_python, "C:\\py\\python.exe");
+        let out = cfg.to_map();
+        assert_eq!(out.get("eye_mode").map(String::as_str), Some("vision"));
+        assert_eq!(out.get("ocr_provider").map(String::as_str), Some("rapid"));
+        let mut m = HashMap::new();
+        m.insert("eye_mode".into(), "bogus".into());
+        assert!(matches!(
+            cfg.apply_map(&m),
+            Err(ConfigError::InvalidValue(_))
+        ));
     }
 
     #[test]

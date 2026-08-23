@@ -6678,6 +6678,7 @@ dependencies = [
 name = "verba-ai"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eventsource-stream",
  "futures-core",
  "futures-util",
@@ -6798,6 +6799,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "verba-ai",
+ "verba-config",
  "windows",
 ]
 

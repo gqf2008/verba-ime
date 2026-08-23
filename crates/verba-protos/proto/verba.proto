@@ -46,6 +46,9 @@ message LlmGenerate {
   optional float temperature = 3;
   optional int32 max_tokens = 4;
   bool stream = 5;
+  // 多模态图像（vision）：mime 如 image/png，字节内容。
+  optional bytes image = 6;
+  optional string image_mime = 7;
 }
 
 message LlmCancel {}

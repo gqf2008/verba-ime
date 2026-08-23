@@ -6,6 +6,7 @@
 // 白名单 crate：Cargo.toml 放开 unsafe_code（仅 windows_media.rs 经 SAFETY 注释使用）。
 
 pub mod mock;
+pub mod rapid;
 
 use std::str::FromStr;
 
@@ -18,16 +19,19 @@ mod windows_media;
 use windows_media::WindowsMediaOcr;
 
 pub use mock::MockOcr;
+pub use rapid::RapidOcr;
 
 /// OCR 错误。
 #[derive(Debug, Error)]
 pub enum OcrError {
-    #[error("未知 OCR provider: {0}（当前支持 mock；Windows 支持 windows）")]
+    #[error("未知 OCR provider: {0}（当前支持 mock|windows|rapid）")]
     UnknownProvider(String),
     #[error("图像为空")]
     EmptyImage,
     #[error("Windows OCR 失败: {0}")]
     Windows(String),
+    #[error("RapidOCR 失败: {0}")]
+    Rapid(String),
 }
 
 /// 已实现的 OCR provider。
@@ -37,6 +41,8 @@ pub enum OcrProviderKind {
     Mock,
     /// Windows.Media.Ocr 本地识别（仅 Windows）。
     WindowsMedia,
+    /// RapidOCR（PaddleOCR + ONNXRuntime，经 Python 子进程）本地识别。
+    Rapid,
 }
 
 impl FromStr for OcrProviderKind {
@@ -46,6 +52,7 @@ impl FromStr for OcrProviderKind {
         match s {
             "" | "mock" => Ok(Self::Mock),
             "windows" => Ok(Self::WindowsMedia),
+            "rapid" => Ok(Self::Rapid),
             other => Err(OcrError::UnknownProvider(other.to_owned())),
         }
     }
@@ -55,13 +62,19 @@ impl FromStr for OcrProviderKind {
 #[derive(Debug, Clone)]
 pub struct OcrClient {
     provider: OcrProviderKind,
+    rapid_python: Option<String>,
 }
 
 impl OcrClient {
     /// 按配置创建（provider: mock|windows）。
-    pub fn from_config(provider: &str) -> Result<Self, OcrError> {
+    pub fn from_config(provider: &str, rapid_python: &str) -> Result<Self, OcrError> {
         Ok(Self {
             provider: provider.parse()?,
+            rapid_python: if rapid_python.is_empty() {
+                None
+            } else {
+                Some(rapid_python.to_owned())
+            },
         })
     }
 
@@ -72,6 +85,10 @@ impl OcrClient {
         }
         match &self.provider {
             OcrProviderKind::Mock => MockOcr::new().recognize(image).await,
+            OcrProviderKind::Rapid => {
+                let py = self.rapid_python.clone().unwrap_or_default();
+                RapidOcr::with_python(py).recognize(image).await
+            }
             OcrProviderKind::WindowsMedia => {
                 #[cfg(windows)]
                 {
@@ -99,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_deterministic_mock() {
-        let c = OcrClient::from_config("mock").unwrap();
+        let c = OcrClient::from_config("mock", "").unwrap();
         let a = c.recognize(b"png-1".as_slice()).await.unwrap();
         let b = c.recognize(b"png-1".as_slice()).await.unwrap();
         assert_eq!(a, b);
@@ -108,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_rejects_empty() {
-        let c = OcrClient::from_config("mock").unwrap();
+        let c = OcrClient::from_config("mock", "").unwrap();
         assert!(matches!(c.recognize(&[]).await, Err(OcrError::EmptyImage)));
     }
 
@@ -126,13 +143,17 @@ mod tests {
             "windows".parse::<OcrProviderKind>().unwrap(),
             OcrProviderKind::WindowsMedia
         );
+        assert_eq!(
+            "rapid".parse::<OcrProviderKind>().unwrap(),
+            OcrProviderKind::Rapid
+        );
         assert!("bogus".parse::<OcrProviderKind>().is_err());
     }
 
     #[test]
     fn client_unknown_provider_rejected() {
         assert!(matches!(
-            OcrClient::from_config("bogus"),
+            OcrClient::from_config("bogus", ""),
             Err(OcrError::UnknownProvider(_))
         ));
     }

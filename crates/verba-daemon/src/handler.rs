@@ -12,8 +12,8 @@ use verba_ipc::server::{Outbound, RequestHandler};
 use verba_librime::{RimeConfig, RimeEngine};
 use verba_protos::{
     request, response, stream_event, ApiKeySet, Audio as AudioMsg, Candidates, Chunk,
-    Config as ConfigMsg, Error as ProtoError, Final, LlmCandidates, Ok as OkMsg, Pong, Response,
-    StreamEvent,
+    Config as ConfigMsg, Error as ProtoError, Final, LlmCandidates, LlmGenerate, Ok as OkMsg, Pong,
+    Response, StreamEvent,
 };
 
 /// 默认 AI 系统提示词（用户未配置时使用）。
@@ -179,18 +179,38 @@ impl DaemonHandler {
         })
         .await?;
 
-        let (llm_cfg, config_system) = self.llm_snapshot();
-        let system = g
-            .system
+        let (mut llm_cfg, config_system) = self.llm_snapshot();
+        let LlmGenerate {
+            prompt,
+            system,
+            temperature,
+            max_tokens,
+            stream: _,
+            image,
+            image_mime,
+        } = g;
+        let image = image.map(|data| {
+            let mime = image_mime.clone().unwrap_or_else(|| "image/png".to_owned());
+            (mime, data)
+        });
+        // vision：请求携带图像时，若配置了独立 vision 模型则切换模型名。
+        if image.is_some() {
+            let vision_model = self.config.read().unwrap().llm_vision_model.clone();
+            if !vision_model.is_empty() {
+                llm_cfg.model = vision_model;
+            }
+        }
+        let system = system
             .filter(|s| !s.is_empty())
             .or_else(|| (!config_system.is_empty()).then_some(config_system))
             .or_else(|| Some(DEFAULT_AI_SYSTEM.to_owned()));
 
         let req = LlmRequest {
-            prompt: g.prompt,
+            prompt,
             system,
-            temperature: g.temperature,
-            max_tokens: g.max_tokens,
+            temperature,
+            max_tokens,
+            image,
         };
 
         match self.llm.stream(&llm_cfg, &req).await {
@@ -298,6 +318,7 @@ impl DaemonHandler {
             system: Some(CANDIDATE_SYSTEM.to_owned()),
             temperature: Some(0.3),
             max_tokens: Some(128),
+            image: None,
         };
 
         match self.llm.stream(&llm_cfg, &req).await {
@@ -525,8 +546,11 @@ impl DaemonHandler {
         g: verba_protos::OcrRecognize,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
-        let provider = self.config.read().unwrap().ocr_provider.clone();
-        let client = match verba_ocr::OcrClient::from_config(&provider) {
+        let (provider, rapid_python) = {
+            let cfg = self.config.read().unwrap();
+            (cfg.ocr_provider.clone(), cfg.ocr_rapid_python.clone())
+        };
+        let client = match verba_ocr::OcrClient::from_config(&provider, &rapid_python) {
             Ok(c) => c,
             Err(e) => {
                 out.response(&Response {

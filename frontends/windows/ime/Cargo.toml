@@ -43,5 +43,7 @@ windows-core = "0.62"
 cpal = "0.15"
 rodio = "0.20"
 
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+
 [profile.release]
 opt-level = 2

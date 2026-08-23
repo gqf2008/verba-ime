@@ -99,7 +99,7 @@ fn cmd_ai(args: &[String]) -> i32 {
         return 1;
     }
     with_client(|c| {
-        let id = c.llm_start(&prompt, None, None, None)?;
+        let id = c.llm_start(&prompt, None, None, None, None)?;
         loop {
             let evt = c.next_event(id)?;
             match evt.kind {

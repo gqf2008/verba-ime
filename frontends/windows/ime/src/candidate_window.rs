@@ -239,7 +239,7 @@ fn apply_window_region(hwnd: HWND, w: u32, h: u32, radius: u32) {
     }
 }
 
-fn monitor_work_area(x: i32, y: i32) -> RECT {
+pub(crate) fn monitor_work_area(x: i32, y: i32) -> RECT {
     unsafe {
         let pt = POINT { x, y };
         let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -263,6 +263,37 @@ impl Drop for CandidateWindow {
     }
 }
 
+/// 眼睛区域定位：默认捕捉「光标上方」屏幕（用户视线所在），
+/// 上方放不下翻到下方，上下都放不下选空间更大的一侧贴边；水平越界平移回工作区。
+/// `anchor` = (x, top, bottom)，`offset_y` 表示眼睛区域底部距组合上缘的向上偏移。
+pub(crate) fn fit_eye_rect(
+    anchor: (i32, i32, i32),
+    w: i32,
+    h: i32,
+    offset_y: i32,
+    work: RECT,
+) -> (i32, i32) {
+    let (x, top, bottom) = anchor;
+    let px = x.clamp(work.left, (work.right - w).max(work.left));
+    let off = offset_y.max(0);
+    // 上方空间：眼睛区域放在组合上方（底部贴 top，再留 off 间隙）。
+    let above_space = top - off - work.top;
+    let below_space = work.bottom - bottom;
+    let py = if h <= above_space {
+        // 上方放得下：眼睛区域底部 = top - off。
+        top - off - h
+    } else if h <= below_space {
+        // 上方放不下，翻到光标下方。
+        bottom
+    } else if above_space >= below_space {
+        // 上方空间更大：贴工作区顶部。
+        work.top
+    } else {
+        // 下方空间更大（或相等）：贴工作区底部。
+        (work.bottom - h).max(work.top)
+    };
+    (px, py)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +357,68 @@ mod tests {
         assert_eq!(
             fit_position((-100, 480, 500), 300, 200, work(0, 0, 1920, 1040)),
             (0, 500)
+        );
+    }
+
+    #[test]
+    fn eye_above_when_space() {
+        // 光标上方有空间 → 眼睛区域放上方（默认）。
+        assert_eq!(
+            fit_eye_rect((100, 700, 720), 640, 480, 0, work(0, 0, 1920, 1040)),
+            (100, 220)
+        );
+    }
+
+    #[test]
+    fn eye_flip_below_when_above_overflow() {
+        // 上方放不下（top=100，h=480 → 越界），下方有空间 → 翻下方。
+        assert_eq!(
+            fit_eye_rect((100, 100, 120), 640, 480, 0, work(0, 0, 1920, 1040)),
+            (100, 120)
+        );
+    }
+
+    #[test]
+    fn eye_top_aligned_when_both_overflow_and_more_above() {
+        // 上下都放不下（h=1000），上方空间 200 > 下方 100 → 贴工作区顶部。
+        assert_eq!(
+            fit_eye_rect((100, 200, 300), 640, 1000, 0, work(0, 0, 1920, 500)),
+            (100, 0)
+        );
+    }
+
+    #[test]
+    fn eye_bottom_aligned_when_both_overflow_and_more_below() {
+        // 上下都放不下（h=1000），下方空间更大；但窗口超高，底部贴齐被钳制回工作区顶部。
+        assert_eq!(
+            fit_eye_rect((100, 50, 80), 640, 1000, 0, work(0, 0, 1920, 500)),
+            (100, 0)
+        );
+    }
+
+    #[test]
+    fn eye_shift_left_when_right_overflow() {
+        // 光标靠右：x=1800 + 640 > 1920 → 左移到 1280。
+        assert_eq!(
+            fit_eye_rect((1800, 700, 720), 640, 480, 0, work(0, 0, 1920, 1040)),
+            (1280, 220)
+        );
+    }
+
+    #[test]
+    fn eye_clamp_left_when_negative_x() {
+        assert_eq!(
+            fit_eye_rect((-100, 700, 720), 640, 480, 0, work(0, 0, 1920, 1040)),
+            (0, 220)
+        );
+    }
+
+    #[test]
+    fn eye_respects_offset() {
+        // offset=40：眼睛区域底部再往上 40px。
+        assert_eq!(
+            fit_eye_rect((100, 760, 780), 640, 480, 40, work(0, 0, 1920, 1040)),
+            (100, 240)
         );
     }
 }

@@ -131,7 +131,7 @@ async fn llm_stream_roundtrip() {
 
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let id = client
-        .llm_start("你好", None, None, None)
+        .llm_start("你好", None, None, None, None)
         .expect("llm_start");
     let mut parts = Vec::new();
     loop {

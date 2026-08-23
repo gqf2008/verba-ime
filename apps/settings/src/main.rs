@@ -16,6 +16,10 @@ use verba_ipc::VerbaClient;
 const OCR_PROVIDERS: &[(&str, &str)] = &[
     ("mock（确定性，开发/验收）", "mock"),
     ("windows（Windows 本地识别）", "windows"),
+    (
+        "rapid（本地 RapidOCR/PaddleOCR，需 Python rapidocr_onnxruntime）",
+        "rapid",
+    ),
 ];
 const ASR_PROVIDERS: &[(&str, &str)] = &[
     ("mock（确定性，开发/验收）", "mock"),
@@ -29,6 +33,10 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
 const ENGINES: &[(&str, &str)] = &[
     ("builtin（内置拼音）", "builtin"),
     ("rime（Rime 引擎，需部署 rime/）", "rime"),
+];
+const EYE_MODES: &[(&str, &str)] = &[
+    ("ocr（本地/在线 OCR → 文字）", "ocr"),
+    ("vision（多模态 LLM 直读图像）", "vision"),
 ];
 const THEMES: &[(&str, &str)] = &[("light（浅色）", "light"), ("dark（深色）", "dark")];
 
@@ -134,6 +142,15 @@ fn read_fields(ui: &SettingsWindow) -> HashMap<String, String> {
         pick(OCR_PROVIDERS, ui.get_ocr_provider_index()),
     );
     values.insert(
+        "ocr_rapid_python".into(),
+        ui.get_ocr_rapid_python().to_string(),
+    );
+    values.insert(
+        "llm_vision_model".into(),
+        ui.get_llm_vision_model().to_string(),
+    );
+    values.insert("eye_mode".into(), pick(EYE_MODES, ui.get_eye_mode_index()));
+    values.insert(
         "asr_provider".into(),
         pick(ASR_PROVIDERS, ui.get_asr_provider_index()),
     );
@@ -211,6 +228,9 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     ui.set_max_tokens(get("max_tokens").into());
     ui.set_ai_system_prompt(get("ai_system_prompt").into());
     ui.set_ocr_provider_index(index_of(OCR_PROVIDERS, &get("ocr_provider")));
+    ui.set_ocr_rapid_python(get("ocr_rapid_python").into());
+    ui.set_llm_vision_model(get("llm_vision_model").into());
+    ui.set_eye_mode_index(index_of(EYE_MODES, &get("eye_mode")));
     ui.set_asr_provider_index(index_of(ASR_PROVIDERS, &get("asr_provider")));
     ui.set_asr_base_url(get("asr_base_url").into());
     ui.set_asr_model(get("asr_model").into());

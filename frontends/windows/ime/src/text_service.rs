@@ -23,9 +23,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_ESCAPE,
     VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-};
 
 use crate::capture::capture_primary_screen;
 use crate::play::play_audio;
@@ -610,6 +607,15 @@ pub fn apply_action(
                 start_tts_play(text);
                 return Ok(());
             }
+            // `//看图`：多模态 vision，直接捕捉眼睛区域（或全屏回退）发图给 LLM。
+            // 与普通 `//` LLM 命令一致：不结束组合、不重置状态机，保持流式输出。
+            if cmd == "看图" {
+                log::info!("看图命令（vision）");
+                let eye_rect = eye_rect_for(data, context);
+                let image = eye_vision_image(eye_rect);
+                start_llm(data, prompt, None, image);
+                return Ok(());
+            }
             let kind = if cmd == "截图" {
                 Some(TriggerKind::Ocr)
             } else if cmd == "听写" {
@@ -629,7 +635,17 @@ pub fn apply_action(
             // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
             // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
             // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult 替换文本。
-            start_llm(data, prompt, eye_rect_for(data, context));
+            let eye_rect = eye_rect_for(data, context);
+            let (eye_enabled, eye_mode) =
+                load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
+            let use_vision = eye_enabled && eye_mode == "vision";
+            let vision = if use_vision {
+                eye_vision_image(eye_rect)
+            } else {
+                None
+            };
+            let ocr_rect = if use_vision { None } else { eye_rect };
+            start_llm(data, prompt, ocr_rect, vision);
             Ok(())
         }
         Action::ResultReady => Ok(()),
@@ -853,7 +869,12 @@ fn error_event(message: &str) -> stream_event::Kind {
 /// 与 daemon 默认一致的 AI 系统提示词（前端注入眼睛上下文时拼接）。
 const AI_SYSTEM_BASE: &str =
     "你是一个输入法里的 AI 助手。回答应简洁、直接，以可上屏的文本输出，不要使用 Markdown。";
-fn start_llm(data: &Rc<TextServiceData>, prompt: String, eye_rect: Option<(i32, i32, i32, i32)>) {
+fn start_llm(
+    data: &Rc<TextServiceData>,
+    prompt: String,
+    eye_rect: Option<(i32, i32, i32, i32)>,
+    vision: Option<(String, Vec<u8>)>,
+) {
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
     let handle = std::thread::spawn(move || {
@@ -865,21 +886,25 @@ fn start_llm(data: &Rc<TextServiceData>, prompt: String, eye_rect: Option<(i32, 
             }
         };
         // 眼睛：指令前自动捕捉光标上方屏幕 → OCR，作为 LLM 上下文注入 system。
+        // vision 模式（`//看图` / eye_mode=vision）直接交给 LLM 图像，不再走 OCR。
         let mut system: Option<String> = None;
-        if let Some((rx, ry, rw, rh)) = eye_rect {
-            match run_region_ocr_rect(rx, ry, rw, rh) {
-                Ok(Some(text)) if !text.is_empty() => {
-                    log::info!("眼睛区域已捕捉, ocr_len={}", text.chars().count());
-                    system = Some(format!(
-                        "{AI_SYSTEM_BASE}\n\n【眼睛内容：光标上方屏幕】\n{text}"
-                    ));
+        if vision.is_none() {
+            if let Some((rx, ry, rw, rh)) = eye_rect {
+                match run_region_ocr_rect(rx, ry, rw, rh) {
+                    Ok(Some(text)) if !text.is_empty() => {
+                        log::info!("眼睛区域已捕捉, ocr_len={}", text.chars().count());
+                        system = Some(format!(
+                            "{AI_SYSTEM_BASE}\n\n【眼睛内容：光标上方屏幕】\n{text}"
+                        ));
+                    }
+                    Ok(_) => log::debug!("眼睛区域无识别文本"),
+                    Err(e) => log::warn!("眼睛区域 OCR 失败: {e}"),
                 }
-                Ok(_) => log::debug!("眼睛区域无识别文本"),
-                Err(e) => log::warn!("眼睛区域 OCR 失败: {e}"),
             }
         }
 
-        let id = match client.llm_start(&prompt, system.as_deref(), None, None) {
+        let image_ref = vision.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
+        let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref) {
             Ok(id) => id,
             Err(e) => {
                 push_chunk(&chunks, 0, error_event(&format!("LLM 启动失败: {e}")));
@@ -1272,23 +1297,47 @@ fn run_region_ocr_rect(
 }
 
 /// 眼睛区域：`//` 指令时自动捕捉「光标上方」矩形（可配 eye.*），供 LLM 上下文。
+/// BMP（32bpp top-down，capture 产物）→ PNG 字节，用于多模态 LLM vision。
+fn bmp_to_png(bmp: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let img = image::load_from_memory(bmp).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// 捕捉眼睛区域（或全屏回退）为 PNG 图像，供多模态 LLM。
+/// `eye_rect` 为 None 时回退到主屏全屏。
+fn eye_vision_image(eye_rect: Option<(i32, i32, i32, i32)>) -> Option<(String, Vec<u8>)> {
+    let shot = match eye_rect {
+        Some((rx, ry, rw, rh)) => crate::capture::capture_region(rx, ry, rw, rh).ok()?,
+        None => crate::capture::capture_primary_screen().ok()?,
+    };
+    let png = bmp_to_png(&shot.bmp).ok()?;
+    Some(("image/png".to_owned(), png))
+}
+
+/// 读取当前眼睛运行配置：是否启用 + 喂给 LLM 的方式（ocr|vision）。
+fn load_eye_runtime_cfg() -> Option<(bool, String)> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    let cfg = verba_config::ConfigManager::new(dirs).load().ok()?;
+    Some((cfg.eye_enabled, cfg.eye_mode.clone()))
+}
+
 fn eye_rect_for(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32, i32, i32)> {
     let dirs = verba_config::VerbaDirs::locate().ok()?;
     let cfg = verba_config::ConfigManager::new(dirs).load().ok()?;
     if !cfg.eye_enabled {
         return None;
     }
-    let (ax, _top, bot) = caret_screen_pos(data, context)?;
+    let (ax, top, bot) = caret_screen_pos(data, context)?;
     let w = cfg.eye_width.max(64);
     let h = cfg.eye_height.max(64);
     let off = cfg.eye_offset_y.max(0);
-    let rx = ax - w / 2;
-    let ry = bot - h - off;
-    let sw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let sh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-    let rx = rx.clamp(0, (sw - w).max(0));
-    let ry = ry.clamp(0, (sh - h).max(0));
-    Some((rx, ry, w, h))
+    // 与候选窗一致：以光标所在显示器「工作区」为边界，智能避让（默认上方）。
+    let work = crate::candidate_window::monitor_work_area(ax, bot);
+    let (px, py) = crate::candidate_window::fit_eye_rect((ax, top, bot), w, h, off, work);
+    Some((px, py, w, h))
 }
 
 /// 全屏截图 → daemon OCR（选区失败时的回退路径）。

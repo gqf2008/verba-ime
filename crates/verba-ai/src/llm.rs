@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use base64::Engine as _;
 use eventsource_stream::Eventsource;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -51,6 +52,8 @@ pub struct LlmRequest {
     pub system: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<i32>,
+    /// 多模态图像（mime, 字节）；Some 时以 OpenAI image_url 发送。
+    pub image: Option<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Error)]
@@ -94,7 +97,18 @@ impl LlmClient {
         if let Some(system) = req.system.as_deref().filter(|s| !s.is_empty()) {
             messages.push(json!({ "role": "system", "content": system }));
         }
-        messages.push(json!({ "role": "user", "content": req.prompt }));
+        if let Some((mime, data)) = &req.image {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            messages.push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": req.prompt},
+                    {"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}
+                ]
+            }));
+        } else {
+            messages.push(json!({ "role": "user", "content": req.prompt }));
+        }
 
         let body = json!({
             "model": cfg.model,
@@ -183,6 +197,7 @@ mod tests {
             system: None,
             temperature: None,
             max_tokens: None,
+            image: None,
         };
         let mut stream = client.stream(&cfg, &req).await.unwrap();
         let mut out = String::new();
@@ -193,6 +208,50 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn stream_sends_vision_image_as_data_url() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        let thread = std::thread::spawn(move || {
+            if let Some(mut request) = server.incoming_requests().next() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                *cap.lock().unwrap() = body;
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .unwrap();
+                let response =
+                    tiny_http::Response::from_string("data: [DONE]\n\n").with_header(header);
+                let _ = request.respond(response);
+            }
+        });
+
+        let cfg = LlmConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            Some("sk-test".into()),
+            "vision-model",
+        );
+        let client = LlmClient::new().unwrap();
+        let req = LlmRequest {
+            prompt: "看图".into(),
+            system: None,
+            temperature: None,
+            max_tokens: None,
+            image: Some(("image/png".into(), b"\x89PNG".to_vec())),
+        };
+        let mut stream = client.stream(&cfg, &req).await.unwrap();
+        while stream.next().await.is_some() {}
+        thread.join().unwrap();
+        let body = captured.lock().unwrap().clone();
+        assert!(body.contains("image_url"), "应包含 image_url");
+        assert!(body.contains("data:image/png;base64,"), "应包含 data URL");
+        assert!(
+            body.contains("\"model\":\"vision-model\""),
+            "应使用指定模型"
+        );
+    }
     #[test]
     fn parse_sse_handles_done_and_junk() {
         assert_eq!(parse_sse("[DONE]").unwrap(), None);

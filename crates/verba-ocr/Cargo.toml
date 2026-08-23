@@ -12,6 +12,7 @@ unsafe_code = "allow"
 
 [dependencies]
 verba-ai = { path = "../verba-ai" }
+verba-config = { path = "../verba-config" }
 thiserror.workspace = true
 log.workspace = true
 tokio.workspace = true

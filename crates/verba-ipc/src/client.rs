@@ -96,6 +96,7 @@ impl VerbaClient {
         system: Option<&str>,
         temperature: Option<f32>,
         max_tokens: Option<i32>,
+        image: Option<(&str, &[u8])>,
     ) -> Result<u64, IpcError> {
         let id = self.new_id();
         let req = Request {
@@ -106,6 +107,8 @@ impl VerbaClient {
                 temperature,
                 max_tokens,
                 stream: true,
+                image: image.map(|(_, data)| data.to_vec()),
+                image_mime: image.map(|(mime, _)| mime.to_owned()),
             })),
         };
         self.write_request(&req)?;
