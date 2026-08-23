@@ -29,6 +29,7 @@ fn main() {
     ]);
     ctrl.set_page(1); // 演示页码脚（2/2）
     ctrl.show();
+    ctrl.set_preedit("nishishui");
     ctrl.set_position(100, 200);
 
     let mut renderer = CpuCandidateRenderer::new();

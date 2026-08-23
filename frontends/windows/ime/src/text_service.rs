@@ -586,7 +586,7 @@ pub fn apply_action(
             llm_request,
         } => {
             set_preedit(data, context, clientid, &preedit)?;
-            update_candidate_window(data, context, &candidates, page);
+            update_candidate_window(data, context, &preedit, &candidates, page);
             schedule_candidate_request(data, llm_request);
             Ok(())
         }
@@ -662,6 +662,7 @@ pub fn apply_action(
 fn update_candidate_window(
     data: &Rc<TextServiceData>,
     context: &ITfContext,
+    preedit: &str,
     candidates: &[String],
     page: usize,
 ) {
@@ -677,6 +678,7 @@ fn update_candidate_window(
     let theme = data.candidate_theme.borrow().clone();
     let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
     ctrl.set_candidates(candidates.to_vec());
+    ctrl.set_preedit(preedit);
     ctrl.set_page(page);
     ctrl.show();
     match caret_screen_pos(data, context) {
@@ -1377,7 +1379,7 @@ impl TextServiceData {
                     } = machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done)
                     {
                         let _ = set_preedit(&rc, &context, clientid, &preedit);
-                        update_candidate_window(&rc, &context, &candidates, page);
+                        update_candidate_window(&rc, &context, &preedit, &candidates, page);
                     }
                 }
                 Some(stream_event::Kind::Error(e)) => {

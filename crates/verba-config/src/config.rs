@@ -63,6 +63,21 @@ pub struct ThemeConfig {
     /// 圆角半径（像素）。
     #[serde(default)]
     pub corner_radius: Option<u32>,
+    /// 布局：horizontal（微软拼音/手心风格）| vertical（竖向列表）。
+    #[serde(default)]
+    pub layout: Option<String>,
+    /// 是否显示拼音组合头。
+    #[serde(default)]
+    pub show_preedit: Option<bool>,
+    /// 组合头高度（px）。
+    #[serde(default)]
+    pub header_height: Option<u32>,
+    /// 候选间距（horizontal，px）。
+    #[serde(default)]
+    pub gap: Option<u32>,
+    /// horizontal 窗口最大宽度（px）。
+    #[serde(default)]
+    pub max_width_horizontal: Option<u32>,
 }
 
 fn default_theme_preset() -> String {
@@ -80,6 +95,11 @@ impl Default for ThemeConfig {
             border_color: None,
             font_size: None,
             corner_radius: None,
+            layout: None,
+            show_preedit: None,
+            header_height: None,
+            gap: None,
+            max_width_horizontal: None,
         }
     }
 }
@@ -111,6 +131,21 @@ impl ThemeConfig {
         }
         if let Some(v) = self.corner_radius {
             t.corner_radius = v;
+        }
+        if let Some(v) = &self.layout {
+            t.layout = v.clone();
+        }
+        if let Some(v) = self.show_preedit {
+            t.show_preedit = v;
+        }
+        if let Some(v) = self.header_height {
+            t.header_height = v;
+        }
+        if let Some(v) = self.gap {
+            t.gap = v;
+        }
+        if let Some(v) = self.max_width_horizontal {
+            t.max_width_horizontal = v;
         }
         t
     }
@@ -268,6 +303,21 @@ impl Config {
         if let Some(v) = self.theme.corner_radius {
             map.insert("theme.corner_radius".into(), v.to_string());
         }
+        if let Some(v) = &self.theme.layout {
+            map.insert("theme.layout".into(), v.clone());
+        }
+        if let Some(v) = self.theme.show_preedit {
+            map.insert("theme.show_preedit".into(), v.to_string());
+        }
+        if let Some(v) = self.theme.header_height {
+            map.insert("theme.header_height".into(), v.to_string());
+        }
+        if let Some(v) = self.theme.gap {
+            map.insert("theme.gap".into(), v.to_string());
+        }
+        if let Some(v) = self.theme.max_width_horizontal {
+            map.insert("theme.max_width_horizontal".into(), v.to_string());
+        }
         map
     }
 
@@ -340,6 +390,31 @@ impl Config {
                 }
                 "theme.corner_radius" => {
                     self.theme.corner_radius = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.layout" => self.theme.layout = Some(v.clone()),
+                "theme.show_preedit" => {
+                    self.theme.show_preedit = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.header_height" => {
+                    self.theme.header_height = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.gap" => {
+                    self.theme.gap = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.max_width_horizontal" => {
+                    self.theme.max_width_horizontal = Some(
                         v.parse()
                             .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
                     );
@@ -507,6 +582,42 @@ mod tests {
             out.get("theme.corner_radius").map(String::as_str),
             Some("10")
         );
+    }
+
+    #[test]
+    fn theme_modern_layout_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        let mut map = std::collections::HashMap::new();
+        map.insert("theme.layout".into(), "horizontal".into());
+        map.insert("theme.show_preedit".into(), "true".into());
+        map.insert("theme.header_height".into(), "26".into());
+        map.insert("theme.gap".into(), "12".into());
+        map.insert("theme.max_width_horizontal".into(), "600".into());
+        cfg.apply_map(&map).unwrap();
+        assert_eq!(cfg.theme.layout.as_deref(), Some("horizontal"));
+        assert_eq!(cfg.theme.show_preedit, Some(true));
+        assert_eq!(cfg.theme.header_height, Some(26));
+        assert_eq!(cfg.theme.gap, Some(12));
+        assert_eq!(cfg.theme.max_width_horizontal, Some(600));
+        let out = cfg.to_map();
+        assert_eq!(
+            out.get("theme.layout").map(String::as_str),
+            Some("horizontal")
+        );
+        assert_eq!(
+            out.get("theme.show_preedit").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.get("theme.header_height").map(String::as_str),
+            Some("26")
+        );
+        let cand = cfg.theme.to_candidate_theme();
+        assert_eq!(cand.layout, "horizontal");
+        assert!(cand.show_preedit);
+        assert_eq!(cand.header_height, 26);
+        assert_eq!(cand.gap, 12);
+        assert_eq!(cand.max_width_horizontal, 600);
     }
 
     #[test]

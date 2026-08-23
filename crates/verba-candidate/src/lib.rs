@@ -25,12 +25,41 @@ pub struct Theme {
     /// 圆角半径（像素）。
     #[serde(default = "default_corner_radius")]
     pub corner_radius: u32,
+    /// 布局：horizontal（横向候选行，微软拼音/手心风格）| vertical（竖向列表）。
+    #[serde(default = "default_layout")]
+    pub layout: String,
+    /// 是否在顶部显示拼音组合串（preedit 头）。
+    #[serde(default = "default_show_preedit")]
+    pub show_preedit: bool,
+    /// 头部高度（show_preedit 且 preedit 非空时占用）。
+    #[serde(default = "default_header_height")]
+    pub header_height: u32,
+    /// 候选间距（horizontal 布局）。
+    #[serde(default = "default_gap")]
+    pub gap: u32,
+    /// horizontal 布局的窗口最大宽度。
+    #[serde(default = "default_max_width_horizontal")]
+    pub max_width_horizontal: u32,
 }
 
 fn default_corner_radius() -> u32 {
     6
 }
-
+fn default_layout() -> String {
+    "horizontal".to_owned()
+}
+fn default_show_preedit() -> bool {
+    true
+}
+fn default_header_height() -> u32 {
+    24
+}
+fn default_gap() -> u32 {
+    10
+}
+fn default_max_width_horizontal() -> u32 {
+    560
+}
 impl Default for Theme {
     fn default() -> Self {
         Self {
@@ -45,6 +74,11 @@ impl Default for Theme {
             page_size: 9,
             max_width: 360,
             corner_radius: default_corner_radius(),
+            layout: default_layout(),
+            show_preedit: default_show_preedit(),
+            header_height: default_header_height(),
+            gap: default_gap(),
+            max_width_horizontal: default_max_width_horizontal(),
         }
     }
 }
@@ -64,6 +98,11 @@ impl Theme {
             page_size: 9,
             max_width: 360,
             corner_radius: default_corner_radius(),
+            layout: default_layout(),
+            show_preedit: default_show_preedit(),
+            header_height: default_header_height(),
+            gap: default_gap(),
+            max_width_horizontal: default_max_width_horizontal(),
         }
     }
 }
@@ -78,6 +117,8 @@ pub struct CandidateWindowController {
     visible: bool,
     /// 逻辑坐标（像素），由平台适配层填充。
     position: Option<(i32, i32)>,
+    /// 当前组合串（拼音/preedit），用于候选窗头部展示。
+    preedit: String,
 }
 
 impl Default for CandidateWindowController {
@@ -95,6 +136,7 @@ impl CandidateWindowController {
             selected: None,
             visible: false,
             position: None,
+            preedit: String::new(),
         }
     }
 
@@ -217,6 +259,16 @@ impl CandidateWindowController {
 
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// 设置当前组合串（拼音/preedit），候选窗头部展示。
+    pub fn set_preedit(&mut self, preedit: &str) {
+        self.preedit = preedit.to_owned();
+    }
+
+    /// 当前组合串（拼音/preedit）。
+    pub fn preedit(&self) -> &str {
+        &self.preedit
     }
 
     pub fn set_position(&mut self, x: i32, y: i32) {
