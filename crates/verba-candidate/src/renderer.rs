@@ -53,17 +53,32 @@ impl CpuCandidateRenderer {
         let height = pad * 2 + items.len() as u32 * theme.item_height + footer;
         let mut pixmap = Pixmap::new(width, height).expect("候选窗 pixmap");
 
-        // 背景
-        pixmap.fill(parse_color(&theme.background).unwrap_or(Color::WHITE));
+        // 背景（圆角：角部透明，配合窗口圆角区域裁切）
+        let bg = parse_color(&theme.background).unwrap_or(Color::WHITE);
+        if let Some(bg_path) =
+            rounded_rect_path(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0, theme.corner_radius as f32)
+        {
+            let mut bg_paint = Paint::default();
+            bg_paint.set_color(bg);
+            pixmap.fill_path(
+                &bg_path,
+                &bg_paint,
+                tiny_skia::FillRule::Winding,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        } else {
+            pixmap.fill(bg);
+        }
 
-        // 边框
+        // 边框（圆角描边）
         let border =
             parse_color(&theme.border_color).unwrap_or(Color::from_rgba8(0xCC, 0xCC, 0xCC, 0xFF));
-        let mut path = PathBuilder::new();
-        path.push_rect(Rect::from_xywh(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0).unwrap());
-        let mut paint = Paint::default();
-        paint.set_color(border);
-        if let Some(stroke_path) = path.finish() {
+        if let Some(stroke_path) =
+            rounded_rect_path(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0, theme.corner_radius as f32)
+        {
+            let mut paint = Paint::default();
+            paint.set_color(border);
             pixmap.stroke_path(
                 &stroke_path,
                 &paint,
@@ -85,17 +100,14 @@ impl CpuCandidateRenderer {
             let y = pad + idx as u32 * theme.item_height;
             let is_selected = ctrl.selected_index() == Some(idx);
             if is_selected {
-                let mut path = PathBuilder::new();
-                path.push_rect(
-                    Rect::from_xywh(
-                        1.0,
-                        y as f32,
-                        width as f32 - 2.0,
-                        theme.item_height as f32 - 1.0,
-                    )
-                    .unwrap(),
-                );
-                if let Some(rect) = path.finish() {
+                let sel_r = (theme.corner_radius as f32).min(8.0);
+                if let Some(rect) = rounded_rect_path(
+                    1.0,
+                    y as f32,
+                    width as f32 - 2.0,
+                    theme.item_height as f32 - 1.0,
+                    sel_r,
+                ) {
                     let mut p = Paint::default();
                     p.set_color(sel_bg);
                     pixmap.fill_path(
@@ -232,6 +244,28 @@ impl CpuCandidateRenderer {
             }
         }
     }
+}
+
+/// 圆角矩形路径（半径按宽高收敛）。
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+    if r <= 0.0 {
+        let mut p = PathBuilder::new();
+        p.push_rect(Rect::from_xywh(x, y, w, h)?);
+        return p.finish();
+    }
+    let mut p = PathBuilder::new();
+    p.move_to(x + r, y);
+    p.line_to(x + w - r, y);
+    p.quad_to(x + w, y, x + w, y + r);
+    p.line_to(x + w, y + h - r);
+    p.quad_to(x + w, y + h, x + w - r, y + h);
+    p.line_to(x + r, y + h);
+    p.quad_to(x, y + h, x, y + h - r);
+    p.line_to(x, y + r);
+    p.quad_to(x, y, x + r, y);
+    p.close();
+    p.finish()
 }
 
 fn parse_color(s: &str) -> Option<Color> {

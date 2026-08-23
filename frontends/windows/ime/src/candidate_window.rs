@@ -8,8 +8,9 @@ use verba_candidate::CandidateWindowController;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, StretchDIBits, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+    CreateRoundRectRgn, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SetWindowRgn,
+    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow,
@@ -163,6 +164,7 @@ impl CandidateWindow {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
+        apply_window_region(self.hwnd, w, h, ctrl.theme().corner_radius);
     }
 
     /// 仅移动位置（组合布局就绪后定时器重试精确定位时调用）。
@@ -216,6 +218,27 @@ fn fit_position(anchor: (i32, i32, i32), w: i32, h: i32, work: RECT) -> (i32, i3
 }
 
 /// 光标所在显示器的工作区（不含任务栏）。
+/// 给窗口设置圆角可见区域（配合渲染器圆角背景，角部透明）。
+fn apply_window_region(hwnd: HWND, w: u32, h: u32, radius: u32) {
+    if radius == 0 {
+        return;
+    }
+    unsafe {
+        let rgn = CreateRoundRectRgn(
+            0,
+            0,
+            w as i32 + 1,
+            h as i32 + 1,
+            (radius * 2) as i32,
+            (radius * 2) as i32,
+        );
+        if !rgn.is_invalid() {
+            // SetWindowRgn 接管区域所有权（此后系统负责释放），勿手动 DeleteObject。
+            let _ = SetWindowRgn(hwnd, Some(rgn), true);
+        }
+    }
+}
+
 fn monitor_work_area(x: i32, y: i32) -> RECT {
     unsafe {
         let pt = POINT { x, y };

@@ -34,6 +34,86 @@ pub enum ConfigError {
     InvalidValue(String),
 }
 
+/// 候选窗主题配置：预设（light/dark）+ 逐项覆盖。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    /// 预设：`light` / `dark`。
+    #[serde(default = "default_theme_preset")]
+    pub preset: String,
+    /// 背景色（`#RRGGBB`）。
+    #[serde(default)]
+    pub background: Option<String>,
+    /// 候选文字色。
+    #[serde(default)]
+    pub text_color: Option<String>,
+    /// 选中项背景色。
+    #[serde(default)]
+    pub selected_background: Option<String>,
+    /// 选中项文字色。
+    #[serde(default)]
+    pub selected_text_color: Option<String>,
+    /// 边框色。
+    #[serde(default)]
+    pub border_color: Option<String>,
+    /// 字号（像素）。
+    #[serde(default)]
+    pub font_size: Option<u32>,
+    /// 圆角半径（像素）。
+    #[serde(default)]
+    pub corner_radius: Option<u32>,
+}
+
+fn default_theme_preset() -> String {
+    "light".to_owned()
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_theme_preset(),
+            background: None,
+            text_color: None,
+            selected_background: None,
+            selected_text_color: None,
+            border_color: None,
+            font_size: None,
+            corner_radius: None,
+        }
+    }
+}
+
+impl ThemeConfig {
+    /// 合并预设与覆盖 → 候选窗主题。
+    pub fn to_candidate_theme(&self) -> verba_candidate::Theme {
+        let mut t = match self.preset.as_str() {
+            "dark" => verba_candidate::Theme::dark(),
+            _ => verba_candidate::Theme::default(),
+        };
+        if let Some(v) = &self.background {
+            t.background = v.clone();
+        }
+        if let Some(v) = &self.text_color {
+            t.text_color = v.clone();
+        }
+        if let Some(v) = &self.selected_background {
+            t.selected_background = v.clone();
+        }
+        if let Some(v) = &self.selected_text_color {
+            t.selected_text_color = v.clone();
+        }
+        if let Some(v) = &self.border_color {
+            t.border_color = v.clone();
+        }
+        if let Some(v) = self.font_size {
+            t.font_size = v;
+        }
+        if let Some(v) = self.corner_radius {
+            t.corner_radius = v;
+        }
+        t
+    }
+}
+
 /// 可持久化配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -52,6 +132,9 @@ pub struct Config {
     /// AI 模式系统提示词（可覆盖默认）。
     #[serde(default)]
     pub ai_system_prompt: String,
+    /// 候选窗主题。
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 fn default_llm_base_url() -> String {
@@ -75,6 +158,7 @@ impl Default for Config {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             ai_system_prompt: String::new(),
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -88,6 +172,28 @@ impl Config {
         map.insert("temperature".into(), self.temperature.to_string());
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
+        map.insert("theme.preset".into(), self.theme.preset.clone());
+        if let Some(v) = &self.theme.background {
+            map.insert("theme.background".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.text_color {
+            map.insert("theme.text_color".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.selected_background {
+            map.insert("theme.selected_background".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.selected_text_color {
+            map.insert("theme.selected_text_color".into(), v.clone());
+        }
+        if let Some(v) = &self.theme.border_color {
+            map.insert("theme.border_color".into(), v.clone());
+        }
+        if let Some(v) = self.theme.font_size {
+            map.insert("theme.font_size".into(), v.to_string());
+        }
+        if let Some(v) = self.theme.corner_radius {
+            map.insert("theme.corner_radius".into(), v.to_string());
+        }
         map
     }
 
@@ -108,6 +214,24 @@ impl Config {
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
                 "ai_system_prompt" => self.ai_system_prompt = v.clone(),
+                "theme.preset" => self.theme.preset = v.clone(),
+                "theme.background" => self.theme.background = Some(v.clone()),
+                "theme.text_color" => self.theme.text_color = Some(v.clone()),
+                "theme.selected_background" => self.theme.selected_background = Some(v.clone()),
+                "theme.selected_text_color" => self.theme.selected_text_color = Some(v.clone()),
+                "theme.border_color" => self.theme.border_color = Some(v.clone()),
+                "theme.font_size" => {
+                    self.theme.font_size = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
+                "theme.corner_radius" => {
+                    self.theme.corner_radius = Some(
+                        v.parse()
+                            .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?,
+                    );
+                }
                 other => return Err(ConfigError::UnknownKey(other.to_owned())),
             }
         }
@@ -202,6 +326,61 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&raw).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn theme_default_is_light_preset() {
+        let t = ThemeConfig::default();
+        assert_eq!(t.preset, "light");
+        // light 预设 ≈ 候选窗默认主题
+        let cand = t.to_candidate_theme();
+        assert_eq!(cand, verba_candidate::Theme::default());
+    }
+
+    #[test]
+    fn theme_dark_preset_changes_colors() {
+        let t = ThemeConfig {
+            preset: "dark".into(),
+            ..ThemeConfig::default()
+        };
+        let cand = t.to_candidate_theme();
+        assert_eq!(cand.background, "#1E1E1E");
+        assert_eq!(cand, verba_candidate::Theme::dark());
+    }
+
+    #[test]
+    fn theme_overrides_merge_onto_preset() {
+        let t = ThemeConfig {
+            preset: "light".into(),
+            background: Some("#112233".into()),
+            font_size: Some(18),
+            corner_radius: Some(0),
+            ..ThemeConfig::default()
+        };
+        let cand = t.to_candidate_theme();
+        assert_eq!(cand.background, "#112233");
+        assert_eq!(cand.font_size, 18);
+        assert_eq!(cand.corner_radius, 0);
+        // 未覆盖的字段仍取预设值
+        assert_eq!(cand.text_color, verba_candidate::Theme::default().text_color);
+    }
+
+    #[test]
+    fn theme_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        let mut map = std::collections::HashMap::new();
+        map.insert("theme.preset".into(), "dark".into());
+        map.insert("theme.corner_radius".into(), "10".into());
+        cfg.apply_map(&map).unwrap();
+        assert_eq!(cfg.theme.preset, "dark");
+        assert_eq!(cfg.theme.corner_radius, Some(10));
+        // 回读 to_map 能看到主题键
+        let out = cfg.to_map();
+        assert_eq!(out.get("theme.preset").map(String::as_str), Some("dark"));
+        assert_eq!(
+            out.get("theme.corner_radius").map(String::as_str),
+            Some("10")
+        );
     }
 
     #[test]

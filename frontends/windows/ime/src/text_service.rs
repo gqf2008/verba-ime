@@ -64,6 +64,10 @@ pub struct TextServiceData {
     pub candidate_window: RefCell<Option<crate::candidate_window::CandidateWindow>>,
     /// 候选窗锚点重试（GetTextExt 返回 TS_E_NOLAYOUT 时，由定时器稍后重试精确定位）。
     candidate_pending_pos: RefCell<Option<CandidatePosRetry>>,
+    /// 候选窗主题（随配置热更新）。
+    candidate_theme: RefCell<verba_candidate::Theme>,
+    /// 配置文件上次 mtime（用于热更新检测）。
+    theme_config_mtime: Cell<Option<std::time::SystemTime>>,
     pub stream_request_id: Arc<AtomicU64>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
@@ -84,6 +88,8 @@ impl TextServiceData {
             chunks: Arc::new(Mutex::new(VecDeque::new())),
             candidate_window: RefCell::new(None),
             candidate_pending_pos: RefCell::new(None),
+            candidate_theme: RefCell::new(verba_candidate::Theme::default()),
+            theme_config_mtime: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_thread: RefCell::new(None),
             control: RefCell::new(None),
@@ -166,6 +172,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
+    // 候选窗主题：从配置文件加载（失败保留默认，不影响激活）
+    reload_candidate_theme(data);
     // 候选窗（懒创建：失败不影响激活）
     if data.candidate_window.borrow().is_none() {
         if let Ok(cw) = crate::candidate_window::CandidateWindow::new() {
@@ -569,8 +577,8 @@ fn update_candidate_window(
         data.candidate_pending_pos.borrow_mut().take();
         return;
     }
-    let mut ctrl =
-        verba_candidate::CandidateWindowController::new(verba_candidate::Theme::default());
+    let theme = data.candidate_theme.borrow().clone();
+    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
     ctrl.set_candidates(candidates.to_vec());
     ctrl.set_page(page);
     ctrl.show();
@@ -597,6 +605,38 @@ fn update_candidate_window(
             });
         }
     }
+}
+
+/// 加载候选窗主题（从配置文件；失败保留当前主题）。
+fn reload_candidate_theme(data: &Rc<TextServiceData>) {
+    match load_candidate_theme() {
+        Ok(theme) => {
+            *data.candidate_theme.borrow_mut() = theme;
+            log::info!("候选窗主题已加载");
+        }
+        Err(e) => log::warn!("候选窗主题加载失败: {e}"),
+    }
+    data.theme_config_mtime.set(config_mtime());
+}
+
+/// 定时器热更新：配置文件 mtime 变化时重载主题。
+fn maybe_reload_candidate_theme(data: &Rc<TextServiceData>) {
+    if config_mtime() != data.theme_config_mtime.get() {
+        reload_candidate_theme(data);
+    }
+}
+
+fn load_candidate_theme() -> std::result::Result<verba_candidate::Theme, String> {
+    let dirs = verba_config::VerbaDirs::locate().map_err(|e| e.to_string())?;
+    let mgr = verba_config::ConfigManager::new(dirs);
+    let cfg = mgr.load().map_err(|e| e.to_string())?;
+    Ok(cfg.theme.to_candidate_theme())
+}
+
+fn config_mtime() -> Option<std::time::SystemTime> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    let path = verba_config::ConfigManager::new(dirs).path().clone();
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// 隐藏候选窗（提交/取消时）。
@@ -859,6 +899,8 @@ impl TextServiceData {
         };
         // 持续重试挂载键盘 sink（Activate 时可能失败）
         try_advise_keysink(&rc);
+        // 候选窗主题：配置文件变更时热更新
+        maybe_reload_candidate_theme(&rc);
         // 候选窗：组合布局就绪后重试精确定位
         retry_candidate_pos(&rc);
 

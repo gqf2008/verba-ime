@@ -22,6 +22,13 @@ pub struct Theme {
     pub item_height: u32,
     pub page_size: usize,
     pub max_width: u32,
+    /// 圆角半径（像素）。
+    #[serde(default = "default_corner_radius")]
+    pub corner_radius: u32,
+}
+
+fn default_corner_radius() -> u32 {
+    6
 }
 
 impl Default for Theme {
@@ -37,6 +44,27 @@ impl Default for Theme {
             item_height: 22,
             page_size: 9,
             max_width: 360,
+            corner_radius: default_corner_radius(),
+        }
+    }
+
+}
+
+impl Theme {
+    /// 暗色预设（深灰底 + 亮色文字 + 蓝色选中）。
+    pub fn dark() -> Self {
+        Self {
+            background: "#1E1E1E".into(),
+            text_color: "#D4D4D4".into(),
+            selected_background: "#264F78".into(),
+            selected_text_color: "#FFFFFF".into(),
+            border_color: "#3C3C3C".into(),
+            font_size: 14,
+            padding: 6,
+            item_height: 22,
+            page_size: 9,
+            max_width: 360,
+            corner_radius: default_corner_radius(),
         }
     }
 }
@@ -296,5 +324,21 @@ mod tests {
         let s = serde_json::to_string(&t).unwrap();
         let t2: Theme = serde_json::from_str(&s).unwrap();
         assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn theme_dark_preset_differs() {
+        let d = Theme::dark();
+        assert_ne!(d.background, Theme::default().background);
+        assert_eq!(d.background, "#1E1E1E");
+        assert_eq!(d.corner_radius, Theme::default().corner_radius);
+    }
+
+    #[test]
+    fn theme_serde_backcompat_missing_corner_radius() {
+        // 旧版序列化无 corner_radius 字段，应能反序列化并取默认值。
+        let s = r##"{"background":"#FFFFFF","text_color":"#333333","selected_background":"#D8E6FF","selected_text_color":"#1A56DB","border_color":"#CCCCCC","font_size":14,"padding":6,"item_height":22,"page_size":9,"max_width":360}"##;
+        let t: Theme = serde_json::from_str(s).unwrap();
+        assert_eq!(t.corner_radius, Theme::default().corner_radius);
     }
 }
