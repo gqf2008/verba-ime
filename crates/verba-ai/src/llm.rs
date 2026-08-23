@@ -54,6 +54,8 @@ pub struct LlmRequest {
     pub max_tokens: Option<i32>,
     /// 多模态图像（mime, 字节）；Some 时以 OpenAI image_url 发送。
     pub image: Option<(String, Vec<u8>)>,
+    /// 历史消息（role, content），按序插在 system 之后、当前 prompt 之前。
+    pub history: Vec<(String, String)>,
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +99,9 @@ impl LlmClient {
         let mut messages = Vec::new();
         if let Some(system) = req.system.as_deref().filter(|s| !s.is_empty()) {
             messages.push(json!({ "role": "system", "content": system }));
+        }
+        for (role, content) in &req.history {
+            messages.push(json!({ "role": role, "content": content }));
         }
         if let Some((mime, data)) = &req.image {
             let b64 = base64::engine::general_purpose::STANDARD.encode(data);
@@ -199,6 +204,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             image: None,
+            history: Vec::new(),
         };
         let mut stream = client.stream(&cfg, &req).await.unwrap();
         let mut out = String::new();
@@ -207,6 +213,52 @@ mod tests {
         }
         assert_eq!(out, "你好");
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_sends_history_messages() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        let thread = std::thread::spawn(move || {
+            if let Some(mut request) = server.incoming_requests().next() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                *cap.lock().unwrap() = body;
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .unwrap();
+                let response =
+                    tiny_http::Response::from_string("data: [DONE]\n\n").with_header(header);
+                let _ = request.respond(response);
+            }
+        });
+
+        let cfg = LlmConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            Some("sk-test".into()),
+            "test-model",
+        );
+        let client = LlmClient::new().unwrap();
+        let req = LlmRequest {
+            prompt: "这是第二句".into(),
+            system: None,
+            temperature: None,
+            max_tokens: None,
+            image: None,
+            history: vec![
+                ("user".into(), "这是第一句".into()),
+                ("assistant".into(), "好的".into()),
+            ],
+        };
+        let mut stream = client.stream(&cfg, &req).await.unwrap();
+        while stream.next().await.is_some() {}
+        thread.join().unwrap();
+        let body = captured.lock().unwrap().clone();
+        assert!(body.contains("这是第一句"), "应包含历史 user");
+        assert!(body.contains("这是第二句"), "应包含当前 prompt");
+        assert!(body.contains("\"assistant\""), "应包含 assistant 历史");
     }
 
     #[tokio::test]
@@ -241,6 +293,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             image: Some(("image/png".into(), b"\x89PNG".to_vec())),
+            history: Vec::new(),
         };
         let mut stream = client.stream(&cfg, &req).await.unwrap();
         while stream.next().await.is_some() {}

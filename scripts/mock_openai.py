@@ -86,7 +86,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             return
 
-        reply = "你好，我是本地 Mock LLM。Verba 输入法链路已打通 ✅"
+        user_count = body.count('"role":"user"')
+        if user_count > 1:
+            reply = f"多轮上下文：已收到 {user_count} 条 user 消息（历史保留正常） ✅"
+        else:
+            reply = "你好，我是本地 Mock LLM。Verba 输入法链路已打通 ✅"
         for i in range(0, len(reply), 2):
             chunk = reply[i : i + 2]
             payload = json.dumps(

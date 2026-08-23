@@ -1,6 +1,6 @@
 //! IPC 请求处理器。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::StreamExt;
@@ -34,6 +34,8 @@ pub struct DaemonHandler {
     cancels: Mutex<HashMap<u64, CancellationToken>>,
     /// 可选 Rime 引擎（config 引擎=rime 时惰性加载；串行化访问）。
     rime: Mutex<Option<RimeEngine>>,
+    /// AI 多轮上下文（role, content）；config ai_context_turns>0 时使用。
+    history: Mutex<VecDeque<(String, String)>>,
 }
 
 impl DaemonHandler {
@@ -45,6 +47,7 @@ impl DaemonHandler {
             llm,
             cancels: Mutex::new(HashMap::new()),
             rime: Mutex::new(None),
+            history: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -193,6 +196,30 @@ impl DaemonHandler {
             let mime = image_mime.clone().unwrap_or_else(|| "image/png".to_owned());
             (mime, data)
         });
+        let user_prompt = prompt.clone();
+        let context_turns = self.config.read().unwrap().ai_context_turns.max(0) as usize;
+        let trimmed = user_prompt.trim();
+        if trimmed == "重置" || trimmed == "reset" {
+            self.history.lock().unwrap().clear();
+            let _ = out
+                .event(&StreamEvent {
+                    id,
+                    kind: Some(stream_event::Kind::Final(Final {
+                        text: "已重置上下文".to_owned(),
+                    })),
+                })
+                .await;
+            return Ok(());
+        }
+        let has_image = image.is_some();
+        let mut history = Vec::new();
+        if !has_image && context_turns > 0 {
+            let guard = self.history.lock().unwrap();
+            let start = guard.len().saturating_sub(context_turns * 2);
+            for (role, content) in guard.iter().skip(start) {
+                history.push((role.clone(), content.clone()));
+            }
+        }
         // vision：请求携带图像时，若配置了独立 vision 模型则切换模型名。
         if image.is_some() {
             let vision_model = self.config.read().unwrap().llm_vision_model.clone();
@@ -211,6 +238,7 @@ impl DaemonHandler {
             temperature,
             max_tokens,
             image,
+            history,
         };
 
         match self.llm.stream(&llm_cfg, &req).await {
@@ -263,9 +291,21 @@ impl DaemonHandler {
                     let _ = out
                         .event(&StreamEvent {
                             id,
-                            kind: Some(stream_event::Kind::Final(Final { text: final_text })),
+                            kind: Some(stream_event::Kind::Final(Final {
+                                text: final_text.clone(),
+                            })),
                         })
                         .await;
+                    // 记录这一轮（文本 AI），供下一轮上下文；图像请求不入历史。
+                    if !has_image && context_turns > 0 {
+                        let mut guard = self.history.lock().unwrap();
+                        guard.push_back(("user".to_owned(), user_prompt.clone()));
+                        guard.push_back(("assistant".to_owned(), final_text.clone()));
+                        let max = context_turns * 2;
+                        while guard.len() > max {
+                            guard.pop_front();
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -319,6 +359,7 @@ impl DaemonHandler {
             temperature: Some(0.3),
             max_tokens: Some(128),
             image: None,
+            history: Vec::new(),
         };
 
         match self.llm.stream(&llm_cfg, &req).await {

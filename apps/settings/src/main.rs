@@ -138,6 +138,10 @@ fn read_fields(ui: &SettingsWindow) -> HashMap<String, String> {
         ui.get_ai_system_prompt().to_string(),
     );
     values.insert(
+        "ai_context_turns".into(),
+        ui.get_ai_context_turns().to_string(),
+    );
+    values.insert(
         "ocr_provider".into(),
         pick(OCR_PROVIDERS, ui.get_ocr_provider_index()),
     );
@@ -227,6 +231,7 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     ui.set_temperature(get("temperature").into());
     ui.set_max_tokens(get("max_tokens").into());
     ui.set_ai_system_prompt(get("ai_system_prompt").into());
+    ui.set_ai_context_turns(get("ai_context_turns").into());
     ui.set_ocr_provider_index(index_of(OCR_PROVIDERS, &get("ocr_provider")));
     ui.set_ocr_rapid_python(get("ocr_rapid_python").into());
     ui.set_llm_vision_model(get("llm_vision_model").into());

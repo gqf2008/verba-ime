@@ -15,6 +15,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> temperature;
     in-out property <string> max-tokens;
     in-out property <string> ai-system-prompt;
+    in-out property <string> ai-context-turns;
     in-out property <string> api-key-state: "未设置";
     in-out property <string> api-key-input: "";
 
@@ -70,6 +71,7 @@ export component SettingsWindow inherits Window {
                         HorizontalBox { spacing: 8px; Text { text: "模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-model; placeholder-text: "deepseek-chat"; } }
                         HorizontalBox { spacing: 8px; Text { text: "温度"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.temperature; placeholder-text: "0.7"; } }
                         HorizontalBox { spacing: 8px; Text { text: "最大 Tokens"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.max-tokens; placeholder-text: "1024"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "多轮上下文"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.ai-context-turns; placeholder-text: "0=关闭；>0 记忆最近 N 轮（//重置 清空）"; } }
                         Text { text: "AI 系统提示词"; }
                         TextEdit { text <=> root.ai-system-prompt; height: 64px; placeholder-text: "留空使用默认：输入法 AI 助手，回答简洁、可上屏，不用 Markdown"; }
                         Text { text: "API Key"; }

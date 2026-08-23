@@ -207,6 +207,9 @@ pub struct Config {
     /// AI 模式系统提示词（可覆盖默认）。
     #[serde(default)]
     pub ai_system_prompt: String,
+    /// AI 多轮上下文轮数（0=关闭）：记忆最近 N 轮对话，`//重置` 清空。
+    #[serde(default = "default_ai_context_turns")]
+    pub ai_context_turns: i32,
     /// 候选窗主题。
     #[serde(default)]
     pub theme: ThemeConfig,
@@ -307,6 +310,9 @@ fn default_eye_offset() -> i32 {
     0
 }
 
+fn default_ai_context_turns() -> i32 {
+    0
+}
 fn default_eye_mode() -> String {
     "ocr".to_owned()
 }
@@ -320,6 +326,7 @@ impl Default for Config {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             ai_system_prompt: String::new(),
+            ai_context_turns: default_ai_context_turns(),
             theme: ThemeConfig::default(),
             engine: default_engine(),
             rime_schema: default_rime_schema(),
@@ -351,6 +358,7 @@ impl Config {
         map.insert("temperature".into(), self.temperature.to_string());
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
+        map.insert("ai_context_turns".into(), self.ai_context_turns.to_string());
         map.insert("engine".into(), self.engine.clone());
         map.insert("rime_schema".into(), self.rime_schema.clone());
         map.insert("tts_provider".into(), self.tts_provider.clone());
@@ -439,6 +447,11 @@ impl Config {
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
                 "ai_system_prompt" => self.ai_system_prompt = v.clone(),
+                "ai_context_turns" => {
+                    self.ai_context_turns = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
                 "llm_vision_model" => self.llm_vision_model = v.clone(),
                 "engine" => {
                     if v != "builtin" && v != "rime" {
@@ -826,11 +839,13 @@ mod tests {
         map.insert("llm_vision_model".into(), "qwen2.5-vl".into());
         map.insert("ocr_provider".into(), "rapid".into());
         map.insert("ocr_rapid_python".into(), "C:\\py\\python.exe".into());
+        map.insert("ai_context_turns".into(), "4".into());
         cfg.apply_map(&map).unwrap();
         assert_eq!(cfg.eye_mode, "vision");
         assert_eq!(cfg.llm_vision_model, "qwen2.5-vl");
         assert_eq!(cfg.ocr_provider, "rapid");
         assert_eq!(cfg.ocr_rapid_python, "C:\\py\\python.exe");
+        assert_eq!(cfg.ai_context_turns, 4);
         let out = cfg.to_map();
         assert_eq!(out.get("eye_mode").map(String::as_str), Some("vision"));
         assert_eq!(out.get("ocr_provider").map(String::as_str), Some("rapid"));
