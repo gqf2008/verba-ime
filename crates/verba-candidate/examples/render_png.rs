@@ -20,7 +20,14 @@ fn main() {
         "你个头".into(),
         "呢".into(),
         "拟".into(),
+        "逆".into(),
+        "腻".into(),
+        "匿".into(),
+        "昵".into(),
+        "溺".into(),
+        "倪".into(),
     ]);
+    ctrl.set_page(1); // 演示页码脚（2/2）
     ctrl.show();
     ctrl.set_position(100, 200);
 
