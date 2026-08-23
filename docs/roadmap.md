@@ -50,7 +50,9 @@
 - [ ] OCR provider：本地 PaddleOCR（ONNX）+ 平台原生（Windows.Media.Ocr / Vision）
   - [x] **mock**（确定性，2026-08-23：`verba-ocr` crate + IPC `OcrRecognize` + daemon 路由 + `verba-cli ocr`）
   - [x] **Windows.Media.Ocr**（2026-08-23 实机验证：英文识别 OK；中文需装 OCR 语言包，代码优先 zh-Hans-CN 并有回退）
-  - [ ] PaddleOCR ONNX（跨平台本地）
+  - [x] **rapid（本地 RapidOCR/PaddleOCR PP-OCRv4）**（2026-08-23：`verba-ocr::rapid`，经 Python 子进程调 `rapidocr_onnxruntime`，中文实测正确；本机 GNU 工具链无 `ort` 预编译故走子进程；`ocr_provider=rapid` + `ocr_rapid_python`/自动探测 venv）
+  - [x] **多模态 vision（`//看图`）**（2026-08-23：`LlmRequest.image` + IPC `image/image_mime` + daemon 透传 + OpenAI 兼容 `image_url`；`eye_mode=vision` 直接把眼睛区域发图给 LLM）
+  - [x] **眼睛区域按光标智能取屏**（2026-08-23：复用候选窗工作区避让逻辑，默认上方、放不下翻下方/贴边）
 - [ ] 截图链路：权限、选区、预览、OCR 结果上屏
   - [x] **触发能力地基**（2026-08-23：`verba-trigger` 全屏截图→BMP→daemon OCR 端到端实机验证，Windows.Media.Ocr 真识别）
   - [x] **TSF 热键/`//截图` 命令接线**（2026-08-23：Ctrl+Alt+O 或 `//截图` → 截图 OCR 结果上屏；待实机验收）

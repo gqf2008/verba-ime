@@ -98,7 +98,8 @@ message Candidates {
 
 - **SetMode**：模式切换（Normal / Voice / Ocr / Ai）。AI 模式进入后，前端把按键收集为 prompt 文本，直到 Enter 提交 / Esc 退出。
 - **OcrImage**：支持 `bytes`（剪贴板 / 截图）或 `file_ref`（临时文件路径，避免大包传输；临时文件由请求方负责清理）。
-- **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）。
+- **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）；
+  可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` / `eye_mode=vision` 使用。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：`config 引擎=rime` 时前端把拼音/五笔码发到 daemon，daemon 内 librime
@@ -106,7 +107,7 @@ message Candidates {
 - **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`（默认 zh-CN-XiaoxiaoNeural）；daemon 按
   `config tts_provider` 选择 provider（`mock` 确定性 WAV / `edge` 微软在线神经音色 MP3），一次性回 `Audio`。
 - **OcrRecognize**：`image` 图像字节；daemon 按 `config ocr_provider` 选择 provider（`mock` 确定性 /
-  `windows` = Windows.Media.Ocr 本地识别），一次性回 `Text`（整段文字，多行以换行拼接）。
+  `windows` = Windows.Media.Ocr 本地识别 / `rapid` = 本地 RapidOCR（PaddleOCR+ONNXRuntime，经 Python 子进程）），一次性回 `Text`（整段文字，多行以换行拼接）。
 - **AsrTranscribe**：`audio` 音频字节；daemon 按 `config asr_provider` 选择 provider（当前 `mock` 确定性），一次性回 `Text`。
 - **取消**：任何流式请求可 `LlmCancel` 按全局请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
 - **断线重连**：客户端检测连接断开后按退避重连，并重新同步当前模式与配置。

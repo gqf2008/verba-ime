@@ -7,7 +7,7 @@
 
 | 方案 | 类型 | 说明 | Rust 接入 | 评价 |
 | --- | --- | --- | --- | --- |
-| PaddleOCR（PP-OCRv4） | 本地 | 中文最强开源 OCR，det + rec + cls 小模型约 10-20MB | ONNX Runtime（`ort` crate） | ✅ 默认本地方案 |
+| RapidOCR / PaddleOCR（PP-OCRv4） | 本地 | 中文最强开源 OCR，det + rec + cls 小模型约 10-20MB | ONNX Runtime（`ort` crate）；本机 `x86_64-pc-windows-gnu`（无 MSVC）无 `ort` 预编译，故经 Python 子进程调 `rapidocr_onnxruntime`（`ocr_provider=rapid`，2026-08-23 实机 OK） | ✅ 默认本地方案 |
 | PaddleOCR-VL / DeepSeek-OCR | 本地 | 新式 VLM OCR，效果好、模型大（GB 级） | `ort` / candle | 备选，视硬件 |
 | Windows.Media.Ocr | 系统 | Win10+ 内置 OCR，多语言 | `windows` crate | ✅ Windows 快速路径 |
 | Apple Vision（VNRecognizeTextRequest） | 系统 | macOS 原生 OCR，质量好 | Swift / ObjC（或 objc2） | ✅ macOS 快速路径 |
@@ -58,10 +58,16 @@
 
 | 能力 | 默认 | 备选 | 说明 |
 | --- | --- | --- | --- |
-| OCR | PaddleOCR（本地） | 平台原生 OCR | 云端仅当用户配置 key |
+| OCR | rapid（本地 RapidOCR/PaddleOCR，经 Python `rapidocr_onnxruntime`） | platform 原生（Windows.Media.Ocr）/ vision LLM | 云端仅当用户配置 key |
 | ASR | openai（在线，OpenAI 兼容 `audio/transcriptions`） | mock / whisper.cpp / audio.cpp | 无 key 时回退 mock |
 | LLM | 无默认服务商，首次引导配置 | DeepSeek / OpenAI 兼容 | 纯远程，必须显式配置 |
 | TTS | edge（在线，微软音色）/ openai（OpenAI 兼容） | mock / Piper / audio.cpp | 无网络时本地兜底 |
+
+## 多模态 vision（`//看图` / 眼睛直读图像）
+
+- `//看图` 或 `eye_mode=vision` 时，把「眼睛区域」（光标上方屏幕，见候选窗避让逻辑）直接发给多模态 LLM（OpenAI 兼容 `image_url` 内容块），例如 `gpt-4o-mini` / `qwen2.5-vl` / `GLM-4V`。
+- 配置：`llm_vision_model`（为空则复用 `llm_model`，需模型支持 vision）、`eye_mode=ocr|vision`。
+- 与 OCR 的区别：vision 由 LLM 直接「理解 + 提取」，擅长版面、表格、图表与上下文；OCR 只做「文字识别」转文本。
 
 ## 降级与失败策略
 
