@@ -619,6 +619,7 @@ pub fn apply_action(
                             }
                             *data.machine.borrow_mut() = CompositionMachine::new();
                             let _ = edit_session::commit_text(context, clientid, &text);
+                            crate::clipboard::set_text_quiet(&text);
                             return Ok(());
                         }
                     }
@@ -1575,6 +1576,7 @@ impl TextServiceData {
                 Ok(()) => log::info!("触发结果上屏: chars={}", text.chars().count()),
                 Err(e) => log::warn!("触发结果上屏失败: {e}"),
             }
+            crate::clipboard::set_text_quiet(&text);
         }
     }
 }
