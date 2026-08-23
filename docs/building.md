@@ -38,6 +38,26 @@ cargo run -p verba-cli -- --help
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup.exe`（需管理员运行安装）。
 
+### Rime 引擎（可选，`config 引擎=rime`）
+
+M5 起支持用 librime 作拼音/五笔引擎（daemon 内动态加载 rime.dll）。构建与部署：
+
+1. 获取第三方二进制/数据（rime.dll x64 + Rime 数据 + wubi86 + opencc）：
+   ```powershell
+   pwsh spikes/librime-sys/fetch-vendor.ps1   # 输出到 spikes/librime-sys/vendor/
+   ```
+2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载）：
+   ```
+   <daemon 同目录>/rime/rime.dll
+   <daemon 同目录>/rime/data/            # schema/dict + opencc/
+   <daemon 同目录>/rime/user_data/       # 首次查询自动部署生成
+   ```
+   或指定 `VERBA_RIME_DLL` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
+3. 启用：`verba-cli config set engine=rime rime_schema=luna_pinyin_simp`
+   （五笔：`rime_schema=wubi86`；切回内置：`engine=builtin`）。
+4. 验证：`verba-cli rime nishishui`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。
+   > 首次查询会部署 schema/词典（数秒）；整句基准见 [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8。
+
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
 - **macOS**：Xcode 工程或 SPM 构建 `.appex` → 装入 `~/Library/Input Methods` → Developer ID 签名 + 公证。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
