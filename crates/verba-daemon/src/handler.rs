@@ -132,6 +132,7 @@ impl RequestHandler for DaemonHandler {
             Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
             Some(request::Kind::TtsSynthesize(g)) => self.handle_tts_synthesize(id, g, out).await,
             Some(request::Kind::OcrRecognize(g)) => self.handle_ocr_recognize(id, g, out).await,
+            Some(request::Kind::AsrTranscribe(g)) => self.handle_asr_transcribe(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
                 let token = self.cancels.lock().unwrap().remove(&id);
                 if let Some(token) = token {
@@ -525,6 +526,55 @@ impl DaemonHandler {
                 log::info!(
                     "OCR 识别: image_bytes={} provider={} text_len={}",
                     g.image.len(),
+                    provider,
+                    text.chars().count()
+                );
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Text(verba_protos::Text { text })),
+                })
+                .await
+            }
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 500,
+                        message: e.to_string(),
+                    })),
+                })
+                .await
+            }
+        }
+    }
+
+    /// ASR 转写：按 config asr_provider 分发，返回识别文字。
+    async fn handle_asr_transcribe(
+        &self,
+        id: u64,
+        g: verba_protos::AsrTranscribe,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let provider = self.config.read().unwrap().asr_provider.clone();
+        let client = match verba_asr::AsrClient::from_config(&provider) {
+            Ok(c) => c,
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 400,
+                        message: e.to_string(),
+                    })),
+                })
+                .await?;
+                return Ok(());
+            }
+        };
+        match client.transcribe(&g.audio).await {
+            Ok(text) => {
+                log::info!(
+                    "ASR 转写: audio_bytes={} provider={} text_len={}",
+                    g.audio.len(),
                     provider,
                     text.chars().count()
                 );

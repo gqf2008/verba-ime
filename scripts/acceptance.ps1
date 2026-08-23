@@ -96,8 +96,17 @@ try {
     Remove-Item -LiteralPath $ocrImg -Force -ErrorAction SilentlyContinue
     Write-Output "ocr <img> -> mock 文本 OK（$ocrText）"
 
+    Write-Output "==== 8) ASR 转写（mock provider） ===="
+    & $cli config set asr_provider=mock | Out-Null
+    $asrAudio = Join-Path $env:TEMP "verba-asr-check.wav"
+    Set-Content -LiteralPath $asrAudio -Value "fake-wav-bytes" -Encoding Ascii
+    $asrText = & $cli asr $asrAudio
+    if ($asrText -notmatch "mock-asr") { throw "ASR mock 未返回确定性文本: $asrText" }
+    Remove-Item -LiteralPath $asrAudio -Force -ErrorAction SilentlyContinue
+    Write-Output "asr <wav> -> mock 文本 OK（$asrText）"
+
     & $cli config set rime_schema=luna_pinyin_simp | Out-Null
-    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock + ocr_provider=mock）"
+    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock + ocr_provider=mock + asr_provider=mock）"
 }
 finally {
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue

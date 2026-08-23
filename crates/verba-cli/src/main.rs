@@ -29,6 +29,7 @@ fn main() {
         Some("rime") => cmd_rime(&args),
         Some("tts") => cmd_tts(&args),
         Some("ocr") => cmd_ocr(&args),
+        Some("asr") => cmd_asr(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -51,6 +52,7 @@ fn print_help() {
          verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
          verba-cli tts <文本> [输出]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
+         verba-cli asr <音频>          ASR 转写音频并打印文字（config asr_provider）\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -217,6 +219,27 @@ fn cmd_ocr(args: &[String]) -> i32 {
     };
     with_client(|c| {
         let text = c.ocr_recognize(&image)?;
+        println!("{text}");
+        Ok(())
+    })
+}
+
+/// `verba-cli asr <音频>`：daemon ASR 转写（provider 由 config asr_provider 决定）。
+fn cmd_asr(args: &[String]) -> i32 {
+    let path = args.get(1).cloned().unwrap_or_default();
+    if path.is_empty() {
+        eprintln!("用法: verba-cli asr <音频>");
+        return 1;
+    }
+    let audio = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取音频失败 {path}: {e}");
+            return 1;
+        }
+    };
+    with_client(|c| {
+        let text = c.asr_transcribe(&audio)?;
         println!("{text}");
         Ok(())
     })

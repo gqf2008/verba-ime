@@ -150,6 +150,9 @@ pub struct Config {
     /// OCR provider：mock（默认，确定性）| windows（Windows.Media.Ocr 本地识别）。
     #[serde(default = "default_ocr_provider")]
     pub ocr_provider: String,
+    /// ASR provider：mock（默认，确定性）| whisper（whisper.cpp，开发中）。
+    #[serde(default = "default_asr_provider")]
+    pub asr_provider: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -176,6 +179,9 @@ fn default_tts_provider() -> String {
 fn default_ocr_provider() -> String {
     "mock".to_owned()
 }
+fn default_asr_provider() -> String {
+    "mock".to_owned()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -191,6 +197,7 @@ impl Default for Config {
             tts_provider: default_tts_provider(),
             tts_voice: String::new(),
             ocr_provider: default_ocr_provider(),
+            asr_provider: default_asr_provider(),
         }
     }
 }
@@ -209,6 +216,7 @@ impl Config {
         map.insert("tts_provider".into(), self.tts_provider.clone());
         map.insert("tts_voice".into(), self.tts_voice.clone());
         map.insert("ocr_provider".into(), self.ocr_provider.clone());
+        map.insert("asr_provider".into(), self.asr_provider.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -276,6 +284,14 @@ impl Config {
                         )));
                     }
                     self.ocr_provider = v.clone();
+                }
+                "asr_provider" => {
+                    if v != "mock" {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "asr_provider 仅支持 mock（whisper 开发中）: {k}={v}"
+                        )));
+                    }
+                    self.asr_provider = v.clone();
                 }
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),

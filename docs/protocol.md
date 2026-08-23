@@ -26,6 +26,7 @@ message Request {
     RimeCandidates rime_candidates = 23; // 可选 Rime 引擎候选（config 引擎=rime）
     TtsSynthesize tts_synthesize = 24;    // TTS 合成（config tts_provider）
     OcrRecognize ocr_recognize = 25;    // OCR 识别（config ocr_provider）
+    AsrTranscribe asr_transcribe = 26;   // ASR 转写（config asr_provider）
   }
 }
 
@@ -51,6 +52,11 @@ message TtsSynthesize {
 // OCR 识别：provider 由 config ocr_provider 决定（mock|windows…）。
 message OcrRecognize {
   bytes image = 1;                 // 图像字节（PNG/JPEG/BMP…）
+}
+
+// ASR 转写：provider 由 config asr_provider 决定（mock|whisper…）。
+message AsrTranscribe {
+  bytes audio = 1;                 // 音频字节（WAV/MP3…）
 }
 
 message Response {
@@ -101,6 +107,7 @@ message Candidates {
   `config tts_provider` 选择 provider（当前 `mock`，产出确定性 WAV），一次性回 `Audio`。
 - **OcrRecognize**：`image` 图像字节；daemon 按 `config ocr_provider` 选择 provider（`mock` 确定性 /
   `windows` = Windows.Media.Ocr 本地识别），一次性回 `Text`（整段文字，多行以换行拼接）。
+- **AsrTranscribe**：`audio` 音频字节；daemon 按 `config asr_provider` 选择 provider（当前 `mock` 确定性），一次性回 `Text`。
 - **取消**：任何流式请求可 `LlmCancel` 按全局请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
 - **断线重连**：客户端检测连接断开后按退避重连，并重新同步当前模式与配置。
 - **背压**：大文件 / 高吞吐用分块 + 流控，避免管道阻塞（参照数据通道背压经验）。

@@ -22,6 +22,7 @@ message Request {
     RimeCandidates rime_candidates = 23;
     TtsSynthesize tts_synthesize = 24;
     OcrRecognize ocr_recognize = 25;
+    AsrTranscribe asr_transcribe = 26;
   }
 }
 
@@ -110,6 +111,11 @@ message Audio {
 // OCR（图片/截图 → 文字）：provider 由 config ocr_provider 决定（mock|windows…）。
 message OcrRecognize {
   bytes image = 1;
+}
+
+// ASR（语音 → 文字）：provider 由 config asr_provider 决定（mock|whisper…）。
+message AsrTranscribe {
+  bytes audio = 1;
 }
 
 // ---------- 流式事件（服务端 -> 客户端，按请求 id 关联） ----------

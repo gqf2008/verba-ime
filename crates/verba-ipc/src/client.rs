@@ -21,8 +21,8 @@ use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream as Lo
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
-    request, response, stream_event, LlmCancel, LlmCandidates, LlmGenerate, OcrRecognize, Ping,
-    Request, Response, RimeCandidates, StreamEvent, TtsSynthesize,
+    request, response, stream_event, AsrTranscribe, LlmCancel, LlmCandidates, LlmGenerate,
+    OcrRecognize, Ping, Request, Response, RimeCandidates, StreamEvent, TtsSynthesize,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -390,6 +390,26 @@ impl VerbaClient {
             id,
             kind: Some(request::Kind::OcrRecognize(OcrRecognize {
                 image: image.to_vec(),
+            })),
+        };
+        let resp = self.request(req)?;
+        match resp.kind {
+            Some(response::Kind::Text(t)) => Ok(t.text),
+            Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                code: e.code,
+                message: e.message,
+            }),
+            _ => Err(IpcError::Protocol("期望 Text 响应".into())),
+        }
+    }
+
+    /// 请求 ASR 转写，返回识别文字。
+    pub fn asr_transcribe(&mut self, audio: &[u8]) -> Result<String, IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::AsrTranscribe(AsrTranscribe {
+                audio: audio.to_vec(),
             })),
         };
         let resp = self.request(req)?;

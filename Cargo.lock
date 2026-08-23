@@ -2175,6 +2175,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "verba-asr"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 2.0.20",
+ "tokio",
+ "verba-ai",
+]
+
+[[package]]
 name = "verba-candidate"
 version = "0.1.0"
 dependencies = [
@@ -2226,6 +2236,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "verba-ai",
+ "verba-asr",
  "verba-config",
  "verba-core",
  "verba-ipc",

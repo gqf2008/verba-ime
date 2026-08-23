@@ -1,0 +1,18 @@
+[package]
+name = "verba-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba ASR 能力：语音 → 文字（mock / whisper.cpp 等 provider）"
+
+[lints]
+workspace = true
+
+[dependencies]
+verba-ai = { path = "../verba-ai" }
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

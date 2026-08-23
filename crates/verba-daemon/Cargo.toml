@@ -18,6 +18,7 @@ verba-core = { path = "../verba-core" }
 verba-librime = { path = "../verba-librime" }
 verba-tts = { path = "../verba-tts" }
 verba-ocr = { path = "../verba-ocr" }
+verba-asr = { path = "../verba-asr" }
 tokio.workspace = true
 tokio-util.workspace = true
 log.workspace = true
