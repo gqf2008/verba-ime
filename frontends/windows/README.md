@@ -7,4 +7,17 @@
   - `ITfInputProcessorProfiles::Register` 注册 GUID + 语言栏按钮；IMM32 仅兼容回退。
   - 候选窗口：TSF `ITfCandidateListUIElement` 或自绘置顶窗口（见架构开放问题）。
 - 安装：Inno Setup 打包，注册 COM + 输入法。
-- 状态：**未开始（M1）**。
+- 状态：M1/M5 已实机验收（LLM 直输 + 拼音/Rime 候选窗 + 融合）；多模态触发能力地基已就绪（见下）。
+
+## 触发工具（verba-trigger）
+
+`verba-trigger` 是 Windows 触发能力入口（与 DLL 同包构建），供手动验证与后续 TSF 热键接线复用：
+
+- `verba-trigger shot [输出.bmp]`：截取主屏全屏（BitBlt → 32bpp top-down BMP，零依赖编码）。
+- `verba-trigger ocr [输出.txt]`：截图 → daemon OCR（`config ocr_provider`：mock / windows）。
+- `verba-trigger mic [秒=3] [输出.wav]`：麦克风录音（cpal → 16bit PCM WAV）。
+- `verba-trigger asr [秒=3]`：录音 → daemon ASR（`config asr_provider`）。
+- `verba-trigger tts <文本> [输出] [语音]`：TTS 合成存文件（`config tts_provider`）。
+- `verba-trigger speak <文本> [语音]`：TTS 合成并播放（rodio，支持 MP3 / WAV）。
+
+能力模块：`capture`（截图）、`record`（录音）、`play`（播放）均在 DLL crate 内，后续 TSF 热键直接复用。

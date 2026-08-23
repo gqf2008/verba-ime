@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 name = "verba-reg"
 path = "src/bin/verba-reg.rs"
 
+[[bin]]
+name = "verba-trigger"
+path = "src/bin/verba-trigger.rs"
+
 [dependencies]
 verba-core = { path = "../../../crates/verba-core" }
 verba-candidate = { path = "../../../crates/verba-candidate" }
@@ -36,6 +40,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.62"
+cpal = "0.15"
+rodio = "0.20"
 
 [profile.release]
 opt-level = 2
