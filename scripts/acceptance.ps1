@@ -87,8 +87,17 @@ try {
     Remove-Item -LiteralPath $ttsOut -Force -ErrorAction SilentlyContinue
     Write-Output "tts 你好 -> WAV OK（$($bytes.Length) bytes）"
 
+    Write-Output "==== 7) OCR 识别（mock provider） ===="
+    & $cli config set ocr_provider=mock | Out-Null
+    $ocrImg = Join-Path $env:TEMP "verba-ocr-check.img"
+    Set-Content -LiteralPath $ocrImg -Value "fake-image-bytes" -Encoding Ascii
+    $ocrText = & $cli ocr $ocrImg
+    if ($ocrText -notmatch "mock-ocr") { throw "OCR mock 未返回确定性文本: $ocrText" }
+    Remove-Item -LiteralPath $ocrImg -Force -ErrorAction SilentlyContinue
+    Write-Output "ocr <img> -> mock 文本 OK（$ocrText）"
+
     & $cli config set rime_schema=luna_pinyin_simp | Out-Null
-    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock）"
+    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock + ocr_provider=mock）"
 }
 finally {
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue

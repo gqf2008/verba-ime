@@ -1,0 +1,32 @@
+[package]
+name = "verba-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba OCR 能力：图片/截图 → 文字（mock / Windows.Media.Ocr 等 provider）"
+
+# 本 crate 需要 WinRT 线程 COM 初始化（unsafe），仅此处放开（其余 crate 维持 workspace forbid）
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+verba-ai = { path = "../verba-ai" }
+thiserror.workspace = true
+log.workspace = true
+tokio.workspace = true
+futures-executor = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Globalization",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_System_Com",
+] }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/verba-candidate",
     "crates/verba-librime",
     "crates/verba-tts",
+    "crates/verba-ocr",
     "crates/verba-cli",
 ]
 

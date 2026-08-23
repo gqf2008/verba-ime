@@ -21,6 +21,7 @@ message Request {
     LlmCandidates llm_candidates = 22;
     RimeCandidates rime_candidates = 23;
     TtsSynthesize tts_synthesize = 24;
+    OcrRecognize ocr_recognize = 25;
   }
 }
 
@@ -104,6 +105,11 @@ message TtsSynthesize {
 message Audio {
   string format = 1;
   bytes data = 2;
+}
+
+// OCR（图片/截图 → 文字）：provider 由 config ocr_provider 决定（mock|windows…）。
+message OcrRecognize {
+  bytes image = 1;
 }
 
 // ---------- 流式事件（服务端 -> 客户端，按请求 id 关联） ----------

@@ -28,6 +28,7 @@ fn main() {
         Some("candidates") => cmd_candidates(&args),
         Some("rime") => cmd_rime(&args),
         Some("tts") => cmd_tts(&args),
+        Some("ocr") => cmd_ocr(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -49,6 +50,7 @@ fn print_help() {
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
          verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
          verba-cli tts <文本> [输出]  TTS 合成音频并写文件（config tts_provider）\n  \
+         verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -195,6 +197,27 @@ fn cmd_tts(args: &[String]) -> i32 {
                 println!("format={format} bytes={}", data.len());
             }
         }
+        Ok(())
+    })
+}
+
+/// `verba-cli ocr <图像>`：daemon OCR 识别（provider 由 config ocr_provider 决定）。
+fn cmd_ocr(args: &[String]) -> i32 {
+    let path = args.get(1).cloned().unwrap_or_default();
+    if path.is_empty() {
+        eprintln!("用法: verba-cli ocr <图像>");
+        return 1;
+    }
+    let image = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取图像失败 {path}: {e}");
+            return 1;
+        }
+    };
+    with_client(|c| {
+        let text = c.ocr_recognize(&image)?;
+        println!("{text}");
         Ok(())
     })
 }
