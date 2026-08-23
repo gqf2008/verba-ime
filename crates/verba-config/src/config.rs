@@ -228,9 +228,7 @@ pub struct Config {
     /// OCR provider：mock（默认，确定性）| windows（Windows.Media.Ocr 本地识别）。
     #[serde(default = "default_ocr_provider")]
     pub ocr_provider: String,
-    /// rapid provider 的 Python 解释器路径；为空则自动探测（data_dir/venv-ocr/Scripts/python.exe → PATH python）。
-    #[serde(default)]
-    pub ocr_rapid_python: String,
+
     /// ASR provider：mock（默认，确定性）| openai（OpenAI 兼容在线转写）。
     #[serde(default = "default_asr_provider")]
     pub asr_provider: String,
@@ -333,7 +331,6 @@ impl Default for Config {
             tts_provider: default_tts_provider(),
             tts_voice: String::new(),
             ocr_provider: default_ocr_provider(),
-            ocr_rapid_python: String::new(),
             asr_provider: default_asr_provider(),
             asr_base_url: String::new(),
             asr_model: default_asr_model(),
@@ -364,7 +361,6 @@ impl Config {
         map.insert("tts_provider".into(), self.tts_provider.clone());
         map.insert("tts_voice".into(), self.tts_voice.clone());
         map.insert("ocr_provider".into(), self.ocr_provider.clone());
-        map.insert("ocr_rapid_python".into(), self.ocr_rapid_python.clone());
         map.insert("asr_provider".into(), self.asr_provider.clone());
         map.insert("asr_base_url".into(), self.asr_base_url.clone());
         map.insert("asr_model".into(), self.asr_model.clone());
@@ -479,7 +475,6 @@ impl Config {
                     }
                     self.ocr_provider = v.clone();
                 }
-                "ocr_rapid_python" => self.ocr_rapid_python = v.clone(),
                 "asr_provider" => {
                     if v != "mock" && v != "openai" {
                         return Err(ConfigError::InvalidValue(format!(
@@ -833,18 +828,15 @@ mod tests {
         let mut cfg = Config::default();
         assert_eq!(cfg.eye_mode, "ocr");
         assert_eq!(cfg.llm_vision_model, "");
-        assert_eq!(cfg.ocr_rapid_python, "");
         let mut map = HashMap::new();
         map.insert("eye_mode".into(), "vision".into());
         map.insert("llm_vision_model".into(), "qwen2.5-vl".into());
         map.insert("ocr_provider".into(), "rapid".into());
-        map.insert("ocr_rapid_python".into(), "C:\\py\\python.exe".into());
         map.insert("ai_context_turns".into(), "4".into());
         cfg.apply_map(&map).unwrap();
         assert_eq!(cfg.eye_mode, "vision");
         assert_eq!(cfg.llm_vision_model, "qwen2.5-vl");
         assert_eq!(cfg.ocr_provider, "rapid");
-        assert_eq!(cfg.ocr_rapid_python, "C:\\py\\python.exe");
         assert_eq!(cfg.ai_context_turns, 4);
         let out = cfg.to_map();
         assert_eq!(out.get("eye_mode").map(String::as_str), Some("vision"));

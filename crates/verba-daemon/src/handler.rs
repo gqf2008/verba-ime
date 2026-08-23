@@ -587,11 +587,8 @@ impl DaemonHandler {
         g: verba_protos::OcrRecognize,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
-        let (provider, rapid_python) = {
-            let cfg = self.config.read().unwrap();
-            (cfg.ocr_provider.clone(), cfg.ocr_rapid_python.clone())
-        };
-        let client = match verba_ocr::OcrClient::from_config(&provider, &rapid_python) {
+        let provider = self.config.read().unwrap().ocr_provider.clone();
+        let client = match verba_ocr::OcrClient::from_config(&provider) {
             Ok(c) => c,
             Err(e) => {
                 out.response(&Response {

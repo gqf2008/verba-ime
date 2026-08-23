@@ -11,7 +11,8 @@ $clsid = "{7C2D4E6A-1F3B-4A9E-8C5D-2F6B9A0E3D51}"
 $dll = (Get-ItemProperty "HKCU:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -ErrorAction Stop)."(default)"
 $dllDir = Split-Path -Parent $dll
 # CLI 优先用根目录 release（与部署同版本、连同一管道；个别部署目录可能被 AV 临时拦截执行）
-$rootCli = Join-Path $root "target\release\verba-cli.exe"
+$msvcCli = Join-Path $root "target\x86_64-pc-windows-msvc\release\verba-cli.exe"
+$rootCli = if (Test-Path $msvcCli) { $msvcCli } else { Join-Path $root "target\release\verba-cli.exe" }
 $cli = if (Test-Path $rootCli) { $rootCli } else { Join-Path $dllDir "verba-cli.exe" }
 $daemonExe = Join-Path $dllDir "verba-daemon.exe"
 

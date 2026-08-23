@@ -21,7 +21,6 @@ export component SettingsWindow inherits Window {
 
     // ---------- 多模态 ----------
     in-out property <int> ocr-provider-index: 0;
-    in-out property <string> ocr-rapid-python;
     in-out property <string> llm-vision-model;
     in-out property <int> eye-mode-index: 0;
     in-out property <int> asr-provider-index: 0;
@@ -93,7 +92,7 @@ export component SettingsWindow inherits Window {
                     VerticalBox {
                         padding: 8px;
                         spacing: 6px;
-                        HorizontalBox { spacing: 8px; Text { text: "OCR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "windows（Windows 本地识别）", "rapid（本地 RapidOCR/PaddleOCR，需 Python rapidocr_onnxruntime）"]; current-index <=> root.ocr-provider-index; } }
+                        HorizontalBox { spacing: 8px; Text { text: "OCR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "windows（Windows 本地识别）", "rapid（本地 ONNX/PaddleOCR，原生 Rust，无需 Python）"]; current-index <=> root.ocr-provider-index; } }
                         HorizontalBox { spacing: 8px; Text { text: "ASR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "openai（在线转写）"]; current-index <=> root.asr-provider-index; } }
                         HorizontalBox { spacing: 8px; Text { text: "ASR Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
                         HorizontalBox { spacing: 8px; Text { text: "ASR 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-model; placeholder-text: "whisper-1"; } }
@@ -101,7 +100,6 @@ export component SettingsWindow inherits Window {
                         HorizontalBox { spacing: 8px; Text { text: "TTS Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
                         HorizontalBox { spacing: 8px; Text { text: "TTS 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-model; placeholder-text: "tts-1"; } }
                         HorizontalBox { spacing: 8px; Text { text: "TTS 音色"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-voice; placeholder-text: "edge: zh-CN-XiaoxiaoNeural / openai: alloy"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "OCR Python"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.ocr-rapid-python; placeholder-text: "留空自动探测 data_dir/venv-ocr/Scripts/python.exe"; } }
                         HorizontalBox { spacing: 8px; Text { text: "Vision 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-vision-model; placeholder-text: "留空复用 LLM 模型（需 vision 模型）/ gpt-4o-mini"; } }
                         HorizontalBox { spacing: 8px; Text { text: "眼睛喂给 LLM"; width: 130px; vertical-alignment: center; } ComboBox { model: ["ocr（本地/在线 OCR → 文字）", "vision（多模态 LLM 直读图像）"]; current-index <=> root.eye-mode-index; } }
                     }

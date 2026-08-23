@@ -1,121 +1,39 @@
-//! RapidOCR 本地识别：PaddleOCR + ONNXRuntime（经常驻 Python 子进程）。
+//! RapidOCR 本地识别：PaddleOCR + ONNXRuntime（原生 Rust，无需 Python）。
 //!
-//! 本机 Rust 工具链为 `x86_64-pc-windows-gnu`（无 MSVC），`ort` 无 windows-gnu 预编译，
-//! 故不走 Rust `ort` 绑定，而是调用用户侧 Python `rapidocr_onnxruntime`（同算法、同模型，
-//! 中文识别强于 Windows.Media.Ocr）。
+//! 本机 Rust 工具链现为 `x86_64-pc-windows-msvc`（MSVC 已安装），`ort` 提供 windows-msvc
+//! 预编译 onnxruntime，故直接内嵌 `rapidocr-core`（PP-OCRv5 中文 mobile 模型），
+//! 不再拉起任何 Python 子进程，也更适合作为系统级输入法的本地 OCR。
 //!
-//! - 常驻单进程：把模型加载一次、复用于多次识别，避免每次调用冷启动（~1.5s→热调用 ~0.4s）。
-//! - 帧协议：stdin 写 `u32 LE 长度 + 图像字节`；stdout 读 `u32 LE 长度 + 识别文本`。
-//!   Python 侧所有库/日志输出重定向到 stderr，防止污染帧流；异常回 `ERROR:<msg>` 帧。
-//! - Python 解释器按 `ocr_rapid_python` 配置 → `VERBA_RAPIDOCR_PYTHON` 环境变量 →
-//!   `{data_dir}/venv-ocr/Scripts/python.exe`（Windows）/ `bin/python`（unix）→ PATH `python` 依次解析。
+//! - 模型自动下载到 `{data_dir}/models-rapidocr`（首次运行，约 10-20MB，校验 SHA-256）。
+//! - 常驻一个 `RapidOcr` 运行器（ONNX session 有状态），串行执行识别。
+//! - `spawn_blocking` 包裹阻塞推理，不占 daemon async 运行时。
 
-use std::io::{Read, Write};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use verba_ai::OcrProvider;
 
 use crate::OcrError;
 
-/// 嵌入的常驻 Python 服务脚本。
-const HELPER_SCRIPT: &str = r#"# -*- coding: utf-8 -*-
-import os, sys, struct, tempfile, time
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-# 库/日志的 print() 全部重定向到 stderr，避免污染帧协议（stdout 只写帧）。
-_orig_stdout = sys.stdout.fileno()
-sys.stdout = sys.stderr
-OUT = os.fdopen(os.dup(_orig_stdout), 'wb', buffering=0)
-
-def _read_exact(n):
-    data = b''
-    while len(data) < n:
-        chunk = sys.stdin.buffer.read(n - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return data
-
-try:
-    from rapidocr_onnxruntime import RapidOCR
-except Exception as e:
-    print("rapidocr_onnxruntime \u672a\u5b89\u88c5: %s" % e, file=sys.stderr)
-    sys.exit(3)
-
-ocr = RapidOCR()
-
-def _frame(text):
-    data = text.encode('utf-8')
-    OUT.write(struct.pack('<I', len(data)) + data)
-    OUT.flush()
-
-def main():
-    if os.name == 'nt':
-        import msvcrt
-        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
-        msvcrt.setmode(_orig_stdout, os.O_BINARY)
-    while True:
-        hdr = _read_exact(4)
-        if hdr is None:
-            break
-        (n,) = struct.unpack('<I', hdr)
-        img = _read_exact(n)
-        if img is None:
-            break
-        tmp = None
-        try:
-            tmp = tempfile.mktemp(suffix='.bmp')
-            with open(tmp, 'wb') as f:
-                f.write(img)
-            result, _ = ocr(tmp)
-            text = '\n'.join(str(item[1]) for item in result) if result else ''
-        except Exception as e:
-            text = 'ERROR:' + str(e)
-        finally:
-            if tmp and os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        _frame(text)
-
-if __name__ == '__main__':
-    main()
-"#;
-
-/// 单次识别超时：常驻 Python 进程挂起时杀死它，免得卡死 daemon 池。
-const OCR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// 常驻 OCR 进程：stdin/stdout 双管道。
-struct RapidProcess {
-    python: String,
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+/// 常驻的快速 OCR 运行器（ONNX sessions 有状态，需串行访问）。
+struct RapidOcrRunner {
+    runner: rapidocr_core::RapidOcr,
 }
 
-impl Drop for RapidProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// 全局共享的常驻 OCR 进程（按 python 路径复用；进程退出自动重启）。
-static RAPID_POOL: OnceLock<Mutex<Option<RapidProcess>>> = OnceLock::new();
+static RAPID_POOL: OnceLock<Mutex<Option<RapidOcrRunner>>> = OnceLock::new();
 
 #[inline]
-fn pool() -> &'static Mutex<Option<RapidProcess>> {
+fn pool() -> &'static Mutex<Option<RapidOcrRunner>> {
     RAPID_POOL.get_or_init(|| Mutex::new(None))
 }
 
-/// RapidOCR 识别器。
+/// RapidOCR 识别器（无内部状态；占用全局常驻运行器）。
 #[derive(Debug, Clone, Default)]
 pub struct RapidOcr {
-    python: Option<String>,
+    /// 保留原 API（Python 时代），现忽略——纯原生，不再需要解释器。
+    _python: Option<String>,
 }
 
 impl RapidOcr {
@@ -123,196 +41,82 @@ impl RapidOcr {
         Self::default()
     }
 
-    /// 指定 Python 解释器路径（覆盖自动探测）。
-    pub fn with_python(python: impl Into<String>) -> Self {
-        Self {
-            python: Some(python.into()),
-        }
+    /// 兼容旧签名：忽略 Python 解释器（已无 Python 依赖）。
+    pub fn with_python(_python: impl Into<String>) -> Self {
+        Self::default()
     }
 
-    /// 解析 Python 解释器路径（见模块头部探测顺序）。
-    fn resolve_python(&self) -> Result<String, OcrError> {
-        if let Some(p) = &self.python {
-            if !p.is_empty() {
-                return Ok(p.clone());
-            }
-        }
-        if let Ok(p) = std::env::var("VERBA_RAPIDOCR_PYTHON") {
-            if !p.is_empty() {
-                return Ok(p);
-            }
-        }
-        if let Ok(dirs) = verba_config::VerbaDirs::locate() {
-            let data = dirs.data_dir();
-            let win = data.join("venv-ocr").join("Scripts").join("python.exe");
-            if win.exists() {
-                return Ok(win.to_string_lossy().into_owned());
-            }
-            let unix = data.join("venv-ocr").join("bin").join("python");
-            if unix.exists() {
-                return Ok(unix.to_string_lossy().into_owned());
-            }
-        }
-        Ok("python".to_owned())
-    }
-
-    /// 确保辅助脚本已写入临时目录并返回其路径。
-    fn helper_path() -> Result<PathBuf, OcrError> {
-        let dir = std::env::temp_dir().join("verba-ocr");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| OcrError::Rapid(format!("创建临时目录失败: {e}")))?;
-        let path = dir.join("rapidocr_server.py");
-        if !path.exists() {
-            std::fs::write(&path, HELPER_SCRIPT)
-                .map_err(|e| OcrError::Rapid(format!("写 helper 失败: {e}")))?;
-        }
-        Ok(path)
-    }
-
-    /// 预热常驻 OCR 进程（后台加载模型），不执行识别。
+    /// 预热：确保模型已下载并构造运行器（后台加载），不执行识别。
     pub fn warmup(&self) -> Result<(), OcrError> {
-        let python = self.resolve_python()?;
-        let helper = Self::helper_path()?.to_string_lossy().into_owned();
-        ensure_warmed(&python, &helper)
+        ensure_runner().map(|_| ())
     }
 
-    /// 常驻识别：spawn_blocking 内完成帧读写（阻塞 IO，不占 async runtime）。
+    /// 识别：spawn_blocking 内完成推理（阻塞 IO，不占 async runtime）。
     async fn run(&self, image: &[u8]) -> Result<String, OcrError> {
-        let python = self.resolve_python()?;
-        let helper = Self::helper_path()?.to_string_lossy().into_owned();
         let img = image.to_vec();
-        tokio::task::spawn_blocking(move || process_image(&python, &helper, &img))
+        tokio::task::spawn_blocking(move || run_native(&img))
             .await
             .map_err(|e| OcrError::Rapid(format!("OCR 线程失败: {e}")))?
     }
 }
 
-/// 在常驻进程中完成一次识别（含必要时的重启）。
-/// 确保常驻进程已启动或重启（按 python 路径复用）。
-fn ensure_spawned(
-    guard: &mut Option<RapidProcess>,
-    python: &str,
-    helper: &str,
-) -> Result<(), OcrError> {
-    let should_spawn = match guard.as_mut() {
-        Some(p) => p.python != python || !matches!(p.child.try_wait(), Ok(None)),
-        None => true,
-    };
-    if should_spawn {
-        *guard = Some(spawn_process(python, helper)?);
+/// 确保全局运行器已就绪（必要时下载模型并构造）。
+fn ensure_runner() -> Result<(), OcrError> {
+    let mut guard = pool()
+        .lock()
+        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
+    if guard.is_none() {
+        *guard = Some(build_runner()?);
     }
     Ok(())
 }
 
-/// 预热：仅确保常驻进程已启动（后台加载模型），不发送识别。
-fn ensure_warmed(python: &str, helper: &str) -> Result<(), OcrError> {
-    let mut guard = pool()
-        .lock()
-        .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
-    ensure_spawned(&mut guard, python, helper)
+/// 构造原生运行器（下载模型 + 初始化 ONNX sessions）。
+fn build_runner() -> Result<RapidOcrRunner, OcrError> {
+    let dirs = verba_config::VerbaDirs::locate()
+        .map_err(|e| OcrError::Rapid(format!("定位数据目录失败: {e}")))?;
+    let model_dir = dirs.data_dir().join("models-rapidocr");
+    let cache = rapidocr_core::model::ModelCache::new(&model_dir);
+    cache
+        .ensure_model_set(
+            &rapidocr_core::model::PPOCRV5_CH_MOBILE,
+            rapidocr_core::model::ModelDownloadMode::Missing,
+        )
+        .map_err(|e| OcrError::Rapid(format!("RapidOCR 模型下载/校验失败: {e}")))?;
+    let cfg = cache.config_for(&rapidocr_core::model::PPOCRV5_CH_MOBILE);
+    let runner = rapidocr_core::RapidOcr::new(cfg)
+        .map_err(|e| OcrError::Rapid(format!("RapidOCR 初始化失败: {e}")))?;
+    log::info!(
+        "RapidOCR 原生运行器就绪（模型目录: {}）",
+        model_dir.display()
+    );
+    Ok(RapidOcrRunner { runner })
 }
 
-/// 在常驻进程中完成一次识别（含必要时的重启）。
-fn process_image(python: &str, helper: &str, image: &[u8]) -> Result<String, OcrError> {
+/// 在常驻运行器上执行一次识别。
+fn run_native(image: &[u8]) -> Result<String, OcrError> {
     let mut guard = pool()
         .lock()
         .map_err(|_| OcrError::Rapid("OCR 池锁中毒".into()))?;
-    ensure_spawned(&mut guard, python, helper)?;
-    let proc = guard.as_mut().expect("spawn 后必有进程");
-    let text = exchange(proc, image)?;
-    if let Some(err) = text.strip_prefix("ERROR:") {
-        return Err(OcrError::Rapid(err.to_owned()));
+    if guard.is_none() {
+        *guard = Some(build_runner()?);
     }
-    Ok(text)
-}
-
-/// 启动常驻 Python OCR 进程。
-fn spawn_process(python: &str, helper: &str) -> Result<RapidProcess, OcrError> {
-    let mut child = Command::new(python)
-        .arg("-u")
-        .arg(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| OcrError::Rapid(format!("启动 Python OCR 进程失败: {e}")))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| OcrError::Rapid("获取 OCR stdin 失败".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| OcrError::Rapid("获取 OCR stdout 失败".into()))?;
-    Ok(RapidProcess {
-        python: python.to_owned(),
-        child,
-        stdin,
-        stdout,
-    })
-}
-
-/// 写图像帧、读文本帧。
-fn exchange(proc: &mut RapidProcess, image: &[u8]) -> Result<String, OcrError> {
-    proc.stdin
-        .write_all(&(image.len() as u32).to_le_bytes())
-        .map_err(|e| OcrError::Rapid(format!("写图像头失败: {e}")))?;
-    proc.stdin
-        .write_all(image)
-        .map_err(|e| OcrError::Rapid(format!("写图像失败: {e}")))?;
-    proc.stdin
-        .flush()
-        .map_err(|e| OcrError::Rapid(format!("刷新 stdin 失败: {e}")))?;
-
-    // 看门狗：超时杀死 Python 进程，令读取返回 EOF，释放池锁。
-    let pid = proc.child.id();
-    let (tx, rx) = mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || match rx.recv_timeout(OCR_TIMEOUT) {
-        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            log::warn!("RapidOCR 超时，终止常驻进程 pid={pid}");
-            kill_pid(pid);
+    let runner = guard.as_mut().expect("set 后必有运行器");
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let img_path =
+        std::env::temp_dir().join(format!("verba-ocr-{}-{}.bmp", std::process::id(), id));
+    std::fs::write(&img_path, image).map_err(|e| OcrError::Rapid(format!("写图像失败: {e}")))?;
+    let result = runner.runner.run_path(&img_path);
+    let _ = std::fs::remove_file(&img_path);
+    let output = result.map_err(|e| OcrError::Rapid(format!("RapidOCR 识别失败: {e}")))?;
+    let mut lines = Vec::new();
+    for line in output.lines {
+        let text = line.text.trim();
+        if !text.is_empty() {
+            lines.push(text.to_owned());
         }
-    });
-
-    let result = read_response(proc);
-    let _ = tx.send(());
-    let _ = watchdog.join();
-    result
-}
-
-/// 读取应答帧（文本）。
-fn read_response(proc: &mut RapidProcess) -> Result<String, OcrError> {
-    let mut rlen = [0u8; 4];
-    proc.stdout
-        .read_exact(&mut rlen)
-        .map_err(|e| OcrError::Rapid(format!("读响应长度失败: {e}")))?;
-    let len = u32::from_le_bytes(rlen) as usize;
-    let mut buf = vec![0u8; len];
-    proc.stdout
-        .read_exact(&mut buf)
-        .map_err(|e| OcrError::Rapid(format!("读响应失败: {e}")))?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// 终止进程（Windows 用 taskkill，其它平台用 kill）。
-#[cfg(windows)]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .creation_flags(0x08000000)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-#[cfg(not(windows))]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    }
+    Ok(lines.join("\n"))
 }
 
 impl OcrProvider for RapidOcr {
@@ -331,13 +135,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_explicit_python() {
-        let o = RapidOcr::with_python("C:\\py\\python.exe");
-        assert_eq!(o.resolve_python().unwrap(), "C:\\py\\python.exe");
+    fn new_is_default() {
+        let o = RapidOcr::new();
+        assert!(o._python.is_none());
     }
 
     #[test]
-    fn helper_script_contains_rapidocr_import() {
-        assert!(HELPER_SCRIPT.contains("rapidocr_onnxruntime"));
+    fn with_python_ignored() {
+        // 兼容旧 API：Python 已被移除，解释器参数不再起作用。
+        let o = RapidOcr::with_python("C:\\py\\python.exe");
+        assert!(o._python.is_none());
     }
 }

@@ -6,7 +6,7 @@
 
 - Rust 工具链（stable，当前 1.97+），含 `rustfmt`、`clippy`。
 - 平台前端额外依赖：
-  - Windows：无（TSF 为系统内置）；打包用 Inno Setup 或 WiX。
+  - Windows：**须 MSVC Build Tools + `x86_64-pc-windows-msvc` target**（Rust 仅为该 target 提供 `ort`/onnxruntime 预编译，因此整个项目用 MSVC 构建）；打包用 Inno Setup 或 WiX。
   - macOS：Xcode Command Line Tools；发布签名需 Apple Developer 账号。
   - Linux：Fcitx5 dev（`fcitx5-dev`）、CMake、ECM、corrosion（Fcitx5 插件）；IBus / Wayland 后端走 Rust crate。
 - AI 能力（按需）：
@@ -16,12 +16,13 @@
 
 ## 构建核心与 CLI
 
-```bash
-cargo build --workspace
-cargo test --workspace
+```powershell
+# Windows：先进 MSVC 环境再构建（RapidOCR/ort 需要 x86_64-pc-windows-msvc）
+scripts\build-msvc.cmd build --workspace --target x86_64-pc-windows-msvc
+scripts\build-msvc.cmd test --workspace --target x86_64-pc-windows-msvc
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p verba-cli -- --help
+scripts\build-msvc.cmd clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+scripts\build-msvc.cmd run -p verba-cli -- --help
 ```
 
 ## 设置面板（apps/settings，Slint 1.17）

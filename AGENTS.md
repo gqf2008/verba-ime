@@ -15,9 +15,9 @@ Verba · 拾言输入法：开源跨平台多模态 AI 输入法（OCR / ASR / L
 遵循 `~/.agents/rules/` 下的通用规则（开发流程、开发规范、提交规范、合并规范、经验沉淀等）；本文件为仓库级规则，冲突时以本文件为准。
 
 ## 构建与验证
-- 构建：`cargo build --workspace`
-- 测试：`cargo test --workspace`
-- Lint：`cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`
+- 构建（Windows 须 MSVC target）：`scripts\build-msvc.cmd build --workspace --target x86_64-pc-windows-msvc`
+- 测试：`scripts\build-msvc.cmd test --workspace --target x86_64-pc-windows-msvc`
+- Lint：`cargo fmt --all -- --check` + `scripts\build-msvc.cmd clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`
 - 文档改动需保持 `docs/` 内交叉引用与 README 一致
 - 平台前端改动需在对应平台验证（TSF / IMK / Fcitx5 无法在纯 CI 完整跑通，至少保证 `cargo check` 门禁）
 - 关键决策（架构、协议、provider）先更新对应文档再写代码，契约不漂移

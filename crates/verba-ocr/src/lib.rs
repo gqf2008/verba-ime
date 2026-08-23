@@ -62,19 +62,13 @@ impl FromStr for OcrProviderKind {
 #[derive(Debug, Clone)]
 pub struct OcrClient {
     provider: OcrProviderKind,
-    rapid_python: Option<String>,
 }
 
 impl OcrClient {
     /// 按配置创建（provider: mock|windows）。
-    pub fn from_config(provider: &str, rapid_python: &str) -> Result<Self, OcrError> {
+    pub fn from_config(provider: &str) -> Result<Self, OcrError> {
         Ok(Self {
             provider: provider.parse()?,
-            rapid_python: if rapid_python.is_empty() {
-                None
-            } else {
-                Some(rapid_python.to_owned())
-            },
         })
     }
 
@@ -85,10 +79,7 @@ impl OcrClient {
         }
         match &self.provider {
             OcrProviderKind::Mock => MockOcr::new().recognize(image).await,
-            OcrProviderKind::Rapid => {
-                let py = self.rapid_python.clone().unwrap_or_default();
-                RapidOcr::with_python(py).recognize(image).await
-            }
+            OcrProviderKind::Rapid => RapidOcr::new().recognize(image).await,
             OcrProviderKind::WindowsMedia => {
                 #[cfg(windows)]
                 {
@@ -112,10 +103,7 @@ impl OcrClient {
     /// 预热：provider 为 rapid 时预加载常驻 OCR 进程（后台加载模型），其它 provider 为空操作。
     pub fn warmup(&self) -> Result<(), OcrError> {
         match &self.provider {
-            OcrProviderKind::Rapid => {
-                let py = self.rapid_python.clone().unwrap_or_default();
-                RapidOcr::with_python(py).warmup()
-            }
+            OcrProviderKind::Rapid => RapidOcr::new().warmup(),
             _ => Ok(()),
         }
     }
@@ -127,7 +115,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_deterministic_mock() {
-        let c = OcrClient::from_config("mock", "").unwrap();
+        let c = OcrClient::from_config("mock").unwrap();
         let a = c.recognize(b"png-1".as_slice()).await.unwrap();
         let b = c.recognize(b"png-1".as_slice()).await.unwrap();
         assert_eq!(a, b);
@@ -136,7 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_rejects_empty() {
-        let c = OcrClient::from_config("mock", "").unwrap();
+        let c = OcrClient::from_config("mock").unwrap();
         assert!(matches!(c.recognize(&[]).await, Err(OcrError::EmptyImage)));
     }
 
@@ -164,7 +152,7 @@ mod tests {
     #[test]
     fn client_unknown_provider_rejected() {
         assert!(matches!(
-            OcrClient::from_config("bogus", ""),
+            OcrClient::from_config("bogus"),
             Err(OcrError::UnknownProvider(_))
         ));
     }

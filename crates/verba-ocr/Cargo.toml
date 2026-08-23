@@ -13,6 +13,7 @@ unsafe_code = "allow"
 [dependencies]
 verba-ai = { path = "../verba-ai" }
 verba-config = { path = "../verba-config" }
+rapidocr-core = "0.2.2"
 thiserror.workspace = true
 log.workspace = true
 tokio.workspace = true
