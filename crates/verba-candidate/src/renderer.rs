@@ -66,6 +66,35 @@ impl CpuCandidateRenderer {
         }
     }
 
+    /// 状态行高度：非空状态时占一行。
+    fn status_height(ctrl: &CandidateWindowController) -> u32 {
+        if ctrl.status().is_some() {
+            (ctrl.theme().font_size + 4).max(16)
+        } else {
+            0
+        }
+    }
+
+    /// 在候选窗底部画状态行（弱化色）。
+    fn draw_status(
+        &mut self,
+        pixmap: &mut Pixmap,
+        ctrl: &CandidateWindowController,
+        _width: u32,
+        y: f32,
+        status_h: u32,
+    ) {
+        let Some(status) = ctrl.status() else {
+            return;
+        };
+        let theme = ctrl.theme();
+        let muted =
+            parse_color(&theme.muted_color).unwrap_or(Color::from_rgba8(0x88, 0x88, 0x88, 0xFF));
+        let size = (theme.font_size as f32 * 0.8).max(10.0);
+        let ty = y + (status_h as f32 - size * 1.3) / 2.0;
+        self.draw_text(pixmap, status, theme.padding as f32, ty, muted, size);
+    }
+
     /// 卡片背景 + 圆角边框（两种布局共用）。
     fn draw_card(&mut self, pixmap: &mut Pixmap, theme: &Theme, width: u32, height: u32) {
         let bg = parse_color(&theme.background).unwrap_or(Color::WHITE);
@@ -175,8 +204,9 @@ impl CpuCandidateRenderer {
         let pad = theme.padding;
         let header = Self::header_height(ctrl);
         let footer = Self::footer_height(ctrl);
+        let status = Self::status_height(ctrl);
         let width = theme.max_width_horizontal;
-        let height = pad * 2 + header + theme.item_height + footer;
+        let height = pad * 2 + header + theme.item_height + footer + status;
         let mut pixmap = Pixmap::new(width, height).expect("候选窗 pixmap");
         self.draw_card(&mut pixmap, theme, width, height);
         self.draw_header(&mut pixmap, ctrl, width, header);
@@ -234,6 +264,15 @@ impl CpuCandidateRenderer {
             x += block_w + theme.gap as f32;
         }
 
+        if status > 0 {
+            self.draw_status(
+                &mut pixmap,
+                ctrl,
+                width,
+                (height - footer - status) as f32,
+                status,
+            );
+        }
         if footer > 0 {
             self.draw_footer(&mut pixmap, ctrl, (height - footer) as f32, width, footer);
         }
@@ -251,8 +290,9 @@ impl CpuCandidateRenderer {
         let pad = theme.padding;
         let header = Self::header_height(ctrl);
         let footer = Self::footer_height(ctrl);
+        let status = Self::status_height(ctrl);
         let width = theme.max_width;
-        let height = pad * 2 + header + items.len() as u32 * theme.item_height + footer;
+        let height = pad * 2 + header + items.len() as u32 * theme.item_height + footer + status;
         let mut pixmap = Pixmap::new(width, height).expect("候选窗 pixmap");
         self.draw_card(&mut pixmap, theme, width, height);
         self.draw_header(&mut pixmap, ctrl, width, header);
@@ -301,6 +341,15 @@ impl CpuCandidateRenderer {
             );
         }
 
+        if status > 0 {
+            self.draw_status(
+                &mut pixmap,
+                ctrl,
+                width,
+                (height - footer - status) as f32,
+                status,
+            );
+        }
         if footer > 0 {
             self.draw_footer(&mut pixmap, ctrl, (height - footer) as f32, width, footer);
         }
@@ -445,16 +494,21 @@ pub fn window_size(ctrl: &CandidateWindowController) -> (u32, u32) {
     } else {
         0
     };
+    let status = if ctrl.status().is_some() {
+        (ctrl.theme().font_size + 4).max(16)
+    } else {
+        0
+    };
     if theme.layout == "horizontal" {
         (
             theme.max_width_horizontal,
-            theme.padding * 2 + header + theme.item_height + footer,
+            theme.padding * 2 + header + theme.item_height + footer + status,
         )
     } else {
         let item_count = ctrl.page_items().len();
         (
             theme.max_width,
-            theme.padding * 2 + header + item_count as u32 * theme.item_height + footer,
+            theme.padding * 2 + header + item_count as u32 * theme.item_height + footer + status,
         )
     }
 }

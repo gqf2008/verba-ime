@@ -159,6 +159,8 @@ pub struct CandidateWindowController {
     position: Option<(i32, i32)>,
     /// 当前组合串（拼音/preedit），用于候选窗头部展示。
     preedit: String,
+    /// 状态行（如 “眼睛已捕捉”）；非空时在候选窗底部显示。
+    status: Option<String>,
 }
 
 impl Default for CandidateWindowController {
@@ -177,6 +179,7 @@ impl CandidateWindowController {
             visible: false,
             position: None,
             preedit: String::new(),
+            status: None,
         }
     }
 
@@ -311,6 +314,16 @@ impl CandidateWindowController {
         &self.preedit
     }
 
+    /// 设置状态行（为 None 则不显示）。
+    pub fn set_status(&mut self, status: Option<String>) {
+        self.status = status.filter(|s| !s.is_empty());
+    }
+
+    /// 当前状态行。
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
     pub fn set_position(&mut self, x: i32, y: i32) {
         self.position = Some((x, y));
     }
@@ -423,6 +436,22 @@ mod tests {
         assert_ne!(d.background, Theme::default().background);
         assert_eq!(d.background, "#1E1E1E");
         assert_eq!(d.corner_radius, Theme::default().corner_radius);
+    }
+
+    #[test]
+    fn status_roundtrip_and_window_grows() {
+        let mut c = ctrl();
+        c.set_candidates(vec!["你".into()]);
+        assert!(c.status().is_none());
+        let (w0, h0) = crate::renderer::window_size(&c);
+        c.set_status(Some("眼睛已捕捉".to_owned()));
+        assert_eq!(c.status(), Some("眼睛已捕捉"));
+        let (w1, h1) = crate::renderer::window_size(&c);
+        assert_eq!(w1, w0);
+        assert!(h1 > h0, "状态行应使窗口变高");
+        // 空字符串→ 置 None
+        c.set_status(Some(String::new()));
+        assert!(c.status().is_none());
     }
 
     #[test]
