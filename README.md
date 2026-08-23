@@ -3,7 +3,9 @@
 > **声、像、思、音，皆成文字。**
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
-> 项目状态：**M1（Windows 垂直切片）开发中** · 共享核心（IPC/LLM/daemon/CLI）完成，Windows TSF 前端代码完成并通过 COM 激活冒烟；真机验收待管理员安装后逐项验证（见 [Windows 手动验收清单](docs/manual-acceptance-windows.md)）。
+> 项目状态：**M1/M5 已实机验收**（Windows TSF + LLM 直输 + 中文引擎：Rime/候选窗/融合）；
+> 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock 已端到端通，OCR/ASR 跟进）。
+> 见 [Windows 手动验收清单](docs/manual-acceptance-windows.md) 与 [路线图](docs/roadmap.md)。
 
 ---
 
@@ -84,7 +86,7 @@ cargo run -p verba-cli -- --help
 - **M2 三端齐平**：macOS IMK、Linux Fcitx5/IBus
 - **M3 多模态**：OCR（截图）与 ASR（语音）接入
 - **M4 打磨发布**：TTS、设置面板、候选窗口、打包签名、Alpha/Beta
-- **M5 中文引擎**：评估并（可选）集成 librime
+- **M5 中文引擎**：librime 集成 + 候选窗/分页/主题/融合 ✅
 
 ## 参考与同类项目
 

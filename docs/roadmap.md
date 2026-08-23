@@ -1,7 +1,9 @@
 # 路线图
 
-> 更新：2026-08-23 · 当前状态：**M5 收尾**（M1 已实机验收；M5 拼音引擎/独立候选窗/分页/主题/候选融合/
-> librime spike + daemon 集成 + 整句基准评估均已完成；剩实机验收）
+> 更新：2026-08-23 · 当前状态：**M5 已收口**（2026-08-23 实机 OK：候选窗即时内置 + Rime 去重追加，
+> 验收清单逐项勾选，见 manual-acceptance-windows.md）。
+> 下一批：**M3 多模态 + M4 TTS 的 Rust 核心**（provider 抽象 + daemon 路由 + IPC + CLI，全部本机可验证）。
+> 已开工（2026-08-23）：TTS mock provider 端到端——`verba-cli tts` 产出合法 WAV；edge/Piper/系统 TTS 与 OCR/ASR 跟进。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -54,7 +56,9 @@
 ## M4 详细任务（体验）
 
 - [ ] TTS provider：系统 TTS / edge-tts / Piper（可选）
-- [ ] 候选窗口样式与交互（分页、主题、皮肤）
+  - [x] **mock**（确定性 WAV，2026-08-23：`verba-tts` crate + IPC `TtsSynthesize`/`Audio` + daemon 路由 + `verba-cli tts`，CLI/验收通过）
+  - [ ] edge-tts（网络） / 系统 TTS（Windows SAPI） / Piper（本地）
+- [x] 候选窗口样式与交互（分页、主题、皮肤）（随 M5 完成，2026-08-23 实机验收）
 - [ ] Tauri 设置面板（服务商配置、快捷键、隐私开关）
 - [ ] 性能与内存预算达标（见 architecture §8）
 - [ ] 日志脱敏与崩溃上报（本地）
@@ -71,13 +75,13 @@
 - [x] librime daemon 集成：`verba-librime` crate（动态加载 rime.dll，拼音/五笔候选）+ IPC
   `RimeCandidates` + `config 引擎=builtin|rime` + `rime_schema`（luna_pinyin_simp/wubi86）；
   CLI `verba-cli rime` 端到端验证通过（你是谁/你好），前端 engine=rime 时请求并融合 rime 候选
-  （2026-08-23，待实机验收）
+  （2026-08-23 实机验收通过）
 - [x] 整句基准：50 句日常对话首候选——自研 6% vs Rime 84%（无 octagram）/ 74%（+essay 模型）；
   结论 librime 整句显著更优、octagram 对口语有害不默认启用（2026-08-23，见
   [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8）
 - [x] 候选融合（词库候选 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`；
   拼音态停顿 320ms 后请求，增量合并去重、按拼音校验过期结果；mock 端到端冒烟通过，
-  待实机验收）（2026-08-23）
+  实机验收通过）（2026-08-23）
 
 ## 风险与开放问题
 
@@ -93,3 +97,4 @@
 | 日期 | 变更 |
 | --- | --- |
 | 2026-08-22 | 初版：M0-M6 里程碑与任务分解 |
+| 2026-08-23 | M5 实机验收收口（候选窗即时内置 + Rime 追加）；M4 TTS mock provider 接入（`verba-tts` + IPC TtsSynthesize/Audio + daemon 路由 + CLI + 验收） |
