@@ -46,16 +46,6 @@ jobs:
       - name: Build
         run: cargo build --release
 
-  frontend-macos-swift:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '5.9'
-      - name: Swift Build (IMK 薄壳)
-        run: swift build
-        working-directory: frontends/macos/ime/swift
 
   frontend-windows:
     runs-on: windows-latest

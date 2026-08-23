@@ -5,7 +5,7 @@ name = "verba-ime-macos"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Verba macOS IMK 前端（Rust 引擎壳）：连接 daemon + 复用 verba-core 状态机"
+description = "Verba macOS IMK 前端（全 Rust）：objc2 + InputMethodKit 绑定 + 连接 daemon"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -20,3 +20,9 @@ verba-ipc = { path = "../../../crates/verba-ipc" }
 verba-protos = { path = "../../../crates/verba-protos" }
 verba-config = { path = "../../../crates/verba-config" }
 log = { version = "0.4", features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-input-method-kit = "0.3"

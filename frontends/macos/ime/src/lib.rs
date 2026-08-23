@@ -1,8 +1,7 @@
-//! Verba macOS IMK 前端（Rust 引擎壳）。
+//! Verba macOS IMK 前端（全 Rust）。
 //!
-//! 真实 IMK 的按键捕获与文本插入由 Swift/ObjC 薄壳完成；本 crate 提供 Rust 侧的
-//! daemon 连接与状态机复用（verba-ipc / verba-core），供 Swift IMK 通过 FFI / 子进程调用。
-//! 为便于 CI 编译验证，当前仅依赖跨平台 crates，不直接依赖 macOS 框架。
+//! `MacIme` 连接 daemon；IMK 输入控制器由 `imk`（objc2 + objc2-input-method-kit）子类化定义；
+//! `ffi` 提供 C ABI 供其它宿主调用。引擎/状态机全部在 verba-core / daemon，前端只做薄壳。
 
 mod ffi;
 
@@ -33,15 +32,15 @@ impl MacIme {
     }
 }
 
-/// macOS 平台特有初始化（真实 IMK 注册）。非 macOS 为 no-op。
+/// macOS 下加载 IMK 输入控制器子类。
 #[cfg(target_os = "macos")]
-pub fn init_imk() -> Result<(), String> {
-    // TODO(ci): 在 macOS 真机/CI 上接入 InputMethodKit（NSInputMethodController 等）。
-    // 当前仅占位，保证 crate 可在 macOS 编译。
-    Ok(())
-}
+mod imk;
 
-#[cfg(not(target_os = "macos"))]
+/// 引导加载 IMK 局：非 macOS 为 no-op（仅供其它平台构建时占位）。
 pub fn init_imk() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        imk::register();
+    }
     Ok(())
 }
