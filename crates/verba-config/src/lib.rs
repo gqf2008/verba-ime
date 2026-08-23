@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod dirs;
+pub mod phrases;
 
 pub use config::{ApiKeyStore, Config, ConfigError, ConfigManager};
 pub use dirs::VerbaDirs;

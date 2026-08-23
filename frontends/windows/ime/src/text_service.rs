@@ -607,6 +607,23 @@ pub fn apply_action(
                 start_tts_play(text);
                 return Ok(());
             }
+            // `//短语 <名称>`：快捷插入用户定义的文本模板。
+            if let Some(name) = cmd.strip_prefix("短语") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    if let Ok(dirs) = verba_config::VerbaDirs::locate() {
+                        if let Ok(Some(text)) = verba_config::phrases::get(&dirs, name) {
+                            log::info!("插入快捷短语: {name}");
+                            if let Some(comp) = data.composition.borrow_mut().take() {
+                                let _ = edit_session::end_composition(context, clientid, &comp, "");
+                            }
+                            *data.machine.borrow_mut() = CompositionMachine::new();
+                            let _ = edit_session::commit_text(context, clientid, &text);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             // `//看图`：多模态 vision，直接捕捉眼睛区域（或全屏回退）发图给 LLM。
             // 与普通 `//` LLM 命令一致：不结束组合、不重置状态机，保持流式输出。
             if cmd == "看图" {

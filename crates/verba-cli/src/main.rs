@@ -34,6 +34,7 @@ fn main() {
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
+        Some("phrase") => cmd_phrase(&args),
         Some("diag") => cmd_diag(&args),
         Some(other) => {
             eprintln!("未知命令: {other}（--help 查看用法）");
@@ -60,6 +61,7 @@ fn print_help() {
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
          verba-cli pinyin <拼音>        查询拼音候选（本地引擎调试）\n  \
+         verba-cli phrase <名称>      查看快捷短语；phrase-set/list/del 管理\n  \
          verba-cli diag                 诊断：daemon 健康/配置/日志尾/相关进程\n  \
          verba-cli --version             版本\n"
     );
@@ -494,4 +496,79 @@ fn print_procs() {
     {
         println!("(非 Windows，暂不列举进程)");
     }
+}
+/// `verba-cli phrase ...`：快捷短语管理（数据层，`//短语 <名称>` 由输入法插入）。
+fn cmd_phrase(args: &[String]) -> i32 {
+    let dirs = match verba_config::VerbaDirs::locate() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("定位数据目录失败: {e}");
+            return 1;
+        }
+    };
+    match args.get(1).map(String::as_str) {
+        Some("set") => {
+            let name = args.get(2).cloned().unwrap_or_default();
+            if name.is_empty() {
+                eprintln!("用法: verba-cli phrase-set <名称> <文本>");
+                return 1;
+            }
+            let text = args[3..].join(" ");
+            if text.is_empty() {
+                eprintln!("文本为空（删除请用 phrase-del）");
+                return 1;
+            }
+            match verba_config::phrases::set(&dirs, &name, &text) {
+                Ok(()) => println!("已保存短语: {name}"),
+                Err(e) => {
+                    eprintln!("保存失败: {e}");
+                    return 1;
+                }
+            }
+        }
+        Some("list") => match verba_config::phrases::load(&dirs) {
+            Ok(map) => {
+                if map.is_empty() {
+                    println!("（无短语）");
+                } else {
+                    for (k, v) in &map {
+                        println!("{k}: {v}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("读取失败: {e}");
+                return 1;
+            }
+        },
+        Some("del") => {
+            let name = args.get(2).cloned().unwrap_or_default();
+            if name.is_empty() {
+                eprintln!("用法: verba-cli phrase-del <名称>");
+                return 1;
+            }
+            match verba_config::phrases::set(&dirs, &name, "") {
+                Ok(()) => println!("已删除短语: {name}"),
+                Err(e) => {
+                    eprintln!("删除失败: {e}");
+                    return 1;
+                }
+            }
+        }
+        Some(name) => match verba_config::phrases::get(&dirs, name) {
+            Ok(Some(text)) => println!("{text}"),
+            Ok(None) => {
+                println!("（未定义短语: {name}）");
+            }
+            Err(e) => {
+                eprintln!("读取失败: {e}");
+                return 1;
+            }
+        },
+        None => {
+            eprintln!("用法: verba-cli phrase <名称> | phrase-set <名称> <文本> | phrase-list | phrase-del <名称>");
+            return 1;
+        }
+    }
+    0
 }
