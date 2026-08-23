@@ -237,6 +237,18 @@ pub struct Config {
     /// TTS 在线模型名（openai provider；默认 tts-1）。
     #[serde(default = "default_tts_model")]
     pub tts_model: String,
+    /// 眼睛区域：是否在 `//` 指令时自动捕捉光标上方屏幕作为 LLM 上下文。
+    #[serde(default = "default_eye_enabled")]
+    pub eye_enabled: bool,
+    /// 眼睛区域宽度（逻辑像素）。
+    #[serde(default = "default_eye_width")]
+    pub eye_width: i32,
+    /// 眼睛区域高度。
+    #[serde(default = "default_eye_height")]
+    pub eye_height: i32,
+    /// 眼睛区域距光标组合的偏移（正值=向上）。
+    #[serde(default = "default_eye_offset")]
+    pub eye_offset_y: i32,
 }
 
 fn default_llm_base_url() -> String {
@@ -273,6 +285,18 @@ fn default_asr_model() -> String {
 fn default_tts_model() -> String {
     DEFAULT_TTS_MODEL.to_owned()
 }
+fn default_eye_enabled() -> bool {
+    true
+}
+fn default_eye_width() -> i32 {
+    640
+}
+fn default_eye_height() -> i32 {
+    480
+}
+fn default_eye_offset() -> i32 {
+    0
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -293,6 +317,10 @@ impl Default for Config {
             asr_model: default_asr_model(),
             tts_base_url: String::new(),
             tts_model: default_tts_model(),
+            eye_enabled: default_eye_enabled(),
+            eye_width: default_eye_width(),
+            eye_height: default_eye_height(),
+            eye_offset_y: default_eye_offset(),
         }
     }
 }
@@ -316,6 +344,10 @@ impl Config {
         map.insert("asr_model".into(), self.asr_model.clone());
         map.insert("tts_base_url".into(), self.tts_base_url.clone());
         map.insert("tts_model".into(), self.tts_model.clone());
+        map.insert("eye_enabled".into(), self.eye_enabled.to_string());
+        map.insert("eye_width".into(), self.eye_width.to_string());
+        map.insert("eye_height".into(), self.eye_height.to_string());
+        map.insert("eye_offset_y".into(), self.eye_offset_y.to_string());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -426,6 +458,26 @@ impl Config {
                 "asr_model" => self.asr_model = v.clone(),
                 "tts_base_url" => self.tts_base_url = v.clone(),
                 "tts_model" => self.tts_model = v.clone(),
+                "eye_enabled" => {
+                    self.eye_enabled = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
+                "eye_width" => {
+                    self.eye_width = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
+                "eye_height" => {
+                    self.eye_height = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
+                "eye_offset_y" => {
+                    self.eye_offset_y = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
                 "theme.text_color" => self.theme.text_color = Some(v.clone()),
@@ -711,6 +763,27 @@ mod tests {
         assert_eq!(cfg.llm_base_url, "https://api.example.com/v1");
         assert_eq!(cfg.temperature, 0.1);
         assert_eq!(cfg.max_tokens, 256);
+    }
+
+    #[test]
+    fn eye_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        assert!(cfg.eye_enabled);
+        assert_eq!(cfg.eye_width, 640);
+        assert_eq!(cfg.eye_height, 480);
+        let mut map = std::collections::HashMap::new();
+        map.insert("eye_enabled".into(), "false".into());
+        map.insert("eye_width".into(), "800".into());
+        map.insert("eye_height".into(), "600".into());
+        map.insert("eye_offset_y".into(), "40".into());
+        cfg.apply_map(&map).unwrap();
+        assert!(!cfg.eye_enabled);
+        assert_eq!(cfg.eye_width, 800);
+        assert_eq!(cfg.eye_height, 600);
+        assert_eq!(cfg.eye_offset_y, 40);
+        let out = cfg.to_map();
+        assert_eq!(out.get("eye_enabled").map(String::as_str), Some("false"));
+        assert_eq!(out.get("eye_width").map(String::as_str), Some("800"));
     }
 
     #[test]

@@ -23,6 +23,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_ESCAPE,
     VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+};
 
 use crate::capture::capture_primary_screen;
 use crate::play::play_audio;
@@ -626,7 +629,7 @@ pub fn apply_action(
             // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
             // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
             // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult 替换文本。
-            start_llm(data, prompt);
+            start_llm(data, prompt, eye_rect_for(data, context));
             Ok(())
         }
         Action::ResultReady => Ok(()),
@@ -847,7 +850,10 @@ fn error_event(message: &str) -> stream_event::Kind {
     })
 }
 
-fn start_llm(data: &Rc<TextServiceData>, prompt: String) {
+/// 与 daemon 默认一致的 AI 系统提示词（前端注入眼睛上下文时拼接）。
+const AI_SYSTEM_BASE: &str =
+    "你是一个输入法里的 AI 助手。回答应简洁、直接，以可上屏的文本输出，不要使用 Markdown。";
+fn start_llm(data: &Rc<TextServiceData>, prompt: String, eye_rect: Option<(i32, i32, i32, i32)>) {
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
     let handle = std::thread::spawn(move || {
@@ -858,7 +864,22 @@ fn start_llm(data: &Rc<TextServiceData>, prompt: String) {
                 return;
             }
         };
-        let id = match client.llm_start(&prompt, None, None, None) {
+        // 眼睛：指令前自动捕捉光标上方屏幕 → OCR，作为 LLM 上下文注入 system。
+        let mut system: Option<String> = None;
+        if let Some((rx, ry, rw, rh)) = eye_rect {
+            match run_region_ocr_rect(rx, ry, rw, rh) {
+                Ok(Some(text)) if !text.is_empty() => {
+                    log::info!("眼睛区域已捕捉, ocr_len={}", text.chars().count());
+                    system = Some(format!(
+                        "{AI_SYSTEM_BASE}\n\n【眼睛内容：光标上方屏幕】\n{text}"
+                    ));
+                }
+                Ok(_) => log::debug!("眼睛区域无识别文本"),
+                Err(e) => log::warn!("眼睛区域 OCR 失败: {e}"),
+            }
+        }
+
+        let id = match client.llm_start(&prompt, system.as_deref(), None, None) {
             Ok(id) => id,
             Err(e) => {
                 push_chunk(&chunks, 0, error_event(&format!("LLM 启动失败: {e}")));
@@ -1205,6 +1226,69 @@ fn run_region_ocr() -> std::result::Result<Option<String>, String> {
     } else {
         Ok(Some(text))
     }
+}
+
+/// 子进程调用 verba-trigger region-ocr --rect：脚本化区域 OCR（眼睛区域），stdout 为识别文本。
+/// Ok(Some(text)) 识别成功；Ok(None) 无文本；Err 失败。
+fn run_region_ocr_rect(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> std::result::Result<Option<String>, String> {
+    let exe = match crate::reg::dll_path() {
+        Ok(p) => {
+            let candidate = p.with_file_name("verba-trigger.exe");
+            if candidate.exists() {
+                candidate
+            } else {
+                return Err(format!(
+                    "未找到 verba-trigger.exe（{}）",
+                    candidate.display()
+                ));
+            }
+        }
+        Err(e) => return Err(format!("定位 DLL 目录失败: {e}")),
+    };
+    let rect_arg = format!("{x},{y},{w},{h}");
+    let out = std::process::Command::new(&exe)
+        .arg("region-ocr")
+        .arg("--rect")
+        .arg(rect_arg)
+        .creation_flags(0x08000000)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("启动 verba-trigger 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("region-ocr --rect 退出码: {:?}", out.status.code()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
+/// 眼睛区域：`//` 指令时自动捕捉「光标上方」矩形（可配 eye.*），供 LLM 上下文。
+fn eye_rect_for(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32, i32, i32)> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    let cfg = verba_config::ConfigManager::new(dirs).load().ok()?;
+    if !cfg.eye_enabled {
+        return None;
+    }
+    let (ax, _top, bot) = caret_screen_pos(data, context)?;
+    let w = cfg.eye_width.max(64);
+    let h = cfg.eye_height.max(64);
+    let off = cfg.eye_offset_y.max(0);
+    let rx = ax - w / 2;
+    let ry = bot - h - off;
+    let sw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let sh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    let rx = rx.clamp(0, (sw - w).max(0));
+    let ry = ry.clamp(0, (sh - h).max(0));
+    Some((rx, ry, w, h))
 }
 
 /// 全屏截图 → daemon OCR（选区失败时的回退路径）。
