@@ -142,15 +142,21 @@ fn cmd_ai(args: &[String]) -> i32 {
     let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
     with_client(|c| {
         let id = c.llm_start(&prompt, None, None, None, image_ref)?;
+        let mut any_chunk = false;
         loop {
             let evt = c.next_event(id)?;
             match evt.kind {
                 Some(stream_event::Kind::Chunk(ch)) => {
+                    any_chunk = true;
                     print!("{}", ch.text);
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
-                Some(stream_event::Kind::Final(_)) => {
+                Some(stream_event::Kind::Final(f)) => {
+                    // 特别命令（重置/会话/上次OCR）无 chunk，绂结文本在 Final 里；有 chunk 时已打印，不重复。
+                    if !any_chunk {
+                        print!("{}", f.text);
+                    }
                     println!();
                     break;
                 }

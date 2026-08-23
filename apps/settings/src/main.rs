@@ -124,6 +124,72 @@ fn wire_callbacks(ui: &SettingsWindow) {
             });
         });
     });
+
+    let weak = ui.as_weak();
+    ui.on_save_phrase(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let name = ui.get_phrase_name().to_string();
+        let text = ui.get_phrase_text().to_string();
+        let status = if name.is_empty() {
+            "请先填短语名称".to_owned()
+        } else {
+            phrase_set(&name, &text)
+        };
+        ui.set_phrase_status(status.into());
+    });
+
+    let weak = ui.as_weak();
+    ui.on_delete_phrase(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let name = ui.get_phrase_name().to_string();
+        let status = if name.is_empty() {
+            "请填要删除的名称".to_owned()
+        } else {
+            phrase_set(&name, "")
+        };
+        ui.set_phrase_status(status.into());
+    });
+
+    let weak = ui.as_weak();
+    ui.on_refresh_phrases(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        ui.set_phrase_status(phrase_refresh().into());
+    });
+}
+
+fn phrase_set(name: &str, text: &str) -> String {
+    match verba_config::VerbaDirs::locate() {
+        Ok(dirs) => match verba_config::phrases::set(&dirs, name, text) {
+            Ok(()) => format!("已保存快捷短语: {name}"),
+            Err(e) => format!("保存失败: {e}"),
+        },
+        Err(e) => format!("定位目录失败: {e}"),
+    }
+}
+
+fn phrase_refresh() -> String {
+    match verba_config::VerbaDirs::locate() {
+        Ok(dirs) => match verba_config::phrases::load(&dirs) {
+            Ok(map) => {
+                if map.is_empty() {
+                    "（暂无短语）".to_owned()
+                } else {
+                    format!(
+                        "已有短语: {}",
+                        map.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                }
+            }
+            Err(e) => format!("读取失败: {e}"),
+        },
+        Err(e) => format!("定位目录失败: {e}"),
+    }
 }
 
 /// 在 UI 线程读取全部字段，生成配置键值表。

@@ -36,8 +36,16 @@ export component SettingsWindow inherits Window {
     in-out property <string> rime-schema;
     in-out property <int> theme-index: 0;
 
+    // ---------- 快捷短语 ----------
+    in-out property <string> phrase-name;
+    in-out property <string> phrase-text;
+    in-out property <string> phrase-status;
+
     // ---------- 回调 ----------
     callback save();
+    callback save-phrase();
+    callback delete-phrase();
+    callback refresh-phrases();
     callback refresh();
     callback set-api-key(string);
     callback clear-api-key();
@@ -125,6 +133,24 @@ export component SettingsWindow inherits Window {
                         Text { text: "Ctrl+Alt+M：录音 → ASR 听写上屏"; }
                         Text { text: "//朗读 文本   //截图   //听写"; }
                         Text { text: "// 前缀进入 AI 模式（LLM 流式，Enter 上屏）"; }
+                    }
+                }
+
+                GroupBox {
+                    title: "快捷短语（`//短语 <名称>` 一键插入）";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        HorizontalBox { spacing: 8px; Text { text: "名称"; width: 90px; vertical-alignment: center; } LineEdit { text <=> root.phrase-name; placeholder-text: "如 greet"; } }
+                        Text { text: "内容"; }
+                        TextEdit { text <=> root.phrase-text; height: 64px; placeholder-text: "输入要插入的文本，如“你好，我是 Verba”"; }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Button { text: "保存短语"; clicked => { root.save-phrase(); } }
+                            Button { text: "删除当前"; clicked => { root.delete-phrase(); } }
+                            Button { text: "刷新"; clicked => { root.refresh-phrases(); } }
+                        }
+                        Text { text: phrase-status; color: #666666; wrap: word-wrap; }
                     }
                 }
 

@@ -36,6 +36,8 @@ pub struct DaemonHandler {
     rime: Mutex<Option<RimeEngine>>,
     /// AI 多轮上下文（role, content）；config ai_context_turns>0 时使用。
     history: Mutex<VecDeque<(String, String)>>,
+    /// 最近一次 OCR 结果（供 `//上次OCR` 复用）。
+    ocr_last: Mutex<Option<String>>,
 }
 
 impl DaemonHandler {
@@ -48,6 +50,7 @@ impl DaemonHandler {
             cancels: Mutex::new(HashMap::new()),
             rime: Mutex::new(None),
             history: Mutex::new(VecDeque::new()),
+            ocr_last: Mutex::new(None),
         }
     }
 
@@ -207,6 +210,31 @@ impl DaemonHandler {
                     kind: Some(stream_event::Kind::Final(Final {
                         text: "已重置上下文".to_owned(),
                     })),
+                })
+                .await;
+            return Ok(());
+        }
+        // `//会话`：查看当前 AI 多轮上下文轮数。
+        if trimmed == "会话" {
+            let turns = self.history.lock().unwrap().len() / 2;
+            let _ = out
+                .event(&StreamEvent {
+                    id,
+                    kind: Some(stream_event::Kind::Final(Final {
+                        text: format!("AI 上下文: {turns} 轮（`//重置` 清空）"),
+                    })),
+                })
+                .await;
+            return Ok(());
+        }
+        // `//上次OCR`：复用最近一次 OCR 识别结果。
+        if trimmed == "上次OCR" {
+            let last = self.ocr_last.lock().unwrap().clone();
+            let text = last.unwrap_or_else(|| "暂无 OCR 历史".to_owned());
+            let _ = out
+                .event(&StreamEvent {
+                    id,
+                    kind: Some(stream_event::Kind::Final(Final { text })),
                 })
                 .await;
             return Ok(());
@@ -610,6 +638,7 @@ impl DaemonHandler {
                     provider,
                     text.chars().count()
                 );
+                *self.ocr_last.lock().unwrap() = Some(text.clone());
                 out.response(&Response {
                     id,
                     kind: Some(response::Kind::Text(verba_protos::Text { text })),
