@@ -25,6 +25,8 @@ const CANDIDATE_SYSTEM: &str = "你是输入法智能候选生成器。根据用
 
 /// 候选融合单次请求上限。
 const CANDIDATE_MAX: usize = 6;
+/// OCR 历史保留条数。
+const OCR_HISTORY_MAX: usize = 8;
 
 pub struct DaemonHandler {
     mgr: ConfigManager,
@@ -36,8 +38,8 @@ pub struct DaemonHandler {
     rime: Mutex<Option<RimeEngine>>,
     /// AI 多轮上下文（role, content）；config ai_context_turns>0 时使用。
     history: Mutex<VecDeque<(String, String)>>,
-    /// 最近一次 OCR 结果（供 `//上次OCR` 复用）。
-    ocr_last: Mutex<Option<String>>,
+    /// 最近若干条 OCR 结果（供 `//上次OCR` / `//OCR <序号>` 复用）。
+    ocr_history: Mutex<VecDeque<String>>,
 }
 
 impl DaemonHandler {
@@ -50,7 +52,7 @@ impl DaemonHandler {
             cancels: Mutex::new(HashMap::new()),
             rime: Mutex::new(None),
             history: Mutex::new(VecDeque::new()),
-            ocr_last: Mutex::new(None),
+            ocr_history: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -227,10 +229,15 @@ impl DaemonHandler {
                 .await;
             return Ok(());
         }
-        // `//上次OCR`：复用最近一次 OCR 识别结果。
+        // `//上次OCR`：复用最新一条 OCR 结果。
         if trimmed == "上次OCR" {
-            let last = self.ocr_last.lock().unwrap().clone();
-            let text = last.unwrap_or_else(|| "暂无 OCR 历史".to_owned());
+            let text = self
+                .ocr_history
+                .lock()
+                .unwrap()
+                .front()
+                .cloned()
+                .unwrap_or_else(|| "暂无 OCR 历史".to_owned());
             let _ = out
                 .event(&StreamEvent {
                     id,
@@ -238,6 +245,48 @@ impl DaemonHandler {
                 })
                 .await;
             return Ok(());
+        }
+        // `//OCR历史`：列出最近的 OCR 结果。
+        if trimmed == "OCR历史" {
+            let hist: Vec<String> = self.ocr_history.lock().unwrap().iter().cloned().collect();
+            let text = if hist.is_empty() {
+                "暂无 OCR 历史".to_owned()
+            } else {
+                let mut lines = Vec::new();
+                for (i, t) in hist.iter().enumerate() {
+                    lines.push(format!("{}. {}", i + 1, t));
+                }
+                lines.join("\n")
+            };
+            let _ = out
+                .event(&StreamEvent {
+                    id,
+                    kind: Some(stream_event::Kind::Final(Final { text })),
+                })
+                .await;
+            return Ok(());
+        }
+        // `//OCR <序号>`：复用第 N 新的一条（从 1 起）。
+        if let Some(num) = trimmed
+            .strip_prefix("OCR ")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            if num >= 1 {
+                let text = self
+                    .ocr_history
+                    .lock()
+                    .unwrap()
+                    .get(num - 1)
+                    .cloned()
+                    .unwrap_or_else(|| format!("无第 {num} 条 OCR 历史"));
+                let _ = out
+                    .event(&StreamEvent {
+                        id,
+                        kind: Some(stream_event::Kind::Final(Final { text })),
+                    })
+                    .await;
+                return Ok(());
+            }
         }
         let has_image = image.is_some();
         let mut history = Vec::new();
@@ -638,7 +687,13 @@ impl DaemonHandler {
                     provider,
                     text.chars().count()
                 );
-                *self.ocr_last.lock().unwrap() = Some(text.clone());
+                {
+                    let mut hist = self.ocr_history.lock().unwrap();
+                    hist.push_front(text.clone());
+                    while hist.len() > OCR_HISTORY_MAX {
+                        hist.pop_back();
+                    }
+                }
                 out.response(&Response {
                     id,
                     kind: Some(response::Kind::Text(verba_protos::Text { text })),
