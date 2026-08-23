@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -88,6 +88,10 @@ pub struct TextServiceData {
     stream_thread: RefCell<Option<JoinHandle<()>>>,
     /// 候选融合请求线程句柄。
     candidate_thread: RefCell<Option<JoinHandle<()>>>,
+    /// 是否有候选/LLM 请求线程在途（防止 daemon 卡住时线程/连接堆积）。
+    candidate_request_busy: Arc<AtomicBool>,
+    /// daemon 是否已在本进程预拉起（激活时预热，避免首次输入冷启动延迟）。
+    daemon_prewarmed: AtomicBool,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
 }
 
@@ -115,6 +119,8 @@ impl TextServiceData {
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
+            candidate_request_busy: Arc::new(AtomicBool::new(false)),
+            daemon_prewarmed: AtomicBool::new(false),
             control: RefCell::new(None),
         }
     }
@@ -195,6 +201,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
+    // 预拉起 daemon（engine=rime 时 daemon 启动即预热 Rime），避免首次输入等冷启动。
+    prewarm_daemon(data);
     // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
     reload_candidate_config(data);
     // 候选窗（懒创建：失败不影响激活）
@@ -877,8 +885,12 @@ fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandida
     }
 }
 
-/// 候选融合防抖触发：输入停顿 DEBOUNCE_TICKS 个周期后才发起 LLM 候选请求。
+/// 候选融合防抖触发：输入停顿 DEBOUNCE_TICKS 个周期后才发起候选请求；
+/// 已有请求在途时暂不触发（保留 pending，下个 tick 重试），防止线程/连接堆积。
 fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
+    if data.candidate_request_busy.load(Ordering::SeqCst) {
+        return;
+    }
     let fire = {
         let mut pending = data.candidate_req_pending.borrow_mut();
         match pending.as_mut() {
@@ -911,7 +923,9 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
     log::info!("Rime 候选请求: pinyin={pinyin} schema={schema}");
     cancel_candidate_request(data);
     let chunks = Arc::clone(&data.chunks);
+    let busy = Arc::clone(&data.candidate_request_busy);
     let handle = std::thread::spawn(move || {
+        let _busy = BusyGuard::new(&busy);
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
@@ -949,7 +963,9 @@ fn start_llm_candidates(data: &Rc<TextServiceData>, pinyin: String, dictionary: 
     cancel_candidate_request(data);
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.candidate_request_id);
+    let busy = Arc::clone(&data.candidate_request_busy);
     let handle = std::thread::spawn(move || {
+        let _busy = BusyGuard::new(&busy);
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
@@ -989,6 +1005,36 @@ fn start_llm_candidates(data: &Rc<TextServiceData>, pinyin: String, dictionary: 
         let _ = request_id.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
     });
     *data.candidate_thread.borrow_mut() = Some(handle);
+}
+
+/// 请求线程在途标志（RAII：任何退出路径都会复位，防止卡住时线程堆积）。
+struct BusyGuard(Arc<AtomicBool>);
+impl BusyGuard {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(Arc::clone(flag))
+    }
+}
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 激活时预拉起 daemon（engine=rime 时 daemon 启动即预热 Rime），
+/// 避免用户首次输入时等待 daemon 冷启动（候选延迟 1-2 秒）。每进程只预热一次。
+fn prewarm_daemon(data: &Rc<TextServiceData>) {
+    if data.daemon_prewarmed.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log::info!("预拉起 daemon…");
+    std::thread::spawn(|| match ipc::ensure_daemon() {
+        Ok(mut client) => {
+            let _ = client.ping();
+            log::info!("daemon 预热完成");
+        }
+        Err(e) => log::warn!("daemon 预热失败（首次请求时会重试）: {e}"),
+    });
 }
 
 // ---- 定时器窗口 ----
