@@ -80,7 +80,8 @@
 
 > 目标：验证「拼音候选窗：跟随光标 + 避让 + 分页 + 主题/皮肤 + LLM 候选融合」。
 > 状态：M5 候选窗主体已实机验收通过（2026-08-23，Notepad--）；分页/主题/融合待复测确认。
-> 前置：已加载 `target_dev12` 新 DLL（关闭重开测试应用），mock LLM 运行中
+> 前置：已加载新 DLL（HKCU CLSID 指向的当前部署目录，`scripts/acceptance.ps1` 自动检测；
+> 每次更新 DLL 后需关闭重开测试应用），mock LLM 运行中
 > （`python scripts/mock_openai.py 8765`），配置 `%APPDATA%\verba\Verba\config\config.toml` 指向
 > `llm_base_url = 'http://127.0.0.1:8765/v1'`、`llm_model = 'mock'`（实际配置路径以
 > `verba-cli config` 输出为准）。
@@ -116,7 +117,7 @@
 > 目标：验证可选 Rime 引擎（daemon 内 librime）：拼音/五笔候选经 `RimeCandidates` 协议回流候选窗。
 > 状态：CLI 端到端已通过（`nishishui`→你是谁、`wqvb`→你好），前端融合待实机确认。
 > 前置：`verba-cli config set engine=rime rime_schema=luna_pinyin_simp`；
-> daemon 同目录 `rime/` 已部署 rime.dll + data（target_dev12 已就绪）。
+> daemon 同目录 `rime/` 已部署 rime.dll + data（与 CLSID 指向的部署目录同路径，脚本自动检测）。
 
 ## Rime 拼音
 - [ ] 输入 `nishishui` 停顿约 0.5s → 候选窗出现 Rime 候选「你是谁 / 你是 / 妳是…」
