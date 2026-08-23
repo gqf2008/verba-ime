@@ -19,7 +19,8 @@ use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_ESCAPE, VK_RETURN,
+    GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR,
+    VK_RETURN,
 };
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
@@ -233,6 +234,7 @@ impl KeyEventSink {
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
+    let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
     match state {
         MachineState::Idle => match get_char_for_vk(vk, lparam) {
             // 认领 `/`（AI 触发）与字母（进入拼音组合）
@@ -240,13 +242,17 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
             None => false,
         },
         MachineState::Pinyin => {
-            if is_control {
-                // Enter/Backspace/Esc：拼音态由状态机处理
+            if is_control || is_page {
+                // Enter/Backspace/Esc 与 PageUp/PageDown：拼音态由状态机处理
                 return true;
             }
             match get_char_for_vk(vk, lparam) {
-                // 拼音态认领：字母（缓冲）、数字（选候选）、空格（选首选）、`/`（提交+AI）
-                Some(c) => c == '/' || c.is_ascii_alphabetic() || c.is_ascii_digit() || c == ' ',
+                // 拼音态认领：字母（缓冲）、数字（选候选）、空格（选首选）、`/`（提交+AI）、
+                // `-`/`=`（翻页）
+                Some(c) => {
+                    c == '/' || c.is_ascii_alphabetic() || c.is_ascii_digit() || c == ' '
+                        || c == '-' || c == '='
+                }
                 None => false,
             }
         }
@@ -376,7 +382,8 @@ pub fn handle_key_down(
     }
     let vk = wparam;
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
-    let ch = if is_control {
+    let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
+    let ch = if is_control || is_page {
         None
     } else {
         get_char_for_vk(vk, lparam)
@@ -384,7 +391,17 @@ pub fn handle_key_down(
 
     let mut machine = data.machine.borrow_mut();
     let state = machine.state();
-    let action = if let Some(c) = ch {
+    let action = if is_page {
+        if state == MachineState::Pinyin {
+            Some(if vk == VK_PRIOR.0 as u32 {
+                machine.feed_page_up()
+            } else {
+                machine.feed_page_down()
+            })
+        } else {
+            None
+        }
+    } else if let Some(c) = ch {
         Some(machine.feed_char(c))
     } else if vk == VK_BACK.0 as u32 {
         Some(machine.feed_backspace())
@@ -495,9 +512,10 @@ pub fn apply_action(
         Action::UpdatePinyin {
             preedit,
             candidates,
+            page,
         } => {
             set_preedit(data, context, clientid, &preedit)?;
-            update_candidate_window(data, context, &candidates);
+            update_candidate_window(data, context, &candidates, page);
             Ok(())
         }
         Action::StartLlm { prompt, system: _ } => {
@@ -540,6 +558,7 @@ fn update_candidate_window(
     data: &Rc<TextServiceData>,
     context: &ITfContext,
     candidates: &[String],
+    page: usize,
 ) {
     let mut borrow = data.candidate_window.borrow_mut();
     let Some(cw) = borrow.as_mut() else {
@@ -553,6 +572,7 @@ fn update_candidate_window(
     let mut ctrl =
         verba_candidate::CandidateWindowController::new(verba_candidate::Theme::default());
     ctrl.set_candidates(candidates.to_vec());
+    ctrl.set_page(page);
     ctrl.show();
     match caret_screen_pos(data, context) {
         Some(anchor) => {

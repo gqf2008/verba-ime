@@ -101,7 +101,7 @@ impl CandidateWindow {
             self.hide();
             return;
         }
-        let (w, h) = window_size(ctrl.theme(), ctrl.page_items().len());
+        let (w, h) = window_size(ctrl);
         let (px, py) = fit_position(
             anchor,
             w as i32,

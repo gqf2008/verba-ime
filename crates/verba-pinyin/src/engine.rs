@@ -22,8 +22,8 @@ pub struct Candidate {
     pub rank: u32,
 }
 
-/// 每次查询返回的最大候选数。
-pub const MAX_CANDIDATES: usize = 9;
+/// 每次查询返回的最大候选数（27 = 3 页 × 9 个/页，候选窗支持翻页）。
+pub const MAX_CANDIDATES: usize = 27;
 
 /// 拼音引擎（无状态；数据在首次使用时解析并缓存）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

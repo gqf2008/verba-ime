@@ -124,6 +124,16 @@ impl CandidateWindowController {
         }
     }
 
+    /// 设置当前页码（0 起，越界钳制；与状态机页码保持同步）。
+    pub fn set_page(&mut self, page: usize) {
+        if self.candidates.is_empty() {
+            self.page = 0;
+        } else {
+            self.page = page.min(self.total_pages() - 1);
+        }
+        self.selected = Some(0);
+    }
+
     // ---- 选择 ----
 
     /// 相对当前页的选中下标（None = 未选中）。
@@ -252,6 +262,23 @@ mod tests {
         let mut c = ctrl();
         c.show();
         assert!(!c.should_render());
+    }
+
+    #[test]
+    fn set_page_clamps_and_syncs() {
+        let mut c = ctrl();
+        c.set_candidates(vec![
+            "你".into(),
+            "你们".into(),
+            "你好".into(),
+            "您".into(),
+            "尼".into(),
+        ]);
+        c.set_page(5); // 越界 → 钳制到最后一页
+        assert_eq!(c.current_page(), 1);
+        assert_eq!(c.page_items(), &["您", "尼"]);
+        c.set_page(0);
+        assert_eq!(c.page_items(), &["你", "你们", "你好"]);
     }
 
     #[test]

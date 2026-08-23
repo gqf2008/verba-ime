@@ -77,9 +77,11 @@ pub enum Action {
     /// 提示词更新，preedit 显示指定文本。
     UpdatePrompt { preedit: String },
     /// 拼音 preedit 更新（preedit 为纯拼音，候选单独给前端渲染候选窗）。
+    /// `page` 为当前候选页码（0 起，每页 `PINYIN_PAGE_SIZE` 个）。
     UpdatePinyin {
         preedit: String,
         candidates: Vec<String>,
+        page: usize,
     },
     /// 提示词模式下按下 Enter：发起 LLM 生成。
     StartLlm {
@@ -114,6 +116,8 @@ pub struct CompositionMachine {
     pinyin_buffer: String,
     /// 当前拼音候选（由引擎查询得到，供选择/展示）。
     pinyin_candidates: Vec<String>,
+    /// 当前候选页码（0 起）。
+    pinyin_page: usize,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
@@ -134,6 +138,7 @@ impl CompositionMachine {
             state: MachineState::Idle,
             pinyin_buffer: String::new(),
             pinyin_candidates: Vec::new(),
+            pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
             engine: verba_pinyin::PinyinEngine::new(),
@@ -169,6 +174,42 @@ impl CompositionMachine {
         }
     }
 
+    /// 每页候选数（与候选窗主题 page_size 对齐）。
+    pub const PINYIN_PAGE_SIZE: usize = 9;
+
+    /// 翻到上一页（仅拼音态；无候选或单页时无动作）。
+    pub fn feed_page_up(&mut self) -> Action {
+        self.paginate(false)
+    }
+
+    /// 翻到下一页（仅拼音态；无候选或单页时无动作）。
+    pub fn feed_page_down(&mut self) -> Action {
+        self.paginate(true)
+    }
+
+    fn paginate(&mut self, next: bool) -> Action {
+        if self.state != MachineState::Pinyin || self.pinyin_candidates.is_empty() {
+            return Action::None;
+        }
+        let total = self
+            .pinyin_candidates
+            .len()
+            .div_ceil(Self::PINYIN_PAGE_SIZE);
+        if total <= 1 {
+            return Action::None;
+        }
+        if next {
+            self.pinyin_page = (self.pinyin_page + 1) % total;
+        } else {
+            self.pinyin_page = (self.pinyin_page + total - 1) % total;
+        }
+        Action::UpdatePinyin {
+            preedit: self.pinyin_composition_preedit(),
+            candidates: self.pinyin_candidates.clone(),
+            page: self.pinyin_page,
+        }
+    }
+
     /// 输入一个可打印字符。
     pub fn feed_char(&mut self, c: char) -> Action {
         match self.state {
@@ -187,6 +228,7 @@ impl CompositionMachine {
                     Action::UpdatePinyin {
                         preedit: self.pinyin_composition_preedit(),
                         candidates: self.pinyin_candidates.clone(),
+                        page: self.pinyin_page,
                     }
                 } else {
                     Action::CommitImmediate(c.to_string())
@@ -219,8 +261,14 @@ impl CompositionMachine {
             self.state = MachineState::PendingSlash;
             return Action::CommitImmediate(text);
         }
+        if c == '-' {
+            return self.paginate(false);
+        }
+        if c == '=' {
+            return self.paginate(true);
+        }
         if c.is_ascii_digit() && c != '0' {
-            let idx = (c as u8 - b'1') as usize;
+            let idx = self.pinyin_page * Self::PINYIN_PAGE_SIZE + (c as u8 - b'1') as usize;
             if let Some(text) = self.pinyin_candidates.get(idx) {
                 let text = text.clone();
                 self.reset_pinyin();
@@ -235,6 +283,7 @@ impl CompositionMachine {
             return Action::UpdatePinyin {
                 preedit: self.pinyin_composition_preedit(),
                 candidates: self.pinyin_candidates.clone(),
+                page: self.pinyin_page,
             };
         }
         if c == ' ' {
@@ -324,6 +373,7 @@ impl CompositionMachine {
                         Action::UpdatePinyin {
                             preedit: self.pinyin_composition_preedit(),
                             candidates: self.pinyin_candidates.clone(),
+                            page: self.pinyin_page,
                         }
                     }
                 } else {
@@ -416,6 +466,7 @@ impl CompositionMachine {
     fn clear_pinyin(&mut self) {
         self.pinyin_buffer.clear();
         self.pinyin_candidates.clear();
+        self.pinyin_page = 0;
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
@@ -455,10 +506,12 @@ impl CompositionMachine {
         self.state = MachineState::Idle;
         self.pinyin_buffer.clear();
         self.pinyin_candidates.clear();
+        self.pinyin_page = 0;
     }
 
-    /// 用当前缓冲刷新候选。
+    /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页）。
     fn refresh_candidates(&mut self) {
+        self.pinyin_page = 0;
         self.pinyin_candidates = self
             .engine
             .lookup(&self.pinyin_buffer)
@@ -573,6 +626,115 @@ mod tests {
             assert_eq!(a, Action::CommitImmediate(expected));
             assert_eq!(m.state(), MachineState::Idle);
         }
+    }
+
+    #[test]
+    fn pinyin_engine_returns_more_than_one_page() {
+        // 引擎候选数须多于 1 页，否则分页无意义。
+        let mut m = CompositionMachine::new();
+        let a = m.feed_char('n');
+        match a {
+            Action::UpdatePinyin {
+                candidates, page, ..
+            } => {
+                assert_eq!(page, 0);
+                assert!(
+                    candidates.len() > CompositionMachine::PINYIN_PAGE_SIZE,
+                    "候选应多于一页（{} > {}），实际 {} 个",
+                    candidates.len(),
+                    CompositionMachine::PINYIN_PAGE_SIZE,
+                    candidates.len()
+                );
+            }
+            other => panic!("应进入拼音，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinyin_page_down_advances_and_wraps() {
+        let mut m = CompositionMachine::new();
+        let full = match m.feed_char('n') {
+            Action::UpdatePinyin {
+                candidates, page, ..
+            } => {
+                assert_eq!(page, 0);
+                candidates
+            }
+            other => panic!("应进入拼音，实际 {other:?}"),
+        };
+        let total = full.len().div_ceil(CompositionMachine::PINYIN_PAGE_SIZE);
+        assert!(total >= 2, "需要至少 2 页才有回绕可测，实际 {total}");
+        // 翻到最后一页
+        for _ in 0..(total - 1) {
+            assert!(matches!(m.feed_page_down(), Action::UpdatePinyin { .. }));
+        }
+        // 末页再下翻 → 回绕到第 1 页
+        assert!(matches!(
+            m.feed_page_down(),
+            Action::UpdatePinyin { page: 0, .. }
+        ));
+        // 第 1 页上翻 → 回绕到最后一页
+        let page = match m.feed_page_up() {
+            Action::UpdatePinyin { page, .. } => page,
+            other => panic!("应翻页，实际 {other:?}"),
+        };
+        assert_eq!(page, total - 1);
+    }
+
+    #[test]
+    fn pinyin_digit_selects_page_relative() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        // 翻到第 2 页
+        let full = match m.feed_page_down() {
+            Action::UpdatePinyin {
+                candidates, page, ..
+            } => {
+                assert_eq!(page, 1);
+                candidates
+            }
+            other => panic!("应翻到第 2 页，实际 {other:?}"),
+        };
+        let expected = full[CompositionMachine::PINYIN_PAGE_SIZE].clone();
+        // 第 2 页按 1 → 应选中全列表第 PAGE_SIZE 个（页码偏移）
+        let a = m.feed_char('1');
+        assert_eq!(a, Action::CommitImmediate(expected));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_oem_paging_keys() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        assert!(matches!(
+            m.feed_char('='),
+            Action::UpdatePinyin { page: 1, .. }
+        ));
+        assert!(matches!(
+            m.feed_char('-'),
+            Action::UpdatePinyin { page: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn paging_noop_when_single_page() {
+        let mut m = CompositionMachine::new();
+        for c in "nihao".chars() {
+            m.feed_char(c);
+        }
+        assert_eq!(m.feed_page_down(), Action::None);
+        assert_eq!(m.feed_page_up(), Action::None);
+    }
+
+    #[test]
+    fn typing_resets_page() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_page_down();
+        assert!(matches!(
+            m.feed_char('i'),
+            Action::UpdatePinyin { page: 0, .. }
+        ));
     }
 
     #[test]

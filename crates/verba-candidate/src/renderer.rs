@@ -7,7 +7,10 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke};
 
-use crate::{CandidateWindowController, Theme};
+use crate::CandidateWindowController;
+
+/// 分页页码脚高度（仅多页时占用）。
+const FOOTER_HEIGHT: u32 = 18;
 
 /// 渲染结果：RGBA（预乘）像素缓冲。
 pub struct RenderedCandidateWindow {
@@ -41,15 +44,21 @@ impl CpuCandidateRenderer {
         let theme = ctrl.theme();
         let items = ctrl.page_items();
         let pad = theme.padding;
+        let footer = if ctrl.total_pages() > 1 {
+            FOOTER_HEIGHT
+        } else {
+            0
+        };
         let width = theme.max_width;
-        let height = pad * 2 + items.len() as u32 * theme.item_height;
+        let height = pad * 2 + items.len() as u32 * theme.item_height + footer;
         let mut pixmap = Pixmap::new(width, height).expect("候选窗 pixmap");
 
         // 背景
         pixmap.fill(parse_color(&theme.background).unwrap_or(Color::WHITE));
 
         // 边框
-        let border = parse_color(&theme.border_color).unwrap_or(Color::from_rgba8(0xCC, 0xCC, 0xCC, 0xFF));
+        let border =
+            parse_color(&theme.border_color).unwrap_or(Color::from_rgba8(0xCC, 0xCC, 0xCC, 0xFF));
         let mut path = PathBuilder::new();
         path.push_rect(Rect::from_xywh(0.5, 0.5, width as f32 - 1.0, height as f32 - 1.0).unwrap());
         let mut paint = Paint::default();
@@ -65,32 +74,73 @@ impl CpuCandidateRenderer {
         }
 
         // 候选行
-        let sel_bg = parse_color(&theme.selected_background).unwrap_or(Color::from_rgba8(0xD8, 0xE6, 0xFF, 0xFF));
-        let sel_fg = parse_color(&theme.selected_text_color).unwrap_or(Color::from_rgba8(0x1A, 0x56, 0xDB, 0xFF));
-        let text_fg = parse_color(&theme.text_color).unwrap_or(Color::from_rgba8(0x33, 0x33, 0x33, 0xFF));
+        let sel_bg = parse_color(&theme.selected_background)
+            .unwrap_or(Color::from_rgba8(0xD8, 0xE6, 0xFF, 0xFF));
+        let sel_fg = parse_color(&theme.selected_text_color)
+            .unwrap_or(Color::from_rgba8(0x1A, 0x56, 0xDB, 0xFF));
+        let text_fg =
+            parse_color(&theme.text_color).unwrap_or(Color::from_rgba8(0x33, 0x33, 0x33, 0xFF));
 
         for (idx, text) in items.iter().enumerate() {
             let y = pad + idx as u32 * theme.item_height;
             let is_selected = ctrl.selected_index() == Some(idx);
             if is_selected {
                 let mut path = PathBuilder::new();
-                path.push_rect(Rect::from_xywh(
-                    1.0,
-                    y as f32,
-                    width as f32 - 2.0,
-                    theme.item_height as f32 - 1.0,
-                ).unwrap());
+                path.push_rect(
+                    Rect::from_xywh(
+                        1.0,
+                        y as f32,
+                        width as f32 - 2.0,
+                        theme.item_height as f32 - 1.0,
+                    )
+                    .unwrap(),
+                );
                 if let Some(rect) = path.finish() {
                     let mut p = Paint::default();
                     p.set_color(sel_bg);
-                    pixmap.fill_path(&rect, &p, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    pixmap.fill_path(
+                        &rect,
+                        &p,
+                        tiny_skia::FillRule::Winding,
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
                 }
             }
             let fg = if is_selected { sel_fg } else { text_fg };
             let label = format!("{}.{text}", idx + 1);
             // 文字行在候选行内垂直居中
-            let line_top = y as f32 + (theme.item_height as f32 - theme.font_size as f32 * 1.3) / 2.0;
-            self.draw_text(&mut pixmap, &label, pad as f32, line_top, fg, theme.font_size as f32);
+            let line_top =
+                y as f32 + (theme.item_height as f32 - theme.font_size as f32 * 1.3) / 2.0;
+            self.draw_text(
+                &mut pixmap,
+                &label,
+                pad as f32,
+                line_top,
+                fg,
+                theme.font_size as f32,
+            );
+        }
+
+        // 页码脚：多页时在底部画分隔线与右对齐页码（如 2/3）。
+        if footer > 0 {
+            let footer_y = height - footer;
+            let muted = Color::from_rgba8(0x88, 0x88, 0x88, 0xFF);
+            // 分隔线
+            let mut line_paint = Paint::default();
+            line_paint.set_color(muted);
+            pixmap.fill_rect(
+                tiny_skia::Rect::from_xywh(1.0, footer_y as f32, width as f32 - 2.0, 1.0).unwrap(),
+                &line_paint,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+            let page_label = format!("{}/{}", ctrl.current_page() + 1, ctrl.total_pages());
+            let size = (theme.font_size as f32 * 0.8).max(10.0);
+            let tw = self.text_width(&page_label, size);
+            let x = width as f32 - pad as f32 - tw;
+            let ty = footer_y as f32 + (footer as f32 - size * 1.3) / 2.0;
+            self.draw_text(&mut pixmap, &page_label, x, ty, muted, size);
         }
 
         RenderedCandidateWindow {
@@ -100,9 +150,31 @@ impl CpuCandidateRenderer {
         }
     }
 
+    /// 文本排版宽度（用于右对齐）。
+    fn text_width(&mut self, text: &str, size: f32) -> f32 {
+        let metrics = Metrics::new(size, size * 1.3);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(&mut self.font_system, Some(10000.0), None);
+        buffer.set_text(&mut self.font_system, text, Attrs::new(), Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
+            .layout_runs()
+            .last()
+            .map(|run| run.line_w)
+            .unwrap_or(0.0)
+    }
+
     /// 在 (x, y) 画一行文字（cosmic-text 排版 + swash 字形栅格化，
     /// 经 tiny-skia source-over 合成到背景，输出全不透明）。
-    fn draw_text(&mut self, pixmap: &mut Pixmap, text: &str, x: f32, y: f32, color: Color, size: f32) {
+    fn draw_text(
+        &mut self,
+        pixmap: &mut Pixmap,
+        text: &str,
+        x: f32,
+        y: f32,
+        color: Color,
+        size: f32,
+    ) {
         let (r8, g8, b8) = (
             (color.red() * 255.0) as u8,
             (color.green() * 255.0) as u8,
@@ -116,7 +188,10 @@ impl CpuCandidateRenderer {
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let pg = glyph.physical((0.0, 0.0), 1.0);
-                let Some(img) = self.swash.get_image_uncached(&mut self.font_system, pg.cache_key) else {
+                let Some(img) = self
+                    .swash
+                    .get_image_uncached(&mut self.font_system, pg.cache_key)
+                else {
                     continue;
                 };
                 let gw = img.placement.width;
@@ -146,7 +221,14 @@ impl CpuCandidateRenderer {
                     blend_mode: tiny_skia::BlendMode::SourceOver,
                     ..PixmapPaint::default()
                 };
-                pixmap.draw_pixmap(gx, gy, gp.as_ref(), &paint, tiny_skia::Transform::identity(), None);
+                pixmap.draw_pixmap(
+                    gx,
+                    gy,
+                    gp.as_ref(),
+                    &paint,
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
             }
         }
     }
@@ -164,10 +246,17 @@ fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
-/// 主题尺寸辅助：窗口期望尺寸（供平台层创建窗口）。
-pub fn window_size(theme: &Theme, item_count: usize) -> (u32, u32) {
+/// 主题尺寸辅助：窗口期望尺寸（多页时含页码脚，供平台层创建窗口）。
+pub fn window_size(ctrl: &CandidateWindowController) -> (u32, u32) {
+    let theme = ctrl.theme();
+    let item_count = ctrl.page_items().len();
+    let footer = if ctrl.total_pages() > 1 {
+        FOOTER_HEIGHT
+    } else {
+        0
+    };
     (
         theme.max_width,
-        theme.padding * 2 + item_count as u32 * theme.item_height,
+        theme.padding * 2 + item_count as u32 * theme.item_height + footer,
     )
 }
