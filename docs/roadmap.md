@@ -1,7 +1,7 @@
 # 路线图
 
 > 更新：2026-08-23 · 当前状态：**M5 收尾**（M1 已实机验收；M5 拼音引擎/独立候选窗/分页/主题/候选融合/
-> librime spike + daemon 集成均已完成；剩实机验收与 octagram 整句评估）
+> librime spike + daemon 集成 + 整句基准评估均已完成；剩实机验收）
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -72,6 +72,9 @@
   `RimeCandidates` + `config 引擎=builtin|rime` + `rime_schema`（luna_pinyin_simp/wubi86）；
   CLI `verba-cli rime` 端到端验证通过（你是谁/你好），前端 engine=rime 时请求并融合 rime 候选
   （2026-08-23，待实机验收）
+- [x] 整句基准：50 句日常对话首候选——自研 6% vs Rime 84%（无 octagram）/ 74%（+essay 模型）；
+  结论 librime 整句显著更优、octagram 对口语有害不默认启用（2026-08-23，见
+  [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8）
 - [x] 候选融合（词库候选 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`；
   拼音态停顿 320ms 后请求，增量合并去重、按拼音校验过期结果；mock 端到端冒烟通过，
   待实机验收）（2026-08-23）

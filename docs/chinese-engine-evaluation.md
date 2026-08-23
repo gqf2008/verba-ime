@@ -60,7 +60,9 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 - [x] daemon 内集成（`config 引擎=builtin|rime`）：`verba-librime` crate（动态加载 rime.dll）+
       IPC `RimeCandidates` + `rime_schema`（luna_pinyin_simp/wubi86）+ 前端 engine=rime 融合
       （2026-08-23，CLI 端到端验证：`nishishui`→你是谁、`wqvb`(五笔)→你好；待实机验收）
-- [ ] 对比自研 vs librime：整句准确率采样（50 句日常对话）——依赖 octagram n-gram 数据另配
+- [x] 对比自研 vs librime：50 句日常对话整句首候选准确率（2026-08-23，见 §8）——
+      自研 6% vs Rime 84%（无 octagram）；结论：整句输入 librime 显著更优，默认建议
+      `engine=rime`；octagram（essay 语料）对日常对话反而有害（74%），不默认启用
 - [x] 候选窗（独立窗口、分页、主题）（2026-08-23 实机验收通过 + 代码完成）
 - [x] 候选融合（词库 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`，mock 端到端冒烟通过，
       待实机验收）（2026-08-23）
@@ -85,6 +87,28 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 
 **决策更新**：spike + daemon 集成证明「预编译 rime.dll + Rust FFI」路线可行且已可用——
 `config 引擎=rime` 即可切换 Rime（拼音/五笔），默认仍为 `builtin`（verba-pinyin，体积/复杂度低）。
-librime 定位为可选增强（五笔/注音/仓颉生态用户）。部署注意：
+**整句基准（§8）显示 librime 显著更优（84% vs 6%），建议把 `engine=rime` 作为推荐默认**（需打包
+rime.dll + 数据）。librime 定位：拼音整句 + 五笔/注音/仓颉生态。部署注意：
 - rime.dll（x64 ~4MB）与 `data/`（含 opencc，~10MB）随 daemon 同目录 `rime/` 分发；
-- 首次查询触发一次部署（编译 schema/词典，数秒）；octagram n-gram 数据未捆绑，另配后评估整句质量。
+- 首次查询触发一次部署（编译 schema/词典，数秒）；
+- octagram（essay 语料 n-gram）已评估：对日常对话无益（74% < 84%），默认不启用。
+
+## 8. 整句基准：自研 vs Rime（2026-08-23）
+
+> 复现：`crates/verba-librime/examples/bench.rs`（50 句日常对话，含易混淆同音字，
+> 整句拼音无空格输入 → 首候选）。数据（lotem/rime-octagram-data）按 spike README 配到
+> `vendor/user_data/`。
+
+| 引擎 | 首候选准确率 |
+| --- | --- |
+| 自研 verba-pinyin（整句 DP） | **3/50（6%）** |
+| Rime luna_pinyin_simp（无 octagram） | **42/50（84%）** |
+| Rime luna_pinyin_simp + octagram（essay 模型） | **37/50（74%）** |
+
+**解读**：
+1. 整句输入下 librime 显著优于自研（84% vs 6%）：自研仅命中极短句，长句同音字组合基本全错；
+   librime 的词/句切分与词典质量高一个量级。
+2. **octagram（essay 语料）对日常对话反而有害**（74% < 84%）：八股文模型偏正式书面语，
+   对口语/日常对话的排序不匹配；且 `.gram` 数据 ~100MB，部署成本高。→ **默认不启用 octagram**。
+3. 结论：`config 引擎=rime` 应作为推荐默认（五笔/拼音整句都强）；`verba-pinyin` 保留为
+   轻量兜底（无外部依赖、体积小）。

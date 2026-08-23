@@ -44,10 +44,26 @@ cargo run --release          # 或先把 vendor 加进 PATH：$env:PATH = "$PWD\
    `rime-<hash>-Windows-msvc-x64.7z`。
 4. 默认 `default.yaml` 的 `schema_list` 不含 wubi86 → 需手动追加 `- schema: wubi86` 才会被部署编译。
 
-## 下一步（daemon 集成）
+## 后续（已落地，见主仓库）
 
-- 新增 `verba-librime` crate（独立 workspace，动态加载 rime.dll），提供
-  `translate(pinyin/wubi) -> Vec<Candidate>` 同步接口。
-- verba-daemon 按 `config 引擎=builtin|rime` 切换：builtin 走 `verba-pinyin`，rime 走 librime。
-- 候选融合沿用现有 `LlmCandidates` 协议：词库候选（builtin/rime）+ LLM 候选。
-- 打包：rime.dll（x64 ~4MB）+ 数据目录（~10MB）随安装包分发；macOS/Linux 用各平台预编译包。
+- `crates/verba-librime`（主 workspace）：把本 spike 的 FFI 封装成库，提供 `RimeEngine::candidates()`。
+- daemon `RimeCandidates` IPC + `config 引擎=builtin|rime` + `rime_schema`（luna_pinyin_simp/wubi86）。
+- 前端 `engine=rime` 时输入停顿后请求并融合 Rime 候选。
+
+## 整句基准（50 句日常对话，`cargo run -p verba-librime --example bench`）
+
+| 引擎 | 首候选准确率 |
+| --- | --- |
+| 自研 verba-pinyin | 3/50（6%） |
+| Rime luna_pinyin_simp（无 octagram） | 42/50（84%） |
+| Rime + octagram（essay 模型） | 37/50（74%） |
+
+结论：整句输入 librime 显著更优；octagram（essay 语料）对日常对话有害，默认不启用。
+
+### 配 octagram（如需复现 74% 那列）
+1. `git clone --depth 1 --branch hans https://github.com/lotem/rime-octagram-data.git <tmp>`
+   （LFS，~50MB），把 `*.gram` 拷到 `vendor/user_data/`；hant 分支同理（默认 luna_pinyin 用）。
+2. `vendor/data/grammar.yaml` 已在仓库脚本可复现；`vendor/data/luna_pinyin.custom.yaml`：
+   `patch: __include: grammar:/hans`（简体模型）。
+3. 清空 `vendor/user_data/build` 后重跑 spike/bench。
+4. 不启用：删掉 `grammar.yaml` + `luna_pinyin.custom.yaml`（schema 的 `grammar:/hant?` 为可选）。

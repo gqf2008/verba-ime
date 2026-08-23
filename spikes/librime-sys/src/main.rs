@@ -7,7 +7,7 @@
 //!   cargo run --release          # 构建并运行 spike
 //! 注意：vendor/ 已 gitignore（含第三方二进制）；spike 独立 workspace，不进主仓库 CI。
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 
 type RimeBool = i32;
@@ -78,13 +78,17 @@ type FnStartMaintenance = unsafe extern "C" fn(full_check: RimeBool) -> RimeBool
 type FnJoinMaintenanceThread = unsafe extern "C" fn();
 type FnSimulateKeySequence =
     unsafe extern "C" fn(session: RimeSessionId, key_sequence: *const c_char) -> RimeBool;
-type FnGetCommit = unsafe extern "C" fn(session: RimeSessionId, commit: *mut RimeCommit) -> RimeBool;
+type FnGetCommit =
+    unsafe extern "C" fn(session: RimeSessionId, commit: *mut RimeCommit) -> RimeBool;
 type FnFreeCommit = unsafe extern "C" fn(commit: *mut RimeCommit) -> RimeBool;
 type FnGetSchemaList = unsafe extern "C" fn(schema_list: *mut RimeSchemaList) -> RimeBool;
 type FnFreeSchemaList = unsafe extern "C" fn(schema_list: *mut RimeSchemaList);
-type FnGetStatus = unsafe extern "C" fn(session: RimeSessionId, status: *mut RimeStatus) -> RimeBool;
+type FnGetStatus =
+    unsafe extern "C" fn(session: RimeSessionId, status: *mut RimeStatus) -> RimeBool;
 type FnFreeStatus = unsafe extern "C" fn(status: *mut RimeStatus) -> RimeBool;
-type FnSelectSchema = unsafe extern "C" fn(session: RimeSessionId, schema_id: *const c_char) -> RimeBool;
+type FnSelectSchema =
+    unsafe extern "C" fn(session: RimeSessionId, schema_id: *const c_char) -> RimeBool;
+type FnFindModule = unsafe extern "C" fn(name: *const c_char) -> *mut c_void;
 
 /// 动态加载 rime.dll（显式 LoadLibrary/GetProcAddress，规避 raw-dylib 在
 /// GNU 工具链下的运行时导入问题），返回函数指针集合。
@@ -105,6 +109,7 @@ struct Rime {
     get_status: FnGetStatus,
     free_status: FnFreeStatus,
     select_schema: FnSelectSchema,
+    find_module: FnFindModule,
 }
 
 impl Rime {
@@ -146,6 +151,7 @@ impl Rime {
                 get_status: std::mem::transmute(get("RimeGetStatus")?),
                 free_status: std::mem::transmute(get("RimeFreeStatus")?),
                 select_schema: std::mem::transmute(get("RimeSelectSchema")?),
+                find_module: std::mem::transmute(get("RimeFindModule")?),
             };
             Ok(rime)
         }
@@ -160,7 +166,9 @@ fn to_rust(ptr: *const c_char) -> String {
     if ptr.is_null() {
         "(null)".to_owned()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -289,6 +297,20 @@ fn main() {
         (rime.start_maintenance)(0);
         (rime.join_maintenance_thread)();
         println!("部署完成");
+
+        // 0) 模块可用性探测（octagram/predict/lua 是否为编译进 rime.dll）
+        for m in ["octagram", "predict", "lua", "reverse_lookup"] {
+            let name = cstring(m);
+            let found = (rime.find_module)(name.as_ptr());
+            println!(
+                "[模块] {m} → {}",
+                if found.is_null() {
+                    "未编译"
+                } else {
+                    "可用"
+                }
+            );
+        }
 
         // 1) 可用方案列表
         let mut list = RimeSchemaList {
