@@ -10,6 +10,7 @@ members = [
     "crates/verba-pinyin",
     "crates/verba-candidate",
     "crates/verba-librime",
+    "crates/verba-tts",
     "crates/verba-cli",
 ]
 

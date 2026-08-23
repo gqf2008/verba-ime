@@ -141,6 +141,12 @@ pub struct Config {
     /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
     #[serde(default = "default_rime_schema")]
     pub rime_schema: String,
+    /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（后续）| …
+    #[serde(default = "default_tts_provider")]
+    pub tts_provider: String,
+    /// TTS 语音名（如 edge 的 zh-CN-XiaoxiaoNeural；mock 忽略）。
+    #[serde(default)]
+    pub tts_voice: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -161,6 +167,9 @@ fn default_engine() -> String {
 fn default_rime_schema() -> String {
     "luna_pinyin_simp".to_owned()
 }
+fn default_tts_provider() -> String {
+    "mock".to_owned()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -173,6 +182,8 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             engine: default_engine(),
             rime_schema: default_rime_schema(),
+            tts_provider: default_tts_provider(),
+            tts_voice: String::new(),
         }
     }
 }
@@ -188,6 +199,8 @@ impl Config {
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
         map.insert("engine".into(), self.engine.clone());
         map.insert("rime_schema".into(), self.rime_schema.clone());
+        map.insert("tts_provider".into(), self.tts_provider.clone());
+        map.insert("tts_voice".into(), self.tts_voice.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -239,6 +252,15 @@ impl Config {
                     self.engine = v.clone();
                 }
                 "rime_schema" => self.rime_schema = v.clone(),
+                "tts_provider" => {
+                    if v != "mock" {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "tts_provider 仅支持 mock（edge 等开发中）: {k}={v}"
+                        )));
+                    }
+                    self.tts_provider = v.clone();
+                }
+                "tts_voice" => self.tts_voice = v.clone(),
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
                 "theme.text_color" => self.theme.text_color = Some(v.clone()),

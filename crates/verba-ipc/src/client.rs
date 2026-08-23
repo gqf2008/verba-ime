@@ -22,7 +22,7 @@ use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
     request, response, stream_event, LlmCancel, LlmCandidates, LlmGenerate, Ping, Request,
-    Response, RimeCandidates, StreamEvent,
+    Response, RimeCandidates, StreamEvent, TtsSynthesize,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -355,6 +355,31 @@ impl VerbaClient {
                 message: e.message,
             }),
             _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
+        }
+    }
+
+    /// 请求 TTS 合成，返回（音频格式, 音频字节）。
+    pub fn tts_synthesize(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+    ) -> Result<(String, Vec<u8>), IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::TtsSynthesize(TtsSynthesize {
+                text: text.to_owned(),
+                voice: voice.map(str::to_owned),
+            })),
+        };
+        let resp = self.request(req)?;
+        match resp.kind {
+            Some(response::Kind::Audio(a)) => Ok((a.format, a.data)),
+            Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                code: e.code,
+                message: e.message,
+            }),
+            _ => Err(IpcError::Protocol("期望 Audio 响应".into())),
         }
     }
 

@@ -11,8 +11,8 @@ use verba_core::VERSION;
 use verba_ipc::server::{Outbound, RequestHandler};
 use verba_librime::{RimeConfig, RimeEngine};
 use verba_protos::{
-    request, response, stream_event, Candidates, Chunk, Config as ConfigMsg, Error as ProtoError,
-    Final, LlmCandidates, Ok as OkMsg, Pong, Response, StreamEvent,
+    request, response, stream_event, Audio as AudioMsg, Candidates, Chunk, Config as ConfigMsg,
+    Error as ProtoError, Final, LlmCandidates, Ok as OkMsg, Pong, Response, StreamEvent,
 };
 
 /// 默认 AI 系统提示词（用户未配置时使用）。
@@ -130,6 +130,7 @@ impl RequestHandler for DaemonHandler {
             Some(request::Kind::LlmGenerate(g)) => self.handle_llm_generate(id, g, out).await,
             Some(request::Kind::LlmCandidates(g)) => self.handle_llm_candidates(id, g, out).await,
             Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
+            Some(request::Kind::TtsSynthesize(g)) => self.handle_tts_synthesize(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
                 let token = self.cancels.lock().unwrap().remove(&id);
                 if let Some(token) = token {
@@ -427,6 +428,68 @@ impl DaemonHandler {
                     kind: Some(response::Kind::Error(ProtoError {
                         code: 502,
                         message: e,
+                    })),
+                })
+                .await
+            }
+        }
+    }
+
+    /// TTS 合成：按 config tts_provider/tts_voice 分发，返回音频字节。
+    async fn handle_tts_synthesize(
+        &self,
+        id: u64,
+        g: verba_protos::TtsSynthesize,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        // 锁在 await 前释放，避免非 Send 守卫跨 await。
+        let (provider, voice) = {
+            let cfg = self.config.read().unwrap();
+            let voice = g
+                .voice
+                .clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| cfg.tts_voice.clone());
+            (cfg.tts_provider.clone(), voice)
+        };
+        let client = match verba_tts::TtsClient::from_config(&provider, &voice) {
+            Ok(c) => c,
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 400,
+                        message: e.to_string(),
+                    })),
+                })
+                .await?;
+                return Ok(());
+            }
+        };
+        match client.synthesize(&g.text).await {
+            Ok(audio) => {
+                log::info!(
+                    "TTS 合成: text_len={} provider={} format={} bytes={}",
+                    g.text.chars().count(),
+                    provider,
+                    audio.format,
+                    audio.bytes.len()
+                );
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Audio(AudioMsg {
+                        format: audio.format.to_owned(),
+                        data: audio.bytes,
+                    })),
+                })
+                .await
+            }
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 500,
+                        message: e.to_string(),
                     })),
                 })
                 .await

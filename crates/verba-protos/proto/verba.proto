@@ -20,6 +20,7 @@ message Request {
     LlmCancel llm_cancel = 21;
     LlmCandidates llm_candidates = 22;
     RimeCandidates rime_candidates = 23;
+    TtsSynthesize tts_synthesize = 24;
   }
 }
 
@@ -69,6 +70,7 @@ message Response {
     Error error = 4;
     Text text = 5;
     Config config = 6;
+    Audio audio = 7;
   }
 }
 
@@ -89,6 +91,19 @@ message Text {
 
 message Config {
   map<string, string> values = 1;
+}
+
+// TTS（文字 → 语音音频）：provider 由 config tts_provider 决定（mock|edge…）。
+message TtsSynthesize {
+  string text = 1;
+  // 可选覆盖 config tts_voice（如 edge 的语音名 zh-CN-XiaoxiaoNeural）。
+  optional string voice = 2;
+}
+
+// 音频输出：format 为 wav / mp3 等，data 为音频字节（WAV 含头）。
+message Audio {
+  string format = 1;
+  bytes data = 2;
 }
 
 // ---------- 流式事件（服务端 -> 客户端，按请求 id 关联） ----------

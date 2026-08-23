@@ -1,0 +1,18 @@
+[package]
+name = "verba-tts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba TTS 能力：文字 → 语音音频（mock/edge 等 provider）"
+
+[lints]
+workspace = true
+
+[dependencies]
+verba-ai = { path = "../verba-ai" }
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

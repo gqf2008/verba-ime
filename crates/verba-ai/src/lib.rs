@@ -9,3 +9,4 @@ pub mod llm;
 pub mod traits;
 
 pub use llm::{LlmClient, LlmConfig, LlmError, LlmRequest};
+pub use traits::{TtsAudio, TtsProvider};

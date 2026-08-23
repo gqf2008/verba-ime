@@ -76,8 +76,19 @@ try {
     if (($r2 -join "`n") -notmatch "你好") { throw "Rime 五笔缺失「你好」: $($r2 -join ';')" }
     Write-Output "rime wqvb wubi86 -> 你好 OK"
 
+    Write-Output "==== 6) TTS 合成（mock provider） ===="
+    & $cli config set tts_provider=mock | Out-Null
+    $ttsOut = Join-Path $env:TEMP "verba-tts-check.wav"
+    & $cli tts "你好" $ttsOut | Out-Null
+    if (-not (Test-Path $ttsOut)) { throw "TTS 未产出音频: $ttsOut" }
+    $bytes = [System.IO.File]::ReadAllBytes($ttsOut)
+    $magic = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+    if ($magic -ne "RIFF") { throw "TTS 输出非 WAV（$magic）" }
+    Remove-Item -LiteralPath $ttsOut -Force -ErrorAction SilentlyContinue
+    Write-Output "tts 你好 -> WAV OK（$($bytes.Length) bytes）"
+
     & $cli config set rime_schema=luna_pinyin_simp | Out-Null
-    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp）"
+    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts_provider=mock）"
 }
 finally {
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
@@ -95,4 +106,4 @@ Write-Output "4. verba-cli config set engine=builtin -> 输入 nishishui -> 候�
 Write-Output "5. 分页：= 或 PageDown 下翻、- 或 PageUp 上翻，底部页码脚 1/3"
 Write-Output "6. 主题：verba-cli config set theme.preset=dark -> 候选窗变深色（热更新）"
 Write-Output "7. 数字选候选上屏、Esc 取消组合、方向键不被吞"
-Write-Output "逐项通过后即 M5 收口。"
+Write-Output "逐项通过后即收口（M5 已收口；TTS mock CLI 检查已自动覆盖）。"

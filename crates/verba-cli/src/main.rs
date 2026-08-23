@@ -27,6 +27,7 @@ fn main() {
         Some("ai") => cmd_ai(&args),
         Some("candidates") => cmd_candidates(&args),
         Some("rime") => cmd_rime(&args),
+        Some("tts") => cmd_tts(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
         Some("pinyin") => cmd_pinyin(&args),
@@ -47,6 +48,7 @@ fn print_help() {
          verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
          verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
+         verba-cli tts <文本> [输出]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
@@ -168,6 +170,29 @@ fn cmd_rime(args: &[String]) -> i32 {
         } else {
             for (i, c) in cands.iter().enumerate() {
                 println!("{}. {c}", i + 1);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `verba-cli tts <文本> [输出文件]`：daemon TTS 合成（provider 由 config tts_provider 决定）。
+fn cmd_tts(args: &[String]) -> i32 {
+    let text = args.get(1).cloned().unwrap_or_default();
+    if text.is_empty() {
+        eprintln!("用法: verba-cli tts <文本> [输出文件]");
+        return 1;
+    }
+    let out = args.get(2).cloned();
+    with_client(|c| {
+        let (format, data) = c.tts_synthesize(&text, None)?;
+        match out {
+            Some(path) => {
+                std::fs::write(&path, &data)?;
+                println!("已写入 {path}（format={format} bytes={}）", data.len());
+            }
+            None => {
+                println!("format={format} bytes={}", data.len());
             }
         }
         Ok(())

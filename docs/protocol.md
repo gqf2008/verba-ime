@@ -24,6 +24,7 @@ message Request {
     LlmCancel llm_cancel = 21;     // 取消流式生成
     LlmCandidates llm_candidates = 22; // 候选融合：为拼音补充 LLM 候选
     RimeCandidates rime_candidates = 23; // 可选 Rime 引擎候选（config 引擎=rime）
+    TtsSynthesize tts_synthesize = 24;    // TTS 合成（config tts_provider）
   }
 }
 
@@ -40,6 +41,12 @@ message RimeCandidates {
   int32 max_candidates = 3;
 }
 
+// TTS 合成：provider 由 config tts_provider 决定（mock|edge…）。
+message TtsSynthesize {
+  string text = 1;                 // 待朗读文本
+  optional string voice = 2;       // 覆盖 config tts_voice（如 zh-CN-XiaoxiaoNeural）
+}
+
 message Response {
   uint64 id = 1;
   oneof kind {
@@ -48,8 +55,15 @@ message Response {
     Error error = 4;               // code + message
     Text text = 5;                 // 一次性结果（OCR / ASR 整段，预留）
     Config config = 6;
+    Audio audio = 7;               // TTS 音频输出
   }
 }
+
+message Audio {
+  string format = 1;               // wav / mp3
+  bytes data = 2;                  // 音频字节（WAV 含头）
+}
+
 
 message StreamEvent {
   uint64 id = 1;                   // 关联请求 id
@@ -77,6 +91,8 @@ message Candidates {
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：`config 引擎=rime` 时前端把拼音/五笔码发到 daemon，daemon 内 librime
   查询候选并一次性回 `Candidates`（`done=true`）；`rime_schema` 配置方案。
+- **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`；daemon 按
+  `config tts_provider` 选择 provider（当前 `mock`，产出确定性 WAV），一次性回 `Audio`。
 - **取消**：任何流式请求可 `LlmCancel` 按全局请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
 - **断线重连**：客户端检测连接断开后按退避重连，并重新同步当前模式与配置。
 - **背压**：大文件 / 高吞吐用分块 + 流控，避免管道阻塞（参照数据通道背压经验）。
