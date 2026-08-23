@@ -82,6 +82,7 @@ impl LlmClient {
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self { http })
     }
