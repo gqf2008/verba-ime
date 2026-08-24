@@ -113,7 +113,7 @@ impl CandidateWindow {
         unsafe {
             // RGBA（预乘）→ BGRA（GDI 32bpp 内存序）
             let mut bgra = vec![0u8; out.pixels.len()];
-            for (i, px) in out.pixels.chunks_exact(4).enumerate() {
+            for (i, px) in out.pixels.as_chunks::<4>().0.iter().enumerate() {
                 let o = i * 4;
                 bgra[o] = px[2];
                 bgra[o + 1] = px[1];
