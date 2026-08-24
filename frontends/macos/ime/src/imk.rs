@@ -44,6 +44,23 @@ fn error_event(message: &str) -> StreamEvent {
     }
 }
 
+/// 读取候选引擎与 Rime 方案（`config.engine` / `config.rime_schema`）。
+///
+/// macOS 前端与 Windows 一致支持 `engine=rime`（候选窗展示 Rime 整句候选）。
+/// 读取失败时回退 `builtin`（内置 verba-pinyin）。
+fn load_candidate_engine() -> (String, String) {
+    let fallback = || ("builtin".to_owned(), "luna_pinyin_simp".to_owned());
+    let dirs = match verba_config::VerbaDirs::locate() {
+        Ok(d) => d,
+        Err(_) => return fallback(),
+    };
+    let mgr = verba_config::ConfigManager::new(dirs);
+    match mgr.load() {
+        Ok(cfg) => (cfg.engine, cfg.rime_schema),
+        Err(_) => fallback(),
+    }
+}
+
 /// LLM 流式事件队列项：`seq` 为全局唯一序号，规避不同客户端本地请求 id 冲突。
 struct LlmItem {
     seq: u64,
@@ -86,6 +103,10 @@ struct Ivars {
     candidate_pinyin: RefCell<Option<String>>,
     /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
     composed: RefCell<String>,
+    /// 候选引擎（builtin | rime）。
+    candidate_engine: RefCell<String>,
+    /// Rime 方案（engine=rime 时）。
+    candidate_rime_schema: RefCell<String>,
 }
 
 impl Default for Ivars {
@@ -98,6 +119,8 @@ impl Default for Ivars {
             timer: RefCell::new(None),
             candidate_pinyin: RefCell::new(None),
             composed: RefCell::new(String::new()),
+            candidate_engine: RefCell::new("builtin".to_owned()),
+            candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
         }
     }
 }
@@ -539,6 +562,14 @@ impl VerbaIMKController {
 
     /// 候选融合请求（拼音变更后向 daemon 请求 LLM 补充候选）。
     fn start_candidates(&self, req: LlmCandidateRequest) {
+        // 候选引擎/Rime 方案：与其它平台一致地按 engine 区分候选来源。
+        let (engine, schema) = load_candidate_engine();
+        *self.ivars().candidate_engine.borrow_mut() = engine.clone();
+        *self.ivars().candidate_rime_schema.borrow_mut() = schema.clone();
+        if engine == "rime" {
+            self.start_rime_candidates(req.pinyin, schema);
+            return;
+        }
         // 取消上一在途候选请求，避免 daemon 继续生成旧候选。
         let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
         ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
@@ -593,6 +624,59 @@ impl VerbaIMKController {
                     }
                 }
             }
+        });
+    }
+
+    /// Rime 候选查询（config 引擎=rime）：一次性请求 Rime 整句候选并压入候选队列。
+    ///
+    /// Rime 为 daemon 内本地同步查询，拼音变更即触发（不防抖），保证「整句候选」即时呈现，
+    /// 与其它平台 engine=rime 行为一致。请求结果经 `feed_candidates_event` 融合/去重。
+    fn start_rime_candidates(&self, pinyin: String, schema: String) {
+        // 取消上一在途候选请求（含 LLM 融合），避免旧候选回流。
+        let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
+        ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+        if old_cand_id != 0 {
+            let old = old_cand_id;
+            std::thread::spawn(move || {
+                if let Ok(mut c) = ipc::try_connect() {
+                    let _ = c.llm_cancel(old);
+                }
+            });
+        }
+        let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
+        self.ivars()
+            .candidate_pinyin
+            .borrow_mut()
+            .replace(pinyin.clone());
+        ACTIVE_CANDIDATES.store(seq, Ordering::SeqCst);
+        self.ensure_timer();
+
+        std::thread::spawn(move || {
+            let mut client = match ipc::ensure_daemon() {
+                Ok(c) => c,
+                Err(e) => {
+                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
+                    return;
+                }
+            };
+            let cands = match client.rime_candidates(&pinyin, &schema, 9) {
+                Ok(c) => c,
+                Err(e) => {
+                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
+                    return;
+                }
+            };
+            push_llm(
+                seq,
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                        pinyin,
+                        candidates: cands,
+                        done: true,
+                    })),
+                },
+            );
         });
     }
 
@@ -841,5 +925,14 @@ mod tests {
             m.feed_char(c);
         }
         assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+    }
+
+    #[test]
+    fn load_candidate_engine_returns_tuple() {
+        // 读取失败应回退内置（builtin），读取成功返回 engine/rime_schema；均不 panic。
+        let (engine, schema) = load_candidate_engine();
+        assert!(!engine.is_empty());
+        assert!(!schema.is_empty());
+        assert!(engine == "builtin" || engine == "rime");
     }
 }

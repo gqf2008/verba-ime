@@ -1,4 +1,5 @@
-# 路线图
+
+| 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |# 路线图
 
 > 更新：2026-08-23 · 当前状态：**多模态在线 provider + Slint 设置面板已落地**（ASR/TTS 走「联网」：OpenAI 兼容
 > audio/transcriptions + audio/speech；设置面板 apps/settings 用 Slint 1.17 替代 Tauri）。后续：audio.cpp 本地

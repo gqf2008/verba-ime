@@ -119,6 +119,16 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 - `etorth/libpinyin` 是 **GPL-3.0-or-later**；Verba 是 **MIT**。直接链接会把 Verba 传染为 GPL，**不建议作为默认 / 编译期内嵌引擎**。
 - 若确要体验 libpinyin 手感，应借鉴其**工程模式**（异步 / 容错选项 / 分段承诺 / 面板跟手），而**不是换引擎**。Rime（BSD-3）更适合 Verba 的开源 + 三平台 + 打包可控定位。
 
+### 跨平台一致性（2026-08-24）
+
+- 「分段承诺」核心逻辑落在共享 `verba-core`（`CompositionMachine`），**三端共用**，无需在前端重复实现。
+- `engine=rime` 整句候选此前仅在 Windows TSF 接入；macOS IMK 已对齐：`start_candidates` 读取
+  `config.engine/rime_schema`，`engine=rime` 时经 `rime_candidates` IPC 一次性请求 Rime 候选并压入
+  候选队列（同 `feed_candidates_event` 融合/去重）。Linux 前端尚未落地（低优先）。
+- 已知差异：Windows 对 Rime/LLM 候选请求做了 ≈320ms 防抖（`CANDIDATE_REQ_DEBOUNCE_TICKS`），
+  macOS 候选请求即时触发。属性能调优差异，非逻辑差异；如需统一，可在 `verba-config` 增加候选
+  请求防抖配置供两端读取。
+
 ---
 
 ## 6. 给 M5 打磨的落地清单（按价值排序）
