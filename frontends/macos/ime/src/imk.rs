@@ -77,6 +77,8 @@ struct Ivars {
     timer: RefCell<Option<Retained<NSTimer>>>,
     /// 在途候选融合请求的拼音。
     candidate_pinyin: RefCell<Option<String>>,
+    /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
+    composed: RefCell<String>,
 }
 
 impl Default for Ivars {
@@ -88,6 +90,7 @@ impl Default for Ivars {
             client: RefCell::new(None),
             timer: RefCell::new(None),
             candidate_pinyin: RefCell::new(None),
+            composed: RefCell::new(String::new()),
         }
     }
 }
@@ -159,6 +162,12 @@ define_class!(
             }
             let _ = self.apply_action(action);
             Bool::new(true)
+        }
+
+        /// 组合文本数据源：updateComposition 调用它取当前 preedit 发给 client。
+        #[unsafe(method_id(composedString:))]
+        fn composed_string(&self, _sender: Option<&AnyObject>) -> Option<Retained<NSString>> {
+            Some(NSString::from_str(&self.ivars().composed.borrow()))
         }
 
         /// 候选窗数据源：返回当前页候选。
@@ -355,38 +364,21 @@ impl VerbaIMKController {
         }
         self.ivars().candidates.borrow_mut().clear();
         self.ivars().page.set(0);
+        *self.ivars().composed.borrow_mut() = String::new();
     }
 
     fn set_marked(&self, text: &str) {
-        let Some(client) = self.ivars().client.borrow().clone() else {
-            return;
-        };
-        let ns = NSString::from_str(text);
-        let len = ns.length();
-        // SAFETY: 同上，setMarkedText:selectionRange:replacementRange: 为 IMKInputText
-        // 非正式协议方法，selectionRange 位于文本末尾。
-        let _: () = unsafe {
-            msg_send![
-                &client,
-                setMarkedText: &*ns,
-                selectionRange: NSRange::new(len, 0),
-                replacementRange: NSRange::new(NSNotFound as NSUInteger, 0),
-            ]
-        };
+        *self.ivars().composed.borrow_mut() = text.to_owned();
+        // SAFETY: updateComposition 为 IMKInputController 方法：取 composedString:
+        // 并经 client setMarkedText: 发送，同时触发候选窗刷新。
+        let _: () = unsafe { msg_send![self, updateComposition] };
     }
 
     fn clear_composition(&self) {
+        *self.ivars().composed.borrow_mut() = String::new();
+        // SAFETY: updateComposition 发空组合 → client 标记文本清空；再 unmark 兜底。
+        let _: () = unsafe { msg_send![self, updateComposition] };
         if let Some(client) = self.ivars().client.borrow().clone() {
-            let ns = NSString::from_str("");
-            // SAFETY: 清空标记文本并 unmark。
-            let _: () = unsafe {
-                msg_send![
-                    &client,
-                    setMarkedText: &*ns,
-                    selectionRange: NSRange::new(0, 0),
-                    replacementRange: NSRange::new(NSNotFound as NSUInteger, 0),
-                ]
-            };
             let _: () = unsafe { msg_send![&client, unmarkText] };
         }
         self.ivars().candidates.borrow_mut().clear();
