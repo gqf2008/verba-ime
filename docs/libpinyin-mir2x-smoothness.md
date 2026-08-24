@@ -5,8 +5,8 @@
 > 关联：[中文引擎选型与集成评估](chinese-engine-evaluation.md)（引擎选型），本文聚焦「集成/交互工程」层面的手感来源。
 
 > **2026-08-24 更新（单引擎化）**：Verba 中文候选已收敛为**单引擎 Rime（librime）**，内置自研
-> `verba-pinyin` 已从运行时移除（不再生成候选）。下文涉及「内置 + Rime」的旧表述为历史记录，
-> 以「单引擎 Rime」为准：候选由 daemon 内 Rime 提供，`config engine` 默认 `rime`。
+> `verba-pinyin` 已移除，`config engine` 开关也已删除；候选由 daemon 内 Rime 提供（Windows
+> `rime.dll` / macOS `librime.dylib`）。正文为当前状态，mir2x/libpinyin 仅作手感参考。
 
 
 ---
@@ -20,7 +20,7 @@
   - `ports/libpinyin` —— vcpkg 端口，拉取 `etorth/libpinyin`（**GPL-3.0-or-later**，BerkeleyDB 词库，`model20.text` 数据）。
 - 代码里显式注释：`// for better implementation, check https://github.com/libpinyin/ibus-libpinyin.git`。
 
-> 一句话结论：**丝滑 = 异步不阻塞 + 高容错候选 + 分段可确定 + 面板跟手**。Verba 已具备其中大部分，最值得补的是「分段承诺」与「候选即时性」。
+> 一句话结论：**丝滑 = 异步不阻塞 + 高容错候选 + 分段可确定 + 面板跟手**。Verba 以**单引擎 Rime**（本地、后台线程、启动预热）实现前三者；「候选即时性」议题已关闭，「分段承诺」保留结构、当前为整句提交。
 
 ---
 
@@ -98,34 +98,35 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 
 ---
 
-## 5. 与 Verba 现状的对比
+## 5. 与 Verba 现状的对比（单引擎 Rime）
+
+> 2026-08-24：Verba 中文候选已收敛为**单引擎 Rime（librime）**；内置 `verba-pinyin`、`config engine`
+> 开关、LLM 候选融合均已移除。下表为当前状态。
 
 ### 已对齐（Verba 不差）
 
-| 维度 | mir2x | Verba 现状（`crates/verba-core/src/machine.rs` + `frontends/windows/ime/src/text_service.rs`） |
+| 维度 | mir2x | Verba 现状 |
 |---|---|---|
-| 异步不阻塞 | 工作线程 + 轮询 | 前端 `start_rime_candidates`（本地 Rime）在**后台线程**，结果经候选队列回流合并分发，不阻塞按键 ✅ |
-| 候选即时 | 每键立即 | `refresh_candidates()` 始终启用内置词库，打字即有即时候选；engine=rime 时再叠加本地 Rime 整句候选（异步去重追加）✅ |
+| 异步不阻塞 | 工作线程 + 轮询 | daemon 内 Rime 查询在后台线程，候选经 IPC 事件回流前端，不阻塞按键 ✅ |
+| 候选即时 | 每键立即 | 拼音变化即请求本地 Rime，daemon 启动预热（`warmup_rime`），返回即展示 ✅ |
 | 独立候选窗 | 内联面板 | 独立浮窗（跟随光标、分页 9→27、主题/皮肤、水平/垂直布局）✅ |
-| 候选排序 | 词频/长度 | 内置按词频；Rime 按词典质量 ✅ |
+| 候选排序 | 词频/长度 | Rime 按词典/语言模型质量 ✅ |
 
-### 候选只走本地；LLM 仅用于「输入 → 结果」（2026-08-24）
+### 候选只走本地；LLM 仅用于「输入 → 结果」
 
-- **候选**（打字过程）只来自**本地引擎**：内置 `verba-pinyin` 与（可选）`engine=rime`。
-  前端在拼音变化时按 `config.engine` 决定是否请求本地 Rime，**不发任何远程 LLM 候选融合请求**。
-- **LLM** 只在「输入 → 结果」的 **AI 直输**（`//` + 回车触发 `StartLlm`）时调用，**一次一条
-  prompt**，打字过程零 LLM 调用。早期版本把「LLM 候选融合」当作候选来源之一，会在打字时
-  请求远程 LLM，已在 2026-08-24 移除（`start_llm_candidates` / macOS `llm_candidates_start` 调用）。
-- 好处：候选零延迟、零成本、跨端一致；LLM 成本只与主动 AI 使用次数成正比。
+- **候选**（打字过程）只来自**本地 Rime（librime）**：Windows `rime.dll` / macOS `librime.dylib`，
+  拼音变化即经 `rime_candidates` IPC 请求候选，**不发任何远程 LLM 候选融合请求**。
+- **LLM** 只在「输入 → 结果」的 **AI 直输**（`//` + 回车触发 `StartLlm`）时调用，一次一条 prompt，
+  打字过程零 LLM 调用。
+- 好处：候选本地、零成本、跨端一致；LLM 成本只与主动 AI 使用次数成正比。
 
 ### 差异 / 可借鉴
 
 | 维度 | mir2x / libpinyin | Verba 现状 | 建议 |
 |---|---|---|---|
-| 候选引擎 | libpinyin 进程内（GPL-3.0） | Rime（daemon IPC）+ 内置 | **保持 Rime**（BSD-3，整句 84% vs 自研 6%，见 `chinese-engine-evaluation.md` §8）。不推荐切 libpinyin：GPL 传染、无明显整句优势 |
-| 候选计算时机 | 每键立即（不防抖） | Rime 候选经 ≈320ms 防抖（`CANDIDATE_REQ_DEBOUNCE_TICKS=4`×80ms） | 实测手感。「整句候选」晚半拍可接受（它本就是补充增强）；若首候选也延迟明显，缩短/取消 Rime 防抖或改「立即 + 合并」 |
-| 打字容错 | `incomplete` + `correct_all` + `dynamic_adjust` | 内置支持 模糊音/简拼，无逐字 auto-correct | 可选：给 `verba-pinyin` 评估弱「自动纠错」，或确认 Rime `luna_pinyin_simp` 已覆盖常见错音 |
-| **分段承诺** | 支持（stk 逐段确定 + 可回退） | ✅ 已实现（2026-08-24）：内置候选经 `lookup_segmented` 支持逐段确定 + 可回退 | 之前是最值得补的缺口，现已落地；Rime/LLM 整句候选仍走整句 |
+| 候选引擎 | libpinyin 进程内（GPL-3.0） | Rime（daemon 内 librime，单引擎） | 保持 Rime（BSD-3，整句 84% vs 自研 6%，见 `chinese-engine-evaluation.md` §8）。不推荐切 libpinyin：GPL 传染、无明显整句优势 |
+| 候选时机 | 每键立即（不防抖） | 拼音变化即请求 Rime（Windows 有 ≈320ms 防抖，见下「候选即时性」） | 已关闭该议题：防抖是后端优化，非 UX 延时 |
+| 分段承诺 | 支持（stk 逐段确定 + 可回退） | 当前为**整句提交**（Rime 候选 `consumed=active_len`）；`CompositionMachine` 保留分段结构，待 daemon 返回覆盖长度后启用 | 可借鉴 mir2x 的逐段确定手感；Rime 整句准确率已高（84%），优先级低 |
 | 面板拖动 | 可拖动 | 未确认（候选窗跟随光标，通常无需拖动） | 低优先，可选 |
 
 ### 许可风险（重要）
@@ -135,26 +136,30 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 
 ### 跨平台一致性（2026-08-24）
 
-- 「分段承诺」核心逻辑落在共享 `verba-core`（`CompositionMachine`），**三端共用**，无需在前端重复实现。
-- `engine=rime` 整句候选此前仅在 Windows TSF 接入；macOS IMK 已对齐：`start_candidates` 读取
-  `config.engine/rime_schema`，`engine=rime` 时经 `rime_candidates` IPC 一次性请求 Rime 候选并压入
-  候选队列（同 `feed_candidates_event` 融合/去重）。Linux 前端尚未落地（低优先）。
+- 单引擎（Rime）逻辑落在共享 `verba-core`（`CompositionMachine`）与 `verba-librime`（跨平台 `platform.rs`，
+  libloading 统一加载），**Windows / macOS 共用**，无需在前端重复实现。
+- 候选经 `rime_candidates` IPC 一次性请求并压入候选队列（`feed_candidates_event` 融合/去重）。
+  Linux 前端尚未落地（低优先）。
 - ~~候选即时性~~ **已关闭（2026-08-24）**：曾担心 Windows 的 Rime 候选 ≈320ms 防抖
-  （`CANDIDATE_REQ_DEBOUNCE_TICKS=4`）会造成「感知延迟」，但这是**后端优化**，不是 UX 问题——
-  内置 `verba-pinyin` 每键同步出候选，候选窗永不空白；Rime 整句候选只是异步追加。用户实测
-  mir2x 无延时；引擎的职责本就是**本地即时出候选**，防抖不该被当成「延时」议题，故不调。
+  （`CANDIDATE_REQ_DEBOUNCE_TICKS=4`）会造成「感知延迟」，但这是**后端优化**，不是 UX 问题；
+  单引擎下候选依赖 Rime 查询返回（本地、启动预热），返回前候选窗为空是正常状态。用户实测
+  mir2x 无延时；防抖不该被当成「延时」议题，故不调。
 
 ---
 
-## 6. 给 M5 打磨的落地清单（按价值排序）
+## 6. 给后续打磨的落地清单（按价值排序）
 
-1. **分段承诺**（P0，手感）✅ 已实现（2026-08-24）：`verba-pinyin::PinyinEngine::lookup_segmented` 返回带 `consumed` 覆盖长度的候选；`CompositionMachine` 增加 `committed`/`commit_offset`，选候选只推进段偏移、`Backspace` 弹回上一段、已消费完自动整句提交。Pinyin 态（内置候选）走分段，Rime 候选仍覆盖整句（`on_llm_candidates` 一律 `consumed = 活跃拼音全长`）。
-2. ~~候选即时性校准~~（P1）**已关闭**：引擎本地即时出候选，内置候选填满候选窗；否定了「防抖=延时」的推演，无需打点/调整（2026-08-24）。
-3. **容错选项**（P2，可选）：确认 `verba-pinyin` 的模糊音/简拼是否覆盖「打字手误」，必要时补弱 auto-correct。
+1. **分段承诺的逐段确定**（可选，手感）：单引擎下 Rime 候选为整句（`consumed=active_len`），当前
+   选中即整句提交；若要 mir2x 的「先确定一段、剩余继续选」手感，需 daemon `RimeCandidates`/
+   `Candidates` 事件返回「覆盖长度」，再启用 `CompositionMachine` 已保留的 `committed`/`commit_offset`
+   结构并补真实分支测试。Rime 整句准确率已高（84%），优先级低。
+2. ~~候选即时性校准~~（P1）**已关闭**：单引擎下候选依赖 Rime 查询返回（本地、启动预热）；防抖是
+   后端优化，非 UX「延时」，无需打点/调整（2026-08-24）。
+3. **打字容错**（P2，可选）：确认 Rime `luna_pinyin_simp` 的模糊音/简拼/纠错选项是否覆盖「打字
+   手误」，必要时在 `rime_schema` 或 librime 选项中开启。
 4. **面板拖动**（P3，可选）：候选窗增加可拖动（不跟随光标时）；低优先。
 
 ---
-
 ## 7. 源码位置与关键 API
 
 - mir2x：`../mir2x/client/src/ime.{hpp,cpp}`、`imeboard.{hpp,cpp}`、`ports/libpinyin/*`。
