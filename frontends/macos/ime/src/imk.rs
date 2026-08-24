@@ -13,8 +13,11 @@ use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool};
-use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSEventModifierFlags};
+use objc2::{
+    define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
+    MainThreadOnly,
+};
+use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
 use objc2_foundation::{
     NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSInteger, NSNotFound,
     NSObjectProtocol, NSRange, NSRunLoop, NSString, NSTimer, NSUInteger,
@@ -236,6 +239,41 @@ define_class!(
             }
             self.cancel_stream();
             self.invalidate_timer();
+        }
+
+        /// 输入法菜单：提供「设置…」入口打开 verba-settings 设置面板。
+        #[unsafe(method_id(menu))]
+        fn menu(&self) -> Option<Retained<NSMenu>> {
+            // SAFETY: IMK 回调均发生在主线程。
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Verba"));
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str("设置…"),
+                    Some(sel!(openSettings:)),
+                    &NSString::from_str(""),
+                )
+            };
+            // SAFETY: self 与 AnyObject 指向同一 ObjC 对象；controller 由 IMKServer 持有，
+            // NSMenuItem 对 target 为弱引用，生命周期安全。
+            let target: &AnyObject =
+                unsafe { &*(self as *const VerbaIMKController as *const AnyObject) };
+            unsafe { item.setTarget(Some(target)) };
+            menu.addItem(&item);
+            Some(menu)
+        }
+
+        /// 打开设置面板（菜单项 action）。
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            match crate::ipc::settings_exe_path() {
+                Some(p) => {
+                    log::info!("[VerbaIMK] 打开设置面板: {}", p.display());
+                    let _ = std::process::Command::new(&p).spawn();
+                }
+                None => log::warn!("[VerbaIMK] 未找到 verba-settings（VERBA_SETTINGS_PATH 或同目录）"),
+            }
         }
 
         /// 主线程定时器：排空 daemon 流事件。

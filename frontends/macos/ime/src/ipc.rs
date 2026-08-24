@@ -25,6 +25,25 @@ pub fn daemon_exe_path() -> Option<PathBuf> {
     None
 }
 
+/// 定位设置面板可执行文件：VERBA_SETTINGS_PATH 或本可执行文件同目录 verba-settings。
+pub fn settings_exe_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("VERBA_SETTINGS_PATH") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            let candidate = d.join("verba-settings");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// 尝试连接 daemon。
 pub fn try_connect() -> Result<VerbaClient, IpcError> {
     VerbaClient::connect()
