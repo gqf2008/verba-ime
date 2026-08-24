@@ -875,10 +875,12 @@ impl DaemonHandler {
 }
 
 /// Rime 资源定位：环境变量优先，缺省取 daemon 同目录 `rime/` 下
-/// `rime.dll`、`data/`、`user_data/`。
+/// `librime` 库、`data/`、`user_data/`（按平台：Windows `rime.dll` / macOS `librime.dylib`）。
 fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let from_env = || -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-        let d = std::env::var("VERBA_RIME_DLL").ok()?;
+        let d = std::env::var("VERBA_RIME_DLL")
+            .or_else(|_| std::env::var("VERBA_RIME_DYLIB"))
+            .ok()?;
         let s = std::env::var("VERBA_RIME_SHARED").ok()?;
         let u = std::env::var("VERBA_RIME_USER").ok()?;
         Some((d.into(), s.into(), u.into()))
@@ -891,8 +893,15 @@ fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) 
         .and_then(|p| p.parent().map(|d| d.to_owned()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let rime_dir = exe_dir.join("rime");
+    let lib_name = if cfg!(windows) {
+        "rime.dll"
+    } else if cfg!(target_os = "macos") {
+        "librime.dylib"
+    } else {
+        "librime.so"
+    };
     (
-        rime_dir.join("rime.dll"),
+        rime_dir.join(lib_name),
         rime_dir.join("data"),
         rime_dir.join("user_data"),
     )

@@ -49,17 +49,25 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 中文候选由 librime 提供（daemon 内动态加载 rime.dll，**唯一引擎**，无引擎开关）。构建与部署：
 
-1. 获取第三方二进制/数据（rime.dll x64 + Rime 数据 + wubi86 + opencc）：
-   ```powershell
-   pwsh spikes/librime-sys/fetch-vendor.ps1   # 输出到 spikes/librime-sys/vendor/
+1. 获取第三方二进制/数据：
+   - Windows（rime.dll x64 + Rime 数据 + wubi86 + opencc）：
+     ```powershell
+     pwsh spikes/librime-sys/fetch-vendor.ps1   # 输出到 spikes/librime-sys/vendor/
+     ```
+   - macOS（librime.dylib + Rime 数据 + wubi86 + opencc）：从 librime 发行版或
+     Homebrew `librime` 包取得 `librime.dylib` 与数据，放到仓库根 `vendor/rime/`：
+     ```
+     vendor/rime/librime.dylib
+     vendor/rime/data/            # schema/dict + opencc/
+     ```
+     `scripts/package.sh` 会把 `vendor/rime/` 打进 `Verba.app/Contents/MacOS/rime/`。
+2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载；Windows `rime.dll` / macOS `librime.dylib`）：
    ```
-2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载）：
-   ```
-   <daemon 同目录>/rime/rime.dll
+   <daemon 同目录>/rime/(rime.dll | librime.dylib)
    <daemon 同目录>/rime/data/            # schema/dict + opencc/
    <daemon 同目录>/rime/user_data/       # 首次查询自动部署生成
    ```
-   或指定 `VERBA_RIME_DLL` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
+   或指定 `VERBA_RIME_DLL` / `VERBA_RIME_DYLIB` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
 3. 配置方案：`verba-cli config set rime_schema=luna_pinyin_simp`
    （五笔：`rime_schema=wubi86`）。
 4. 验证：`verba-cli rime nishishui`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。

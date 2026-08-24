@@ -17,8 +17,6 @@ pub struct SegCandidate {
     pub text: String,
     /// 覆盖的输入拼音字符数。
     pub consumed: usize,
-    /// 频率排名（越小越常用）。
-    pub rank: u32,
 }
 
 /// 输入法模式（与 IPC SetMode 对应）。
@@ -112,7 +110,7 @@ pub enum Action {
     LlmFailed { message: String },
 }
 
-/// 拼音候选融合请求：在词库候选基础上请 LLM 补充语境候选。
+/// Rime 候选请求：拼音 + 现有候选（供 daemon 查询 Rime；单引擎）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmCandidateRequest {
     pub pinyin: String,
@@ -139,7 +137,10 @@ pub struct CompositionMachine {
     llm_candidates: Vec<SegCandidate>,
     /// 融合后的展示候选（词库 + LLM，去重），供选择/分页/提交。
     pinyin_candidates: Vec<SegCandidate>,
-    /// 已承诺的候选段（文本 + 覆盖的拼音字符数），用于「分段承诺」。
+    /// 已承诺的候选段（文本 + 覆盖的拼音字符数）。
+    ///
+    /// 单引擎（Rime）下候选 `consumed = 活跃拼音全长`，选中即整句提交，此字段恒空；
+    /// 「分段承诺」需 daemon 返回覆盖长度后方可启用（当前保留结构）。
     committed: Vec<(String, usize)>,
     /// 已承诺段累计覆盖的拼音缓冲前缀长度。
     commit_offset: usize,
@@ -753,7 +754,6 @@ impl CompositionMachine {
             self.llm_candidates.push(SegCandidate {
                 text: cand.to_owned(),
                 consumed: active_len,
-                rank: u32::MAX,
             });
             changed = true;
         }
@@ -903,13 +903,11 @@ mod tests {
     fn pinyin_digit_out_of_range_ignored() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
-        m.feed_char('i');
-        let n = m.pinyin_candidates.len();
-        if n < 9 {
-            // 超出候选的编号应被忽略：不吞字、不提交原文，仍留在拼音态。
-            assert_eq!(m.feed_char('9'), Action::None);
-            assert_eq!(m.state(), MachineState::Pinyin);
-        }
+        // 注入少于 1 页（9 个）的候选：按 9 超出候选 → 忽略（不吞字、不提交原文）。
+        rime(&mut m, "n", &["你", "你好"]);
+        assert!(m.pinyin_candidates.len() < CompositionMachine::PINYIN_PAGE_SIZE);
+        assert_eq!(m.feed_char('9'), Action::None);
+        assert_eq!(m.state(), MachineState::Pinyin);
     }
 
     #[test]
@@ -1499,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn pinyin_segmented_commit_partial_then_continue() {
+    fn pinyin_rime_candidate_commits_whole() {
         // 单引擎（Rime）：候选覆盖活跃拼音全长，选中即整句提交（无内置子短语分段）。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {
@@ -1516,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn pinyin_segmented_commit_full_when_all_consumed() {
+    fn pinyin_candidate_commits_whole() {
         // 候选覆盖全部剩余（无子短语）→ 整句提交并回 Idle（不破坏原有整句行为）。
         let mut m = CompositionMachine::new();
         for c in "ni".chars() {
@@ -1531,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn pinyin_segmented_backspace_pops_segment() {
+    fn pinyin_backspace_pops_pinyin_char() {
         // 单引擎（Rime）：候选均为整句（consumed=active_len），无已承诺段；退格回退拼音字符。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {
@@ -1550,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn pinyin_segmented_commit_remaining_auto_commits() {
+    fn pinyin_rime_whole_sentence_commits() {
         // 单引擎（Rime）：注入覆盖全长的整句候选，选中即整句提交。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {

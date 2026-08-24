@@ -1,13 +1,17 @@
-//! Windows 实现：动态加载 rime.dll（`LoadLibraryW`/`GetProcAddress`）。
+//! 跨平台 Rime（librime）实现：用 `libloading` 动态加载
+//! （Windows `rime.dll` / macOS `librime.dylib` / 其它 Unix `librime.so`）。
 //!
 //! 踩坑（见 spikes/librime-sys/README.md）：
 //! - librime 1.17 的 `RimeSessionId` 是 `uintptr_t`（64 位），必须用 `usize`；
 //! - GNU 工具链下 `raw-dylib` 运行时导入不可靠，统一用显式动态加载；
 //! - Weasel 安装包的 rime.dll 是 x86，须取 librime 官方 `Windows-msvc-x64` 包；
+//! - macOS 需 `librime.dylib`（librime 原生支持 macOS，如 Squirrel 即基于 librime）；
 //! - `RimeTraits` 的路径指针 librime 会保存引用，CString 须随引擎存活。
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
+
+use libloading::Library;
 
 use crate::{RimeCandidate, RimeConfig, RimeError, RimeSchema};
 
@@ -79,13 +83,6 @@ struct RimeContext {
     select_labels: *mut *mut c_char,
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn LoadLibraryW(name: *const u16) -> *mut c_void;
-    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-    fn FreeLibrary(module: *mut c_void) -> i32;
-}
-
 type FnSetupLogging = unsafe extern "C" fn();
 type FnInitialize = unsafe extern "C" fn(traits: *mut RimeTraits);
 type FnFinalize = unsafe extern "C" fn();
@@ -103,9 +100,9 @@ type FnFreeSchemaList = unsafe extern "C" fn(schema_list: *mut RimeSchemaList);
 type FnSelectSchema =
     unsafe extern "C" fn(session: RimeSessionId, schema_id: *const c_char) -> RimeBool;
 
-/// 动态加载得到的函数指针集合（模块句柄保持存活）。
+/// 动态加载得到的函数指针集合（`Library` 句柄保持存活）。
 struct Rime {
-    _module: *mut c_void,
+    _lib: Library,
     setup_logging: FnSetupLogging,
     initialize: FnInitialize,
     finalize: FnFinalize,
@@ -122,84 +119,63 @@ struct Rime {
 }
 
 impl Rime {
-    fn load(dll_path: &Path) -> Result<Self, RimeError> {
+    fn load(lib_path: &Path) -> Result<Self, RimeError> {
         unsafe {
-            let wide: Vec<u16> = dll_path
-                .to_str()
-                .ok_or_else(|| RimeError::Load("路径非 UTF-8".into()))?
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let module = LoadLibraryW(wide.as_ptr());
-            if module.is_null() {
-                return Err(RimeError::Load(format!(
-                    "LoadLibraryW 失败: {}",
-                    dll_path.display()
-                )));
-            }
-            let get = |name: &str| -> Result<*mut c_void, RimeError> {
-                let cname = CString::new(name).map_err(|e| RimeError::Load(e.to_string()))?;
-                let p = GetProcAddress(module, cname.as_ptr() as *const u8);
-                if p.is_null() {
-                    Err(RimeError::Load(format!("GetProcAddress 失败: {name}")))
-                } else {
-                    Ok(p)
-                }
+            let lib = Library::new(lib_path).map_err(|e| {
+                RimeError::Load(format!("动态加载失败: {} ({e})", lib_path.display()))
+            })?;
+            let get = |name: &[u8]| -> Result<*mut c_void, RimeError> {
+                // Symbol<T> deref 到 T（函数指针），*sym 即原始函数指针。
+                lib.get::<unsafe extern "C" fn()>(name)
+                    .map(|sym| *sym as *mut c_void)
+                    .map_err(|e| RimeError::Load(format!("取符号失败 {name:?}: {e}")))
             };
             let rime = Rime {
-                _module: module,
                 setup_logging: std::mem::transmute::<*mut c_void, FnSetupLogging>(get(
-                    "RimeSetupLogging",
+                    b"RimeSetupLogging\0",
                 )?),
                 initialize: std::mem::transmute::<*mut c_void, FnInitialize>(get(
-                    "RimeInitialize",
+                    b"RimeInitialize\0",
                 )?),
-                finalize: std::mem::transmute::<*mut c_void, FnFinalize>(get("RimeFinalize")?),
+                finalize: std::mem::transmute::<*mut c_void, FnFinalize>(get(b"RimeFinalize\0")?),
                 create_session: std::mem::transmute::<*mut c_void, FnCreateSession>(get(
-                    "RimeCreateSession",
+                    b"RimeCreateSession\0",
                 )?),
                 destroy_session: std::mem::transmute::<*mut c_void, FnDestroySession>(get(
-                    "RimeDestroySession",
+                    b"RimeDestroySession\0",
                 )?),
                 start_maintenance: std::mem::transmute::<*mut c_void, FnStartMaintenance>(get(
-                    "RimeStartMaintenance",
+                    b"RimeStartMaintenance\0",
                 )?),
                 join_maintenance_thread: std::mem::transmute::<*mut c_void, FnJoinMaintenanceThread>(
-                    get("RimeJoinMaintenanceThread")?,
+                    get(b"RimeJoinMaintenanceThread\0")?,
                 ),
                 simulate_key_sequence: std::mem::transmute::<*mut c_void, FnSimulateKeySequence>(
-                    get("RimeSimulateKeySequence")?,
+                    get(b"RimeSimulateKeySequence\0")?,
                 ),
                 get_context: std::mem::transmute::<*mut c_void, FnGetContext>(get(
-                    "RimeGetContext",
+                    b"RimeGetContext\0",
                 )?),
                 free_context: std::mem::transmute::<*mut c_void, FnFreeContext>(get(
-                    "RimeFreeContext",
+                    b"RimeFreeContext\0",
                 )?),
                 get_schema_list: std::mem::transmute::<*mut c_void, FnGetSchemaList>(get(
-                    "RimeGetSchemaList",
+                    b"RimeGetSchemaList\0",
                 )?),
                 free_schema_list: std::mem::transmute::<*mut c_void, FnFreeSchemaList>(get(
-                    "RimeFreeSchemaList",
+                    b"RimeFreeSchemaList\0",
                 )?),
                 select_schema: std::mem::transmute::<*mut c_void, FnSelectSchema>(get(
-                    "RimeSelectSchema",
+                    b"RimeSelectSchema\0",
                 )?),
+                _lib: lib,
             };
             Ok(rime)
         }
     }
 }
 
-impl Drop for Rime {
-    fn drop(&mut self) {
-        unsafe {
-            FreeLibrary(self._module);
-        }
-    }
-}
-
-/// Rime 引擎：持有模块句柄 + 初始化状态 + 目录字符串（librime 保存指针引用）。
+/// Rime 引擎：持有库句柄 + 初始化状态 + 目录字符串（librime 保存指针引用）。
 pub struct RimeEngine {
     inner: Rime,
     _shared: CString,
@@ -209,7 +185,7 @@ pub struct RimeEngine {
     shared_dir: PathBuf,
 }
 
-// SAFETY: rime.dll 内部对全局 Service 与会话有锁；本引擎所有可变操作由调用方
+// SAFETY: librime 内部对全局 Service 与会话有锁；本引擎所有可变操作由调用方
 // （daemon 的 Mutex）串行化，函数指针与句柄可跨线程安全传递。
 unsafe impl Send for RimeEngine {}
 unsafe impl Sync for RimeEngine {}
@@ -225,7 +201,7 @@ fn to_rust(ptr: *const c_char) -> String {
 }
 
 impl RimeEngine {
-    /// 加载 rime.dll 并初始化 + 首次部署（同步等待完成）。
+    /// 加载 librime 并初始化 + 首次部署（同步等待完成）。
     pub fn new(cfg: &RimeConfig) -> Result<Self, RimeError> {
         let inner = Rime::load(&cfg.dll_path)?;
         std::fs::create_dir_all(&cfg.shared_data_dir)
@@ -379,18 +355,21 @@ impl Drop for RimeEngine {
 mod tests {
     use super::*;
 
-    /// 需真实 rime.dll 与数据：设 VERBA_RIME_DLL/SHARED/USER 后运行；
-    /// 未设环境变量时跳过（保持 CI 可过）。
+    /// 需真实 librime 库与数据：设 VERBA_RIME_DLL（Windows）/
+    /// VERBA_RIME_DYLIB（macOS）及 SHARED/USER 后运行；未设时跳过（保持 CI 可过）。
     #[test]
     fn rime_engine_translates_pinyin_and_wubi() {
-        let Ok(dll) = std::env::var("VERBA_RIME_DLL") else {
-            eprintln!("跳过：未设置 VERBA_RIME_DLL");
+        let dll = std::env::var("VERBA_RIME_DLL")
+            .or_else(|_| std::env::var("VERBA_RIME_DYLIB"))
+            .ok();
+        let Some(dll) = dll else {
+            eprintln!("跳过：未设置 VERBA_RIME_DLL / VERBA_RIME_DYLIB");
             return;
         };
         let shared = std::env::var("VERBA_RIME_SHARED").unwrap_or_default();
         let user = std::env::var("VERBA_RIME_USER").unwrap_or_default();
         let cfg = RimeConfig::load(Path::new(&dll), Path::new(&shared), Path::new(&user));
-        let engine = RimeEngine::new(&cfg).expect("加载 rime");
+        let engine = RimeEngine::new(&cfg).expect("加载 librime");
         let schemas = engine.schemas().expect("方案列表");
         assert!(
             schemas.iter().any(|s| s.schema_id == "luna_pinyin"),

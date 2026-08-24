@@ -25,6 +25,15 @@ cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 
+# 可选：捆绑 Rime（librime.dylib + data/），daemon 从 $APP/Contents/MacOS/rime/ 加载。
+# 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。
+if [ -d "$REPO_ROOT/vendor/rime" ]; then
+    cp -R "$REPO_ROOT/vendor/rime" "$APP/Contents/MacOS/rime"
+    echo "已捆绑 Rime: vendor/rime -> Verba.app/Contents/MacOS/rime"
+else
+    echo "未找到 vendor/rime（librime.dylib + data/），跳过 Rime 捆绑"
+fi
+
 # ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）。
 # 失败不吞：CI 与本地都应看到签名错误。
 codesign --force --deep --sign - "$APP"

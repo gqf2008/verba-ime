@@ -100,8 +100,10 @@ struct Ivars {
     candidate_pinyin: RefCell<Option<String>>,
     /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
     composed: RefCell<String>,
-    /// Rime 方案（单引擎）。
+    /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
+    /// 配置 mtime（用于 Rime 方案热更新检测）。
+    candidate_config_mtime: Cell<Option<std::time::SystemTime>>,
 }
 
 impl Default for Ivars {
@@ -115,6 +117,7 @@ impl Default for Ivars {
             candidate_pinyin: RefCell::new(None),
             composed: RefCell::new(String::new()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
+            candidate_config_mtime: Cell::new(None),
         }
     }
 }
@@ -559,9 +562,25 @@ impl VerbaIMKController {
     /// 单引擎（Rime）：候选只走本地 Rime。LLM 只在「输入 → 结果」的 AI 直输
     /// （回车触发 `StartLlm`）时调用，**打字过程不调用远程 LLM 做候选融合**。
     fn start_candidates(&self, req: LlmCandidateRequest) {
-        let schema = load_rime_schema();
-        *self.ivars().candidate_rime_schema.borrow_mut() = schema.clone();
+        self.maybe_reload_rime_schema();
+        let schema = self.ivars().candidate_rime_schema.borrow().clone();
         self.start_rime_candidates(req.pinyin, schema);
+    }
+
+    /// 按配置 mtime 热更新 Rime 方案（避免每键读盘解析；未变则用缓存）。
+    fn maybe_reload_rime_schema(&self) {
+        let mtime = verba_config::VerbaDirs::locate().ok().and_then(|d| {
+            let mgr = verba_config::ConfigManager::new(d);
+            std::fs::metadata(mgr.path())
+                .and_then(|m| m.modified())
+                .ok()
+        });
+        if mtime == self.ivars().candidate_config_mtime.get() {
+            return;
+        }
+        self.ivars().candidate_config_mtime.set(mtime);
+        let schema = load_rime_schema();
+        *self.ivars().candidate_rime_schema.borrow_mut() = schema;
     }
 
     /// Rime 候选查询（单引擎）：一次性请求 Rime 整句候选并压入候选队列。

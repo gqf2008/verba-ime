@@ -1,16 +1,17 @@
-//! 可选中文引擎（Rime）封装：daemon 内动态加载 rime.dll，查询拼音/五笔候选。
+//! 中文引擎（Rime/librime）封装：daemon 内动态加载 librime，查询拼音/五笔候选。
 //!
-//! - Windows：动态加载（`LoadLibraryW`/`GetProcAddress`），RimeInitialize + 部署 +
+//! - Windows / macOS（及可加载 librime 的 Unix）：用 `libloading` 动态加载
+//!   （Windows `rime.dll` / macOS `librime.dylib`），RimeInitialize + 部署 +
 //!   `RimeSimulateKeySequence` + `RimeGetContext` 取候选列表。
-//! - 其他平台：stub（`Unsupported`），供 CI 编译通过。
+//! - 其它平台：stub（`Unsupported`），供 CI 编译通过。
 //!
 //! 线程安全：内部 C 状态由 librime 自身同步，本 crate 额外用 `Mutex` 串行化
 //! （见 daemon 用法）；`RimeEngine` 为 `Send + Sync`。
 
-#[cfg(windows)]
-pub mod windows;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod platform;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod stub;
 
 use std::path::Path;
@@ -32,9 +33,9 @@ pub struct RimeSchema {
 
 #[derive(Debug, Error)]
 pub enum RimeError {
-    #[error("Rime 仅支持 Windows（当前平台未实现）")]
+    #[error("当前平台未实现 Rime 加载")]
     Unsupported,
-    #[error("加载 rime.dll 失败: {0}")]
+    #[error("加载 librime 失败: {0}")]
     Load(String),
     #[error("Rime 初始化失败: {0}")]
     Init(String),
@@ -45,16 +46,16 @@ pub enum RimeError {
 }
 
 /// Rime 引擎：加载后保持初始化状态，可重复查询。
-#[cfg(windows)]
-pub type RimeEngine = windows::RimeEngine;
+#[cfg(any(windows, target_os = "macos"))]
+pub type RimeEngine = platform::RimeEngine;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub type RimeEngine = stub::RimeEngine;
 
 /// 构造引擎的输入参数。
 #[derive(Debug, Clone)]
 pub struct RimeConfig {
-    /// rime.dll 路径。
+    /// librime 库路径（Windows `rime.dll` / macOS `librime.dylib`）。
     pub dll_path: std::path::PathBuf,
     /// 共享数据目录（schema/dict yaml）。
     pub shared_data_dir: std::path::PathBuf,
