@@ -99,10 +99,19 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 
 | 维度 | mir2x | Verba 现状（`crates/verba-core/src/machine.rs` + `frontends/windows/ime/src/text_service.rs`） |
 |---|---|---|
-| 异步不阻塞 | 工作线程 + 轮询 | 前端 `start_rime_candidates` / `start_llm_candidates` 在**后台线程**，结果经 `chunks` 队列 + `on_timer` 合并分发，不阻塞按键 ✅ |
-| 候选即时 | 每键立即 | `refresh_candidates()` 始终启用内置词库，打字即有即时候选；Rime/LLM 候选异步去重追加 ✅ |
+| 异步不阻塞 | 工作线程 + 轮询 | 前端 `start_rime_candidates`（本地 Rime）在**后台线程**，结果经候选队列回流合并分发，不阻塞按键 ✅ |
+| 候选即时 | 每键立即 | `refresh_candidates()` 始终启用内置词库，打字即有即时候选；engine=rime 时再叠加本地 Rime 整句候选（异步去重追加）✅ |
 | 独立候选窗 | 内联面板 | 独立浮窗（跟随光标、分页 9→27、主题/皮肤、水平/垂直布局）✅ |
 | 候选排序 | 词频/长度 | 内置按词频；Rime 按词典质量 ✅ |
+
+### 候选只走本地；LLM 仅用于「输入 → 结果」（2026-08-24）
+
+- **候选**（打字过程）只来自**本地引擎**：内置 `verba-pinyin` 与（可选）`engine=rime`。
+  前端在拼音变化时按 `config.engine` 决定是否请求本地 Rime，**不发任何远程 LLM 候选融合请求**。
+- **LLM** 只在「输入 → 结果」的 **AI 直输**（`//` + 回车触发 `StartLlm`）时调用，**一次一条
+  prompt**，打字过程零 LLM 调用。早期版本把「LLM 候选融合」当作候选来源之一，会在打字时
+  请求远程 LLM，已在 2026-08-24 移除（`start_llm_candidates` / macOS `llm_candidates_start` 调用）。
+- 好处：候选零延迟、零成本、跨端一致；LLM 成本只与主动 AI 使用次数成正比。
 
 ### 差异 / 可借鉴
 

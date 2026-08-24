@@ -560,71 +560,19 @@ impl VerbaIMKController {
         self.ensure_timer();
     }
 
-    /// 候选融合请求（拼音变更后向 daemon 请求 LLM 补充候选）。
+    /// 候选请求（拼音变更后按 `config.engine` 取候选来源）。
+    ///
+    /// **候选只走本地引擎**：`engine=rime` 请求本地 Rime 整句候选；`builtin` 直接用本地
+    /// 内置候选（已由 `Action::UpdatePinyin.candidates` 给出）。LLM 只在「输入 → 结果」的
+    /// AI 直输（回车触发 `StartLlm`）时调用，**打字过程不调用远程 LLM 做候选融合**。
     fn start_candidates(&self, req: LlmCandidateRequest) {
-        // 候选引擎/Rime 方案：与其它平台一致地按 engine 区分候选来源。
         let (engine, schema) = load_candidate_engine();
         *self.ivars().candidate_engine.borrow_mut() = engine.clone();
         *self.ivars().candidate_rime_schema.borrow_mut() = schema.clone();
         if engine == "rime" {
             self.start_rime_candidates(req.pinyin, schema);
-            return;
         }
-        // 取消上一在途候选请求，避免 daemon 继续生成旧候选。
-        let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
-        ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
-        if old_cand_id != 0 {
-            let old = old_cand_id;
-            std::thread::spawn(move || {
-                if let Ok(mut c) = ipc::try_connect() {
-                    let _ = c.llm_cancel(old);
-                }
-            });
-        }
-        let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
-        self.ivars()
-            .candidate_pinyin
-            .borrow_mut()
-            .replace(req.pinyin.clone());
-        ACTIVE_CANDIDATES.store(seq, Ordering::SeqCst);
-
-        std::thread::spawn(move || {
-            let mut client = match ipc::ensure_daemon() {
-                Ok(c) => c,
-                Err(e) => {
-                    push_llm(seq, error_event(&format!("候选请求失败: {e}")));
-                    return;
-                }
-            };
-            let id = match client.llm_candidates_start(&req.pinyin, &req.dictionary, 6) {
-                Ok(id) => id,
-                Err(e) => {
-                    push_llm(seq, error_event(&format!("候选请求失败: {e}")));
-                    return;
-                }
-            };
-            CAND_DAEMON_ID.store(id, Ordering::SeqCst);
-            if ACTIVE_CANDIDATES.load(Ordering::SeqCst) != seq {
-                let _ = client.llm_cancel(id);
-                return;
-            }
-            loop {
-                match client.next_event(id) {
-                    Ok(evt) => {
-                        let done = matches!(&evt.kind, Some(stream_event::Kind::Candidates(c)) if c.done)
-                            || matches!(&evt.kind, Some(stream_event::Kind::Error(_)));
-                        push_llm(seq, evt);
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        push_llm(seq, error_event(&format!("候选请求中断: {e}")));
-                        break;
-                    }
-                }
-            }
-        });
+        // builtin：候选已由核心状态机给出，无需远程请求。
     }
 
     /// Rime 候选查询（config 引擎=rime）：一次性请求 Rime 整句候选并压入候选队列。

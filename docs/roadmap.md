@@ -1,5 +1,4 @@
-
-| 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |# 路线图
+# 路线图
 
 > 更新：2026-08-23 · 当前状态：**多模态在线 provider + Slint 设置面板已落地**（ASR/TTS 走「联网」：OpenAI 兼容
 > audio/transcriptions + audio/speech；设置面板 apps/settings 用 Slint 1.17 替代 Tauri）。后续：audio.cpp 本地
@@ -109,6 +108,10 @@
 - [x] 候选融合（词库候选 + LLM 候选，IPC 协议扩展 `LlmCandidates`/`Candidates`；
   拼音态停顿 320ms 后请求，增量合并去重、按拼音校验过期结果；mock 端到端冒烟通过，
   实机验收通过）（2026-08-23）
+- [x] **决策：移除打字过程的 LLM 候选融合自动触发**（2026-08-24）——候选只走本地（内置 / Rime），
+  LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`）。理由：候选本应是本地的；LLM 只按「用户输入
+  → 输出结果」使用，打字过程调用远程 LLM 会造成每键成本与延迟。`LlmCandidates` daemon handler /
+  IPC 保留但前端不再自动触发。
 
 ## 风险与开放问题
 
@@ -135,7 +138,7 @@
 | 2026-08-23 | 在线 ASR/TTS provider（OpenAI 兼容 `audio/transcriptions` + `audio/speech`，复用 LLM base_url+key；config 新增 `asr_base_url`/`asr_model`/`tts_base_url`/`tts_model`） |
 | 2026-08-23 | 修复 keyring 未启用平台后端（默认 mock 内存存储不跨进程）——启用 windows-native/apple-native/linux-native-sync-persistent |
 | 2026-08-23 | Slint 1.17 设置面板 `apps/settings`（替代 Tauri：LLM/多模态/引擎/快捷键/隐私 + GetConfig/SetConfig/ApiKeySet IPC 热生效；`verba-cli key` 查看/设置/清除密钥） |
-
 | 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；erba-candidate renderer 重构） |
-
 | 2026-08-24 | 拼音分段承诺（`verba-pinyin::lookup_segmented` + `CompositionMachine` committed/commit_offset）：选子短语候选可保留剩余拼音继续组合、Backspace 弹回已选段、消费完自动整句提交；顺带实现 mir2x/libpinyin 手感参考（[docs/libpinyin-mir2x-smoothness.md](docs/libpinyin-mir2x-smoothness.md)） |
+| 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |
+| 2026-08-24 | 候选只走本地引擎；移除打字过程的「LLM 候选融合」自动触发：前端不再在拼音变化时调 `llm_candidates_start`（Windows/macOS 一致），LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`），打字零 LLM 调用、零成本 |

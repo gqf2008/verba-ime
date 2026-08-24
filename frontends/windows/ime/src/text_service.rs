@@ -996,6 +996,11 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
 /// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
 fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandidateRequest>) {
     if let Some(r) = req {
+        // 候选只走本地引擎（内置 / Rime）；打字过程不请求远程 LLM 候选融合（LLM 仅
+        // 用于回车触发的 AI 直输）。仅 engine=rime 时调度本地 Rime 查询。
+        if data.candidate_engine.borrow().as_str() != "rime" {
+            return;
+        }
         *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
             pinyin: r.pinyin,
             dictionary: r.dictionary,
@@ -1030,9 +1035,8 @@ fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
         if engine == "rime" {
             let schema = data.candidate_rime_schema.borrow().clone();
             start_rime_candidates(data, req.pinyin, schema);
-        } else {
-            start_llm_candidates(data, req.pinyin, req.dictionary);
         }
+        // 其余引擎（builtin）：候选已由本地引擎给出，无需远程请求。
     }
 }
 
@@ -1069,59 +1073,6 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
                 })),
             });
         }
-    });
-    *data.candidate_thread.borrow_mut() = Some(handle);
-}
-
-/// 发起候选融合请求（后台线程；增量候选经 chunks 队列回流 on_timer 合并展示）。
-fn start_llm_candidates(data: &Rc<TextServiceData>, pinyin: String, dictionary: Vec<String>) {
-    log::info!(
-        "候选融合请求: pinyin={pinyin} dict_count={}",
-        dictionary.len()
-    );
-    cancel_candidate_request(data);
-    let chunks = Arc::clone(&data.chunks);
-    let request_id = Arc::clone(&data.candidate_request_id);
-    let busy = Arc::clone(&data.candidate_request_busy);
-    let handle = std::thread::spawn(move || {
-        let _busy = BusyGuard::new(&busy);
-        let mut client = match ipc::ensure_daemon() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("候选融合无法连接 daemon: {e}");
-                return;
-            }
-        };
-        let id = match client.llm_candidates_start(&pinyin, &dictionary, 6) {
-            Ok(id) => id,
-            Err(e) => {
-                log::warn!("候选融合启动失败: {e}");
-                return;
-            }
-        };
-        request_id.store(id, Ordering::SeqCst);
-        loop {
-            match client.next_event(id) {
-                Ok(evt) => {
-                    let done = matches!(
-                        evt.kind,
-                        Some(stream_event::Kind::Candidates(ref c)) if c.done
-                    ) || matches!(evt.kind, Some(stream_event::Kind::Error(_)));
-                    if let Ok(mut q) = chunks.lock() {
-                        q.push_back(evt);
-                    }
-                    if done {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("候选融合连接中断: {e}");
-                    break;
-                }
-            }
-        }
-        // 仅当仍是本次请求时才清 id，避免误清新请求
-        let _ = request_id.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
     });
     *data.candidate_thread.borrow_mut() = Some(handle);
 }
