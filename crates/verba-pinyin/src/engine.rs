@@ -22,6 +22,20 @@ pub struct Candidate {
     pub rank: u32,
 }
 
+/// 分段候选：文本 + 覆盖的输入拼音字符数。
+///
+/// `consumed` 表示该候选覆盖了输入拼音的多少个字符（前缀），用于「分段承诺」：
+/// - `consumed == input.len()`：候选覆盖全部剩余拼音（整句 / 整词提交）。
+/// - `consumed < input.len()`：候选只覆盖一个前缀段，提交后剩余拼音继续组合。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegCandidate {
+    pub text: String,
+    /// 覆盖的输入拼音字符数（ASCII，字符数 == 字节数）。
+    pub consumed: usize,
+    /// 频率排名（越小越常用），用于排序/去重。
+    pub rank: u32,
+}
+
 /// 每次查询返回的最大候选数（27 = 3 页 × 9 个/页，候选窗支持翻页）。
 pub const MAX_CANDIDATES: usize = 27;
 
@@ -198,7 +212,85 @@ impl PinyinEngine {
 
         cands
     }
+    /// 分段候选：按音节切分输入，返回「逐音节边界」的精确词/字候选（`consumed` = 覆盖前缀长度），
+    /// 以及整串候选（整句 / 整词 / 整字，`consumed` = 全长）。
+    ///
+    /// 排序：**覆盖更长者优先**（里程碑级整句/整词在前，子短语段在后），同覆盖长度内按词频。
+    /// 供状态机「分段承诺」使用：用户可先选一个覆盖部分拼音的候选段，剩余拼音继续组合。
+    pub fn lookup_segmented(&self, input: &str) -> Vec<SegCandidate> {
+        let input = normalize(input);
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let idx = data::index();
+
+        // 无法按音节切分（如含无法切分的串）时退回整串 lookup：所有候选都覆盖全长。
+        let Some(syllables) = segment_syllables(&input, &idx.syllables) else {
+            return self
+                .lookup(&input)
+                .into_iter()
+                .map(|c| SegCandidate {
+                    text: c.text,
+                    consumed: input.len(),
+                    rank: c.rank,
+                })
+                .collect();
+        };
+
+        let mut out: Vec<SegCandidate> = Vec::new();
+        let mut seen_text: HashSet<String> = HashSet::new();
+
+        // 1) 逐音节前缀边界的「精确」词/字候选（consumed = 该前缀拼音长度）。
+        let mut prefix = String::new();
+        for syl in &syllables {
+            prefix.push_str(syl);
+            let consumed = prefix.len(); // 拼音为 ASCII，字节数==字符数
+
+            // 只取该前缀的「最佳」词与「最佳」字，避免整串单字洪水淹没整句候选。
+            let wlo = idx.words.partition_point(|b| b.pinyin < prefix.as_str());
+            if wlo < idx.words.len() && idx.words[wlo].pinyin == prefix {
+                if let Some(&(r, w)) = idx.words[wlo].entries.first() {
+                    if seen_text.insert(w.to_owned()) {
+                        out.push(SegCandidate {
+                            text: w.to_owned(),
+                            consumed,
+                            rank: r,
+                        });
+                    }
+                }
+            }
+            let clo = idx.chars.partition_point(|b| b.pinyin < prefix.as_str());
+            if clo < idx.chars.len() && idx.chars[clo].pinyin == prefix {
+                if let Some(&(r, c)) = idx.chars[clo].entries.first() {
+                    if seen_text.insert(c.to_string()) {
+                        out.push(SegCandidate {
+                            text: c.to_string(),
+                            consumed,
+                            rank: r,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2) 整串候选（整句/整词/整字/模糊/简拼），consumed = 全长。
+        for c in self.lookup(&input) {
+            if seen_text.insert(c.text.clone()) {
+                out.push(SegCandidate {
+                    text: c.text,
+                    consumed: input.len(),
+                    rank: c.rank,
+                });
+            }
+        }
+
+        // 覆盖更长者优先，同覆盖长度内按词频。
+        out.sort_by(|a, b| b.consumed.cmp(&a.consumed).then(a.rank.cmp(&b.rank)));
+        out.truncate(MAX_CANDIDATES);
+        out
+    }
 }
+
 /// 贪心最长匹配把拼音串切成音节；无法切分返回 None。
 fn segment_syllables<'a>(
     input: &'a str,
@@ -381,5 +473,59 @@ mod tests {
             c.iter().any(|x| x.text == "中国"),
             "简拼 zg 应含 中国（zhongguo），实际 {c:?}"
         );
+    }
+
+    #[test]
+    fn segmented_ni_full_only_single_boundary() {
+        let e = PinyinEngine::new();
+        let c = e.lookup_segmented("ni");
+        assert!(!c.is_empty());
+        // 单音节串：只有整串候选，consumed 全部覆盖全长 2
+        assert!(
+            c.iter().all(|s| s.consumed == 2),
+            "ni 子短语段应覆盖全长，实际 {c:?}"
+        );
+        assert_eq!(c[0].text, "你", "ni 首选应为 你，实际 {:?}", c[0].text);
+    }
+
+    #[test]
+    fn segmented_nishishui_has_subphrase() {
+        let e = PinyinEngine::new();
+        let c = e.lookup_segmented("nishishui");
+        let len = "nishishui".len();
+        // 整句候选覆盖全长
+        assert!(
+            c.iter().any(|s| s.text == "你是谁" && s.consumed == len),
+            "整句应为覆盖全长，实际 {c:?}"
+        );
+        // 子短语段覆盖部分前缀：如「你」(ni, consumed=2)
+        assert!(
+            c.iter().any(|s| s.text == "你" && s.consumed == 2),
+            "应含子短语 你(consumed=2)，实际 {c:?}"
+        );
+        // 存在覆盖长度严格介于单字与整句之间的段（如双音节词）
+        assert!(
+            c.iter().any(|s| s.consumed > 2 && s.consumed < len),
+            "应含长度介于 2 与全长之间的子短语段，实际 {c:?}"
+        );
+        // 覆盖更长者优先（整句在前）
+        assert!(
+            c[0].consumed >= c.last().map(|s| s.consumed).unwrap_or(0),
+            "应覆盖更长者优先，实际 {c:?}"
+        );
+    }
+
+    #[test]
+    fn segmented_capped_and_sorted() {
+        let e = PinyinEngine::new();
+        let c = e.lookup_segmented("nishishui");
+        assert!(c.len() <= MAX_CANDIDATES);
+        // 按 consumed 降序排列
+        for w in c.windows(2) {
+            assert!(
+                w[0].consumed >= w[1].consumed,
+                "consumed 应单调不增，实际 {c:?}"
+            );
+        }
     }
 }

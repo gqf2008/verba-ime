@@ -136,3 +136,5 @@
 | 2026-08-23 | Slint 1.17 设置面板 `apps/settings`（替代 Tauri：LLM/多模态/引擎/快捷键/隐私 + GetConfig/SetConfig/ApiKeySet IPC 热生效；`verba-cli key` 查看/设置/清除密钥） |
 
 | 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；erba-candidate renderer 重构） |
+
+| 2026-08-24 | 拼音分段承诺（`verba-pinyin::lookup_segmented` + `CompositionMachine` committed/commit_offset）：选子短语候选可保留剩余拼音继续组合、Backspace 弹回已选段、消费完自动整句提交；顺带实现 mir2x/libpinyin 手感参考（[docs/libpinyin-mir2x-smoothness.md](docs/libpinyin-mir2x-smoothness.md)） |

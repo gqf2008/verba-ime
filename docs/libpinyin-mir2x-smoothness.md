@@ -111,7 +111,7 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 | 候选引擎 | libpinyin 进程内（GPL-3.0） | Rime（daemon IPC）+ 内置 | **保持 Rime**（BSD-3，整句 84% vs 自研 6%，见 `chinese-engine-evaluation.md` §8）。不推荐切 libpinyin：GPL 传染、无明显整句优势 |
 | 候选计算时机 | 每键立即（不防抖） | Rime 候选经 ≈320ms 防抖（`CANDIDATE_REQ_DEBOUNCE_TICKS=4`×80ms） | 实测手感。「整句候选」晚半拍可接受（它本就是补充增强）；若首候选也延迟明显，缩短/取消 Rime 防抖或改「立即 + 合并」 |
 | 打字容错 | `incomplete` + `correct_all` + `dynamic_adjust` | 内置支持 模糊音/简拼，无逐字 auto-correct | 可选：给 `verba-pinyin` 评估弱「自动纠错」，或确认 Rime `luna_pinyin_simp` 已覆盖常见错音 |
-| **分段承诺** | 支持（stk 逐段确定 + 可回退） | **选择候选即整句提交**（`reset_pinyin()` → Idle），**不支持部分承诺** | **最值得补的高价值项**：当整句候选不准时，支持「先确定部分、再继续对剩余拼音选候选」，并允许 Backspace 回退已选段 |
+| **分段承诺** | 支持（stk 逐段确定 + 可回退） | ✅ 已实现（2026-08-24）：内置候选经 `lookup_segmented` 支持逐段确定 + 可回退 | 之前是最值得补的缺口，现已落地；Rime/LLM 整句候选仍走整句 |
 | 面板拖动 | 可拖动 | 未确认（候选窗跟随光标，通常无需拖动） | 低优先，可选 |
 
 ### 许可风险（重要）
@@ -123,7 +123,7 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 
 ## 6. 给 M5 打磨的落地清单（按价值排序）
 
-1. **分段承诺**（P0，手感）：在 `CompositionMachine` 增加「已承诺段 + 剩余缓冲」模型，选候选时只推进段偏移而非整句提交；`Backspace` 弹回上一段。可在 Pinyin 态（内置候选）先行，Rime 整句候选仍走整句。
+1. **分段承诺**（P0，手感）✅ 已实现（2026-08-24）：`verba-pinyin::PinyinEngine::lookup_segmented` 返回带 `consumed` 覆盖长度的候选；`CompositionMachine` 增加 `committed`/`commit_offset`，选候选只推进段偏移、`Backspace` 弹回上一段、已消费完自动整句提交。Pinyin 态（内置候选）走分段，Rime / LLM 候选仍覆盖整句（`on_llm_candidates` 一律 `consumed = 活跃拼音全长`）。
 2. **候选即时性校准**（P1，量测）：打点测「按键 → Rime 首候选呈现」延迟；若 >150ms 且首候选常来自 Rime，则缩短防抖或去掉对 Rime 的防抖。
 3. **容错选项**（P2，可选）：确认 `verba-pinyin` 的模糊音/简拼是否覆盖「打字手误」，必要时补弱 auto-correct。
 4. **面板拖动**（P3，可选）：候选窗增加可拖动（不跟随光标时）；低优先。

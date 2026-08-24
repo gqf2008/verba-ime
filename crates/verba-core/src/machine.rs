@@ -123,12 +123,16 @@ pub struct CompositionMachine {
     state: MachineState,
     /// 拼音组合缓冲（小写无调）。
     pinyin_buffer: String,
-    /// 词库候选（由拼音引擎查询得到）。
-    dictionary_candidates: Vec<String>,
-    /// LLM 补充候选（候选融合，可为空）。
-    llm_candidates: Vec<String>,
+    /// 词库候选（由拼音引擎查询得到；含覆盖拼音长度，用于分段承诺）。
+    dictionary_candidates: Vec<verba_pinyin::SegCandidate>,
+    /// LLM / Rime 补充候选（候选融合，可为空；一律覆盖当前活跃拼音全长）。
+    llm_candidates: Vec<verba_pinyin::SegCandidate>,
     /// 融合后的展示候选（词库 + LLM，去重），供选择/分页/提交。
-    pinyin_candidates: Vec<String>,
+    pinyin_candidates: Vec<verba_pinyin::SegCandidate>,
+    /// 已承诺的候选段（文本 + 覆盖的拼音字符数），用于「分段承诺」。
+    committed: Vec<(String, usize)>,
+    /// 已承诺段累计覆盖的拼音缓冲前缀长度。
+    commit_offset: usize,
     /// 已发起 LLM 候选请求的拼音（避免同一拼音重复请求）。
     last_candidates_request: Option<String>,
     /// 是否启用内置词库候选（engine=rime 时关闭：词库候选来自 daemon 的 Rime）。
@@ -157,6 +161,8 @@ impl CompositionMachine {
             dictionary_candidates: Vec::new(),
             llm_candidates: Vec::new(),
             pinyin_candidates: Vec::new(),
+            committed: Vec::new(),
+            commit_offset: 0,
             last_candidates_request: None,
             dictionary_enabled: true,
             pinyin_page: 0,
@@ -226,7 +232,7 @@ impl CompositionMachine {
         }
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
-            candidates: self.pinyin_candidates.clone(),
+            candidates: self.pinyin_candidate_texts(),
             page: self.pinyin_page,
             llm_request: None,
         }
@@ -252,7 +258,7 @@ impl CompositionMachine {
                     self.refresh_candidates();
                     Action::UpdatePinyin {
                         preedit: self.pinyin_composition_preedit(),
-                        candidates: self.pinyin_candidates.clone(),
+                        candidates: self.pinyin_candidate_texts(),
                         page: self.pinyin_page,
                         llm_request: self.request_llm_candidates_if_needed(),
                     }
@@ -295,12 +301,10 @@ impl CompositionMachine {
         }
         if c.is_ascii_digit() && c != '0' {
             let idx = self.pinyin_page * Self::PINYIN_PAGE_SIZE + (c as u8 - b'1') as usize;
-            if let Some(text) = self.pinyin_candidates.get(idx) {
-                let text = text.clone();
-                self.reset_pinyin();
-                return Action::CommitImmediate(text);
+            if idx < self.pinyin_candidates.len() {
+                return self.select_candidate(idx);
             }
-            // 候选不存在：忽略该数字（不吞后文）
+            // 候选不存在：忽略该数字（不吞后文，也不提交原文）。
             return Action::None;
         }
         if c.is_ascii_alphabetic() {
@@ -312,17 +316,11 @@ impl CompositionMachine {
             }
             self.pinyin_buffer.push(c.to_ascii_lowercase());
             self.refresh_candidates();
-            return Action::UpdatePinyin {
-                preedit: self.pinyin_composition_preedit(),
-                candidates: self.pinyin_candidates.clone(),
-                page: self.pinyin_page,
-                llm_request: self.request_llm_candidates_if_needed(),
-            };
+            return self.pinyin_action();
         }
         if c == ' ' {
-            let text = self.commit_pinyin_text();
-            self.reset_pinyin();
-            return Action::CommitImmediate(text);
+            // 空格：选当前首候选（是否整句提交由 select_candidate 决定）
+            return self.select_candidate(0);
         }
         // 其它可打印字符：提交候选 0 + 该字符，避免吞字
         let text = format!("{}{c}", self.commit_pinyin_text());
@@ -352,8 +350,8 @@ impl CompositionMachine {
             }
             if c.is_ascii_digit() && c != '0' {
                 let idx = (c as u8 - b'1') as usize;
-                if let Some(text) = self.pinyin_candidates.get(idx) {
-                    self.prompt.push_str(text);
+                if let Some(seg) = self.pinyin_candidates.get(idx) {
+                    self.prompt.push_str(&seg.text);
                     self.clear_pinyin();
                     return Action::UpdatePrompt {
                         preedit: self.preedit(),
@@ -413,18 +411,27 @@ impl CompositionMachine {
                 Action::Cancel
             }
             MachineState::Pinyin => {
-                if self.pinyin_buffer.pop().is_some() {
+                if !self.committed.is_empty() {
+                    // 弹回上一已承诺段（不删活跃拼音字符）。
+                    if let Some((_, consumed)) = self.committed.pop() {
+                        self.commit_offset = self.commit_offset.saturating_sub(consumed);
+                    }
+                    self.refresh_candidates();
+                    if self.pinyin_buffer.is_empty()
+                        || self.commit_offset >= self.pinyin_buffer.len()
+                    {
+                        self.reset_pinyin();
+                        Action::Cancel
+                    } else {
+                        self.pinyin_action()
+                    }
+                } else if self.pinyin_buffer.pop().is_some() {
                     self.refresh_candidates();
                     if self.pinyin_buffer.is_empty() {
                         self.reset_pinyin();
                         Action::Cancel
                     } else {
-                        Action::UpdatePinyin {
-                            preedit: self.pinyin_composition_preedit(),
-                            candidates: self.pinyin_candidates.clone(),
-                            page: self.pinyin_page,
-                            llm_request: self.request_llm_candidates_if_needed(),
-                        }
+                        self.pinyin_action()
                     }
                 } else {
                     Action::None
@@ -502,10 +509,77 @@ impl CompositionMachine {
                 self.dictionary_candidates.clear();
                 self.llm_candidates.clear();
                 self.pinyin_candidates.clear();
+                self.committed.clear();
+                self.commit_offset = 0;
                 self.last_candidates_request = None;
                 self.prompt.clear();
                 self.result.clear();
                 Action::Cancel
+            }
+        }
+    }
+
+    /// 尚未被分段承诺消费的活跃缓冲（全缓冲的剩余尾部）。
+    fn active_pinyin(&self) -> &str {
+        &self.pinyin_buffer[self.commit_offset.min(self.pinyin_buffer.len())..]
+    }
+
+    /// 已承诺段的拼接文本。
+    fn committed_text(&self) -> String {
+        self.committed.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    /// 展示候选文本列表（供 Action::UpdatePinyin / 候选窗 / 提示词态）。
+    fn pinyin_candidate_texts(&self) -> Vec<String> {
+        self.pinyin_candidates
+            .iter()
+            .map(|c| c.text.clone())
+            .collect()
+    }
+
+    /// 构建拼音态 UpdatePinyin 动作（preedit/候选/页码/LLM 请求）。
+    fn pinyin_action(&mut self) -> Action {
+        Action::UpdatePinyin {
+            preedit: self.pinyin_composition_preedit(),
+            candidates: self.pinyin_candidate_texts(),
+            page: self.pinyin_page,
+            llm_request: self.request_llm_candidates_if_needed(),
+        }
+    }
+
+    /// 取融合候选中的第 `index` 个（含覆盖长度）。
+    fn fused_segment(&self, index: usize) -> Option<&verba_pinyin::SegCandidate> {
+        self.pinyin_candidates.get(index)
+    }
+
+    /// 选择第 `index` 个候选：整句提交或分段承诺。
+    ///
+    /// - 候选覆盖全部剩余拼音（或无候选）→ 整句提交并回 Idle。
+    /// - 候选只覆盖一个前缀段 → 将候选压入 `committed`，剩余拼音继续组合；
+    ///   若已消费完整个缓冲则自动提交。
+    fn select_candidate(&mut self, index: usize) -> Action {
+        let active_len = self.active_pinyin().len();
+        let (text, consumed) = match self.fused_segment(index) {
+            Some(seg) => (seg.text.clone(), seg.consumed.min(active_len)),
+            None => (self.active_pinyin().to_owned(), active_len),
+        };
+        if consumed >= active_len {
+            // 覆盖全部剩余：整句提交
+            let full = format!("{}{}", self.committed_text(), text);
+            self.reset_pinyin();
+            Action::CommitImmediate(full)
+        } else {
+            // 分段承诺：保留已选段，剩余拼音继续组合
+            self.committed.push((text, consumed));
+            self.commit_offset += consumed;
+            if self.commit_offset >= self.pinyin_buffer.len() {
+                // 已消费完整个缓冲：自动提交
+                let full = self.committed_text();
+                self.reset_pinyin();
+                Action::CommitImmediate(full)
+            } else {
+                self.refresh_candidates();
+                self.pinyin_action()
             }
         }
     }
@@ -521,18 +595,21 @@ impl CompositionMachine {
         self.dictionary_candidates.clear();
         self.llm_candidates.clear();
         self.pinyin_candidates.clear();
+        self.committed.clear();
+        self.commit_offset = 0;
         self.last_candidates_request = None;
         self.pinyin_page = 0;
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
     fn pinyin_preedit(&self) -> String {
+        let base = format!("{}{}", self.committed_text(), self.active_pinyin());
         if self.pinyin_candidates.is_empty() {
-            self.pinyin_buffer.clone()
+            base
         } else {
-            let mut out = self.pinyin_buffer.clone();
+            let mut out = base;
             for (i, cand) in self.pinyin_candidates.iter().enumerate() {
-                out.push_str(&format!(" {}.{cand}", i + 1));
+                out.push_str(&format!(" {}.{}", i + 1, cand.text));
             }
             out
         }
@@ -542,18 +619,19 @@ impl CompositionMachine {
     /// 提示词态带 `//` 与已提交提示词前缀。
     pub fn pinyin_composition_preedit(&self) -> String {
         match self.state {
-            MachineState::Pinyin => self.pinyin_buffer.clone(),
-            MachineState::Prompt => format!("//{}{}", self.prompt, self.pinyin_buffer),
+            MachineState::Pinyin => format!("{}{}", self.committed_text(), self.active_pinyin()),
+            MachineState::Prompt => format!("//{}{}", self.prompt, self.active_pinyin()),
             _ => String::new(),
         }
     }
 
     /// 当前拼音提交文本：有候选取候选 0，否则取原始缓冲。
     fn commit_pinyin_text(&self) -> String {
+        let committed = self.committed_text();
         if let Some(first) = self.pinyin_candidates.first() {
-            first.clone()
+            format!("{committed}{}", first.text)
         } else {
-            self.pinyin_buffer.clone()
+            format!("{committed}{}", self.active_pinyin())
         }
     }
 
@@ -564,6 +642,8 @@ impl CompositionMachine {
         self.dictionary_candidates.clear();
         self.llm_candidates.clear();
         self.pinyin_candidates.clear();
+        self.committed.clear();
+        self.commit_offset = 0;
         self.last_candidates_request = None;
         self.pinyin_page = 0;
     }
@@ -587,11 +667,7 @@ impl CompositionMachine {
         // Prompt 态（// 提示词拼音转中文）同样保留内置内联候选。
         self.dictionary_candidates =
             if self.dictionary_enabled || self.state != MachineState::Pinyin {
-                self.engine
-                    .lookup(&self.pinyin_buffer)
-                    .into_iter()
-                    .map(|c| c.text)
-                    .collect()
+                self.engine.lookup_segmented(self.active_pinyin())
             } else {
                 Vec::new()
             };
@@ -603,7 +679,7 @@ impl CompositionMachine {
     fn fuse_candidates(&mut self) {
         self.pinyin_candidates = self.dictionary_candidates.clone();
         for cand in &self.llm_candidates {
-            if !self.pinyin_candidates.contains(cand) {
+            if !self.pinyin_candidates.iter().any(|c| c.text == cand.text) {
                 self.pinyin_candidates.push(cand.clone());
             }
         }
@@ -611,17 +687,22 @@ impl CompositionMachine {
 
     /// 拼音变更后是否需要发起 LLM 候选请求（同一拼音只请求一次）。
     fn request_llm_candidates_if_needed(&mut self) -> Option<LlmCandidateRequest> {
-        if self.state != MachineState::Pinyin || self.pinyin_buffer.is_empty() {
+        let active = self.active_pinyin().to_owned();
+        if self.state != MachineState::Pinyin || active.is_empty() {
             self.last_candidates_request = None;
             return None;
         }
-        if self.last_candidates_request.as_deref() == Some(self.pinyin_buffer.as_str()) {
+        if self.last_candidates_request.as_deref() == Some(active.as_str()) {
             return None;
         }
-        self.last_candidates_request = Some(self.pinyin_buffer.clone());
+        self.last_candidates_request = Some(active.clone());
         Some(LlmCandidateRequest {
-            pinyin: self.pinyin_buffer.clone(),
-            dictionary: self.dictionary_candidates.clone(),
+            pinyin: active,
+            dictionary: self
+                .dictionary_candidates
+                .iter()
+                .map(|c| c.text.clone())
+                .collect(),
         })
     }
 
@@ -668,21 +749,26 @@ impl CompositionMachine {
     /// `pinyin` 与当前组合不符时视为过期结果直接忽略。
     pub fn on_llm_candidates(&mut self, pinyin: &str, candidates: &[String], done: bool) -> Action {
         let _ = done;
-        if self.state != MachineState::Pinyin || self.pinyin_buffer != pinyin {
+        if self.state != MachineState::Pinyin || self.active_pinyin() != pinyin {
             return Action::None;
         }
+        let active_len = self.active_pinyin().len();
         let mut changed = false;
         for cand in candidates {
             let cand = cand.trim();
             if cand.is_empty() {
                 continue;
             }
-            if self.llm_candidates.iter().any(|c| c == cand)
-                || self.dictionary_candidates.iter().any(|c| c == cand)
+            if self.llm_candidates.iter().any(|c| c.text == cand)
+                || self.dictionary_candidates.iter().any(|c| c.text == cand)
             {
                 continue;
             }
-            self.llm_candidates.push(cand.to_owned());
+            self.llm_candidates.push(verba_pinyin::SegCandidate {
+                text: cand.to_owned(),
+                consumed: active_len,
+                rank: u32::MAX,
+            });
             changed = true;
         }
         if !changed {
@@ -691,7 +777,7 @@ impl CompositionMachine {
         self.fuse_candidates();
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
-            candidates: self.pinyin_candidates.clone(),
+            candidates: self.pinyin_candidate_texts(),
             page: self.pinyin_page,
             llm_request: None,
         }
@@ -802,10 +888,23 @@ mod tests {
         m.feed_char('i');
         // 候选索引 1（第二个）
         if m.pinyin_candidates.len() > 1 {
-            let expected = m.pinyin_candidates[1].clone();
+            let expected = m.pinyin_candidates[1].text.clone();
             let a = m.feed_char('2');
             assert_eq!(a, Action::CommitImmediate(expected));
             assert_eq!(m.state(), MachineState::Idle);
+        }
+    }
+
+    #[test]
+    fn pinyin_digit_out_of_range_ignored() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        let n = m.pinyin_candidates.len();
+        if n < 9 {
+            // 超出候选的编号应被忽略：不吞字、不提交原文，仍留在拼音态。
+            assert_eq!(m.feed_char('9'), Action::None);
+            assert_eq!(m.state(), MachineState::Pinyin);
         }
     }
 
@@ -1325,7 +1424,7 @@ mod tests {
         let full = m.pinyin_candidates.clone();
         let llm_idx = full
             .iter()
-            .position(|c| c == "你是")
+            .position(|c| c.text == "你是")
             .expect("LLM 候选应在融合列表");
         let page = llm_idx / CompositionMachine::PINYIN_PAGE_SIZE;
         let rel = llm_idx % CompositionMachine::PINYIN_PAGE_SIZE;
@@ -1404,5 +1503,101 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pinyin_segmented_commit_partial_then_continue() {
+        let mut m = CompositionMachine::new();
+        for c in "nishishui".chars() {
+            m.feed_char(c);
+        }
+        assert_eq!(m.state(), MachineState::Pinyin);
+        // 子短语「你」覆盖前缀 ni（consumed=2），选择后应保留组合、剩余 shishui 继续。
+        let idx = m
+            .pinyin_candidates
+            .iter()
+            .position(|c| c.text == "你")
+            .expect("应含子短语段 你");
+        let a = m.select_candidate(idx);
+        assert!(
+            matches!(a, Action::UpdatePinyin { .. }),
+            "分段承诺应保留组合，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin);
+        assert_eq!(m.committed_text(), "你");
+        assert_eq!(m.active_pinyin(), "shishui");
+        assert_eq!(m.pinyin_composition_preedit(), "你shishui");
+    }
+
+    #[test]
+    fn pinyin_segmented_commit_full_when_all_consumed() {
+        // 候选覆盖全部剩余（无子短语）→ 整句提交并回 Idle（不破坏原有整句行为）。
+        let mut m = CompositionMachine::new();
+        for c in "ni".chars() {
+            m.feed_char(c);
+        }
+        let a = m.select_candidate(0);
+        assert!(
+            matches!(a, Action::CommitImmediate(_)),
+            "整句提交应上屏，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_segmented_backspace_pops_segment() {
+        let mut m = CompositionMachine::new();
+        for c in "nishishui".chars() {
+            m.feed_char(c);
+        }
+        let idx = m
+            .pinyin_candidates
+            .iter()
+            .position(|c| c.text == "你")
+            .expect("应含子短语段 你");
+        let _ = m.select_candidate(idx);
+        assert_eq!(m.committed_text(), "你");
+        // 退格应弹出已承诺段（不删活跃拼音字符），活跃回到全长 nishishui。
+        let a = m.feed_backspace();
+        assert!(
+            matches!(a, Action::UpdatePinyin { .. }),
+            "退格应弹出已承诺段，实际 {a:?}"
+        );
+        assert_eq!(m.committed_text(), "");
+        assert_eq!(m.active_pinyin(), "nishishui");
+        assert_eq!(m.state(), MachineState::Pinyin);
+    }
+
+    #[test]
+    fn pinyin_segmented_commit_remaining_auto_commits() {
+        let mut m = CompositionMachine::new();
+        for c in "nishishui".chars() {
+            m.feed_char(c);
+        }
+        let idx = m
+            .pinyin_candidates
+            .iter()
+            .position(|c| c.text == "你")
+            .expect("应含子短语段 你");
+        let _ = m.select_candidate(idx);
+        // 剩余 shishui：找覆盖全长的整句候选并选择 → 应整句提交（已承诺段 + 剩余候选）。
+        let full = m
+            .pinyin_candidates
+            .iter()
+            .find(|c| c.consumed >= m.active_pinyin().len())
+            .cloned();
+        if let Some(cand) = full {
+            let fi = m
+                .pinyin_candidates
+                .iter()
+                .position(|c| c.text == cand.text)
+                .unwrap();
+            let a = m.select_candidate(fi);
+            assert!(
+                matches!(a, Action::CommitImmediate(_)),
+                "应整句提交，实际 {a:?}"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+        }
     }
 }

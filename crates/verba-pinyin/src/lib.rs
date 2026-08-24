@@ -14,4 +14,4 @@ mod data;
 mod engine;
 mod fuzzy;
 
-pub use engine::{Candidate, CandidateKind, PinyinEngine};
+pub use engine::{Candidate, CandidateKind, PinyinEngine, SegCandidate};
