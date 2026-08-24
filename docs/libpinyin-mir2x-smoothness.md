@@ -134,16 +134,17 @@ std::vector<std::pair<std::string, int>> stk; // (sentence, start)
 - `engine=rime` 整句候选此前仅在 Windows TSF 接入；macOS IMK 已对齐：`start_candidates` 读取
   `config.engine/rime_schema`，`engine=rime` 时经 `rime_candidates` IPC 一次性请求 Rime 候选并压入
   候选队列（同 `feed_candidates_event` 融合/去重）。Linux 前端尚未落地（低优先）。
-- 已知差异：Windows 对 Rime/LLM 候选请求做了 ≈320ms 防抖（`CANDIDATE_REQ_DEBOUNCE_TICKS`），
-  macOS 候选请求即时触发。属性能调优差异，非逻辑差异；如需统一，可在 `verba-config` 增加候选
-  请求防抖配置供两端读取。
+- ~~候选即时性~~ **已关闭（2026-08-24）**：曾担心 Windows 的 Rime 候选 ≈320ms 防抖
+  （`CANDIDATE_REQ_DEBOUNCE_TICKS=4`）会造成「感知延迟」，但这是**后端优化**，不是 UX 问题——
+  内置 `verba-pinyin` 每键同步出候选，候选窗永不空白；Rime 整句候选只是异步追加。用户实测
+  mir2x 无延时；引擎的职责本就是**本地即时出候选**，防抖不该被当成「延时」议题，故不调。
 
 ---
 
 ## 6. 给 M5 打磨的落地清单（按价值排序）
 
-1. **分段承诺**（P0，手感）✅ 已实现（2026-08-24）：`verba-pinyin::PinyinEngine::lookup_segmented` 返回带 `consumed` 覆盖长度的候选；`CompositionMachine` 增加 `committed`/`commit_offset`，选候选只推进段偏移、`Backspace` 弹回上一段、已消费完自动整句提交。Pinyin 态（内置候选）走分段，Rime / LLM 候选仍覆盖整句（`on_llm_candidates` 一律 `consumed = 活跃拼音全长`）。
-2. **候选即时性校准**（P1，量测）：打点测「按键 → Rime 首候选呈现」延迟；若 >150ms 且首候选常来自 Rime，则缩短防抖或去掉对 Rime 的防抖。
+1. **分段承诺**（P0，手感）✅ 已实现（2026-08-24）：`verba-pinyin::PinyinEngine::lookup_segmented` 返回带 `consumed` 覆盖长度的候选；`CompositionMachine` 增加 `committed`/`commit_offset`，选候选只推进段偏移、`Backspace` 弹回上一段、已消费完自动整句提交。Pinyin 态（内置候选）走分段，Rime 候选仍覆盖整句（`on_llm_candidates` 一律 `consumed = 活跃拼音全长`）。
+2. ~~候选即时性校准~~（P1）**已关闭**：引擎本地即时出候选，内置候选填满候选窗；否定了「防抖=延时」的推演，无需打点/调整（2026-08-24）。
 3. **容错选项**（P2，可选）：确认 `verba-pinyin` 的模糊音/简拼是否覆盖「打字手误」，必要时补弱 auto-correct。
 4. **面板拖动**（P3，可选）：候选窗增加可拖动（不跟随光标时）；低优先。
 

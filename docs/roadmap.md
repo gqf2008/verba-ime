@@ -142,3 +142,5 @@
 | 2026-08-24 | 拼音分段承诺（`verba-pinyin::lookup_segmented` + `CompositionMachine` committed/commit_offset）：选子短语候选可保留剩余拼音继续组合、Backspace 弹回已选段、消费完自动整句提交；顺带实现 mir2x/libpinyin 手感参考（[docs/libpinyin-mir2x-smoothness.md](docs/libpinyin-mir2x-smoothness.md)） |
 | 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |
 | 2026-08-24 | 候选只走本地引擎；移除打字过程的「LLM 候选融合」自动触发：前端不再在拼音变化时调 `llm_candidates_start`（Windows/macOS 一致），LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`），打字零 LLM 调用、零成本 |
+
+| 2026-08-24 | 关闭「候选即时性」议题：引擎本地即时出候选（内置每键同步 + Rime 异步追加），候选窗永不空白；防抖是后端优化，不构成 UX「延时」问题，实测 mir2x 无延时，不再打点/调整 |
