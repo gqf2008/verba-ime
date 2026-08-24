@@ -39,5 +39,6 @@ cargo test  --manifest-path frontends/macos/ime/Cargo.toml   # 按键分类 / �
 - [x] IMK 控制器类注册与 `activateServer` / `deactivateServer`
 - [x] 按键 → 状态机 → 上屏 / preedit / 候选窗（拼音 + AI 模式）
 - [x] LLM 流式（`//` 触发，经 daemon）
-- [x] `.app` 打包（含 daemon）+ ad-hoc 签名 + 安装脚本
+- [x] `.app` 打包（含 daemon + verba-settings 设置面板）+ ad-hoc 签名 + 安装脚本
+- [x] 输入法菜单「设置…」入口（打开设置面板）
 - [ ] 真机交互验收（候选窗自动展示、输入法切换、权限弹窗等需 macOS 真机确认）

@@ -14,6 +14,7 @@ REPO_ROOT="$(cd "$IME_ROOT/../../.." && pwd)"
 cd "$IME_ROOT"
 cargo build --release --manifest-path "$IME_ROOT/Cargo.toml"
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p verba-daemon
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p verba-settings
 
 APP="$IME_ROOT/dist/Verba.app"
 rm -rf "$APP"
@@ -21,6 +22,7 @@ mkdir -p "$APP/Contents/MacOS"
 
 cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
+cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 
 # ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）。
