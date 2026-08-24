@@ -65,6 +65,7 @@ Verba 的目标是成为三个平台上的「统一输入入口」：**任何表
 - [路线图](docs/roadmap.md)
 - [AI 服务商矩阵（OCR/ASR/LLM/TTS）](docs/providers.md)
 - [IPC 协议草案](docs/protocol.md)
+- [输入法手感参考（mir2x/libpinyin）](docs/libpinyin-mir2x-smoothness.md)
 - [构建与打包](docs/building.md)
 - [命名与品牌](docs/naming.md)
 

@@ -4,6 +4,8 @@
 > 背景：`verba-pinyin` 自研引擎已落地（拼音 + 模糊音 + 简拼 + 整句 DP + 提示词中文）。
 > 本文件评估是否/如何引入 librime 等成熟引擎，以及候选融合路线。
 
+> 手感/交互参考：关于「输入法为什么丝滑」（异步不阻塞、容错候选、分段承诺），见 [libpinyin-mir2x 手感参考](libpinyin-mir2x-smoothness.md)。
+
 ## 1. 目标与约束
 
 - Verba 定位：**开源 + 三平台（Windows/macOS/Linux）+ AI/LLM 融合**。
