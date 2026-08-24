@@ -2,24 +2,75 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
-    <key>CFBundleIdentifier</key><string>dev.verba.VerbaIMK</string>
-    <key>CFBundleName</key><string>Verba</string>
-    <key>CFBundleDisplayName</key><string>Verba · 拾言输入法</string>
-    <key>CFBundlePackageType</key><string>BNDL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
-    <key>NSPrincipalClass</key><string>VerbaIMKController</string>
-    <key>InputMethodKind</key><integer>1</integer>
-    <key>TSMInputMethodKind</key><integer>1</integer>
-    <key>TISInputSource</key>
-    <array>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>verba-mac</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.verba.inputmethod.Verba</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Verba</string>
+    <key>CFBundleDisplayName</key>
+    <string>拾言输入法</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>InputMethodConnectionName</key>
+    <string>Verba_1_Connection</string>
+    <key>InputMethodServerControllerClass</key>
+    <string>VerbaIMKController</string>
+    <key>ComponentInputModeDict</key>
+    <dict>
+        <key>tsInputModeListKey</key>
         <dict>
-            <key>TISInputSourceID</key><string>dev.verba.VerbaIMK</string>
-            <key>TISInputSourceType</key><string>KeyboardLayout</string>
-            <key>TISInputSourceCategory</key><string>Keyboard</string>
-            <key>TISIntendedLanguage</key><array><string>zh-Hans</string><string>en</string></array>
+            <key>dev.verba.inputmethod.Verba.Pinyin</key>
+            <dict>
+                <key>TISInputSourceID</key>
+                <string>dev.verba.inputmethod.Verba.Pinyin</string>
+                <key>TISIntendedLanguage</key>
+                <string>zh-Hans</string>
+                <key>tsInputModeIsVisibleKey</key>
+                <true/>
+                <key>tsInputModePrimaryInScriptKey</key>
+                <false/>
+                <key>tsInputModeScriptKey</key>
+                <string>smSimpChinese</string>
+                <key>tsInputModeCharacterRepertoireKey</key>
+                <array>
+                    <string>Hans</string>
+                </array>
+                <key>TISIconLabels</key>
+                <dict>
+                    <key>Primary</key>
+                    <string>拼音</string>
+                </dict>
+            </dict>
         </dict>
+        <key>tsVisibleInputModeOrderedArrayKey</key>
+        <array>
+            <string>dev.verba.inputmethod.Verba.Pinyin</string>
+        </array>
+    </dict>
+    <key>TISIntendedLanguage</key>
+    <string>zh-Hans</string>
+    <key>tsInputMethodCharacterRepertoireKey</key>
+    <array>
+        <string>Hans</string>
     </array>
+    <key>TISIconIsTemplate</key>
+    <true/>
 </dict>
 </plist>

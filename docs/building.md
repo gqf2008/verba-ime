@@ -66,7 +66,8 @@ M5 起支持用 librime 作拼音/五笔引擎（daemon 内动态加载 rime.dll
    > 首次查询会部署 schema/词典（数秒）；整句基准见 [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8。
 
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
-- **macOS**：Xcode 工程或 SPM 构建 `.appex` → 装入 `~/Library/Input Methods` → Developer ID 签名 + 公证。
+- **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` 与 `verba-daemon`，ad-hoc 签名）
+  → `cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 系统设置「键盘 → 输入法」启用；正式发布需 Developer ID 签名 + 公证。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
 
 ## CI（GitHub Actions）

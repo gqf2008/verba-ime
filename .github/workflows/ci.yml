@@ -56,7 +56,7 @@ jobs:
       - name: 打包 IMK .app
         run: bash frontends/macos/ime/scripts/package.sh
       - name: 校验 .app
-        run: test -d frontends/macos/ime/dist/VerbaIMK.app && ls -la frontends/macos/ime/dist/VerbaIMK.app/Contents
+        run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && ls -la frontends/macos/ime/dist/Verba.app/Contents
 
   frontend-windows:
     runs-on: windows-latest

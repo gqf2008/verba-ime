@@ -42,7 +42,10 @@
 
 - [x] **共享 Rust 核心跨平台验证**（2026-08-23：CI check 矩阵 windows/macos/ubuntu 建设与测试共享核心（crates + apps/settings）；Rust 核心仅有 Windows 额外 crate 用 `cfg(windows)` 隔离，本质可跨平台。
 - [x] **macOS IMK 前端（全 Rust，objc2 + objc2-input-method-kit）**（2026-08-23：`frontends/macos/ime`，`MacIme::connect/ping` + `imk`（`define_class!` 子类化 `IMKInputController`，实现 `IMKStateSetting`）+ `ffi`（C ABI）；CI `frontend-macos` 在 macos-latest 构建验证）
-- [ ] macOS IMK 输入处理与注册（inputText:client: 覆盖 + .app/Info.plist + TISInputSource）：需 macOS 真机与 CI 迭代
+- [x] **macOS IMK 输入处理与注册**（2026-08-24：`inputText:key:modifiers:client:` 收键 → verba-core 状态机 → 上屏/标记文本/候选窗；
+  `//` AI 模式 LLM 流式经 daemon；`app/Info.plist` + `ComponentInputModeDict` + `TISInputSource`；`scripts/package.sh` 打包 `dist/Verba.app`
+  （含 verba-mac 与 verba-daemon，ad-hoc 签名）；修复 verba-librime 非 Windows 链接 kernel32 问题使 daemon 可在 macOS 构建）
+- [ ] macOS IMK 真机交互验收（候选窗自动展示、输入法切换、TIS 注册需 macOS 真机确认）
 - [ ] Linux Fcitx5 插件（C++ shim + Rust 核心）—— **低优先（用户确认）**
 - [ ] Linux IBus / Wayland 兼容（imekit 评估）—— 低优先
 - [ ] 三端功能对齐矩阵 + 各端手动验收清单
