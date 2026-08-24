@@ -57,10 +57,9 @@ struct CandidatePosRetry {
     attempts_left: u32,
 }
 
-/// 待触发的候选融合请求（防抖中，pinyin 变更时重置计时）。
+/// 待触发的 Rime 候选请求（防抖中，pinyin 变更时重置计时）。
 struct PendingCandidateReq {
     pinyin: String,
-    dictionary: Vec<String>,
     ticks: u32,
 }
 
@@ -89,9 +88,7 @@ pub struct TextServiceData {
     candidate_pending_pos: RefCell<Option<CandidatePosRetry>>,
     /// 候选窗主题（随配置热更新）。
     candidate_theme: RefCell<verba_candidate::Theme>,
-    /// 中文引擎（builtin|rime，随配置热更新；rime 时向 daemon 请求 Rime 候选）。
-    candidate_engine: RefCell<String>,
-    /// Rime 方案（engine=rime 时，如 luna_pinyin_simp / wubi86）。
+    /// Rime 方案（单引擎，如 luna_pinyin_simp / wubi86）。
     candidate_rime_schema: RefCell<String>,
     /// 配置文件上次 mtime（用于热更新检测）。
     theme_config_mtime: Cell<Option<std::time::SystemTime>>,
@@ -127,7 +124,6 @@ impl TextServiceData {
             candidate_window: RefCell::new(None),
             candidate_pending_pos: RefCell::new(None),
             candidate_theme: RefCell::new(verba_candidate::Theme::default()),
-            candidate_engine: RefCell::new("builtin".into()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".into()),
             theme_config_mtime: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
@@ -217,7 +213,7 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
-    // 预拉起 daemon（engine=rime 时 daemon 启动即预热 Rime），避免首次输入等冷启动。
+    // 预拉起 daemon（daemon 启动即预热 Rime），避免首次输入等冷启动。
     prewarm_daemon(data);
     // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
     reload_candidate_config(data);
@@ -738,13 +734,10 @@ fn update_candidate_window(
 /// 从配置文件加载候选相关配置（主题 + 引擎 + Rime 方案）；失败保留当前值。
 fn reload_candidate_config(data: &Rc<TextServiceData>) {
     match load_candidate_config() {
-        Ok((theme, engine, schema)) => {
+        Ok((theme, schema)) => {
             *data.candidate_theme.borrow_mut() = theme;
-            *data.candidate_engine.borrow_mut() = engine.clone();
             *data.candidate_rime_schema.borrow_mut() = schema.clone();
-            // 始终启用内置词库候选：打字立刻有即时反馈，rime 融合作为追加增强。
-            // （勿按 engine 关闭内置——会导致候选窗在 rime 查询返回前一直空白，体验差。）
-            log::info!("候选配置已加载（engine={engine} schema={schema}）");
+            log::info!("候选配置已加载（schema={schema}）");
         }
         Err(e) => log::warn!("候选配置加载失败: {e}"),
     }
@@ -758,12 +751,11 @@ fn maybe_reload_candidate_config(data: &Rc<TextServiceData>) {
     }
 }
 
-fn load_candidate_config() -> std::result::Result<(verba_candidate::Theme, String, String), String>
-{
+fn load_candidate_config() -> std::result::Result<(verba_candidate::Theme, String), String> {
     let dirs = verba_config::VerbaDirs::locate().map_err(|e| e.to_string())?;
     let mgr = verba_config::ConfigManager::new(dirs);
     let cfg = mgr.load().map_err(|e| e.to_string())?;
-    Ok((cfg.theme.to_candidate_theme(), cfg.engine, cfg.rime_schema))
+    Ok((cfg.theme.to_candidate_theme(), cfg.rime_schema))
 }
 
 fn config_mtime() -> Option<std::time::SystemTime> {
@@ -996,9 +988,10 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
 /// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
 fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandidateRequest>) {
     if let Some(r) = req {
+        // 单引擎（Rime）：打字过程只请求本地 Rime 候选，不请求远程 LLM 候选融合
+        // （LLM 仅用于回车触发的 AI 直输）。
         *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
             pinyin: r.pinyin,
-            dictionary: r.dictionary,
             ticks: 0,
         });
     }
@@ -1026,17 +1019,12 @@ fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
             .borrow_mut()
             .take()
             .expect("存在");
-        let engine = data.candidate_engine.borrow().clone();
-        if engine == "rime" {
-            let schema = data.candidate_rime_schema.borrow().clone();
-            start_rime_candidates(data, req.pinyin, schema);
-        } else {
-            start_llm_candidates(data, req.pinyin, req.dictionary);
-        }
+        let schema = data.candidate_rime_schema.borrow().clone();
+        start_rime_candidates(data, req.pinyin, schema);
     }
 }
 
-/// 发起 Rime 候选查询（engine=rime 时；一次性返回候选，经 chunks 队列回流合并展示）。
+/// 发起 Rime 候选查询（单引擎；一次性返回候选，经 chunks 队列回流合并展示）。
 /// Rime 查询为本地同步调用，未使用候选请求 id（cancel_candidate_request 仅清理 pending）。
 fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: String) {
     log::info!("Rime 候选请求: pinyin={pinyin} schema={schema}");
@@ -1073,59 +1061,6 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
     *data.candidate_thread.borrow_mut() = Some(handle);
 }
 
-/// 发起候选融合请求（后台线程；增量候选经 chunks 队列回流 on_timer 合并展示）。
-fn start_llm_candidates(data: &Rc<TextServiceData>, pinyin: String, dictionary: Vec<String>) {
-    log::info!(
-        "候选融合请求: pinyin={pinyin} dict_count={}",
-        dictionary.len()
-    );
-    cancel_candidate_request(data);
-    let chunks = Arc::clone(&data.chunks);
-    let request_id = Arc::clone(&data.candidate_request_id);
-    let busy = Arc::clone(&data.candidate_request_busy);
-    let handle = std::thread::spawn(move || {
-        let _busy = BusyGuard::new(&busy);
-        let mut client = match ipc::ensure_daemon() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("候选融合无法连接 daemon: {e}");
-                return;
-            }
-        };
-        let id = match client.llm_candidates_start(&pinyin, &dictionary, 6) {
-            Ok(id) => id,
-            Err(e) => {
-                log::warn!("候选融合启动失败: {e}");
-                return;
-            }
-        };
-        request_id.store(id, Ordering::SeqCst);
-        loop {
-            match client.next_event(id) {
-                Ok(evt) => {
-                    let done = matches!(
-                        evt.kind,
-                        Some(stream_event::Kind::Candidates(ref c)) if c.done
-                    ) || matches!(evt.kind, Some(stream_event::Kind::Error(_)));
-                    if let Ok(mut q) = chunks.lock() {
-                        q.push_back(evt);
-                    }
-                    if done {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("候选融合连接中断: {e}");
-                    break;
-                }
-            }
-        }
-        // 仅当仍是本次请求时才清 id，避免误清新请求
-        let _ = request_id.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
-    });
-    *data.candidate_thread.borrow_mut() = Some(handle);
-}
-
 /// 请求线程在途标志（RAII：任何退出路径都会复位，防止卡住时线程堆积）。
 struct BusyGuard(Arc<AtomicBool>);
 impl BusyGuard {
@@ -1140,7 +1075,7 @@ impl Drop for BusyGuard {
     }
 }
 
-/// 激活时预拉起 daemon（engine=rime 时 daemon 启动即预热 Rime），
+/// 激活时预拉起 daemon（daemon 启动即预热 Rime），
 /// 避免用户首次输入时等待 daemon 冷启动（候选延迟 1-2 秒）。每进程只预热一次。
 fn prewarm_daemon(data: &Rc<TextServiceData>) {
     if data.daemon_prewarmed.swap(true, Ordering::SeqCst) {

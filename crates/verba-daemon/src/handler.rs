@@ -529,19 +529,6 @@ impl DaemonHandler {
         g: verba_protos::RimeCandidates,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
-        let engine = self.config.read().unwrap().engine.clone();
-        if engine != "rime" {
-            out.response(&Response {
-                id,
-                kind: Some(response::Kind::Error(ProtoError {
-                    code: 400,
-                    message: "中文引擎未启用 rime（verba-cli config set engine=rime 后重试）"
-                        .into(),
-                })),
-            })
-            .await?;
-            return Ok(());
-        }
         let max = (g.max_candidates as usize).clamp(1, 27);
         let schema = if g.schema.is_empty() {
             "luna_pinyin_simp"
@@ -813,13 +800,9 @@ impl DaemonHandler {
         }
     }
 
-    /// 后台预热 Rime 引擎（engine=rime 时由 daemon 启动调用）：提前触发首次部署，
+    /// 后台预热 Rime 引擎（单引擎，daemon 启动时调用）：提前触发首次部署，
     /// 使首次候选查询免于等待部署（2-5 秒），避免用户误以为无反应。
     pub fn warmup_rime(&self) {
-        let engine = self.config.read().unwrap().engine.clone();
-        if engine != "rime" {
-            return;
-        }
         match self.rime_query(|_| Ok(())) {
             Ok(()) => log::info!("Rime 引擎预热完成"),
             Err(e) => log::warn!("Rime 引擎预热失败（首次查询时会重试）: {e}"),
@@ -892,10 +875,12 @@ impl DaemonHandler {
 }
 
 /// Rime 资源定位：环境变量优先，缺省取 daemon 同目录 `rime/` 下
-/// `rime.dll`、`data/`、`user_data/`。
+/// `librime` 库、`data/`、`user_data/`（按平台：Windows `rime.dll` / macOS `librime.dylib`）。
 fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let from_env = || -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-        let d = std::env::var("VERBA_RIME_DLL").ok()?;
+        let d = std::env::var("VERBA_RIME_DLL")
+            .or_else(|_| std::env::var("VERBA_RIME_DYLIB"))
+            .ok()?;
         let s = std::env::var("VERBA_RIME_SHARED").ok()?;
         let u = std::env::var("VERBA_RIME_USER").ok()?;
         Some((d.into(), s.into(), u.into()))
@@ -908,8 +893,15 @@ fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) 
         .and_then(|p| p.parent().map(|d| d.to_owned()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let rime_dir = exe_dir.join("rime");
+    let lib_name = if cfg!(windows) {
+        "rime.dll"
+    } else if cfg!(target_os = "macos") {
+        "librime.dylib"
+    } else {
+        "librime.so"
+    };
     (
-        rime_dir.join("rime.dll"),
+        rime_dir.join(lib_name),
         rime_dir.join("data"),
         rime_dir.join("user_data"),
     )

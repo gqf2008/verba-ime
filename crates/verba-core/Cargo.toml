@@ -10,4 +10,3 @@ description = "Verba 核心引擎：输入状态机与领域模型"
 workspace = true
 
 [dependencies]
-verba-pinyin = { path = "../verba-pinyin" }

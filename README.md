@@ -3,7 +3,7 @@
 > **声、像、思、音，皆成文字。**
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
-> 项目状态：**M1/M5 已实机验收**（Windows TSF + LLM 直输 + 中文引擎：Rime/候选窗/融合）；
+> 项目状态：**M1/M5 已实机验收**（Windows TSF + LLM 直输 + 中文引擎：Rime（单引擎）/候选窗）；
 > 当前推进 **M3 多模态 + M4 TTS Rust 核心**（TTS mock/edge-tts + OCR mock/Windows.Media.Ocr/rapid（原生 Rust ONNX/RapidOCR，无 Python） + ASR mock/openai 已端到端通；「眼睛」——`//` 指令自动捕捉光标上方屏幕，OCR 或多模态 vision 喂给 LLM；AI 模式支持多轮上下文（`//重置` 清空）。`verba-cli diag` 一键诊断（健康/配置/日志尾/进程）。Piper/whisper.cpp 跟进）。
 > 见 [Windows 手动验收清单](docs/manual-acceptance-windows.md) 与 [路线图](docs/roadmap.md)。
 
@@ -28,7 +28,7 @@ Verba 的目标是成为三个平台上的「统一输入入口」：**任何表
 | 🎙️ ASR | 全局快捷键唤起语音输入 → 实时转写 → 上屏 |
 | 🤖 LLM（远程） | 输入法内 AI 模式：翻译、润色、续写、总结、自定义 Prompt，流式输出；多轮上下文（`ai_context_turns`，`//重置` 清空） |
 | 🔊 TTS | 朗读选中文本 / 候选词，可配置上屏自动朗读 |
-| ⌨️ 输入 | 英文直输 + 标点 + 快捷指令；快捷短语（`//短语 <名称>` 一键插入用户模板，`verba-cli phrase set/list/del` 管理）；中文拼音引擎（可选集成 librime） |
+| ⌨️ 输入 | 英文直输 + 标点 + 快捷指令；快捷短语（`//短语 <名称>` 一键插入用户模板，`verba-cli phrase set/list/del` 管理）；中文拼音引擎（librime/Rime，单引擎） |
 | ⚙️ 配置 | 统一设置面板（Slint 跨平台），AI 服务商可插拔，密钥系统密钥库安全存储 |
 | 🔒 隐私 | 本地能力默认离线；远程 LLM 显式开关并提示数据出境 |
 
@@ -65,6 +65,7 @@ Verba 的目标是成为三个平台上的「统一输入入口」：**任何表
 - [路线图](docs/roadmap.md)
 - [AI 服务商矩阵（OCR/ASR/LLM/TTS）](docs/providers.md)
 - [IPC 协议草案](docs/protocol.md)
+- [输入法手感参考（mir2x/libpinyin）](docs/libpinyin-mir2x-smoothness.md)
 - [构建与打包](docs/building.md)
 - [命名与品牌](docs/naming.md)
 

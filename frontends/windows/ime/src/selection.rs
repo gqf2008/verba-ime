@@ -165,7 +165,7 @@ fn render(hwnd: HWND, state: &SelectionState) {
         }
         let px = std::slice::from_raw_parts_mut(state.bits, w * h * 4);
         // 半透明变暗（premultiplied BGRA）
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0.iter_mut() {
             p[0] = 0;
             p[1] = 0;
             p[2] = 0;

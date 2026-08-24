@@ -40,9 +40,9 @@ if ($ok.Count -ge 2) {
 
 $rimeDir = Join-Path $dllDir "rime"
 if (-not (Test-Path (Join-Path $rimeDir "rime.dll"))) {
-    Write-Warning "rime/ 缺失（engine=rime 需要）"
+    Write-Warning "rime/ 缺失（Rime 单引擎需要 librime）"
 } else {
-    Write-Output "rime/ 就绪（rime.dll + data）OK"
+    Write-Output "rime/ 就绪（librime + data）OK"
 }
 
 Write-Output "==== 2) 启动 mock + daemon ===="
@@ -56,28 +56,19 @@ Start-Sleep -Seconds 2
 Write-Output "daemon ping 通过 OK"
 
 try {
-    Write-Output "==== 3) LLM 候选融合（engine=builtin） ===="
-    & $cli config set engine=builtin | Out-Null
-    $cand = & $cli candidates nishishui
-    $joined = $cand -join "`n"
-    foreach ($expect in @("你是谁呀", "你是谁啊")) {
-        if ($joined -notmatch [regex]::Escape($expect)) { throw "LLM 融合缺失「$expect」: $joined" }
-    }
-    Write-Output "candidates nishishui -> 含「你是谁呀/你是谁啊」OK"
-
-    Write-Output "==== 4) Rime 拼音（engine=rime） ===="
-    & $cli config set engine=rime rime_schema=luna_pinyin_simp | Out-Null
+    Write-Output "==== 3) Rime 拼音（单引擎） ===="
+    & $cli config set rime_schema=luna_pinyin_simp | Out-Null
     $r1 = & $cli rime nishishui
     if (($r1 -join "`n") -notmatch "你是谁") { throw "Rime 拼音缺失「你是谁」: $($r1 -join ';')" }
     Write-Output "rime nishishui -> 你是谁 OK"
 
-    Write-Output "==== 5) Rime 五笔（wubi86） ===="
+    Write-Output "==== 4) Rime 五笔（wubi86） ===="
     & $cli config set rime_schema=wubi86 | Out-Null
     $r2 = & $cli rime wqvb wubi86
     if (($r2 -join "`n") -notmatch "你好") { throw "Rime 五笔缺失「你好」: $($r2 -join ';')" }
     Write-Output "rime wqvb wubi86 -> 你好 OK"
 
-    Write-Output "==== 6) TTS 合成（mock provider） ===="
+    Write-Output "==== 5) TTS 合成（mock provider） ===="
     & $cli config set tts_provider=mock | Out-Null
     $ttsOut = Join-Path $env:TEMP "verba-tts-check.wav"
     & $cli tts "你好" $ttsOut | Out-Null
@@ -139,10 +130,9 @@ Write-Output ""
 Write-Output "==== CLI 级自动化检查全部通过 OK ===="
 Write-Output "==== 手工实机验收清单（请在真实输入框操作） ===="
 Write-Output "1. 关闭已打开的应用 -> 重新打开记事本 -> Win+Space 切到「Verba · 拾言输入法」"
-Write-Output "2. 输入 nishishui -> 候选窗即时出现内置「你是谁/你是说…」+ 停顿后尾部追加 Rime「你是/妳是/逆势…」"
+Write-Output "2. 输入 nishishui -> 候选窗出现 Rime「你是谁/你是说…」（单引擎，无内置即时层）"
 Write-Output "3. verba-cli config set rime_schema=wubi86 -> 输入 wqvb -> 出「你好/您好」；aaaa -> 工"
-Write-Output "4. verba-cli config set engine=builtin -> 输入 nishishui -> 候选窗尾部追加 LLM「你是谁呀/你是谁啊」"
+Write-Output "4. 数字选候选上屏、Esc 取消组合、方向键不被吞"
 Write-Output "5. 分页：= 或 PageDown 下翻、- 或 PageUp 上翻，底部页码脚 1/3"
 Write-Output "6. 主题：verba-cli config set theme.preset=dark -> 候选窗变深色（热更新）"
-Write-Output "7. 数字选候选上屏、Esc 取消组合、方向键不被吞"
 Write-Output "逐项通过后即收口（M5 已收口；TTS mock CLI 检查已自动覆盖）。"

@@ -44,6 +44,20 @@ fn error_event(message: &str) -> StreamEvent {
     }
 }
 
+/// 读取 Rime 方案（`config.rime_schema`）。单引擎（Rime）下不再有引擎开关。
+/// 读取失败时回退 `luna_pinyin_simp`。
+fn load_rime_schema() -> String {
+    let dirs = match verba_config::VerbaDirs::locate() {
+        Ok(d) => d,
+        Err(_) => return "luna_pinyin_simp".to_owned(),
+    };
+    let mgr = verba_config::ConfigManager::new(dirs);
+    match mgr.load() {
+        Ok(cfg) => cfg.rime_schema,
+        Err(_) => "luna_pinyin_simp".to_owned(),
+    }
+}
+
 /// LLM 流式事件队列项：`seq` 为全局唯一序号，规避不同客户端本地请求 id 冲突。
 struct LlmItem {
     seq: u64,
@@ -86,6 +100,10 @@ struct Ivars {
     candidate_pinyin: RefCell<Option<String>>,
     /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
     composed: RefCell<String>,
+    /// Rime 方案（单引擎，缓存；配置变更时热更新）。
+    candidate_rime_schema: RefCell<String>,
+    /// 配置 mtime（用于 Rime 方案热更新检测）。
+    candidate_config_mtime: Cell<Option<std::time::SystemTime>>,
 }
 
 impl Default for Ivars {
@@ -98,6 +116,8 @@ impl Default for Ivars {
             timer: RefCell::new(None),
             candidate_pinyin: RefCell::new(None),
             composed: RefCell::new(String::new()),
+            candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
+            candidate_config_mtime: Cell::new(None),
         }
     }
 }
@@ -537,9 +557,38 @@ impl VerbaIMKController {
         self.ensure_timer();
     }
 
-    /// 候选融合请求（拼音变更后向 daemon 请求 LLM 补充候选）。
+    /// 候选请求（拼音变更后请求本地 Rime 整句候选）。
+    ///
+    /// 单引擎（Rime）：候选只走本地 Rime。LLM 只在「输入 → 结果」的 AI 直输
+    /// （回车触发 `StartLlm`）时调用，**打字过程不调用远程 LLM 做候选融合**。
     fn start_candidates(&self, req: LlmCandidateRequest) {
-        // 取消上一在途候选请求，避免 daemon 继续生成旧候选。
+        self.maybe_reload_rime_schema();
+        let schema = self.ivars().candidate_rime_schema.borrow().clone();
+        self.start_rime_candidates(req.pinyin, schema);
+    }
+
+    /// 按配置 mtime 热更新 Rime 方案（避免每键读盘解析；未变则用缓存）。
+    fn maybe_reload_rime_schema(&self) {
+        let mtime = verba_config::VerbaDirs::locate().ok().and_then(|d| {
+            let mgr = verba_config::ConfigManager::new(d);
+            std::fs::metadata(mgr.path())
+                .and_then(|m| m.modified())
+                .ok()
+        });
+        if mtime == self.ivars().candidate_config_mtime.get() {
+            return;
+        }
+        self.ivars().candidate_config_mtime.set(mtime);
+        let schema = load_rime_schema();
+        *self.ivars().candidate_rime_schema.borrow_mut() = schema;
+    }
+
+    /// Rime 候选查询（单引擎）：一次性请求 Rime 整句候选并压入候选队列。
+    ///
+    /// Rime 为 daemon 内本地同步查询，拼音变更即触发（不防抖），保证「整句候选」即时呈现，
+    /// 与其它平台 engine=rime 行为一致。请求结果经 `feed_candidates_event` 融合/去重。
+    fn start_rime_candidates(&self, pinyin: String, schema: String) {
+        // 取消上一在途候选请求（含 LLM 融合），避免旧候选回流。
         let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
         ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
         if old_cand_id != 0 {
@@ -554,45 +603,36 @@ impl VerbaIMKController {
         self.ivars()
             .candidate_pinyin
             .borrow_mut()
-            .replace(req.pinyin.clone());
+            .replace(pinyin.clone());
         ACTIVE_CANDIDATES.store(seq, Ordering::SeqCst);
+        self.ensure_timer();
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
                 Ok(c) => c,
                 Err(e) => {
-                    push_llm(seq, error_event(&format!("候选请求失败: {e}")));
+                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
                     return;
                 }
             };
-            let id = match client.llm_candidates_start(&req.pinyin, &req.dictionary, 6) {
-                Ok(id) => id,
+            let cands = match client.rime_candidates(&pinyin, &schema, 9) {
+                Ok(c) => c,
                 Err(e) => {
-                    push_llm(seq, error_event(&format!("候选请求失败: {e}")));
+                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
                     return;
                 }
             };
-            CAND_DAEMON_ID.store(id, Ordering::SeqCst);
-            if ACTIVE_CANDIDATES.load(Ordering::SeqCst) != seq {
-                let _ = client.llm_cancel(id);
-                return;
-            }
-            loop {
-                match client.next_event(id) {
-                    Ok(evt) => {
-                        let done = matches!(&evt.kind, Some(stream_event::Kind::Candidates(c)) if c.done)
-                            || matches!(&evt.kind, Some(stream_event::Kind::Error(_)));
-                        push_llm(seq, evt);
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        push_llm(seq, error_event(&format!("候选请求中断: {e}")));
-                        break;
-                    }
-                }
-            }
+            push_llm(
+                seq,
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                        pinyin,
+                        candidates: cands,
+                        done: true,
+                    })),
+                },
+            );
         });
     }
 
@@ -626,37 +666,48 @@ impl VerbaIMKController {
     }
 
     fn feed_candidates_event(&self, evt: StreamEvent) {
-        let Some(stream_event::Kind::Candidates(c)) = evt.kind else {
+        let Some(kind) = evt.kind else {
             return;
         };
-        // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
-        let pinyin = if c.pinyin.is_empty() {
-            let Some(py) = self.ivars().candidate_pinyin.borrow().clone() else {
-                return;
-            };
-            py
-        } else {
-            c.pinyin.clone()
-        };
-        let action =
-            self.ivars()
-                .machine
-                .borrow_mut()
-                .on_llm_candidates(&pinyin, &c.candidates, c.done);
-        if let Action::UpdatePinyin {
-            preedit,
-            candidates,
-            page,
-            ..
-        } = action
-        {
-            self.ivars().candidates.borrow_mut().clone_from(&candidates);
-            self.ivars().page.set(page);
-            self.set_marked(&preedit);
-        }
-        if c.done {
-            self.ivars().candidate_pinyin.borrow_mut().take();
-            ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+        match kind {
+            stream_event::Kind::Candidates(c) => {
+                // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
+                let pinyin = if c.pinyin.is_empty() {
+                    let Some(py) = self.ivars().candidate_pinyin.borrow().clone() else {
+                        return;
+                    };
+                    py
+                } else {
+                    c.pinyin.clone()
+                };
+                let action = self.ivars().machine.borrow_mut().on_llm_candidates(
+                    &pinyin,
+                    &c.candidates,
+                    c.done,
+                );
+                if let Action::UpdatePinyin {
+                    preedit,
+                    candidates,
+                    page,
+                    ..
+                } = action
+                {
+                    self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                    self.ivars().page.set(page);
+                    self.set_marked(&preedit);
+                }
+                if c.done {
+                    self.ivars().candidate_pinyin.borrow_mut().take();
+                    ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+                }
+            }
+            stream_event::Kind::Error(e) => {
+                // Rime 候选错误：不再静默空白，落到日志便于排查（如 librime 未部署）。
+                log::warn!("[VerbaIMK] Rime 候选错误: {}", e.message);
+                self.ivars().candidate_pinyin.borrow_mut().take();
+                ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
 
@@ -825,10 +876,11 @@ mod tests {
     fn pinyin_machine_drives_actions() {
         let mut m = CompositionMachine::new();
         assert!(matches!(m.feed_char('n'), Action::UpdatePinyin { .. }));
-        let a = m.feed_char('i');
-        assert!(matches!(a, Action::UpdatePinyin { candidates, .. } if !candidates.is_empty()));
+        m.feed_char('i');
+        // 单引擎 Rime：拼音态候选经 on_llm_candidates 异步注入。
+        let _ = m.on_llm_candidates("ni", &["你".to_string()], true);
         let a = m.feed_char(' ');
-        assert!(matches!(a, Action::CommitImmediate(text) if text == "你"));
+        assert!(matches!(&a, Action::CommitImmediate(text) if text == "你"));
         assert_eq!(m.state(), MachineState::Idle);
     }
 
@@ -841,5 +893,12 @@ mod tests {
             m.feed_char(c);
         }
         assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+    }
+
+    #[test]
+    fn load_rime_schema_returns_schema() {
+        // 读取失败/成功均返回非空 scheme；不 panic。
+        let schema = load_rime_schema();
+        assert!(!schema.is_empty());
     }
 }

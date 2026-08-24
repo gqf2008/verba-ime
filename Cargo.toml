@@ -7,7 +7,6 @@ members = [
     "crates/verba-config",
     "crates/verba-ai",
     "crates/verba-daemon",
-    "crates/verba-pinyin",
     "crates/verba-candidate",
     "crates/verba-librime",
     "crates/verba-tts",
