@@ -33,7 +33,6 @@ fn main() {
         Some("key") => cmd_key(&args),
         Some("config") => cmd_config(&args),
         Some("mode") => cmd_mode(&args),
-        Some("pinyin") => cmd_pinyin(&args),
         Some("phrase") => cmd_phrase(&args),
         Some("diag") => cmd_diag(&args),
         Some(other) => {
@@ -60,7 +59,6 @@ fn print_help() {
          verba-cli config                查看配置\n  \
          verba-cli config set <k=v>...   修改配置\n  \
          verba-cli mode <normal|ai|...>  切换模式\n  \
-         verba-cli pinyin <拼音>        查询拼音候选（本地引擎调试）\n  \
          verba-cli phrase <名称>      查看快捷短语；phrase-set/list/del 管理\n  \
          verba-cli diag                 诊断：daemon 健康/配置/日志尾/相关进程\n  \
          verba-cli --version             版本\n"
@@ -387,20 +385,6 @@ fn cmd_mode(args: &[String]) -> i32 {
     })
 }
 
-/// `verba-cli pinyin <拼音>`：本地拼音引擎候选查询（不依赖 daemon）。
-fn cmd_pinyin(args: &[String]) -> i32 {
-    let input = args.get(1).map(String::as_str).unwrap_or("");
-    let engine = verba_pinyin::PinyinEngine::new();
-    let cands = engine.lookup(input);
-    if cands.is_empty() {
-        println!("（无候选）");
-    } else {
-        for (i, c) in cands.iter().enumerate() {
-            println!("{}. {} ({:?})", i + 1, c.text, c.kind);
-        }
-    }
-    0
-}
 /// `verba-cli diag`：输出 daemon 健康、关键配置、日志尾、相关进程，便于故障定位。
 fn cmd_diag(_args: &[String]) -> i32 {
     println!("== Verba 诊断 ==");

@@ -12,7 +12,7 @@
 - 隐私可控：默认本地优先，远程调用显式授权。
 
 ### 非目标（v1）
-- 内置轻量拼音引擎（`verba-pinyin`，本地词库 + 音节切分）；完整方案（五笔 / Rime 词库生态）在 M5 评估 librime。
+- 中文拼音引擎：**Rime（librime）单引擎**（daemon 内；本地词库 + 五笔/注音生态）。此前内置 `verba-pinyin` 已移除。
 - 不做移动端（Android / iOS）与 Web 前端。
 - 不内置模型训练 / 微调。
 
@@ -61,7 +61,7 @@
 | crate | 职责 |
 | --- | --- |
 | `verba-core` | 输入状态机（Normal / Voice / Ocr / Ai）、拼音组合 + 候选选择、AI 提示词、命令路由 |
-| `verba-pinyin` | 本地拼音 → 汉字候选引擎（词库 + 音节切分 + 频率排序） |
+| `verba-librime` | Rime（librime）中文引擎 FFI 封装（单引擎，候选来源） |
 | `verba-ai` | AI provider 抽象（trait）与实现：ocr / asr / llm / tts 四类，含本地 / 系统 / 云端实现 |
 | `verba-protos` | IPC Protobuf 定义（prost 生成） |
 | `verba-ipc` | IPC client / server：Windows NamedPipe、Unix Socket、Linux D-Bus（可选） |
@@ -184,7 +184,7 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 > TSF 档案/类别注册需管理员（安装程序/verba-reg 提权路径）。
 ## 12. 开放问题（实现中决策）
 
-1. 中文拼音引擎：已内置轻量引擎（`verba-pinyin`，2026-08-22 落地）；M5 评估 librime 以补齐五笔 / 高级词库 / 模糊音。
+1. 中文拼音引擎：**单引擎 = Rime（librime）**（daemon 内，启动预热）；此前内置 `verba-pinyin` 已移除。
 2. TSF 候选窗口：原生 `ITfCandidateListUIElement` vs 自绘 overlay。
 3. macOS appex 常驻限制下的 daemon 启动 / 生命周期策略。
 4. 截图实现：Windows Graphics Capture vs GDI；macOS ScreenCaptureKit vs CGWindowList。

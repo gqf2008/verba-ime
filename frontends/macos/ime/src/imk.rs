@@ -47,7 +47,7 @@ fn error_event(message: &str) -> StreamEvent {
 /// 读取候选引擎与 Rime 方案（`config.engine` / `config.rime_schema`）。
 ///
 /// macOS 前端与 Windows 一致支持 `engine=rime`（候选窗展示 Rime 整句候选）。
-/// 读取失败时回退 `builtin`（内置 verba-pinyin）。
+/// 读取失败时回退 `builtin`（本地默认，无内置 verba-pinyin）。
 fn load_candidate_engine() -> (String, String) {
     let fallback = || ("builtin".to_owned(), "luna_pinyin_simp".to_owned());
     let dirs = match verba_config::VerbaDirs::locate() {
@@ -857,10 +857,11 @@ mod tests {
     fn pinyin_machine_drives_actions() {
         let mut m = CompositionMachine::new();
         assert!(matches!(m.feed_char('n'), Action::UpdatePinyin { .. }));
-        let a = m.feed_char('i');
-        assert!(matches!(a, Action::UpdatePinyin { candidates, .. } if !candidates.is_empty()));
+        m.feed_char('i');
+        // 单引擎 Rime：拼音态候选经 on_llm_candidates 异步注入。
+        let _ = m.on_llm_candidates("ni", &["你".to_string()], true);
         let a = m.feed_char(' ');
-        assert!(matches!(a, Action::CommitImmediate(text) if text == "你"));
+        assert!(matches!(&a, Action::CommitImmediate(text) if text == "你"));
         assert_eq!(m.state(), MachineState::Idle);
     }
 

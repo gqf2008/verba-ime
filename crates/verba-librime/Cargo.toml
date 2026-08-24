@@ -15,4 +15,3 @@ log.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-verba-pinyin = { path = "../verba-pinyin" }

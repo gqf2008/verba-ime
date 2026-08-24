@@ -11,6 +11,16 @@
 
 use std::fmt;
 
+/// 候选：文本 + 覆盖的输入拼音字符数（用于分段承诺/整句提交）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegCandidate {
+    pub text: String,
+    /// 覆盖的输入拼音字符数。
+    pub consumed: usize,
+    /// 频率排名（越小越常用）。
+    pub rank: u32,
+}
+
 /// 输入法模式（与 IPC SetMode 对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -124,11 +134,11 @@ pub struct CompositionMachine {
     /// 拼音组合缓冲（小写无调）。
     pinyin_buffer: String,
     /// 词库候选（由拼音引擎查询得到；含覆盖拼音长度，用于分段承诺）。
-    dictionary_candidates: Vec<verba_pinyin::SegCandidate>,
+    dictionary_candidates: Vec<SegCandidate>,
     /// LLM / Rime 补充候选（候选融合，可为空；一律覆盖当前活跃拼音全长）。
-    llm_candidates: Vec<verba_pinyin::SegCandidate>,
+    llm_candidates: Vec<SegCandidate>,
     /// 融合后的展示候选（词库 + LLM，去重），供选择/分页/提交。
-    pinyin_candidates: Vec<verba_pinyin::SegCandidate>,
+    pinyin_candidates: Vec<SegCandidate>,
     /// 已承诺的候选段（文本 + 覆盖的拼音字符数），用于「分段承诺」。
     committed: Vec<(String, usize)>,
     /// 已承诺段累计覆盖的拼音缓冲前缀长度。
@@ -143,8 +153,6 @@ pub struct CompositionMachine {
     prompt: String,
     /// LLM 流式结果。
     result: String,
-    /// 拼音引擎。
-    engine: verba_pinyin::PinyinEngine,
 }
 
 impl Default for CompositionMachine {
@@ -168,7 +176,6 @@ impl CompositionMachine {
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
-            engine: verba_pinyin::PinyinEngine::new(),
         }
     }
 
@@ -344,9 +351,8 @@ impl CompositionMachine {
                 }
                 self.pinyin_buffer.push(c.to_ascii_lowercase());
                 self.refresh_candidates();
-                return Action::UpdatePrompt {
-                    preedit: self.preedit(),
-                };
+                // 提示词内拼音组合：走 Rime 候选（与主组合一致），前端已能处理 UpdatePinyin。
+                return self.pinyin_action();
             }
             if c.is_ascii_digit() && c != '0' {
                 let idx = (c as u8 - b'1') as usize;
@@ -392,9 +398,7 @@ impl CompositionMachine {
             self.pinyin_buffer.clear();
             self.pinyin_buffer.push(c.to_ascii_lowercase());
             self.refresh_candidates();
-            return Action::UpdatePrompt {
-                preedit: self.preedit(),
-            };
+            return self.pinyin_action();
         }
         self.prompt.push(c);
         Action::UpdatePrompt {
@@ -548,7 +552,7 @@ impl CompositionMachine {
     }
 
     /// 取融合候选中的第 `index` 个（含覆盖长度）。
-    fn fused_segment(&self, index: usize) -> Option<&verba_pinyin::SegCandidate> {
+    fn fused_segment(&self, index: usize) -> Option<&SegCandidate> {
         self.pinyin_candidates.get(index)
     }
 
@@ -659,18 +663,13 @@ impl CompositionMachine {
         }
     }
 
-    /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧 LLM/远程候选）。
+    /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
+    ///
+    /// 单引擎（Rime）：候选只来自 `on_llm_candidates`（daemon 一次性推送），
+    /// 不再使用内置 `verba-pinyin` 生成词库候选。
     fn refresh_candidates(&mut self) {
         self.pinyin_page = 0;
-        // 始终启用内置词库：打字即有即时候选，Rime/LLM 候选作为追加增强
-        // （勿按 engine 关闭——候选窗会在远程候选返回前一直空白，实机体验差）。
-        // Prompt 态（// 提示词拼音转中文）同样保留内置内联候选。
-        self.dictionary_candidates =
-            if self.dictionary_enabled || self.state != MachineState::Pinyin {
-                self.engine.lookup_segmented(self.active_pinyin())
-            } else {
-                Vec::new()
-            };
+        self.dictionary_candidates.clear();
         self.llm_candidates.clear();
         self.fuse_candidates();
     }
@@ -688,7 +687,7 @@ impl CompositionMachine {
     /// 拼音变更后是否需要发起 LLM 候选请求（同一拼音只请求一次）。
     fn request_llm_candidates_if_needed(&mut self) -> Option<LlmCandidateRequest> {
         let active = self.active_pinyin().to_owned();
-        if self.state != MachineState::Pinyin || active.is_empty() {
+        if !self.pinyin_composing() || active.is_empty() {
             self.last_candidates_request = None;
             return None;
         }
@@ -749,7 +748,8 @@ impl CompositionMachine {
     /// `pinyin` 与当前组合不符时视为过期结果直接忽略。
     pub fn on_llm_candidates(&mut self, pinyin: &str, candidates: &[String], done: bool) -> Action {
         let _ = done;
-        if self.state != MachineState::Pinyin || self.active_pinyin() != pinyin {
+        // 单引擎（Rime）：在主组合（Pinyin）与提示词内拼音（Prompt 组合中）都接受 Rime 候选。
+        if !self.pinyin_composing() || self.active_pinyin() != pinyin {
             return Action::None;
         }
         let active_len = self.active_pinyin().len();
@@ -764,7 +764,7 @@ impl CompositionMachine {
             {
                 continue;
             }
-            self.llm_candidates.push(verba_pinyin::SegCandidate {
+            self.llm_candidates.push(SegCandidate {
                 text: cand.to_owned(),
                 consumed: active_len,
                 rank: u32::MAX,
@@ -801,6 +801,20 @@ impl fmt::Display for MachineState {
 mod tests {
     use super::*;
 
+    /// 模拟 Rime 候选推送（单引擎）：向状态机注入候选。
+    fn rime(m: &mut CompositionMachine, py: &str, texts: &[&str]) {
+        let _ = m.on_llm_candidates(
+            py,
+            &texts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            true,
+        );
+    }
+
+    /// 多候选（>9）用于分页测试。
+    const MANY: [&str; 12] = [
+        "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+    ];
+
     #[test]
     fn letters_start_pinyin_composition() {
         let mut m = CompositionMachine::new();
@@ -830,6 +844,7 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你", "你好"]);
         assert_eq!(m.state(), MachineState::Pinyin);
         let first = m.commit_pinyin_text();
         assert_eq!(first, "你", "ni 首选应为 你，实际 {first:?}");
@@ -850,6 +865,7 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你"]);
         assert_eq!(m.state(), MachineState::Pinyin);
         // 候选 0 为「你」：大写 A 提交「你A」并回到 Idle
         let a = m.feed_char('A');
@@ -875,6 +891,7 @@ mod tests {
         m.feed_char('/');
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你"]);
         // 提示词内拼音组合中：大写提交候选「你」+ H 到提示词
         let a = m.feed_char('H');
         assert!(matches!(a, Action::UpdatePrompt { preedit } if preedit == "//你H"));
@@ -886,6 +903,7 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你", "你好", "你好吗", "你来"]);
         // 候选索引 1（第二个）
         if m.pinyin_candidates.len() > 1 {
             let expected = m.pinyin_candidates[1].text.clone();
@@ -910,39 +928,28 @@ mod tests {
 
     #[test]
     fn pinyin_engine_returns_more_than_one_page() {
-        // 引擎候选数须多于 1 页，否则分页无意义。
+        // 候选数须多于 1 页，否则分页无意义。
         let mut m = CompositionMachine::new();
-        let a = m.feed_char('n');
-        match a {
-            Action::UpdatePinyin {
-                candidates, page, ..
-            } => {
-                assert_eq!(page, 0);
-                assert!(
-                    candidates.len() > CompositionMachine::PINYIN_PAGE_SIZE,
-                    "候选应多于一页（{} > {}），实际 {} 个",
-                    candidates.len(),
-                    CompositionMachine::PINYIN_PAGE_SIZE,
-                    candidates.len()
-                );
-            }
-            other => panic!("应进入拼音，实际 {other:?}"),
-        }
+        let _ = m.feed_char('n');
+        rime(&mut m, "n", &MANY);
+        assert!(
+            m.pinyin_candidates.len() > CompositionMachine::PINYIN_PAGE_SIZE,
+            "候选应多于一页（{} > {}），实际 {} 个",
+            m.pinyin_candidates.len(),
+            CompositionMachine::PINYIN_PAGE_SIZE,
+            m.pinyin_candidates.len()
+        );
     }
 
     #[test]
     fn pinyin_page_down_advances_and_wraps() {
         let mut m = CompositionMachine::new();
-        let full = match m.feed_char('n') {
-            Action::UpdatePinyin {
-                candidates, page, ..
-            } => {
-                assert_eq!(page, 0);
-                candidates
-            }
-            other => panic!("应进入拼音，实际 {other:?}"),
-        };
-        let total = full.len().div_ceil(CompositionMachine::PINYIN_PAGE_SIZE);
+        let _ = m.feed_char('n');
+        rime(&mut m, "n", &MANY);
+        let total = m
+            .pinyin_candidates
+            .len()
+            .div_ceil(CompositionMachine::PINYIN_PAGE_SIZE);
         assert!(total >= 2, "需要至少 2 页才有回绕可测，实际 {total}");
         // 翻到最后一页
         for _ in 0..(total - 1) {
@@ -965,6 +972,7 @@ mod tests {
     fn pinyin_digit_selects_page_relative() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
+        rime(&mut m, "n", &MANY);
         // 翻到第 2 页
         let full = match m.feed_page_down() {
             Action::UpdatePinyin {
@@ -986,6 +994,7 @@ mod tests {
     fn pinyin_oem_paging_keys() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
+        rime(&mut m, "n", &MANY);
         assert!(matches!(
             m.feed_char('='),
             Action::UpdatePinyin { page: 1, .. }
@@ -1023,6 +1032,7 @@ mod tests {
         for c in "nihao".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "nihao", &["你好", "你好吗"]);
         assert_eq!(m.commit_pinyin_text(), "你好");
         let a = m.feed_char(' ');
         assert_eq!(a, Action::CommitImmediate("你好".into()));
@@ -1044,6 +1054,7 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你"]);
         assert_eq!(m.feed_char('/'), Action::CommitImmediate("你".into()));
         assert_eq!(m.state(), MachineState::PendingSlash);
         m.feed_char('/');
@@ -1055,12 +1066,14 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        rime(&mut m, "ni", &["你"]);
         assert_eq!(m.feed_enter(), Action::CommitImmediate("你".into()));
         assert_eq!(m.state(), MachineState::Idle);
 
         let mut m2 = CompositionMachine::new();
         m2.feed_char('n');
         m2.feed_char('i');
+        rime(&mut m2, "ni", &["你"]);
         assert_eq!(m2.feed_escape(), Action::Cancel);
         assert_eq!(m2.state(), MachineState::Idle);
     }
@@ -1225,6 +1238,7 @@ mod tests {
         for c in "nihao".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "nihao", &["你好", "你好吗"]);
         assert!(m.pinyin_composing(), "提示词中应处于拼音组合");
         assert!(
             m.preedit().contains(" 1."),
@@ -1250,6 +1264,7 @@ mod tests {
         for c in "nihao".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "nihao", &["你好"]);
         // 第一次 Enter：提交拼音到提示词，不触发 LLM
         let a1 = m.feed_enter();
         assert!(
@@ -1318,9 +1333,9 @@ mod tests {
             Action::UpdatePinyin { llm_request, .. } => llm_request,
             other => panic!("应进入拼音，实际 {other:?}"),
         };
-        let req = llm_req.expect("拼音变更后应请求 LLM 候选");
+        let req = llm_req.expect("拼音变更后应请求 Rime 候选");
         assert_eq!(req.pinyin, "n");
-        assert!(!req.dictionary.is_empty(), "词库候选应非空");
+        assert!(req.dictionary.is_empty(), "单引擎 Rime 词库候选应为空");
         // 同一拼音重复刷新不再发请求（last_candidates_request 去重）
         assert!(m.request_llm_candidates_if_needed().is_none());
         // 拼音变化再次请求
@@ -1336,28 +1351,26 @@ mod tests {
     #[test]
     fn llm_candidates_fuse_and_dedupe() {
         let mut m = CompositionMachine::new();
-        let dict = match m.feed_char('n') {
-            Action::UpdatePinyin { candidates, .. } => candidates,
-            other => panic!("应进入拼音，实际 {other:?}"),
-        };
-        // 与词库候选重复的忽略，新候选追加到尾部
-        let a = m.on_llm_candidates("n", &[dict[0].clone(), "你是".into()], false);
+        let _ = m.feed_char('n');
+        // 首次 Rime 候选：全部追加
+        let a = m.on_llm_candidates("n", &["你".into(), "你是".into()], false);
         match a {
             Action::UpdatePinyin {
                 candidates, page, ..
             } => {
                 assert_eq!(page, 0);
-                assert_eq!(candidates.len(), dict.len() + 1);
-                assert_eq!(candidates[dict.len()], "你是");
+                assert_eq!(candidates, vec!["你".to_string(), "你是".to_string()]);
             }
             other => panic!("融合应返回更新，实际 {other:?}"),
         }
-        // 已存在的 LLM 候选不重复
+        // 已存在的候选不重复，新候选追加到尾部
         let a = m.on_llm_candidates("n", &["你是".into(), "你好".into()], false);
         match a {
             Action::UpdatePinyin { candidates, .. } => {
-                assert_eq!(candidates.len(), dict.len() + 2);
-                assert_eq!(candidates[dict.len() + 1], "你好");
+                assert_eq!(
+                    candidates,
+                    vec!["你".to_string(), "你是".to_string(), "你好".to_string()]
+                );
             }
             other => panic!("融合应返回更新，实际 {other:?}"),
         }
@@ -1370,27 +1383,21 @@ mod tests {
 
     #[test]
     fn default_builtin_instant_and_rime_appended() {
-        // 回归（59a4bd9）：engine=rime 曾按 engine 抑制内置词库，导致候选窗在 Rime
-        // 查询返回前一直空白（实机「没有候选窗口、候选词出现慢」）。默认（dictionary_enabled
-        // 恒为 true）必须打字即出内置候选，Rime 候选到达后去重追加到尾部，而非替换/等待。
+        // 单引擎（Rime）：候选只来自 Rime；打字时无内置即时候选，Rime 到达后填充候选列表。
         let mut m = CompositionMachine::new();
-        // 打字即时有内置候选（不等 Rime 返回）
         let dict = match m.feed_char('n') {
             Action::UpdatePinyin { candidates, .. } => candidates,
             other => panic!("应进入拼音，实际 {other:?}"),
         };
-        assert!(!dict.is_empty(), "内置词库应即时返回候选，实际 {dict:?}");
-        // Rime 候选到达：已在词库的「你」去重，新候选「你是」追加到尾部
+        assert!(dict.is_empty(), "单引擎 Rime 不应有内置候选");
         match m.on_llm_candidates("n", &["你".into(), "你是".into()], true) {
             Action::UpdatePinyin { candidates, .. } => {
-                assert_eq!(candidates.len(), dict.len() + 1, "应只追加「你是」");
-                assert_eq!(&candidates[..dict.len()], &dict[..]);
-                assert_eq!(candidates[dict.len()], "你是");
+                assert_eq!(candidates, vec!["你".to_string(), "你是".to_string()]);
             }
-            other => panic!("Rime 融合应追加候选，实际 {other:?}"),
+            other => panic!("Rime 融合应填充候选，实际 {other:?}"),
         }
-        // 数字选择仍可选中内置首候选
-        assert_eq!(m.feed_char('1'), Action::CommitImmediate(dict[0].clone()));
+        // 数字选择提交首候选
+        assert_eq!(m.feed_char('1'), Action::CommitImmediate("你".into()));
         assert_eq!(m.state(), MachineState::Idle);
     }
 
@@ -1466,28 +1473,29 @@ mod tests {
 
     #[test]
     fn rime_mode_keeps_prompt_pinyin_dictionary() {
-        // engine=rime（词库抑制）时：Pinyin 态无内置候选，但 // 提示词拼音仍用内置内联候选。
+        // 单引擎 Rime：Pinyin 态与提示词拼音都经 Rime 候选。
         let mut m = CompositionMachine::new();
         m.set_dictionary_enabled(false);
-        // Pinyin 态：无内置候选
+        // Pinyin 态：无内置候选（等 Rime）
         match m.feed_char('n') {
             Action::UpdatePinyin { candidates, .. } => assert!(candidates.is_empty()),
             other => panic!("应进入拼音，实际 {other:?}"),
         }
         m.feed_escape();
-        // Prompt 态：//nihao → 有内置内联候选
+        // Prompt 态：//nihao → 注入 Rime 候选后应含「你好」
         m.feed_char('/');
         m.feed_char('/');
         for c in "nihao".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "nihao", &["你好"]);
         assert!(m.pinyin_composing());
         assert!(
             m.preedit().contains("你好"),
-            "Prompt 态应保留内置内联候选，实际 {:?}",
+            "Prompt 态应含 Rime 内联候选，实际 {:?}",
             m.preedit()
         );
-        // 空格提交内置候选到提示词（而非拼音原文）
+        // 空格提交候选到提示词（而非拼音原文）
         assert!(matches!(m.feed_char(' '), Action::UpdatePrompt { .. }));
         assert_eq!(m.prompt(), "你好");
     }
@@ -1496,6 +1504,7 @@ mod tests {
     fn page_flip_does_not_re_request_llm() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
+        rime(&mut m, "n", &MANY);
         assert!(matches!(
             m.feed_page_down(),
             Action::UpdatePinyin {
@@ -1507,26 +1516,19 @@ mod tests {
 
     #[test]
     fn pinyin_segmented_commit_partial_then_continue() {
+        // 单引擎（Rime）：候选覆盖活跃拼音全长，选中即整句提交（无内置子短语分段）。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "nishishui", &["你是谁", "你是说"]);
         assert_eq!(m.state(), MachineState::Pinyin);
-        // 子短语「你」覆盖前缀 ni（consumed=2），选择后应保留组合、剩余 shishui 继续。
-        let idx = m
-            .pinyin_candidates
-            .iter()
-            .position(|c| c.text == "你")
-            .expect("应含子短语段 你");
-        let a = m.select_candidate(idx);
+        let a = m.select_candidate(0);
         assert!(
-            matches!(a, Action::UpdatePinyin { .. }),
-            "分段承诺应保留组合，实际 {a:?}"
+            matches!(a, Action::CommitImmediate(_)),
+            "Rime 整句候选应整句提交，实际 {a:?}"
         );
-        assert_eq!(m.state(), MachineState::Pinyin);
-        assert_eq!(m.committed_text(), "你");
-        assert_eq!(m.active_pinyin(), "shishui");
-        assert_eq!(m.pinyin_composition_preedit(), "你shishui");
+        assert_eq!(m.state(), MachineState::Idle);
     }
 
     #[test]
@@ -1546,58 +1548,36 @@ mod tests {
 
     #[test]
     fn pinyin_segmented_backspace_pops_segment() {
+        // 单引擎（Rime）：候选均为整句（consumed=active_len），无已承诺段；退格回退拼音字符。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {
             m.feed_char(c);
         }
-        let idx = m
-            .pinyin_candidates
-            .iter()
-            .position(|c| c.text == "你")
-            .expect("应含子短语段 你");
-        let _ = m.select_candidate(idx);
-        assert_eq!(m.committed_text(), "你");
-        // 退格应弹出已承诺段（不删活跃拼音字符），活跃回到全长 nishishui。
+        rime(&mut m, "nishishui", &["你是谁"]);
+        assert_eq!(m.committed_text(), "");
         let a = m.feed_backspace();
         assert!(
             matches!(a, Action::UpdatePinyin { .. }),
-            "退格应弹出已承诺段，实际 {a:?}"
+            "退格应回退拼音字符，实际 {a:?}"
         );
         assert_eq!(m.committed_text(), "");
-        assert_eq!(m.active_pinyin(), "nishishui");
+        assert_eq!(m.active_pinyin(), "nishishu");
         assert_eq!(m.state(), MachineState::Pinyin);
     }
 
     #[test]
     fn pinyin_segmented_commit_remaining_auto_commits() {
+        // 单引擎（Rime）：注入覆盖全长的整句候选，选中即整句提交。
         let mut m = CompositionMachine::new();
         for c in "nishishui".chars() {
             m.feed_char(c);
         }
-        let idx = m
-            .pinyin_candidates
-            .iter()
-            .position(|c| c.text == "你")
-            .expect("应含子短语段 你");
-        let _ = m.select_candidate(idx);
-        // 剩余 shishui：找覆盖全长的整句候选并选择 → 应整句提交（已承诺段 + 剩余候选）。
-        let full = m
-            .pinyin_candidates
-            .iter()
-            .find(|c| c.consumed >= m.active_pinyin().len())
-            .cloned();
-        if let Some(cand) = full {
-            let fi = m
-                .pinyin_candidates
-                .iter()
-                .position(|c| c.text == cand.text)
-                .unwrap();
-            let a = m.select_candidate(fi);
-            assert!(
-                matches!(a, Action::CommitImmediate(_)),
-                "应整句提交，实际 {a:?}"
-            );
-            assert_eq!(m.state(), MachineState::Idle);
-        }
+        rime(&mut m, "nishishui", &["你是谁"]);
+        let a = m.select_candidate(0);
+        assert!(
+            matches!(&a, Action::CommitImmediate(text) if text == "你是谁"),
+            "应整句提交，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
     }
 }

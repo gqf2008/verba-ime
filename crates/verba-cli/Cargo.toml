@@ -14,7 +14,6 @@ name = "verba-cli"
 path = "src/main.rs"
 
 [dependencies]
-verba-pinyin = { path = "../verba-pinyin" }
 verba-core = { path = "../verba-core" }
 verba-ipc = { path = "../verba-ipc" }
 verba-config = { path = "../verba-config" }

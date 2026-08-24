@@ -213,7 +213,7 @@ pub struct Config {
     /// 候选窗主题。
     #[serde(default)]
     pub theme: ThemeConfig,
-    /// 中文引擎：builtin（默认，verba-pinyin）| rime（可选，daemon 内 librime）。
+    /// 中文引擎：rime（默认，daemon 内 librime）。单引擎；此前内置 verba-pinyin 已移除。
     #[serde(default = "default_engine")]
     pub engine: String,
     /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
@@ -274,7 +274,7 @@ fn default_max_tokens() -> i32 {
     DEFAULT_MAX_TOKENS
 }
 fn default_engine() -> String {
-    "builtin".to_owned()
+    "rime".to_owned()
 }
 fn default_rime_schema() -> String {
     "luna_pinyin_simp".to_owned()

@@ -4,6 +4,11 @@
 > 背景：`verba-pinyin` 自研引擎已落地（拼音 + 模糊音 + 简拼 + 整句 DP + 提示词中文）。
 > 本文件评估是否/如何引入 librime 等成熟引擎，以及候选融合路线。
 
+> **决策已定（2026-08-24）**：中文引擎收敛为**单引擎 Rime（librime）**。内置自研 `verba-pinyin`
+> 已从运行时移除（不再生成候选；`config engine` 默认 `rime`）。本文件历史评估保留，结论以
+> 「§ 单引擎化」为准：候选由 daemon 内 Rime 提供，启动预热（`warmup_rime`）避免首次冷启动。
+
+
 > 手感/交互参考：关于「输入法为什么丝滑」（异步不阻塞、容错候选、分段承诺），见 [libpinyin-mir2x 手感参考](libpinyin-mir2x-smoothness.md)。
 
 ## 1. 目标与约束

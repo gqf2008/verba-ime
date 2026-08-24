@@ -2142,9 +2142,6 @@ dependencies = [
 [[package]]
 name = "verba-core"
 version = "0.1.0"
-dependencies = [
- "verba-pinyin",
-]
 
 [[package]]
 name = "verba-ime-macos"
@@ -2174,10 +2171,6 @@ dependencies = [
  "tokio",
  "verba-protos",
 ]
-
-[[package]]
-name = "verba-pinyin"
-version = "0.1.0"
 
 [[package]]
 name = "verba-protos"

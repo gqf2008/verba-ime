@@ -4,6 +4,11 @@
 > 来源：用户反馈 `../mir2x` 里的 libpinyin 输入法「用起来挺丝滑」，本文件拆解其实现，并映射到 Verba 现状。
 > 关联：[中文引擎选型与集成评估](chinese-engine-evaluation.md)（引擎选型），本文聚焦「集成/交互工程」层面的手感来源。
 
+> **2026-08-24 更新（单引擎化）**：Verba 中文候选已收敛为**单引擎 Rime（librime）**，内置自研
+> `verba-pinyin` 已从运行时移除（不再生成候选）。下文涉及「内置 + Rime」的旧表述为历史记录，
+> 以「单引擎 Rime」为准：候选由 daemon 内 Rime 提供，`config engine` 默认 `rime`。
+
+
 ---
 
 ## 0. 背景

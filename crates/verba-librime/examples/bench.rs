@@ -1,4 +1,4 @@
-//! 自研 verba-pinyin vs Rime（luna_pinyin_simp + octagram 八股文模型）整句首候选对比。
+//! Rime（luna_pinyin_simp）整句首候选正确率基准（50 句日常对话）。
 //! 运行（Windows，需 rime.dll + 数据）：
 //!   $env:VERBA_RIME_DLL=...; $env:VERBA_RIME_SHARED=...; $env:VERBA_RIME_USER=...;
 //!   cargo run -p verba-librime --example bench
@@ -78,28 +78,9 @@ fn main() {
         None
     };
 
-    let engine = verba_pinyin::PinyinEngine::new();
-    let mut builtin_hit = 0usize;
     let mut rime_hit = 0usize;
     let mut rime_done = false;
     for (i, (expected, py)) in CASES.iter().enumerate() {
-        let builtin = engine
-            .lookup(py)
-            .first()
-            .map(|c| c.text.clone())
-            .unwrap_or_default();
-        let b_ok = builtin == *expected;
-        if b_ok {
-            builtin_hit += 1;
-        }
-        let mut line = format!(
-            "{:>2}. {} | 期望 {} | builtin {} {}",
-            i + 1,
-            py,
-            expected,
-            builtin,
-            if b_ok { "✓" } else { "✗" }
-        );
         if let Some(r) = &rime {
             let rc = r
                 .candidates(py, "luna_pinyin_simp", 1)
@@ -112,24 +93,26 @@ fn main() {
                 rime_hit += 1;
             }
             rime_done = true;
-            line.push_str(&format!(" | rime {} {}", rc, if r_ok { "✓" } else { "✗" }));
+            println!(
+                "{:>2}. {} | 期望 {} | rime {} {}",
+                i + 1,
+                py,
+                expected,
+                rc,
+                if r_ok { "✓" } else { "✗" }
+            );
         }
-        println!("{line}");
     }
     let n = CASES.len();
     println!("\n==== 汇总（{} 句） ====", n);
-    println!(
-        "builtin verba-pinyin 首候选准确率: {}/{} ({:.1}%)",
-        builtin_hit,
-        n,
-        builtin_hit as f64 * 100.0 / n as f64
-    );
     if rime_done {
         println!(
-            "rime luna_pinyin_simp(octagram) 首候选准确率: {}/{} ({:.1}%)",
+            "rime luna_pinyin_simp 首候选准确率: {}/{} ({:.1}%)",
             rime_hit,
             n,
             rime_hit as f64 * 100.0 / n as f64
         );
+    } else {
+        eprintln!("未设置 VERBA_RIME_DLL，无法基准");
     }
 }

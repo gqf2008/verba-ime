@@ -143,4 +143,5 @@
 | 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |
 | 2026-08-24 | 候选只走本地引擎；移除打字过程的「LLM 候选融合」自动触发：前端不再在拼音变化时调 `llm_candidates_start`（Windows/macOS 一致），LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`），打字零 LLM 调用、零成本 |
 
+| 2026-08-24 | **单引擎化（Rime）**：移除内置 `verba-pinyin` 候选引擎（不再生成候选），中文候选统一由 daemon 内 Rime 提供（`config engine` 默认 `rime`，启动预热）；`CompositionMachine` 候选只经 `on_llm_candidates` 注入，`//` 提示词拼音也走 Rime；`verba-cli pinyin` 改走 `verba-cli rime`；`verba-pinyin` 从 workspace 移除（目录残留待清）。全面 `cargo test`/`clippy` 通过，macOS 前端验证通过 |
 | 2026-08-24 | 关闭「候选即时性」议题：引擎本地即时出候选（内置每键同步 + Rime 异步追加），候选窗永不空白；防抖是后端优化，不构成 UX「延时」问题，实测 mir2x 无延时，不再打点/调整 |

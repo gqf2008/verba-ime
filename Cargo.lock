@@ -7060,7 +7060,6 @@ dependencies = [
  "verba-core",
  "verba-daemon",
  "verba-ipc",
- "verba-pinyin",
  "verba-protos",
 ]
 
@@ -7079,9 +7078,6 @@ dependencies = [
 [[package]]
 name = "verba-core"
 version = "0.1.0"
-dependencies = [
- "verba-pinyin",
-]
 
 [[package]]
 name = "verba-daemon"
@@ -7124,7 +7120,6 @@ version = "0.1.0"
 dependencies = [
  "log",
  "thiserror 2.0.20",
- "verba-pinyin",
 ]
 
 [[package]]
@@ -7140,10 +7135,6 @@ dependencies = [
  "verba-config",
  "windows",
 ]
-
-[[package]]
-name = "verba-pinyin"
-version = "0.1.0"
 
 [[package]]
 name = "verba-protos"
