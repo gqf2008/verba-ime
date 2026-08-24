@@ -1,10 +1,11 @@
-//! 跨平台 Rime（librime）实现：用 `libloading` 动态加载
-//! （Windows `rime.dll` / macOS `librime.dylib` / 其它 Unix `librime.so`）。
+//! 跨平台 Rime（librime）实现：用 `libloading` 加载，并走 **现代 `rime_get_api()`** 返回的
+//! `RimeApi` 结构体（librime 1.x 的正统入口；兼容 Windows rime.dll / macOS librime.dylib /
+//! Squirrel 内置等，避免逐个 dlsym 单个符号在不同构建下找不到）。
 //!
 //! 踩坑（见 spikes/librime-sys/README.md）：
 //! - librime 1.17 的 `RimeSessionId` 是 `uintptr_t`（64 位），必须用 `usize`；
-//! - GNU 工具链下 `raw-dylib` 运行时导入不可靠，统一用显式动态加载；
-//! - Weasel 安装包的 rime.dll 是 x86，须取 librime 官方 `Windows-msvc-x64` 包；
+//! - 单个符号（RimeInitialize 等）在部分构建（如 Homebrew macOS bottle）以 C++ 修饰名导出，
+//!   不可靠；统一走 `rime_get_api()` 结构体。
 //! - macOS 需 `librime.dylib`（librime 原生支持 macOS，如 Squirrel 即基于 librime）；
 //! - `RimeTraits` 的路径指针 librime 会保存引用，CString 须随引擎存活。
 
@@ -17,6 +18,13 @@ use crate::{RimeCandidate, RimeConfig, RimeError, RimeSchema};
 
 type RimeBool = i32;
 type RimeSessionId = usize; // librime 1.17+：uintptr_t
+
+type RimeNotificationHandler = unsafe extern "C" fn(
+    context_object: *mut c_void,
+    session_id: RimeSessionId,
+    message_type: *const c_char,
+    message_value: *const c_char,
+);
 
 #[repr(C)]
 struct RimeTraits {
@@ -32,19 +40,6 @@ struct RimeTraits {
     log_dir: *const c_char,
     prebuilt_data_dir: *const c_char,
     staging_dir: *const c_char,
-}
-
-#[repr(C)]
-struct RimeSchemaListItem {
-    schema_id: *mut c_char,
-    name: *mut c_char,
-    reserved: *mut c_void,
-}
-
-#[repr(C)]
-struct RimeSchemaList {
-    size: usize,
-    list: *mut RimeSchemaListItem,
 }
 
 #[repr(C)]
@@ -83,39 +78,292 @@ struct RimeContext {
     select_labels: *mut *mut c_char,
 }
 
-type FnSetupLogging = unsafe extern "C" fn();
-type FnInitialize = unsafe extern "C" fn(traits: *mut RimeTraits) -> RimeBool;
-type FnFinalize = unsafe extern "C" fn();
-type FnCreateSession = unsafe extern "C" fn() -> RimeSessionId;
-type FnDestroySession = unsafe extern "C" fn(session: RimeSessionId) -> RimeBool;
-type FnStartMaintenance = unsafe extern "C" fn(full_check: RimeBool) -> RimeBool;
-type FnJoinMaintenanceThread = unsafe extern "C" fn();
-type FnSimulateKeySequence =
-    unsafe extern "C" fn(session: RimeSessionId, key_sequence: *const c_char) -> RimeBool;
-type FnGetContext =
-    unsafe extern "C" fn(session: RimeSessionId, context: *mut RimeContext) -> RimeBool;
-type FnFreeContext = unsafe extern "C" fn(context: *mut RimeContext) -> RimeBool;
-type FnGetSchemaList = unsafe extern "C" fn(schema_list: *mut RimeSchemaList) -> RimeBool;
-type FnFreeSchemaList = unsafe extern "C" fn(schema_list: *mut RimeSchemaList);
-type FnSelectSchema =
-    unsafe extern "C" fn(session: RimeSessionId, schema_id: *const c_char) -> RimeBool;
+#[repr(C)]
+struct RimeCommit {
+    data_size: i32,
+    text: *mut c_char,
+}
 
-/// 动态加载得到的函数指针集合（`Library` 句柄保持存活）。
+#[repr(C)]
+struct RimeStatus {
+    data_size: i32,
+    schema_id: *mut c_char,
+    schema_name: *mut c_char,
+    is_disabled: RimeBool,
+    is_composing: RimeBool,
+    is_ascii_mode: RimeBool,
+    is_full_shape: RimeBool,
+    is_simplified: RimeBool,
+    is_traditional: RimeBool,
+    is_ascii_punct: RimeBool,
+}
+
+#[repr(C)]
+struct RimeSchemaListItem {
+    schema_id: *mut c_char,
+    name: *mut c_char,
+    reserved: *mut c_void,
+}
+
+#[repr(C)]
+struct RimeSchemaList {
+    size: usize,
+    list: *mut RimeSchemaListItem,
+}
+
+#[repr(C)]
+struct RimeConfigC {
+    ptr: *mut c_void,
+}
+
+#[repr(C)]
+struct RimeConfigIterator {
+    list: *mut c_void,
+    map: *mut c_void,
+    index: i32,
+    key: *const c_char,
+    path: *const c_char,
+}
+
+#[repr(C)]
+struct RimeCustomApi {
+    data_size: i32,
+}
+
+#[repr(C)]
+struct RimeModule {
+    data_size: i32,
+    module_name: *const c_char,
+    initialize: unsafe extern "C" fn(),
+    finalize: unsafe extern "C" fn(),
+    get_api: unsafe extern "C" fn() -> *mut RimeCustomApi,
+}
+
+#[repr(C)]
+struct RimeCandidateListIterator {
+    ptr: *mut c_void,
+    index: i32,
+    candidate: RimeCandidateC,
+}
+
+#[repr(C)]
+struct RimeCandidatePreview {
+    data_size: i32,
+    text_before_selection: *mut c_char,
+    selected_text: *mut c_char,
+    text_after_selection: *mut c_char,
+}
+
+#[repr(C)]
+struct RimeStringSlice {
+    str: *const c_char,
+    length: usize,
+}
+
+/// librime 1.x 的 `RimeApi`（由 `rime_get_api()` 返回）。字段顺序严格对照 `rime_api.h`。
+#[repr(C)]
+struct RimeApi {
+    data_size: i32,
+    setup: unsafe extern "C" fn(traits: *mut RimeTraits),
+    set_notification_handler:
+        unsafe extern "C" fn(handler: RimeNotificationHandler, context_object: *mut c_void),
+    initialize: unsafe extern "C" fn(traits: *mut RimeTraits),
+    finalize: unsafe extern "C" fn(),
+    start_maintenance: unsafe extern "C" fn(full_check: RimeBool) -> RimeBool,
+    is_maintenance_mode: unsafe extern "C" fn() -> RimeBool,
+    join_maintenance_thread: unsafe extern "C" fn(),
+    deployer_initialize: unsafe extern "C" fn(traits: *mut RimeTraits),
+    prebuild: unsafe extern "C" fn() -> RimeBool,
+    deploy: unsafe extern "C" fn() -> RimeBool,
+    deploy_schema: unsafe extern "C" fn(schema_file: *const c_char) -> RimeBool,
+    deploy_config_file:
+        unsafe extern "C" fn(file_name: *const c_char, version_key: *const c_char) -> RimeBool,
+    sync_user_data: unsafe extern "C" fn() -> RimeBool,
+    create_session: unsafe extern "C" fn() -> RimeSessionId,
+    find_session: unsafe extern "C" fn(session_id: RimeSessionId) -> RimeBool,
+    destroy_session: unsafe extern "C" fn(session_id: RimeSessionId) -> RimeBool,
+    cleanup_stale_sessions: unsafe extern "C" fn(),
+    cleanup_all_sessions: unsafe extern "C" fn(),
+    process_key:
+        unsafe extern "C" fn(session_id: RimeSessionId, keycode: i32, mask: i32) -> RimeBool,
+    commit_composition: unsafe extern "C" fn(session_id: RimeSessionId) -> RimeBool,
+    clear_composition: unsafe extern "C" fn(session_id: RimeSessionId),
+    get_commit:
+        unsafe extern "C" fn(session_id: RimeSessionId, commit: *mut RimeCommit) -> RimeBool,
+    free_commit: unsafe extern "C" fn(commit: *mut RimeCommit) -> RimeBool,
+    get_context:
+        unsafe extern "C" fn(session_id: RimeSessionId, context: *mut RimeContext) -> RimeBool,
+    free_context: unsafe extern "C" fn(ctx: *mut RimeContext) -> RimeBool,
+    get_status:
+        unsafe extern "C" fn(session_id: RimeSessionId, status: *mut RimeStatus) -> RimeBool,
+    free_status: unsafe extern "C" fn(status: *mut RimeStatus) -> RimeBool,
+    set_option:
+        unsafe extern "C" fn(session_id: RimeSessionId, option: *const c_char, value: RimeBool),
+    get_option: unsafe extern "C" fn(session_id: RimeSessionId, option: *const c_char) -> RimeBool,
+    set_property:
+        unsafe extern "C" fn(session_id: RimeSessionId, prop: *const c_char, value: *const c_char),
+    get_property: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        prop: *const c_char,
+        value: *mut c_char,
+        buffer_size: usize,
+    ) -> RimeBool,
+    get_schema_list: unsafe extern "C" fn(schema_list: *mut RimeSchemaList) -> RimeBool,
+    free_schema_list: unsafe extern "C" fn(schema_list: *mut RimeSchemaList),
+    get_current_schema: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        schema_id: *mut c_char,
+        buffer_size: usize,
+    ) -> RimeBool,
+    select_schema:
+        unsafe extern "C" fn(session_id: RimeSessionId, schema_id: *const c_char) -> RimeBool,
+    schema_open:
+        unsafe extern "C" fn(schema_id: *const c_char, config: *mut RimeConfigC) -> RimeBool,
+    config_open:
+        unsafe extern "C" fn(config_id: *const c_char, config: *mut RimeConfigC) -> RimeBool,
+    config_close: unsafe extern "C" fn(config: *mut RimeConfigC) -> RimeBool,
+    config_get_bool: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut RimeBool,
+    ) -> RimeBool,
+    config_get_int: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut i32,
+    ) -> RimeBool,
+    config_get_double: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut f64,
+    ) -> RimeBool,
+    config_get_string: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut c_char,
+        buffer_size: usize,
+    ) -> RimeBool,
+    config_get_cstring:
+        unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char) -> *const c_char,
+    config_update_signature:
+        unsafe extern "C" fn(config: *mut RimeConfigC, signer: *const c_char) -> RimeBool,
+    config_begin_map: unsafe extern "C" fn(
+        iterator: *mut RimeConfigIterator,
+        config: *mut RimeConfigC,
+        key: *const c_char,
+    ) -> RimeBool,
+    config_next: unsafe extern "C" fn(iterator: *mut RimeConfigIterator) -> RimeBool,
+    config_end: unsafe extern "C" fn(iterator: *mut RimeConfigIterator),
+    simulate_key_sequence:
+        unsafe extern "C" fn(session_id: RimeSessionId, key_sequence: *const c_char) -> RimeBool,
+    register_module: unsafe extern "C" fn(module: *mut RimeModule) -> RimeBool,
+    find_module: unsafe extern "C" fn(module_name: *const c_char) -> *mut RimeModule,
+    run_task: unsafe extern "C" fn(task_name: *const c_char) -> RimeBool,
+    get_shared_data_dir: unsafe extern "C" fn() -> *const c_char,
+    get_user_data_dir: unsafe extern "C" fn() -> *const c_char,
+    get_sync_dir: unsafe extern "C" fn() -> *const c_char,
+    get_user_id: unsafe extern "C" fn() -> *const c_char,
+    get_user_data_sync_dir: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    config_init: unsafe extern "C" fn(config: *mut RimeConfigC) -> RimeBool,
+    config_load_string:
+        unsafe extern "C" fn(config: *mut RimeConfigC, yaml: *const c_char) -> RimeBool,
+    config_set_bool: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: RimeBool,
+    ) -> RimeBool,
+    config_set_int:
+        unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char, value: i32) -> RimeBool,
+    config_set_double:
+        unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char, value: f64) -> RimeBool,
+    config_set_string: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *const c_char,
+    ) -> RimeBool,
+    config_get_item: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut RimeConfigC,
+    ) -> RimeBool,
+    config_set_item: unsafe extern "C" fn(
+        config: *mut RimeConfigC,
+        key: *const c_char,
+        value: *mut RimeConfigC,
+    ) -> RimeBool,
+    config_clear: unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char) -> RimeBool,
+    config_create_list:
+        unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char) -> RimeBool,
+    config_create_map:
+        unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char) -> RimeBool,
+    config_list_size: unsafe extern "C" fn(config: *mut RimeConfigC, key: *const c_char) -> usize,
+    config_begin_list: unsafe extern "C" fn(
+        iterator: *mut RimeConfigIterator,
+        config: *mut RimeConfigC,
+        key: *const c_char,
+    ) -> RimeBool,
+    get_input: unsafe extern "C" fn(session_id: RimeSessionId) -> *const c_char,
+    get_caret_pos: unsafe extern "C" fn(session_id: RimeSessionId) -> usize,
+    select_candidate: unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    get_version: unsafe extern "C" fn() -> *const c_char,
+    set_caret_pos: unsafe extern "C" fn(session_id: RimeSessionId, caret_pos: usize),
+    select_candidate_on_current_page:
+        unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    candidate_list_begin: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        iterator: *mut RimeCandidateListIterator,
+    ) -> RimeBool,
+    candidate_list_next: unsafe extern "C" fn(iterator: *mut RimeCandidateListIterator) -> RimeBool,
+    candidate_list_end: unsafe extern "C" fn(iterator: *mut RimeCandidateListIterator),
+    user_config_open:
+        unsafe extern "C" fn(config_id: *const c_char, config: *mut RimeConfigC) -> RimeBool,
+    candidate_list_from_index: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        iterator: *mut RimeCandidateListIterator,
+        index: i32,
+    ) -> RimeBool,
+    get_prebuilt_data_dir: unsafe extern "C" fn() -> *const c_char,
+    get_staging_dir: unsafe extern "C" fn() -> *const c_char,
+    commit_proto: unsafe extern "C" fn(session_id: RimeSessionId, commit_builder: *mut c_void),
+    context_proto: unsafe extern "C" fn(session_id: RimeSessionId, context_builder: *mut c_void),
+    status_proto: unsafe extern "C" fn(session_id: RimeSessionId, status_builder: *mut c_void),
+    get_state_label: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        option_name: *const c_char,
+        state: RimeBool,
+    ) -> *const c_char,
+    delete_candidate: unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    delete_candidate_on_current_page:
+        unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    get_state_label_abbreviated: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        option_name: *const c_char,
+        state: RimeBool,
+        abbreviated: RimeBool,
+    ) -> RimeStringSlice,
+    set_input: unsafe extern "C" fn(session_id: RimeSessionId, input: *const c_char) -> RimeBool,
+    get_shared_data_dir_s: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    get_user_data_dir_s: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    get_prebuilt_data_dir_s: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    get_staging_dir_s: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    get_sync_dir_s: unsafe extern "C" fn(dir: *mut c_char, buffer_size: usize),
+    highlight_candidate: unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    highlight_candidate_on_current_page:
+        unsafe extern "C" fn(session_id: RimeSessionId, index: usize) -> RimeBool,
+    change_page: unsafe extern "C" fn(session_id: RimeSessionId, backward: RimeBool) -> RimeBool,
+    get_candidate_preview: unsafe extern "C" fn(
+        session_id: RimeSessionId,
+        preview: *mut RimeCandidatePreview,
+    ) -> RimeBool,
+    free_candidate_preview: unsafe extern "C" fn(preview: *mut RimeCandidatePreview) -> RimeBool,
+}
+
+/// 动态加载得到的 `RimeApi` 指针。
+///
+/// `Library` 句柄在加载时泄露（进程生命周期内不 dlclose）：librime 为进程级单例，
+/// 卸载（dlclose）时其全局状态仍在，会在退出时 SIGSEGV（Squirrel/Weasel 亦从不卸载）。
 struct Rime {
-    _lib: Library,
-    setup_logging: FnSetupLogging,
-    initialize: FnInitialize,
-    finalize: FnFinalize,
-    create_session: FnCreateSession,
-    destroy_session: FnDestroySession,
-    start_maintenance: FnStartMaintenance,
-    join_maintenance_thread: FnJoinMaintenanceThread,
-    simulate_key_sequence: FnSimulateKeySequence,
-    get_context: FnGetContext,
-    free_context: FnFreeContext,
-    get_schema_list: FnGetSchemaList,
-    free_schema_list: FnFreeSchemaList,
-    select_schema: FnSelectSchema,
+    api: *const RimeApi,
 }
 
 impl Rime {
@@ -124,58 +372,21 @@ impl Rime {
             let lib = Library::new(lib_path).map_err(|e| {
                 RimeError::Load(format!("动态加载失败: {} ({e})", lib_path.display()))
             })?;
-            let get = |name: &[u8]| -> Result<*mut c_void, RimeError> {
-                // Symbol<T> deref 到 T（函数指针），*sym 即原始函数指针。
-                lib.get::<unsafe extern "C" fn()>(name)
-                    .map(|sym| *sym as *mut c_void)
-                    .map_err(|e| RimeError::Load(format!("取符号失败 {name:?}: {e}")))
-            };
-            let rime = Rime {
-                setup_logging: std::mem::transmute::<*mut c_void, FnSetupLogging>(get(
-                    b"RimeSetupLogging\0",
-                )?),
-                initialize: std::mem::transmute::<*mut c_void, FnInitialize>(get(
-                    b"RimeInitialize\0",
-                )?),
-                finalize: std::mem::transmute::<*mut c_void, FnFinalize>(get(b"RimeFinalize\0")?),
-                create_session: std::mem::transmute::<*mut c_void, FnCreateSession>(get(
-                    b"RimeCreateSession\0",
-                )?),
-                destroy_session: std::mem::transmute::<*mut c_void, FnDestroySession>(get(
-                    b"RimeDestroySession\0",
-                )?),
-                start_maintenance: std::mem::transmute::<*mut c_void, FnStartMaintenance>(get(
-                    b"RimeStartMaintenance\0",
-                )?),
-                join_maintenance_thread: std::mem::transmute::<*mut c_void, FnJoinMaintenanceThread>(
-                    get(b"RimeJoinMaintenanceThread\0")?,
-                ),
-                simulate_key_sequence: std::mem::transmute::<*mut c_void, FnSimulateKeySequence>(
-                    get(b"RimeSimulateKeySequence\0")?,
-                ),
-                get_context: std::mem::transmute::<*mut c_void, FnGetContext>(get(
-                    b"RimeGetContext\0",
-                )?),
-                free_context: std::mem::transmute::<*mut c_void, FnFreeContext>(get(
-                    b"RimeFreeContext\0",
-                )?),
-                get_schema_list: std::mem::transmute::<*mut c_void, FnGetSchemaList>(get(
-                    b"RimeGetSchemaList\0",
-                )?),
-                free_schema_list: std::mem::transmute::<*mut c_void, FnFreeSchemaList>(get(
-                    b"RimeFreeSchemaList\0",
-                )?),
-                select_schema: std::mem::transmute::<*mut c_void, FnSelectSchema>(get(
-                    b"RimeSelectSchema\0",
-                )?),
-                _lib: lib,
-            };
-            Ok(rime)
+            let get_api: libloading::Symbol<unsafe extern "C" fn() -> *const RimeApi> = lib
+                .get(b"rime_get_api\0")
+                .map_err(|e| RimeError::Load(format!("取 rime_get_api 失败: {e}")))?;
+            let api = get_api();
+            if api.is_null() {
+                return Err(RimeError::Load("rime_get_api 返回空指针".into()));
+            }
+            // 进程生命周期内不 dlclose（见 struct 注释）。
+            std::mem::forget(lib);
+            Ok(Rime { api })
         }
     }
 }
 
-/// Rime 引擎：持有库句柄 + 初始化状态 + 目录字符串（librime 保存指针引用）。
+/// Rime 引擎：持有库句柄 + `RimeApi` + 初始化状态 + 目录字符串（librime 保存指针引用）。
 pub struct RimeEngine {
     inner: Rime,
     _shared: CString,
@@ -234,12 +445,13 @@ impl RimeEngine {
             staging_dir: std::ptr::null(),
         };
 
+        let api = inner.api;
         unsafe {
-            (inner.setup_logging)();
-            (inner.initialize)(&mut traits);
+            ((*api).setup)(&mut traits);
+            ((*api).initialize)(&mut traits);
             // 首次运行需部署（编译 schema/词典）；同步等待完成。
-            (inner.start_maintenance)(0);
-            (inner.join_maintenance_thread)();
+            ((*api).start_maintenance)(0);
+            ((*api).join_maintenance_thread)();
         }
 
         Ok(Self {
@@ -254,12 +466,13 @@ impl RimeEngine {
 
     /// 已部署的方案列表（诊断/调试用）。
     pub fn schemas(&self) -> Result<Vec<RimeSchema>, RimeError> {
+        let api = self.inner.api;
         unsafe {
             let mut list = RimeSchemaList {
                 size: 0,
                 list: std::ptr::null_mut(),
             };
-            if (self.inner.get_schema_list)(&mut list) == 0 {
+            if ((*api).get_schema_list)(&mut list) == 0 {
                 return Err(RimeError::Input("获取方案列表失败".into()));
             }
             let mut out = Vec::with_capacity(list.size);
@@ -270,7 +483,7 @@ impl RimeEngine {
                     name: to_rust(item.name),
                 });
             }
-            (self.inner.free_schema_list)(&mut list);
+            ((*api).free_schema_list)(&mut list);
             Ok(out)
         }
     }
@@ -282,18 +495,19 @@ impl RimeEngine {
         schema: &str,
         max: usize,
     ) -> Result<Vec<RimeCandidate>, RimeError> {
+        let api = self.inner.api;
         unsafe {
-            let session = (self.inner.create_session)();
+            let session = ((*api).create_session)();
             if session == 0 {
                 return Err(RimeError::Input("创建会话失败".into()));
             }
             let result = (|| {
                 let sel = CString::new(schema).map_err(|e| RimeError::Input(e.to_string()))?;
-                if (self.inner.select_schema)(session, sel.as_ptr()) == 0 {
+                if ((*api).select_schema)(session, sel.as_ptr()) == 0 {
                     return Err(RimeError::Input(format!("选择方案失败: {schema}")));
                 }
                 let seq = CString::new(input).map_err(|e| RimeError::Input(e.to_string()))?;
-                if (self.inner.simulate_key_sequence)(session, seq.as_ptr()) == 0 {
+                if ((*api).simulate_key_sequence)(session, seq.as_ptr()) == 0 {
                     return Err(RimeError::Input(format!("输入处理失败: {input}")));
                 }
                 let mut ctx = RimeContext {
@@ -317,7 +531,7 @@ impl RimeEngine {
                     commit_text_preview: std::ptr::null_mut(),
                     select_labels: std::ptr::null_mut(),
                 };
-                if (self.inner.get_context)(session, &mut ctx) == 0 {
+                if ((*api).get_context)(session, &mut ctx) == 0 {
                     return Err(RimeError::Input("获取上下文失败".into()));
                 }
                 let n = ctx.menu.num_candidates.max(0) as usize;
@@ -329,10 +543,10 @@ impl RimeEngine {
                         comment: to_rust(c.comment),
                     });
                 }
-                (self.inner.free_context)(&mut ctx);
+                ((*api).free_context)(&mut ctx);
                 Ok(out)
             })();
-            (self.inner.destroy_session)(session);
+            ((*api).destroy_session)(session);
             result
         }
     }
@@ -345,8 +559,10 @@ impl RimeEngine {
 
 impl Drop for RimeEngine {
     fn drop(&mut self) {
+        // 只做优雅清理（finalize）；库句柄已泄露（不 dlclose）。
         unsafe {
-            (self.inner.finalize)();
+            let api = self.inner.api;
+            ((*api).finalize)();
         }
     }
 }

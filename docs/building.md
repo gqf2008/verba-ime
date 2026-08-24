@@ -70,8 +70,22 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    或指定 `VERBA_RIME_DLL` / `VERBA_RIME_DYLIB` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
 3. 配置方案：`verba-cli config set rime_schema=luna_pinyin_simp`
    （五笔：`rime_schema=wubi86`）。
-4. 验证：`verba-cli rime nishishui`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。
+4. 验证：`verba-cli rime nishishui luna_pinyin`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。
    > 首次查询会部署 schema/词典（数秒）；整句基准见 [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8。
+
+### macOS 真机验证记录（2026-08-24）
+
+- **brew 的 `librime` 可用，但要走现代 API**：Homebrew `librime`（1.17）只导出 `rime_get_api`
+  （C++ 修饰名导出其余符号），因此 `verba-librime` 统一用 `rime_get_api()` 返回的 `RimeApi` 结构体，
+  不再逐个 dlsym 单个符号（Windows rime.dll 同样兼容）。
+- **部署数据**：`data/minimal`（luna_pinyin）+ `rime-wubi`（wubi86）+ `opencc` 数据
+  （brew `share/opencc/*`）放入 shared 目录；`default.yaml` 的 `schema_list` 需含 `wubi86`。
+- **运行**：`VERBA_RIME_DYLIB=/opt/homebrew/lib/librime.dylib VERBA_RIME_SHARED=... VERBA_RIME_USER=... verba-daemon`
+- **已验证**（本机 arm64 + brew librime 1.17）：
+  - `verba-cli rime nishishui luna_pinyin` → `你是誰 / 你是 / 妳是 …`
+  - `verba-cli rime wqvb wubi86` → `你好 / 您好`
+- **注意**：librime 为进程级单例，`verba-librime` 加载后**不 dlclose**（泄露句柄）——退出时
+  dlclose 会 SIGSEGV（Squirrel/Weasel 同样从不卸载）；`finalize()` 在 drop 时调用。
 
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
 - **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` 与 `verba-daemon`，ad-hoc 签名）
