@@ -150,14 +150,19 @@ define_class!(
                 return Bool::new(false);
             }
 
+            let key = classify_key(string, key_code);
+            // Shift+方向键等：交给宿主做文本选择，不当候选翻页。
+            if mods.contains(NSEventModifierFlags::Shift)
+                && matches!(key, Some(ImkKey::PageUp | ImkKey::PageDown))
+            {
+                return Bool::new(false);
+            }
+
             let was_idle = matches!(self.ivars().machine.borrow().state(), MachineState::Idle);
-            let action = match classify_key(string, key_code) {
+            let action = match key {
                 Some(ImkKey::Char(c)) => {
-                    // 大写 ASCII（Shift+字母）直上屏，不进入拼音组合（IME 惯例）。
-                    if c.is_ascii_uppercase() {
-                        let _ = self.apply_action(Action::CommitImmediate(c.to_string()));
-                        return Bool::new(true);
-                    }
+                    // 大写/小写统一交给状态机：Idle 大写直上屏、Pinyin/Prompt
+                    // 按候选提交 + 字符（见 verba-core machine 大写分支）。
                     self.ivars().machine.borrow_mut().feed_char(c)
                 }
                 Some(ImkKey::Backspace) => self.ivars().machine.borrow_mut().feed_backspace(),
@@ -345,7 +350,14 @@ impl VerbaIMKController {
     fn apply_action(&self, action: Action) -> bool {
         match action {
             Action::None => true,
-            Action::CommitImmediate(text) | Action::CommitResult { text } => {
+            Action::CommitImmediate(text) => {
+                self.commit(&text);
+                true
+            }
+            Action::CommitResult { text } => {
+                // Streaming/ResultReady 提前 Enter：停流并停表，避免空转。
+                self.cancel_stream();
+                self.invalidate_timer();
                 self.commit(&text);
                 true
             }
@@ -414,6 +426,7 @@ impl VerbaIMKController {
         }
         self.ivars().candidates.borrow_mut().clear();
         self.ivars().page.set(0);
+        self.ivars().candidate_pinyin.borrow_mut().take();
         *self.ivars().composed.borrow_mut() = String::new();
     }
 
@@ -488,7 +501,17 @@ impl VerbaIMKController {
 
     /// 候选融合请求（拼音变更后向 daemon 请求 LLM 补充候选）。
     fn start_candidates(&self, req: LlmCandidateRequest) {
+        // 取消上一在途候选请求，避免 daemon 继续生成旧候选。
+        let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
         ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+        if old_cand_id != 0 {
+            let old = old_cand_id;
+            std::thread::spawn(move || {
+                if let Ok(mut c) = ipc::try_connect() {
+                    let _ = c.llm_cancel(old);
+                }
+            });
+        }
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars()
             .candidate_pinyin

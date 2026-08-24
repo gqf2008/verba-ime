@@ -45,7 +45,9 @@
 - [x] **macOS IMK 输入处理与注册**（2026-08-24：`inputText:key:modifiers:client:` 收键 → verba-core 状态机 → 上屏/标记文本/候选窗；
   `//` AI 模式 LLM 流式经 daemon；`app/Info.plist` + `ComponentInputModeDict` + `TISInputSource`；`scripts/package.sh` 打包 `dist/Verba.app`
   （含 verba-mac 与 verba-daemon，ad-hoc 签名）；修复 verba-librime 非 Windows 链接 kernel32 问题使 daemon 可在 macOS 构建）
-- [ ] macOS IMK 真机交互验收（候选窗自动展示、输入法切换、TIS 注册需 macOS 真机确认）
+- [ ] macOS IMK 真机交互验收（候选窗自动展示、输入法切换、TIS 注册需 macOS 真机确认；
+  另需确认多客户端会话语义——当前 LLM 流/候选队列为进程级全局状态，单活跃会话可用，
+  多会话并行时需改为 per-controller 状态）
 - [ ] Linux Fcitx5 插件（C++ shim + Rust 核心）—— **低优先（用户确认）**
 - [ ] Linux IBus / Wayland 兼容（imekit 评估）—— 低优先
 - [ ] 三端功能对齐矩阵 + 各端手动验收清单
