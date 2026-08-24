@@ -58,6 +58,10 @@ static LLM_SEQ: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_STREAM: AtomicU64 = AtomicU64::new(0);
 /// 当前活跃的候选融合请求序号。
 static ACTIVE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+/// 活跃流式请求的 daemon 侧 id（用于取消，0=无）。
+static STREAM_DAEMON_ID: AtomicU64 = AtomicU64::new(0);
+/// 活跃候选请求的 daemon 侧 id（用于取消，0=无）。
+static CAND_DAEMON_ID: AtomicU64 = AtomicU64::new(0);
 
 fn push_llm(seq: u64, event: StreamEvent) {
     if let Ok(mut q) = llm_queue().lock() {
@@ -148,7 +152,14 @@ define_class!(
 
             let was_idle = matches!(self.ivars().machine.borrow().state(), MachineState::Idle);
             let action = match classify_key(string, key_code) {
-                Some(ImkKey::Char(c)) => self.ivars().machine.borrow_mut().feed_char(c),
+                Some(ImkKey::Char(c)) => {
+                    // 大写 ASCII（Shift+字母）直上屏，不进入拼音组合（IME 惯例）。
+                    if c.is_ascii_uppercase() {
+                        let _ = self.apply_action(Action::CommitImmediate(c.to_string()));
+                        return Bool::new(true);
+                    }
+                    self.ivars().machine.borrow_mut().feed_char(c)
+                }
                 Some(ImkKey::Backspace) => self.ivars().machine.borrow_mut().feed_backspace(),
                 Some(ImkKey::Enter) => self.ivars().machine.borrow_mut().feed_enter(),
                 Some(ImkKey::Escape) => self.ivars().machine.borrow_mut().feed_escape(),
@@ -170,19 +181,16 @@ define_class!(
             Some(NSString::from_str(&self.ivars().composed.borrow()))
         }
 
-        /// 候选窗数据源：返回当前页候选。
+        /// 候选窗数据源（0 参）：部分运行时按 `candidates` 查询。
         #[unsafe(method_id(candidates))]
         fn candidates(&self) -> Option<Retained<NSArray<NSString>>> {
-            let ivars = self.ivars();
-            let page = ivars.page.get();
-            let all = ivars.candidates.borrow();
-            let items: Vec<Retained<NSString>> = all
-                .iter()
-                .skip(page * CompositionMachine::PINYIN_PAGE_SIZE)
-                .take(CompositionMachine::PINYIN_PAGE_SIZE)
-                .map(|s| NSString::from_str(s))
-                .collect();
-            Some(NSArray::from_retained_slice(&items))
+            self.current_candidates()
+        }
+
+        /// 候选窗数据源（1 参）：SDK 头文件 IMKServerInput 类别声明为 `candidates:`。
+        #[unsafe(method_id(candidates:))]
+        fn candidates_with_sender(&self, _sender: Option<&AnyObject>) -> Option<Retained<NSArray<NSString>>> {
+            self.current_candidates()
         }
 
         /// 候选窗点击选中。
@@ -198,12 +206,11 @@ define_class!(
                 return;
             };
             let page = ivars.page.get();
-            let rel = global_idx + 1 - page * CompositionMachine::PINYIN_PAGE_SIZE;
-            if (1..=CompositionMachine::PINYIN_PAGE_SIZE).contains(&rel) {
-                let digit = char::from_digit(rel as u32, 10).expect("1..=9 可转数字");
-                let action = self.ivars().machine.borrow_mut().feed_char(digit);
-                let _ = self.apply_action(action);
-            }
+            let Some(digit) = selection_digit(global_idx, page, CompositionMachine::PINYIN_PAGE_SIZE) else {
+                return;
+            };
+            let action = self.ivars().machine.borrow_mut().feed_char(digit);
+            let _ = self.apply_action(action);
         }
 
         /// 宿主要求结束组合（如焦点切换）：把当前组合内容提交。
@@ -261,12 +268,31 @@ enum ImkKey {
     PageDown,
 }
 
-fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey> {
-    if let Some(s) = string {
-        if let Some(c) = s.to_string().chars().next() {
-            return Some(ImkKey::Char(c));
-        }
+/// 候选分页切片（纯逻辑，供 candidates: 数据源与测试复用）。
+fn page_slice(candidates: &[String], page: usize, page_size: usize) -> Vec<String> {
+    candidates
+        .iter()
+        .skip(page * page_size)
+        .take(page_size)
+        .cloned()
+        .collect()
+}
+
+/// 候选全局索引 → 当前页数字选择键（1 起；越界返回 None）。
+fn selection_digit(global_idx: usize, page: usize, page_size: usize) -> Option<char> {
+    let offset = page * page_size;
+    if global_idx < offset {
+        return None;
     }
+    let rel = global_idx + 1 - offset;
+    if (1..=page_size).contains(&rel) {
+        char::from_digit(rel as u32, 10)
+    } else {
+        None
+    }
+}
+
+fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey> {
     match key_code {
         // delete / backspace
         51 => Some(ImkKey::Backspace),
@@ -277,11 +303,35 @@ fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey
         // 左箭头：上一页；右箭头：下一页
         123 => Some(ImkKey::PageUp),
         124 => Some(ImkKey::PageDown),
-        _ => None,
+        // 其余 keyCode 交给字符分支
+        _ => string
+            .and_then(|s| s.to_string().chars().next())
+            .filter(|c| {
+                // 过滤控制字符与 NS*FunctionKey（0xF700..0xF8FF）：这些走 keyCode 已处理，
+                // 避免被误当作可打印字符提交。
+                *c >= ' ' && !(0xF700..=0xF8FF).contains(&(*c as u32))
+            })
+            .map(ImkKey::Char),
     }
 }
 
 impl VerbaIMKController {
+    /// 当前页候选（candidates / candidates: 共用）。
+    fn current_candidates(&self) -> Option<Retained<NSArray<NSString>>> {
+        let ivars = self.ivars();
+        let page = ivars.page.get();
+        let page_candidates = page_slice(
+            &ivars.candidates.borrow(),
+            page,
+            CompositionMachine::PINYIN_PAGE_SIZE,
+        );
+        let items: Vec<Retained<NSString>> = page_candidates
+            .iter()
+            .map(|s| NSString::from_str(s))
+            .collect();
+        Some(NSArray::from_retained_slice(&items))
+    }
+
     fn set_client(&self, sender: Option<&AnyObject>) {
         if let Some(s) = sender {
             // SAFETY: sender 是 IMK 会话客户端对象，保留以跨回调使用。
@@ -407,6 +457,12 @@ impl VerbaIMKController {
                     return;
                 }
             };
+            STREAM_DAEMON_ID.store(id, Ordering::SeqCst);
+            // 启动期间已被取消：立即向 daemon 取消并退出，避免空转。
+            if ACTIVE_STREAM.load(Ordering::SeqCst) != seq {
+                let _ = client.llm_cancel(id);
+                return;
+            }
             loop {
                 match client.next_event(id) {
                     Ok(evt) => {
@@ -455,6 +511,11 @@ impl VerbaIMKController {
                     return;
                 }
             };
+            CAND_DAEMON_ID.store(id, Ordering::SeqCst);
+            if ACTIVE_CANDIDATES.load(Ordering::SeqCst) != seq {
+                let _ = client.llm_cancel(id);
+                return;
+            }
             loop {
                 match client.next_event(id) {
                     Ok(evt) => {
@@ -507,8 +568,14 @@ impl VerbaIMKController {
         let Some(stream_event::Kind::Candidates(c)) = evt.kind else {
             return;
         };
-        let Some(pinyin) = self.ivars().candidate_pinyin.borrow().clone() else {
-            return;
+        // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
+        let pinyin = if c.pinyin.is_empty() {
+            let Some(py) = self.ivars().candidate_pinyin.borrow().clone() else {
+                return;
+            };
+            py
+        } else {
+            c.pinyin.clone()
         };
         let action =
             self.ivars()
@@ -535,7 +602,22 @@ impl VerbaIMKController {
     fn cancel_stream(&self) {
         ACTIVE_STREAM.store(0, Ordering::SeqCst);
         ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+        let stream_id = STREAM_DAEMON_ID.swap(0, Ordering::SeqCst);
+        let cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
         self.ivars().candidate_pinyin.borrow_mut().take();
+        // 尽力向 daemon 取消在途请求，让工作线程尽快退出、停止生成资源。
+        if stream_id != 0 || cand_id != 0 {
+            std::thread::spawn(move || {
+                if let Ok(mut c) = ipc::try_connect() {
+                    if stream_id != 0 {
+                        let _ = c.llm_cancel(stream_id);
+                    }
+                    if cand_id != 0 {
+                        let _ = c.llm_cancel(cand_id);
+                    }
+                }
+            });
+        }
     }
 
     fn reset(&self) {
@@ -543,6 +625,7 @@ impl VerbaIMKController {
         self.ivars().machine.borrow_mut().feed_escape();
         self.ivars().candidates.borrow_mut().clear();
         self.ivars().page.set(0);
+        *self.ivars().composed.borrow_mut() = String::new();
     }
 
     // ---- 主线程定时器 ----
@@ -641,6 +724,40 @@ mod tests {
     #[test]
     fn classify_unknown_keycode_is_none() {
         assert_eq!(classify_key(None, 96), None);
+    }
+
+    #[test]
+    fn page_slice_paginates() {
+        let all: Vec<String> = (1..=20).map(|i| format!("c{i}")).collect();
+        assert_eq!(
+            page_slice(&all, 0, 9),
+            (1..=9).map(|i| format!("c{i}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            page_slice(&all, 2, 9),
+            (19..=20).map(|i| format!("c{i}")).collect::<Vec<_>>()
+        );
+        assert!(page_slice(&all, 9, 9).is_empty());
+    }
+
+    #[test]
+    fn selection_digit_maps_within_page() {
+        assert_eq!(selection_digit(0, 0, 9), Some('1'));
+        assert_eq!(selection_digit(8, 0, 9), Some('9'));
+        assert_eq!(selection_digit(9, 1, 9), Some('1'));
+        assert_eq!(selection_digit(17, 1, 9), Some('9'));
+        assert_eq!(selection_digit(9, 0, 9), None);
+        assert_eq!(selection_digit(0, 1, 9), None);
+    }
+
+    #[test]
+    fn classify_filters_function_key_unicode() {
+        // NSLeftArrowFunctionKey 等 0xF700..0xF8FF 不应作为可打印字符
+        let fk = NSString::from_str("\u{F702}");
+        assert_eq!(classify_key(Some(&fk), 123), Some(ImkKey::PageUp));
+        // 控制字符不落字符分支
+        let ctrl = NSString::from_str("\u{3}");
+        assert_eq!(classify_key(Some(&ctrl), 0), None);
     }
 
     #[test]

@@ -23,8 +23,10 @@ cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 
-# ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+# ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）。
+# 失败不吞：CI 与本地都应看到签名错误。
+codesign --force --deep --sign - "$APP"
+codesign --verify "$APP" 
 
 echo "打包完成: $APP"
 echo "安装: cp -R '$APP' \"\$HOME/Library/Input Methods/\""
