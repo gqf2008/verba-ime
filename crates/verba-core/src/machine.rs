@@ -145,8 +145,6 @@ pub struct CompositionMachine {
     commit_offset: usize,
     /// 已发起 LLM 候选请求的拼音（避免同一拼音重复请求）。
     last_candidates_request: Option<String>,
-    /// 是否启用内置词库候选（engine=rime 时关闭：词库候选来自 daemon 的 Rime）。
-    dictionary_enabled: bool,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
     /// AI 提示词（不含 `//` 前缀）。
@@ -172,7 +170,6 @@ impl CompositionMachine {
             committed: Vec::new(),
             commit_offset: 0,
             last_candidates_request: None,
-            dictionary_enabled: true,
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
@@ -650,17 +647,6 @@ impl CompositionMachine {
         self.commit_offset = 0;
         self.last_candidates_request = None;
         self.pinyin_page = 0;
-    }
-
-    /// 设置是否启用内置词库候选（生产恒为 true：59a4bd9 起前端不再按 engine 关闭，
-    /// 候选窗始终即时显示内置词库，Rime/LLM 候选经 on_llm_candidates 去重追加；此接口仅
-    /// 供测试覆盖抑制机制，误用会导致候选窗在远程候选返回前一直空白）。
-    pub fn set_dictionary_enabled(&mut self, enabled: bool) {
-        self.dictionary_enabled = enabled;
-        if !enabled {
-            self.dictionary_candidates.clear();
-            self.fuse_candidates();
-        }
     }
 
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
@@ -1447,7 +1433,6 @@ mod tests {
     #[test]
     fn rime_mode_disables_dictionary_candidates() {
         let mut m = CompositionMachine::new();
-        m.set_dictionary_enabled(false);
         // 内置词库被抑制：首候选为空，等 Rime 候选到达
         let a = m.feed_char('n');
         match a {
@@ -1475,7 +1460,6 @@ mod tests {
     fn rime_mode_keeps_prompt_pinyin_dictionary() {
         // 单引擎 Rime：Pinyin 态与提示词拼音都经 Rime 候选。
         let mut m = CompositionMachine::new();
-        m.set_dictionary_enabled(false);
         // Pinyin 态：无内置候选（等 Rime）
         match m.feed_char('n') {
             Action::UpdatePinyin { candidates, .. } => assert!(candidates.is_empty()),

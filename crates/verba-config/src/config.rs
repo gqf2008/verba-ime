@@ -450,9 +450,10 @@ impl Config {
                 }
                 "llm_vision_model" => self.llm_vision_model = v.clone(),
                 "engine" => {
-                    if v != "builtin" && v != "rime" {
+                    // 单引擎化：仅 rime（daemon 内 librime）。
+                    if v != "rime" {
                         return Err(ConfigError::InvalidValue(format!(
-                            "engine 仅支持 builtin|rime: {k}={v}"
+                            "engine 仅支持 rime（单引擎）: {k}={v}"
                         )));
                     }
                     self.engine = v.clone();
