@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn default_builtin_instant_and_rime_appended() {
+    fn default_rime_only_candidates() {
         // 单引擎（Rime）：候选只来自 Rime；打字时无内置即时候选，Rime 到达后填充候选列表。
         let mut m = CompositionMachine::new();
         let dict = match m.feed_char('n') {

@@ -84,7 +84,7 @@ struct RimeContext {
 }
 
 type FnSetupLogging = unsafe extern "C" fn();
-type FnInitialize = unsafe extern "C" fn(traits: *mut RimeTraits);
+type FnInitialize = unsafe extern "C" fn(traits: *mut RimeTraits) -> RimeBool;
 type FnFinalize = unsafe extern "C" fn();
 type FnCreateSession = unsafe extern "C" fn() -> RimeSessionId;
 type FnDestroySession = unsafe extern "C" fn(session: RimeSessionId) -> RimeBool;

@@ -142,9 +142,7 @@
 | 2026-08-24 | 拼音分段承诺（`verba-pinyin::lookup_segmented` + `CompositionMachine` committed/commit_offset）：选子短语候选可保留剩余拼音继续组合、Backspace 弹回已选段、消费完自动整句提交；顺带实现 mir2x/libpinyin 手感参考（[docs/libpinyin-mir2x-smoothness.md](docs/libpinyin-mir2x-smoothness.md)） |
 | 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |
 | 2026-08-24 | 候选只走本地引擎；移除打字过程的「LLM 候选融合」自动触发：前端不再在拼音变化时调 `llm_candidates_start`（Windows/macOS 一致），LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`），打字零 LLM 调用、零成本 |
-
 | 2026-08-24 | **单引擎化（Rime）**：移除内置 `verba-pinyin` 候选引擎（不再生成候选），中文候选统一由 daemon 内 Rime 提供（`config engine` 默认 `rime`，启动预热）；`CompositionMachine` 候选只经 `on_llm_candidates` 注入，`//` 提示词拼音也走 Rime；`verba-cli pinyin` 改走 `verba-cli rime`；`verba-pinyin` 从 workspace 移除（目录残留待清）。全面 `cargo test`/`clippy` 通过，macOS 前端验证通过 |
-
 | 2026-08-24 | 移除冗余的 `config engine` 开关（单引擎已无切换对象）：配置/daemon/前端（Windows+macOS）/settings/CLI 全部去掉 engine 判断，恒走 Rime；`rime_schema` 保留。`cargo test`/`clippy` 通过 |
 | 2026-08-24 | 关闭「候选即时性」议题：单引擎下候选依赖 daemon Rime 查询返回（本地、启动预热），候选窗在返回前为空是正常状态；防抖是后端优化，不构成 UX「延时」问题，实测 mir2x 无延时，不再打点/调整 |
 | 2026-08-24 | macOS 支持 librime（`librime.dylib`）：`verba-librime` 由 Windows-only 重构为跨平台 `platform.rs`（libloading 统一加载 rime.dll / librime.dylib）；daemon `rime_paths` 平台化；打包捆绑 `vendor/rime`。修复 macOS 单引擎化后候选为空（P1 审查项） |

@@ -666,37 +666,48 @@ impl VerbaIMKController {
     }
 
     fn feed_candidates_event(&self, evt: StreamEvent) {
-        let Some(stream_event::Kind::Candidates(c)) = evt.kind else {
+        let Some(kind) = evt.kind else {
             return;
         };
-        // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
-        let pinyin = if c.pinyin.is_empty() {
-            let Some(py) = self.ivars().candidate_pinyin.borrow().clone() else {
-                return;
-            };
-            py
-        } else {
-            c.pinyin.clone()
-        };
-        let action =
-            self.ivars()
-                .machine
-                .borrow_mut()
-                .on_llm_candidates(&pinyin, &c.candidates, c.done);
-        if let Action::UpdatePinyin {
-            preedit,
-            candidates,
-            page,
-            ..
-        } = action
-        {
-            self.ivars().candidates.borrow_mut().clone_from(&candidates);
-            self.ivars().page.set(page);
-            self.set_marked(&preedit);
-        }
-        if c.done {
-            self.ivars().candidate_pinyin.borrow_mut().take();
-            ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+        match kind {
+            stream_event::Kind::Candidates(c) => {
+                // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
+                let pinyin = if c.pinyin.is_empty() {
+                    let Some(py) = self.ivars().candidate_pinyin.borrow().clone() else {
+                        return;
+                    };
+                    py
+                } else {
+                    c.pinyin.clone()
+                };
+                let action = self.ivars().machine.borrow_mut().on_llm_candidates(
+                    &pinyin,
+                    &c.candidates,
+                    c.done,
+                );
+                if let Action::UpdatePinyin {
+                    preedit,
+                    candidates,
+                    page,
+                    ..
+                } = action
+                {
+                    self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                    self.ivars().page.set(page);
+                    self.set_marked(&preedit);
+                }
+                if c.done {
+                    self.ivars().candidate_pinyin.borrow_mut().take();
+                    ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+                }
+            }
+            stream_event::Kind::Error(e) => {
+                // Rime 候选错误：不再静默空白，落到日志便于排查（如 librime 未部署）。
+                log::warn!("[VerbaIMK] Rime 候选错误: {}", e.message);
+                self.ivars().candidate_pinyin.borrow_mut().take();
+                ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
 

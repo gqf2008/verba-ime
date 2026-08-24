@@ -4,7 +4,7 @@
 - 职责：
   - LLM 服务商（base_url / model / temperature / max_tokens / 系统提示词）与 **API Key**（经 IPC `ApiKeySet` 写系统密钥库并热更新 daemon，无需重启）
   - 多模态：OCR / ASR / TTS provider 选择 + 在线端点与模型（ASR/TTS 走「联网」：OpenAI 兼容 `audio/transcriptions` / `audio/speech`；edge-tts 在线音色）
-  - 中文引擎（builtin / rime + 方案）与候选窗主题
+  - 候选窗：Rime 方案（单引擎，librime）与候选窗主题
   - 快捷键速览（当前内置：Ctrl+Alt+O 选区 OCR / Ctrl+Alt+M 录音 ASR / `//朗读` `//截图` `//听写`）
   - 隐私说明（远程数据出境提示、密钥存储位置）
 - 通过 `verba-ipc` 与 daemon 通信（GetConfig / SetConfig / ApiKeySet），保存即热生效。

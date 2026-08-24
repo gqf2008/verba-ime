@@ -57,10 +57,9 @@ struct CandidatePosRetry {
     attempts_left: u32,
 }
 
-/// 待触发的候选融合请求（防抖中，pinyin 变更时重置计时）。
+/// 待触发的 Rime 候选请求（防抖中，pinyin 变更时重置计时）。
 struct PendingCandidateReq {
     pinyin: String,
-    dictionary: Vec<String>,
     ticks: u32,
 }
 
@@ -993,7 +992,6 @@ fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandida
         // （LLM 仅用于回车触发的 AI 直输）。
         *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
             pinyin: r.pinyin,
-            dictionary: r.dictionary,
             ticks: 0,
         });
     }
