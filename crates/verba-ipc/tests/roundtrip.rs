@@ -237,3 +237,73 @@ async fn llm_vision_image_roundtrip() {
     assert_eq!(got.image.as_deref(), Some(img.as_slice()));
     assert_eq!(got.image_mime.as_deref(), Some("image/png"));
 }
+
+/// 捕获 LlmCancel 请求 id 的 handler：验证取消请求命中原始目标 id。
+struct CancelCapturingHandler {
+    captured: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for CancelCapturingHandler {
+    async fn handle(&self, req: Request, out: Outbound) {
+        match req.kind {
+            Some(request::Kind::LlmGenerate(_)) => {
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+            }
+            Some(request::Kind::LlmCancel(_)) => {
+                // daemon 端正是用 req.id 从 cancels 表移除 token。
+                *self.captured.lock().unwrap() = Some(req.id);
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+            }
+            _ => {
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 1,
+                            message: "not implemented".into(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+/// 回归测试：llm_cancel 必须用目标请求 id 发送，daemon 才能命中取消 token。
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_cancel_uses_target_request_id() {
+    let name = unique_name("cancel");
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(CancelCapturingHandler {
+        captured: captured.clone(),
+    });
+    let server_name = name.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(&server_name, handler).await;
+    });
+
+    let mut client = connect_with_retry(&name, Duration::from_secs(5));
+    let target = client
+        .llm_start("你好", None, None, None, None)
+        .expect("llm_start");
+    client.llm_cancel(target).expect("llm_cancel 成功");
+
+    let seen = captured.lock().unwrap().expect("收到 LlmCancel 请求");
+    assert_eq!(
+        seen, target,
+        "LlmCancel 必须携带目标请求 id（修复前为自增新 id，取消静默失效）"
+    );
+    server.abort();
+    let _ = server.await;
+}

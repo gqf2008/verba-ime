@@ -241,6 +241,9 @@ impl CompositionMachine {
                     Action::UpdatePrompt {
                         preedit: "/".to_owned(),
                     }
+                } else if c.is_ascii_uppercase() {
+                    // 大写 ASCII（Shift+字母）直上屏，不进拼音组合（IME 惯例）
+                    Action::CommitImmediate(c.to_string())
                 } else if c.is_ascii_alphabetic() {
                     // 字母开始拼音组合
                     self.state = MachineState::Pinyin;
@@ -301,6 +304,12 @@ impl CompositionMachine {
             return Action::None;
         }
         if c.is_ascii_alphabetic() {
+            if c.is_ascii_uppercase() {
+                // 大写：提交当前候选（或原文）+ 该字符，避免吞字（与其它可打印字符一致）
+                let text = format!("{}{c}", self.commit_pinyin_text());
+                self.reset_pinyin();
+                return Action::CommitImmediate(text);
+            }
             self.pinyin_buffer.push(c.to_ascii_lowercase());
             self.refresh_candidates();
             return Action::UpdatePinyin {
@@ -326,6 +335,15 @@ impl CompositionMachine {
     fn feed_prompt_char(&mut self, c: char) -> Action {
         if self.pinyin_composing() {
             if c.is_ascii_alphabetic() {
+                if c.is_ascii_uppercase() {
+                    // 大写：提交拼音候选（或原文）+ 大写字符到提示词
+                    self.prompt.push_str(&self.commit_pinyin_text());
+                    self.prompt.push(c);
+                    self.clear_pinyin();
+                    return Action::UpdatePrompt {
+                        preedit: self.preedit(),
+                    };
+                }
                 self.pinyin_buffer.push(c.to_ascii_lowercase());
                 self.refresh_candidates();
                 return Action::UpdatePrompt {
@@ -365,6 +383,13 @@ impl CompositionMachine {
             };
         }
         // 未组合：字母开始拼音；其它字符直接入提示词
+        if c.is_ascii_uppercase() {
+            // 大写 ASCII 直接入提示词（保 `//translate Hello` 这类英文提示词）
+            self.prompt.push(c);
+            return Action::UpdatePrompt {
+                preedit: self.preedit(),
+            };
+        }
         if c.is_ascii_alphabetic() {
             self.pinyin_buffer.clear();
             self.pinyin_buffer.push(c.to_ascii_lowercase());
@@ -725,6 +750,49 @@ mod tests {
         let a = m.feed_char(' ');
         assert_eq!(a, Action::CommitImmediate("你".into()));
         assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn uppercase_in_idle_commits_directly() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(m.feed_char('A'), Action::CommitImmediate("A".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn uppercase_in_pinyin_commits_candidate_plus_char() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.state(), MachineState::Pinyin);
+        // 候选 0 为「你」：大写 A 提交「你A」并回到 Idle
+        let a = m.feed_char('A');
+        assert_eq!(a, Action::CommitImmediate("你A".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn uppercase_in_prompt_not_composing_appends() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        // Prompt 未组合：大写直接入提示词（保英文提示词）
+        let a = m.feed_char('H');
+        assert!(matches!(a, Action::UpdatePrompt { preedit } if preedit == "//H"));
+        assert_eq!(m.prompt(), "H");
+    }
+
+    #[test]
+    fn uppercase_in_prompt_composing_commits_candidate_plus_char() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('n');
+        m.feed_char('i');
+        // 提示词内拼音组合中：大写提交候选「你」+ H 到提示词
+        let a = m.feed_char('H');
+        assert!(matches!(a, Action::UpdatePrompt { preedit } if preedit == "//你H"));
+        assert_eq!(m.prompt(), "你H");
     }
 
     #[test]

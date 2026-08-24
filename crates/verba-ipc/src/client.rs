@@ -252,16 +252,18 @@ impl VerbaClient {
     /// 取消指定请求的流式生成（daemon 按全局请求 id 取消）。
     pub fn llm_cancel(&mut self, request_id: u64) -> Result<(), IpcError> {
         log::debug!("取消请求 {request_id}");
-        let id = self.new_id();
+        // 注意：Request.id 必须等于目标请求 id——daemon 端按 req.id 从 cancels 表
+        // 移除对应的 CancellationToken（见 verba-daemon handler 的 LlmCancel 分支）。
+        // 若用新自增 id，remove 永远取不到 token，取消静默失效。
         let req = Request {
-            id,
+            id: request_id,
             kind: Some(request::Kind::LlmCancel(LlmCancel {})),
         };
         self.write_request(&req)?;
         loop {
             let frame = self.read_frame_blocking()?;
             if let Ok(resp) = Response::decode(frame.as_slice()) {
-                if resp.id == id {
+                if resp.id == request_id {
                     return Ok(());
                 }
             }
