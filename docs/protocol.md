@@ -23,7 +23,7 @@ message Request {
     LlmGenerate llm_generate = 20; // // AI 模式：prompt + 参数，流式
     LlmCancel llm_cancel = 21;     // 取消流式生成
     LlmCandidates llm_candidates = 22; // 候选融合：为拼音补充 LLM 候选
-    RimeCandidates rime_candidates = 23; // 可选 Rime 引擎候选（config 引擎=rime）
+    RimeCandidates rime_candidates = 23; // Rime 引擎候选（单引擎）
     TtsSynthesize tts_synthesize = 24;    // TTS 合成（config tts_provider）
     OcrRecognize ocr_recognize = 25;    // OCR 识别（config ocr_provider）
     AsrTranscribe asr_transcribe = 26;   // ASR 转写（config asr_provider）
@@ -103,7 +103,7 @@ message Candidates {
   多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空本轮会话）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
-- **RimeCandidates**：`config 引擎=rime` 时前端把拼音/五笔码发到 daemon，daemon 内 librime
+- **RimeCandidates**：前端把拼音/五笔码发到 daemon，daemon 内 librime（单引擎）
   查询候选并一次性回 `Candidates`（`done=true`）；`rime_schema` 配置方案。
 - **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`（默认 zh-CN-XiaoxiaoNeural）；daemon 按
   `config tts_provider` 选择 provider（`mock` 确定性 WAV / `edge` 微软在线神经音色 MP3），一次性回 `Audio`。

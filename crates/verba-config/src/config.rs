@@ -213,10 +213,7 @@ pub struct Config {
     /// 候选窗主题。
     #[serde(default)]
     pub theme: ThemeConfig,
-    /// 中文引擎：rime（默认，daemon 内 librime）。单引擎；此前内置 verba-pinyin 已移除。
-    #[serde(default = "default_engine")]
-    pub engine: String,
-    /// Rime 方案（engine=rime 时）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
+    /// Rime 方案（单引擎）：luna_pinyin_simp（默认）| wubi86 | 其它已部署方案。
     #[serde(default = "default_rime_schema")]
     pub rime_schema: String,
     /// TTS provider：mock（默认，确定性 WAV，开发/验收）| edge（微软在线神经音色）| openai（OpenAI 兼容在线音色）| …
@@ -273,9 +270,6 @@ fn default_temperature() -> f32 {
 fn default_max_tokens() -> i32 {
     DEFAULT_MAX_TOKENS
 }
-fn default_engine() -> String {
-    "rime".to_owned()
-}
 fn default_rime_schema() -> String {
     "luna_pinyin_simp".to_owned()
 }
@@ -326,7 +320,6 @@ impl Default for Config {
             ai_system_prompt: String::new(),
             ai_context_turns: default_ai_context_turns(),
             theme: ThemeConfig::default(),
-            engine: default_engine(),
             rime_schema: default_rime_schema(),
             tts_provider: default_tts_provider(),
             tts_voice: String::new(),
@@ -356,7 +349,6 @@ impl Config {
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
         map.insert("ai_context_turns".into(), self.ai_context_turns.to_string());
-        map.insert("engine".into(), self.engine.clone());
         map.insert("rime_schema".into(), self.rime_schema.clone());
         map.insert("tts_provider".into(), self.tts_provider.clone());
         map.insert("tts_voice".into(), self.tts_voice.clone());
@@ -449,15 +441,6 @@ impl Config {
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
                 "llm_vision_model" => self.llm_vision_model = v.clone(),
-                "engine" => {
-                    // 单引擎化：仅 rime（daemon 内 librime）。
-                    if v != "rime" {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "engine 仅支持 rime（单引擎）: {k}={v}"
-                        )));
-                    }
-                    self.engine = v.clone();
-                }
                 "rime_schema" => self.rime_schema = v.clone(),
                 "tts_provider" => {
                     if v != "mock" && v != "edge" && v != "openai" {

@@ -44,20 +44,17 @@ fn error_event(message: &str) -> StreamEvent {
     }
 }
 
-/// 读取候选引擎与 Rime 方案（`config.engine` / `config.rime_schema`）。
-///
-/// macOS 前端与 Windows 一致支持 `engine=rime`（候选窗展示 Rime 整句候选）。
-/// 读取失败时回退 `builtin`（本地默认，无内置 verba-pinyin）。
-fn load_candidate_engine() -> (String, String) {
-    let fallback = || ("builtin".to_owned(), "luna_pinyin_simp".to_owned());
+/// 读取 Rime 方案（`config.rime_schema`）。单引擎（Rime）下不再有引擎开关。
+/// 读取失败时回退 `luna_pinyin_simp`。
+fn load_rime_schema() -> String {
     let dirs = match verba_config::VerbaDirs::locate() {
         Ok(d) => d,
-        Err(_) => return fallback(),
+        Err(_) => return "luna_pinyin_simp".to_owned(),
     };
     let mgr = verba_config::ConfigManager::new(dirs);
     match mgr.load() {
-        Ok(cfg) => (cfg.engine, cfg.rime_schema),
-        Err(_) => fallback(),
+        Ok(cfg) => cfg.rime_schema,
+        Err(_) => "luna_pinyin_simp".to_owned(),
     }
 }
 
@@ -103,9 +100,7 @@ struct Ivars {
     candidate_pinyin: RefCell<Option<String>>,
     /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
     composed: RefCell<String>,
-    /// 候选引擎（builtin | rime）。
-    candidate_engine: RefCell<String>,
-    /// Rime 方案（engine=rime 时）。
+    /// Rime 方案（单引擎）。
     candidate_rime_schema: RefCell<String>,
 }
 
@@ -119,7 +114,6 @@ impl Default for Ivars {
             timer: RefCell::new(None),
             candidate_pinyin: RefCell::new(None),
             composed: RefCell::new(String::new()),
-            candidate_engine: RefCell::new("builtin".to_owned()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
         }
     }
@@ -560,22 +554,17 @@ impl VerbaIMKController {
         self.ensure_timer();
     }
 
-    /// 候选请求（拼音变更后按 `config.engine` 取候选来源）。
+    /// 候选请求（拼音变更后请求本地 Rime 整句候选）。
     ///
-    /// **候选只走本地引擎**：`engine=rime` 请求本地 Rime 整句候选；`builtin` 直接用本地
-    /// 内置候选（已由 `Action::UpdatePinyin.candidates` 给出）。LLM 只在「输入 → 结果」的
-    /// AI 直输（回车触发 `StartLlm`）时调用，**打字过程不调用远程 LLM 做候选融合**。
+    /// 单引擎（Rime）：候选只走本地 Rime。LLM 只在「输入 → 结果」的 AI 直输
+    /// （回车触发 `StartLlm`）时调用，**打字过程不调用远程 LLM 做候选融合**。
     fn start_candidates(&self, req: LlmCandidateRequest) {
-        let (engine, schema) = load_candidate_engine();
-        *self.ivars().candidate_engine.borrow_mut() = engine.clone();
+        let schema = load_rime_schema();
         *self.ivars().candidate_rime_schema.borrow_mut() = schema.clone();
-        if engine == "rime" {
-            self.start_rime_candidates(req.pinyin, schema);
-        }
-        // builtin：候选已由核心状态机给出，无需远程请求。
+        self.start_rime_candidates(req.pinyin, schema);
     }
 
-    /// Rime 候选查询（config 引擎=rime）：一次性请求 Rime 整句候选并压入候选队列。
+    /// Rime 候选查询（单引擎）：一次性请求 Rime 整句候选并压入候选队列。
     ///
     /// Rime 为 daemon 内本地同步查询，拼音变更即触发（不防抖），保证「整句候选」即时呈现，
     /// 与其它平台 engine=rime 行为一致。请求结果经 `feed_candidates_event` 融合/去重。
@@ -877,11 +866,9 @@ mod tests {
     }
 
     #[test]
-    fn load_candidate_engine_returns_tuple() {
-        // 读取失败应回退内置（builtin），读取成功返回 engine/rime_schema；均不 panic。
-        let (engine, schema) = load_candidate_engine();
-        assert!(!engine.is_empty());
+    fn load_rime_schema_returns_schema() {
+        // 读取失败/成功均返回非空 scheme；不 panic。
+        let schema = load_rime_schema();
         assert!(!schema.is_empty());
-        assert!(engine == "builtin" || engine == "rime");
     }
 }

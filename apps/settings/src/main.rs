@@ -30,10 +30,6 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
     ("edge（微软在线音色）", "edge"),
     ("openai（OpenAI 兼容音色）", "openai"),
 ];
-const ENGINES: &[(&str, &str)] = &[
-    ("builtin（内置拼音）", "builtin"),
-    ("rime（Rime 引擎，需部署 rime/）", "rime"),
-];
 const EYE_MODES: &[(&str, &str)] = &[
     ("ocr（本地/在线 OCR → 文字）", "ocr"),
     ("vision（多模态 LLM 直读图像）", "vision"),
@@ -229,7 +225,6 @@ fn read_fields(ui: &SettingsWindow) -> HashMap<String, String> {
     values.insert("tts_base_url".into(), ui.get_tts_base_url().to_string());
     values.insert("tts_model".into(), ui.get_tts_model().to_string());
     values.insert("tts_voice".into(), ui.get_tts_voice().to_string());
-    values.insert("engine".into(), pick(ENGINES, ui.get_engine_index()));
     values.insert("rime_schema".into(), ui.get_rime_schema().to_string());
     values.insert("theme.preset".into(), pick(THEMES, ui.get_theme_index()));
     values
@@ -304,7 +299,6 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     ui.set_tts_base_url(get("tts_base_url").into());
     ui.set_tts_model(get("tts_model").into());
     ui.set_tts_voice(get("tts_voice").into());
-    ui.set_engine_index(index_of(ENGINES, &get("engine")));
     ui.set_rime_schema(get("rime_schema").into());
     ui.set_theme_index(index_of(THEMES, &get("theme.preset")));
 }
@@ -352,7 +346,6 @@ mod tests {
         assert_eq!(index_of(ASR_PROVIDERS, "unknown"), 0, "未知值回退 0");
         assert_eq!(index_of(TTS_PROVIDERS, "edge"), 1);
         assert_eq!(index_of(TTS_PROVIDERS, "openai"), 2);
-        assert_eq!(index_of(ENGINES, "rime"), 1);
         assert_eq!(index_of(THEMES, "dark"), 1);
     }
 

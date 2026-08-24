@@ -45,9 +45,9 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup.exe`（需管理员运行安装）。
 
-### Rime 引擎（可选，`config 引擎=rime`）
+### Rime 引擎（单引擎，librime）
 
-M5 起支持用 librime 作拼音/五笔引擎（daemon 内动态加载 rime.dll）。构建与部署：
+中文候选由 librime 提供（daemon 内动态加载 rime.dll，**唯一引擎**，无引擎开关）。构建与部署：
 
 1. 获取第三方二进制/数据（rime.dll x64 + Rime 数据 + wubi86 + opencc）：
    ```powershell
@@ -60,8 +60,8 @@ M5 起支持用 librime 作拼音/五笔引擎（daemon 内动态加载 rime.dll
    <daemon 同目录>/rime/user_data/       # 首次查询自动部署生成
    ```
    或指定 `VERBA_RIME_DLL` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
-3. 启用：`verba-cli config set engine=rime rime_schema=luna_pinyin_simp`
-   （五笔：`rime_schema=wubi86`；切回内置：`engine=builtin`）。
+3. 配置方案：`verba-cli config set rime_schema=luna_pinyin_simp`
+   （五笔：`rime_schema=wubi86`）。
 4. 验证：`verba-cli rime nishishui`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。
    > 首次查询会部署 schema/词典（数秒）；整句基准见 [chinese-engine-evaluation.md](chinese-engine-evaluation.md) §8。
 

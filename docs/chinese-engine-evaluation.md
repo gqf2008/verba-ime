@@ -93,9 +93,8 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 3. Weasel 0.17.4 安装包的 rime.dll 是 x86；x64 需取 librime 官方 release 的 msvc-x64 包。
 
 **决策更新**：spike + daemon 集成证明「预编译 rime.dll + Rust FFI」路线可行且已可用——
-`config 引擎=rime` 即可切换 Rime（拼音/五笔），默认仍为 `builtin`（verba-pinyin，体积/复杂度低）。
-**整句基准（§8）显示 librime 显著更优（84% vs 6%），建议把 `engine=rime` 作为推荐默认**（需打包
-rime.dll + 数据）。librime 定位：拼音整句 + 五笔/注音/仓颉生态。部署注意：
+**整句基准（§8）显示 librime 显著更优（84% vs 6%）**；2026-08-24 起**单引擎化：中文候选只走 Rime**，
+内置 verba-pinyin 已移除（无引擎开关）。librime 定位：拼音整句 + 五笔/注音/仓颉生态。部署注意：
 - rime.dll（x64 ~4MB）与 `data/`（含 opencc，~10MB）随 daemon 同目录 `rime/` 分发；
 - 首次查询触发一次部署（编译 schema/词典，数秒）；
 - octagram（essay 语料 n-gram）已评估：对日常对话无益（74% < 84%），默认不启用。
@@ -117,5 +116,5 @@ rime.dll + 数据）。librime 定位：拼音整句 + 五笔/注音/仓颉生�
    librime 的词/句切分与词典质量高一个量级。
 2. **octagram（essay 语料）对日常对话反而有害**（74% < 84%）：八股文模型偏正式书面语，
    对口语/日常对话的排序不匹配；且 `.gram` 数据 ~100MB，部署成本高。→ **默认不启用 octagram**。
-3. 结论：`config 引擎=rime` 应作为推荐默认（五笔/拼音整句都强）；`verba-pinyin` 保留为
-   轻量兜底（无外部依赖、体积小）。
+3. 结论：**单引擎 = Rime**（五笔/拼音整句都强）；内置 `verba-pinyin` 已移除（2026-08-24），
+   不再有引擎开关。

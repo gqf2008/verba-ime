@@ -529,19 +529,6 @@ impl DaemonHandler {
         g: verba_protos::RimeCandidates,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
-        let engine = self.config.read().unwrap().engine.clone();
-        if engine != "rime" {
-            out.response(&Response {
-                id,
-                kind: Some(response::Kind::Error(ProtoError {
-                    code: 400,
-                    message: "中文引擎未启用 rime（verba-cli config set engine=rime 后重试）"
-                        .into(),
-                })),
-            })
-            .await?;
-            return Ok(());
-        }
         let max = (g.max_candidates as usize).clamp(1, 27);
         let schema = if g.schema.is_empty() {
             "luna_pinyin_simp"
@@ -813,13 +800,9 @@ impl DaemonHandler {
         }
     }
 
-    /// 后台预热 Rime 引擎（engine=rime 时由 daemon 启动调用）：提前触发首次部署，
+    /// 后台预热 Rime 引擎（单引擎，daemon 启动时调用）：提前触发首次部署，
     /// 使首次候选查询免于等待部署（2-5 秒），避免用户误以为无反应。
     pub fn warmup_rime(&self) {
-        let engine = self.config.read().unwrap().engine.clone();
-        if engine != "rime" {
-            return;
-        }
         match self.rime_query(|_| Ok(())) {
             Ok(()) => log::info!("Rime 引擎预热完成"),
             Err(e) => log::warn!("Rime 引擎预热失败（首次查询时会重试）: {e}"),

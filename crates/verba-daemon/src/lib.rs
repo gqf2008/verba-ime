@@ -71,13 +71,11 @@ pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    // engine=rime 时后台预热 Rime（触发首次部署），首次候选查询免等待。
-    if config.engine == "rime" {
-        let h = Arc::clone(&handler);
-        runtime.spawn(async move {
-            h.warmup_rime();
-        });
-    }
+    // 单引擎（Rime）：后台预热 Rime（触发首次部署），首次候选查询免等待。
+    let h = Arc::clone(&handler);
+    runtime.spawn(async move {
+        h.warmup_rime();
+    });
     Ok(runtime.block_on(verba_ipc::server::serve(socket_name, handler))?)
 }
 

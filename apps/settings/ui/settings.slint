@@ -31,8 +31,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> tts-model;
     in-out property <string> tts-voice;
 
-    // ---------- 引擎 / 候选 ----------
-    in-out property <int> engine-index: 0;
+    // ---------- 候选 ----------
     in-out property <string> rime-schema;
     in-out property <int> theme-index: 0;
 
@@ -114,11 +113,10 @@ export component SettingsWindow inherits Window {
                 }
 
                 GroupBox {
-                    title: "中文引擎 / 候选窗";
+                    title: "候选窗";
                     VerticalBox {
                         padding: 8px;
                         spacing: 6px;
-                        HorizontalBox { spacing: 8px; Text { text: "中文引擎"; width: 130px; vertical-alignment: center; } ComboBox { model: ["builtin（内置拼音）", "rime（Rime 引擎，需部署 rime/）"]; current-index <=> root.engine-index; } }
                         HorizontalBox { spacing: 8px; Text { text: "Rime 方案"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.rime-schema; placeholder-text: "luna_pinyin_simp / wubi86"; } }
                         HorizontalBox { spacing: 8px; Text { text: "候选窗主题"; width: 130px; vertical-alignment: center; } ComboBox { model: ["light（浅色）", "dark（深色）"]; current-index <=> root.theme-index; } }
                     }

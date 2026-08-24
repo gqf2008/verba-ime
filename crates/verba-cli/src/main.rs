@@ -51,7 +51,7 @@ fn print_help() {
          verba-cli ping                  健康检查\n  \
          verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
-         verba-cli rime <输入> [方案]  查询 Rime 引擎候选（需 config engine=rime）\n  \
+         verba-cli rime <输入> [方案]  查询 Rime 引擎候选（单引擎）\n  \
          verba-cli tts <文本> [输出] [语音]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
          verba-cli asr <音频>          ASR 转写音频并打印文字（config asr_provider）\n  \
@@ -204,7 +204,7 @@ fn cmd_candidates(args: &[String]) -> i32 {
     })
 }
 
-/// `verba-cli rime <输入> [方案]`：查询 daemon 内 Rime 引擎候选（需 engine=rime）。
+/// `verba-cli rime <输入> [方案]`：查询 daemon 内 Rime 引擎候选（单引擎）。
 fn cmd_rime(args: &[String]) -> i32 {
     let input = args.get(1).cloned().unwrap_or_default();
     if input.is_empty() {
@@ -407,7 +407,6 @@ fn cmd_diag(_args: &[String]) -> i32 {
                         "llm_base_url",
                         "llm_model",
                         "llm_vision_model",
-                        "engine",
                         "rime_schema",
                         "ocr_provider",
                         "asr_provider",
