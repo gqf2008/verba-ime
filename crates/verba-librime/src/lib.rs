@@ -7,6 +7,7 @@
 //! 线程安全：内部 C 状态由 librime 自身同步，本 crate 额外用 `Mutex` 串行化
 //! （见 daemon 用法）；`RimeEngine` 为 `Send + Sync`。
 
+#[cfg(windows)]
 pub mod windows;
 
 #[cfg(not(windows))]

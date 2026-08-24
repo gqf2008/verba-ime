@@ -43,6 +43,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
       - name: Build
         run: cargo build --release
 
@@ -56,7 +58,7 @@ jobs:
       - name: 打包 IMK .app
         run: bash frontends/macos/ime/scripts/package.sh
       - name: 校验 .app
-        run: test -d frontends/macos/ime/dist/VerbaIMK.app && ls -la frontends/macos/ime/dist/VerbaIMK.app/Contents
+        run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && ls -la frontends/macos/ime/dist/Verba.app/Contents
 
   frontend-windows:
     runs-on: windows-latest
