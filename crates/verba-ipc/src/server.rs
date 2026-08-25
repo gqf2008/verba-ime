@@ -48,9 +48,13 @@ impl Outbound {
 }
 
 /// 请求处理器：daemon 实现该 trait 处理每个请求，可向 `Outbound` 推送响应与事件。
+///
+/// `conn_id`：服务端为每条连接分配的全局唯一标识。daemon 侧以连接为维度的
+/// 状态（如取消注册表）必须用 `(conn_id, req_id)` 键控——请求 id 是每连接从
+/// 1 自增的，全局键会跨连接互踩（架构审查 P1-1）。
 #[async_trait::async_trait]
 pub trait RequestHandler: Send + Sync + 'static {
-    async fn handle(&self, req: Request, out: Outbound);
+    async fn handle(&self, conn_id: u64, req: Request, out: Outbound);
 }
 
 /// 启动服务端，持续接受连接。
@@ -78,12 +82,15 @@ pub async fn serve(name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), I
         }
     }
     let listener = ListenerOptions::new().name(ns_name).create_tokio()?;
+    // 连接级全局唯一 id（取消表等以连接为维度的状态键控用）
+    let next_conn = std::sync::atomic::AtomicU64::new(1);
     loop {
         match listener.accept().await {
             Ok(stream) => {
                 let handler = Arc::clone(&handler);
+                let conn_id = next_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, handler).await {
+                    if let Err(e) = handle_connection(conn_id, stream, handler).await {
                         log::debug!("连接处理结束: {e}");
                     }
                 });
@@ -97,6 +104,7 @@ pub async fn serve(name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), I
 }
 
 async fn handle_connection(
+    conn_id: u64,
     stream: TokioStream,
     handler: Arc<dyn RequestHandler>,
 ) -> Result<(), IpcError> {
@@ -130,7 +138,7 @@ async fn handle_connection(
         let out = Outbound { tx: out_tx.clone() };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            handler.handle(req, out).await;
+            handler.handle(conn_id, req, out).await;
         });
     }
 
