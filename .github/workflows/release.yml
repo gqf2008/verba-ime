@@ -71,8 +71,21 @@ jobs:
         if: env.IDENTITY != ''
         run: |
           ditto -c -k --keepParent frontends/macos/ime/dist/Verba.app /tmp/Verba-notarize.zip
-          xcrun notarytool submit /tmp/Verba-notarize.zip \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          set +e
+          NOTARY_OUT="$(xcrun notarytool submit /tmp/Verba-notarize.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+          NOTARY_RC=$?
+          set -e
+          printf '%s\n' "$NOTARY_OUT"
+          if [ $NOTARY_RC -ne 0 ]; then
+            SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+            if [ -n "$SUB_ID" ]; then
+              echo "::error::.app 公证失败（submission=$SUB_ID），详细原因：" >&2
+              xcrun notarytool log "$SUB_ID" \
+                --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+            fi
+            exit $NOTARY_RC
+          fi
           xcrun stapler staple frontends/macos/ime/dist/Verba.app
           spctl --assess --type execute --verbose=4 frontends/macos/ime/dist/Verba.app || true
 

@@ -34,7 +34,8 @@ sed -i '' -E "s|<string>[0-9]+\.[0-9]+\.[0-9]+</string>|<string>$VERSION</string
 # 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。
 if [ -d "$REPO_ROOT/vendor/rime" ]; then
     # 需含版本化 dylib：librime 实体的 install_name 为 @rpath/librime.1.dylib
-    # （LC_ID_DYLIB），链接链被解引用后缺失会破坏依赖解析
+    # （LC_ID_DYLIB，非运行依赖——daemon 全路径 dlopen；缺失会影响未来链接场景与
+    # 完整性，故仍作打包前置校验）
     if [ ! -f "$REPO_ROOT/vendor/rime/librime.dylib" ] || [ ! -f "$REPO_ROOT/vendor/rime/librime.1.dylib" ] || [ ! -d "$REPO_ROOT/vendor/rime/data" ]; then
         echo "::error::vendor/rime 不完整（需 librime.dylib + librime.1.dylib + data/，见 scripts/fetch-rime-vendor.sh）" >&2
         exit 1
