@@ -71,15 +71,33 @@ jobs:
         if: env.IDENTITY != ''
         run: |
           ditto -c -k --keepParent frontends/macos/ime/dist/Verba.app /tmp/Verba-notarize.zip
-          xcrun notarytool submit /tmp/Verba-notarize.zip \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          set +e
+          NOTARY_OUT="$(xcrun notarytool submit /tmp/Verba-notarize.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+          NOTARY_RC=$?
+          set -e
+          printf '%s\n' "$NOTARY_OUT"
+          if [ $NOTARY_RC -ne 0 ]; then
+            SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+            if [ -n "$SUB_ID" ]; then
+              echo "::error::.app 公证失败（submission=$SUB_ID），详细原因：" >&2
+              xcrun notarytool log "$SUB_ID" \
+                --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+            fi
+            exit $NOTARY_RC
+          fi
           xcrun stapler staple frontends/macos/ime/dist/Verba.app
           spctl --assess --type execute --verbose=4 frontends/macos/ime/dist/Verba.app || true
 
-      - name: Rime 冒烟（daemon 从 .app 启动，同目录 rime/ 加载）
+      - name: Rime 冒烟（daemon 从 .app 副本启动，不写坏已签名 bundle）
         run: |
           cargo build --release -p verba-cli
-          "$PWD/frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon" >/dev/null 2>&1 &
+          # 必须用 .app 副本冒烟：daemon 默认把 user_data/ 写在 exe 同目录 rime/ 下，
+          # 直接运行会改动已签名 bundle 破坏 seal → 后续 DMG 公证报 "signature of the
+          # binary is invalid"（32849155322 实测：verba-mac 签名无效）。
+          SMOKE_APP="$(mktemp -d)/Verba.app"
+          cp -R frontends/macos/ime/dist/Verba.app "$SMOKE_APP"
+          "$SMOKE_APP/Contents/MacOS/verba-daemon" >/dev/null 2>&1 &
           DPID=$!
           trap 'kill $DPID 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do
@@ -97,6 +115,8 @@ jobs:
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # 显式校验 bundle 签名未被冒烟等步骤破坏（seal 失效会直接导致 DMG 公证 Invalid）
+          codesign --verify --deep --strict frontends/macos/ime/dist/Verba.app
           mkdir -p dmg-staging
           cp -R frontends/macos/ime/dist/Verba.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
@@ -104,8 +124,22 @@ jobs:
           if [ -n "$IDENTITY" ]; then
             # DMG 也要签名 + 公证（分发的盘片本身要过 Gatekeeper）
             codesign --force --sign "$IDENTITY" --timestamp "Verba-$VERSION.dmg"
-            xcrun notarytool submit "Verba-$VERSION.dmg" \
-              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            set +e
+            NOTARY_OUT="$(xcrun notarytool submit "Verba-$VERSION.dmg" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+            NOTARY_RC=$?
+            set -e
+            printf '%s\n' "$NOTARY_OUT"
+            if [ $NOTARY_RC -ne 0 ]; then
+              # 公证被拒（status: Invalid）时打印详细原因，避免盲查
+              SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+              if [ -n "$SUB_ID" ]; then
+                echo "::error::DMG 公证失败（submission=$SUB_ID），详细原因：" >&2
+                xcrun notarytool log "$SUB_ID" \
+                  --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+              fi
+              exit $NOTARY_RC
+            fi
             xcrun stapler staple "Verba-$VERSION.dmg"
             spctl --assess --type open --context context:primary-signature -v "Verba-$VERSION.dmg" || true
           fi

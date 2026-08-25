@@ -46,7 +46,13 @@ if [ ! -f "$TMP/dist/lib/librime.dylib" ]; then
     echo "::error::librime 资产中未找到 dist/lib/librime.dylib" >&2
     exit 1
 fi
-cp "$TMP/dist/lib/librime.dylib" "$VENDOR/"
+# cp -a 保留符号链接链（librime.dylib -> librime.1.dylib -> librime.1.17.0.dylib）：
+# @rpath/librime.1.dylib 是实体的 install_name（LC_ID_DYLIB），后续若有人链接
+# librime 会按此解析；裸 cp 解引用只留实体，曾导致链接链丢失。
+cp -a "$TMP/dist/lib/librime.dylib" "$TMP/dist/lib/librime.1.dylib" "$TMP/dist/lib/librime.1.17.0.dylib" "$VENDOR/"
+# 回归守卫：链接链必须保留（旧代码裸 cp 解引用，此断言为红）
+[ -L "$VENDOR/librime.dylib" ] || { echo "::error::librime.dylib 应为符号链接（链接链被解引用）" >&2; exit 1; }
+[ -L "$VENDOR/librime.1.dylib" ] || { echo "::error::librime.1.dylib 应为符号链接（链接链被解引用）" >&2; exit 1; }
 
 # 2) Weasel 0.17.4 数据（与 Windows 同一来源，与平台无关）
 SEVENZ="$(resolve_7zz)"
