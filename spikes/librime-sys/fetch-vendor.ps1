@@ -14,6 +14,8 @@ New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 $7z = "C:\Program Files\7-Zip\7z.exe"
 
 # 1) librime nightly（查询最新 asset 名，匹配 Windows-msvc-x64）
+# 注：开发期 spike 工具（不在 CI 路径）；未认证 API 调用偶发 403 限流，
+# 发布用 scripts/fetch-rime-vendor.ps1（gh api 认证）。
 $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/rime/librime/releases/latest"
 $asset = $rel.assets | Where-Object { $_.name -match "Windows-msvc-x64\.7z" } | Select-Object -First 1
 if (-not $asset) { throw "未找到 librime Windows-msvc-x64 资产" }

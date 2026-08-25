@@ -5,7 +5,10 @@
 # 产物: vendor/rime/{rime.dll, data/}
 # 用法: pwsh scripts/fetch-rime-vendor.ps1   （需 PowerShell 7+，utf8NoBOM）
 # 说明: librime 资产名嵌 commit hash，按 tag + 名称动态解析，不写死 URL。
+# 需 gh CLI（GitHub runner 预装，本地 `gh auth login`）。
 $ErrorActionPreference = "Stop"
+# 让 gh api 等原生命令的非零退出码直接抛错（错误 JSON 会写在 stdout，尽早浮出真因）
+$PSNativeCommandUseErrorActionPreference = $true
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $vendor = Join-Path $repoRoot "vendor\rime"
