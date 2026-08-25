@@ -44,6 +44,9 @@ $weaselUrl = "https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.1
 Invoke-WebRequest -Uri $weaselUrl -OutFile (Join-Path $tmp "weasel.exe") -UseBasicParsing
 & $7z x (Join-Path $tmp "weasel.exe") ("-o" + (Join-Path $tmp "weasel")) -y | Out-Null
 if (-not (Test-Path (Join-Path $tmp "weasel\data"))) { throw "Weasel 安装包中未找到 data 目录" }
+# 目标目录须先创建：Copy-Item 通配符 + -Recurse 到不存在的目标会对子目录条目报
+# "Container cannot be copied onto existing leaf item"（PowerShell 已知行为）
+New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 Copy-Item (Join-Path $tmp "weasel\data\*") $dataDir -Recurse -Force
 
 # 3) wubi86 五笔
