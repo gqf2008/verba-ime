@@ -119,17 +119,20 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ### secrets 配置（一次性，值复用 abb/ossfs 同一套凭证）
 
-**推荐脚本化**（自动从钥匙串导出含私钥的 P12 并逐项设置，交互输密码不落盘）：
+**推荐脚本化**（自动从钥匙串导出含私钥的 P12 并逐项设置，交互输密码不落盘；自动化场景可用
+`VERBA_P12_PASSWORD` / `VERBA_APPLE_ID` / `VERBA_APPLE_APP_PASSWORD` 环境变量覆盖输入）：
 
 ```bash
 bash scripts/setup-release-secrets.sh            # 默认 gqf2008/verba-ime
 ```
 
-手动等价命令（注意 P12 必须带私钥——`-t identities` 而非 `-t certs`，后者 CI 会报找不到私钥）：
+手动等价命令（注意 P12 必须带私钥——`-t identities` 而非 `-t certs`，后者 CI 会报找不到私钥；
+`-P '<密码>'` 会进 shell 历史，用完删除临时文件）：
 
 ```bash
 security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
 gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-cert.p12)"
+rm -f /tmp/verba-cert.p12
 ```
 
 - `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64

@@ -13,7 +13,8 @@ set -euo pipefail
 REPO="${1:-gqf2008/verba-ime}"
 KEYCHAIN="${KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 
-CERT="$(security find-identity -v -p codesigning -k "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+# 注意：find-identity 的钥匙串是位置参数（-k 是 export 的选项，放这里会报 illegal option）
+CERT="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ && $0 !~ /\(invalid\)/ {print $2; exit}')"
 if [ -z "$CERT" ]; then
     echo "::error::本机钥匙串未找到 Developer ID Application 证书（先到 Apple 开发者后台创建并安装）" >&2
     exit 1
