@@ -1,0 +1,252 @@
+name: Build & Release
+
+# 打 tag v* 时自动构建 macOS（签名/公证/DMG）+ Windows（Inno Setup 安装包），
+# 生成 SHA256SUMS 后发 GitHub Release；也可 workflow_dispatch 干跑（只出 artifact）。
+# 与 ../abb、../ossfs 同构；verba 特有：捆绑 Rime（vendor/rime）+ PE 子系统守卫。
+#
+# 密钥说明（运行时判空，缺失时优雅降级）：
+#   APPLE_CERT_P12 / APPLE_CERT_PASSWORD / APPLE_TEAM_ID / APPLE_ID / APPLE_APP_PASSWORD
+#     → macOS 签名 + 公证；未配置时产出未签名 DMG（仅 dry-run；tag 发布会显式失败）
+#   WIN_SIGN_PFX / WIN_SIGN_PASSWORD
+#     → Windows 安装包签名；未配置时跳过（SmartScreen 会提示）
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ─────────────────────────── macOS（Apple Silicon）───────────────────────────
+  macos:
+    runs-on: macos-14 # Apple Silicon（arm64），与本地 aarch64 产物一致
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 导入 Developer ID 证书（临时钥匙串）
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "::warning::APPLE_CERT_P12 未配置——产出未签名产物（仅 dry-run）"
+            echo "IDENTITY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$APPLE_CERT_P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p temp /tmp/temp.keychain
+          # 关键：关闭临时钥匙串自动锁（默认 5 分钟）——冷构建（vendor 下载 + 3 crate 编译）
+          # 远超 5 分钟，若自动锁会在签名时弹密码框永久挂起（ossfs 曾卡 5h44m）
+          security set-keychain-settings -lut 21600 /tmp/temp.keychain
+          security default-keychain -s /tmp/temp.keychain
+          security unlock-keychain -p temp /tmp/temp.keychain
+          security import /tmp/cert.p12 -k /tmp/temp.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k temp /tmp/temp.keychain
+          IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: 获取 Rime vendor（librime.dylib + data/）
+        run: bash scripts/fetch-rime-vendor.sh
+
+      - name: 组装 Verba.app（构建 + 版本注入 + Rime 捆绑 + ad-hoc 签名）
+        run: bash frontends/macos/ime/scripts/package.sh
+
+      - name: 逐二进制签名（hardened runtime + timestamp）
+        if: env.IDENTITY != ''
+        run: |
+          # 公证前 bundle 内每个 Mach-O（含 rime/*.dylib）都必须带时间戳签名
+          find frontends/macos/ime/dist/Verba.app/Contents/MacOS -type f \( -perm -111 -o -name "*.dylib" \) \
+            -exec codesign --force --options runtime --timestamp --sign "$IDENTITY" {} \;
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" frontends/macos/ime/dist/Verba.app
+          codesign --verify --deep --strict --verbose=2 frontends/macos/ime/dist/Verba.app
+
+      - name: 公证 + staple .app
+        if: env.IDENTITY != ''
+        run: |
+          ditto -c -k --keepParent frontends/macos/ime/dist/Verba.app /tmp/Verba-notarize.zip
+          xcrun notarytool submit /tmp/Verba-notarize.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple frontends/macos/ime/dist/Verba.app
+          spctl --assess --type execute --verbose=4 frontends/macos/ime/dist/Verba.app || true
+
+      - name: Rime 冒烟（daemon 从 .app 启动，同目录 rime/ 加载）
+        run: |
+          cargo build --release -p verba-cli
+          "$PWD/frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon" >/dev/null 2>&1 &
+          DPID=$!
+          trap 'kill $DPID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            ./target/release/verba-cli ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          OUT="$(./target/release/verba-cli rime nishishui luna_pinyin_simp 2>&1 || true)"
+          if ! printf '%s' "$OUT" | grep -q "你是谁"; then
+            echo "::error::Rime 冒烟失败：$OUT" >&2
+            exit 1
+          fi
+          echo "Rime 冒烟通过：$OUT"
+
+      - name: 打包 DMG（有身份时签名 + 公证 + staple）
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dmg-staging
+          cp -R frontends/macos/ime/dist/Verba.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Verba" -srcfolder dmg-staging -ov -format UDZO "Verba-$VERSION.dmg"
+          if [ -n "$IDENTITY" ]; then
+            # DMG 也要签名 + 公证（分发的盘片本身要过 Gatekeeper）
+            codesign --force --sign "$IDENTITY" --timestamp "Verba-$VERSION.dmg"
+            xcrun notarytool submit "Verba-$VERSION.dmg" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple "Verba-$VERSION.dmg"
+            spctl --assess --type open --context context:primary-signature -v "Verba-$VERSION.dmg" || true
+          fi
+
+      - name: 校验（tag 发布必须已签名）
+        if: startsWith(github.ref, 'refs/tags/') && env.IDENTITY == ''
+        run: |
+          echo "::error::tag 发布缺少签名身份（APPLE_* secrets 未配置）" >&2
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: Verba-*.dmg
+          if-no-files-found: error
+
+  # ─────────────────────────── Windows（x64 + Inno Setup）───────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建 release（workspace：daemon/settings/cli）
+        shell: pwsh
+        run: cargo build --release
+
+      - name: 构建 release（Windows 前端：DLL + reg + trigger）
+        shell: pwsh
+        run: cargo build --release --manifest-path frontends/windows/ime/Cargo.toml
+
+      - name: PE 子系统守卫（daemon 必须 GUI 子系统，防控制台回归）
+        shell: pwsh
+        run: |
+          $b = [IO.File]::ReadAllBytes('target\release\verba-daemon.exe')
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $sub = [BitConverter]::ToUInt16($b, $pe + 24 + 0x44)   # OptionalHeader+Subsystem
+          if ($sub -ne 2) { throw "verba-daemon.exe subsystem=$sub（期望 2=GUI）；release 仍会弹控制台" }
+          Write-Host "PE 守卫通过：subsystem=$sub (GUI)"
+
+      - name: 安装 Inno Setup（含中文语言文件补丁）
+        shell: pwsh
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+          }
+          $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
+          if (-not (Test-Path "$langDir\ChineseSimplified.isl")) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile "$langDir\ChineseSimplified.isl"
+          }
+          Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
+
+      - name: 获取 Rime vendor（rime.dll + data/）
+        shell: pwsh
+        run: ./scripts/fetch-rime-vendor.ps1
+
+      - name: 构建安装包
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & ISCC.exe /DMyAppVersion=$version frontends\windows\installer\verba-ime.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败（exit=$LASTEXITCODE）" }
+
+      - name: Rime 冒烟（daemon + vendor/rime）
+        shell: pwsh
+        run: |
+          $env:VERBA_RIME_DLL = "$pwd\vendor\rime\rime.dll"
+          $env:VERBA_RIME_SHARED = "$pwd\vendor\rime\data"
+          $env:VERBA_RIME_USER = "$pwd\vendor\rime\user_data"
+          $p = Start-Process -FilePath "target\release\verba-daemon.exe" -WindowStyle Hidden -PassThru
+          try {
+            # 等 daemon socket 就绪（30×1s 重试，与 macOS 冒烟对称；防慢 runner flake）
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              & "target\release\verba-cli.exe" ping *> $null
+              if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw "daemon ping 30s 未就绪" }
+            $out = & "target\release\verba-cli.exe" rime nishishui luna_pinyin_simp 2>&1 | Out-String
+            if ($out -notmatch "你是谁") { throw "Rime 冒烟失败: $out" }
+            Write-Host "Rime 冒烟通过: $($out.Trim())"
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+      # Windows 代码签名：有证书时启用，否则跳过（secrets 不能出现在 if 条件里）
+      - name: Sign installer (optional)
+        shell: pwsh
+        env:
+          WIN_SIGN_PFX: ${{ secrets.WIN_SIGN_PFX }}
+          WIN_SIGN_PASSWORD: ${{ secrets.WIN_SIGN_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WIN_SIGN_PFX)) {
+            Write-Host "未配置 WIN_SIGN_PFX，跳过 Windows 代码签名"
+            exit 0
+          }
+          $pfx = [IO.File]::WriteAllBytes("$env:TEMP\cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
+          $exe = Get-ChildItem frontends\windows\installer\output\verba-ime-setup-*.exe | Select-Object -First 1
+          & signtool sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign 失败（exit=$LASTEXITCODE）" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: frontends/windows/installer/output/verba-ime-setup-*.exe
+          if-no-files-found: error
+
+  # ─────────────────────────── 汇总发 Release ───────────────────────────
+  release:
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v') # 只有打 tag 才发 Release；手动跑只出产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum Verba-*.dmg verba-ime-setup-*.exe > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" -f target_commitish="${{ github.sha }}" \
+            -q '.body' > /tmp/notes-generated.md
+          printf '%s\n' '> ⚠️ **macOS 版仅支持 Apple Silicon（M 系列，arm64）**；Intel Mac 请勿下载。' | cat - /tmp/notes-generated.md > /tmp/notes-final.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: /tmp/notes-final.md
+          fail_on_unmatched_files: true
