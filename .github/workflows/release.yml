@@ -104,8 +104,22 @@ jobs:
           if [ -n "$IDENTITY" ]; then
             # DMG 也要签名 + 公证（分发的盘片本身要过 Gatekeeper）
             codesign --force --sign "$IDENTITY" --timestamp "Verba-$VERSION.dmg"
-            xcrun notarytool submit "Verba-$VERSION.dmg" \
-              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            set +e
+            NOTARY_OUT="$(xcrun notarytool submit "Verba-$VERSION.dmg" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+            NOTARY_RC=$?
+            set -e
+            printf '%s\n' "$NOTARY_OUT"
+            if [ $NOTARY_RC -ne 0 ]; then
+              # 公证被拒（status: Invalid）时打印详细原因，避免盲查
+              SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+              if [ -n "$SUB_ID" ]; then
+                echo "::error::DMG 公证失败（submission=$SUB_ID），详细原因：" >&2
+                xcrun notarytool log "$SUB_ID" \
+                  --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+              fi
+              exit $NOTARY_RC
+            fi
             xcrun stapler staple "Verba-$VERSION.dmg"
             spctl --assess --type open --context context:primary-signature -v "Verba-$VERSION.dmg" || true
           fi

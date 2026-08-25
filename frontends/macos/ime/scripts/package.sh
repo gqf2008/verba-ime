@@ -33,8 +33,9 @@ sed -i '' -E "s|<string>[0-9]+\.[0-9]+\.[0-9]+</string>|<string>$VERSION</string
 # 可选：捆绑 Rime（librime.dylib + data/），daemon 从 $APP/Contents/MacOS/rime/ 加载。
 # 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。
 if [ -d "$REPO_ROOT/vendor/rime" ]; then
-    if [ ! -f "$REPO_ROOT/vendor/rime/librime.dylib" ] || [ ! -d "$REPO_ROOT/vendor/rime/data" ]; then
-        echo "::error::vendor/rime 不完整（需 librime.dylib + data/，见 scripts/fetch-rime-vendor.sh）" >&2
+    # 需含版本化 dylib：librime.dylib 依赖 @rpath/librime.1.dylib，缺失会导致公证 Invalid
+    if [ ! -f "$REPO_ROOT/vendor/rime/librime.dylib" ] || [ ! -f "$REPO_ROOT/vendor/rime/librime.1.dylib" ] || [ ! -d "$REPO_ROOT/vendor/rime/data" ]; then
+        echo "::error::vendor/rime 不完整（需 librime.dylib + librime.1.dylib + data/，见 scripts/fetch-rime-vendor.sh）" >&2
         exit 1
     fi
     cp -R "$REPO_ROOT/vendor/rime" "$APP/Contents/MacOS/rime"

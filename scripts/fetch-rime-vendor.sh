@@ -46,7 +46,10 @@ if [ ! -f "$TMP/dist/lib/librime.dylib" ]; then
     echo "::error::librime 资产中未找到 dist/lib/librime.dylib" >&2
     exit 1
 fi
-cp "$TMP/dist/lib/librime.dylib" "$VENDOR/"
+# cp -a 保留符号链接链（librime.dylib -> librime.1.dylib -> librime.1.17.0.dylib）。
+# 此前裸 cp 解引用只留实体 librime.dylib，公证 dyld 级检查解析 @rpath/librime.1.dylib
+# 依赖失败导致 DMG 公证 status: Invalid。
+cp -a "$TMP/dist/lib/librime.dylib" "$TMP/dist/lib/librime.1.dylib" "$TMP/dist/lib/librime.1.17.0.dylib" "$VENDOR/"
 
 # 2) Weasel 0.17.4 数据（与 Windows 同一来源，与平台无关）
 SEVENZ="$(resolve_7zz)"
