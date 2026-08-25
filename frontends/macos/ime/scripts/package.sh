@@ -25,13 +25,22 @@ cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 
+# 版本注入：以根 Cargo.toml 的 workspace 版本为唯一版本源，同步
+# CFBundleShortVersionString / CFBundleVersion（只改拷贝，不弄脏源码树）。
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml")"
+sed -i '' -E "s|<string>[0-9]+\.[0-9]+\.[0-9]+</string>|<string>$VERSION</string>|g" "$APP/Contents/Info.plist"
+
 # 可选：捆绑 Rime（librime.dylib + data/），daemon 从 $APP/Contents/MacOS/rime/ 加载。
 # 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。
 if [ -d "$REPO_ROOT/vendor/rime" ]; then
+    if [ ! -f "$REPO_ROOT/vendor/rime/librime.dylib" ] || [ ! -d "$REPO_ROOT/vendor/rime/data" ]; then
+        echo "::error::vendor/rime 不完整（需 librime.dylib + data/，见 scripts/fetch-rime-vendor.sh）" >&2
+        exit 1
+    fi
     cp -R "$REPO_ROOT/vendor/rime" "$APP/Contents/MacOS/rime"
     echo "已捆绑 Rime: vendor/rime -> Verba.app/Contents/MacOS/rime"
 else
-    echo "未找到 vendor/rime（librime.dylib + data/），跳过 Rime 捆绑"
+    echo "未找到 vendor/rime（librime.dylib + data/），跳过 Rime 捆绑；发布构建须先跑 scripts/fetch-rime-vendor.sh"
 fi
 
 # ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）。

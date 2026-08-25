@@ -35,32 +35,36 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ### Windows 安装包（Inno Setup）
 1. 构建产物：
-   - 前端（DLL + 注册工具）：`cd frontends/windows/ime && cargo build --release`
-   - daemon：根目录 `cargo build -p verba-daemon --release`
-2. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
-3. 编译：
+   - 前端（DLL + 注册/触发工具）：`cd frontends/windows/ime && cargo build --release`
+   - daemon + 设置面板：根目录 `cargo build -p verba-daemon --release && cargo build -p verba-settings --release`
+2. 获取 Rime 运行时：`pwsh scripts/fetch-rime-vendor.ps1`（见下节）。
+3. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
+4. 编译（`/DMyAppVersion` 可选，默认 0.1.0；发布流水线注入根 Cargo.toml 版本）：
    ```powershell
    cd frontends/windows/installer
-   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" verba-ime.iss
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.1.0 verba-ime.iss
    ```
-   产物：`frontends/windows/installer/output/verba-ime-setup.exe`（需管理员运行安装）。
+   产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
 
 ### Rime 引擎（单引擎，librime）
 
 中文候选由 librime 提供（daemon 内动态加载 rime.dll，**唯一引擎**，无引擎开关）。构建与部署：
 
-1. 获取第三方二进制/数据：
-   - Windows（rime.dll x64 + Rime 数据 + wubi86 + opencc）：
-     ```powershell
-     pwsh spikes/librime-sys/fetch-vendor.ps1   # 输出到 spikes/librime-sys/vendor/
-     ```
-   - macOS（librime.dylib + Rime 数据 + wubi86 + opencc）：从 librime 发行版或
-     Homebrew `librime` 包取得 `librime.dylib` 与数据，放到仓库根 `vendor/rime/`：
-     ```
-     vendor/rime/librime.dylib
-     vendor/rime/data/            # schema/dict + opencc/
-     ```
-     `scripts/package.sh` 会把 `vendor/rime/` 打进 `Verba.app/Contents/MacOS/rime/`。
+1. 获取第三方二进制/数据（统一输出到仓库根 `vendor/rime/`，gitignored，CI 与本地共用）：
+   ```powershell
+   pwsh scripts/fetch-rime-vendor.ps1   # Windows: rime.dll + data/ + wubi86
+   bash scripts/fetch-rime-vendor.sh    # macOS:   librime.dylib + data/ + wubi86
+   ```
+   脚本从 librime 1.17.0 官方发行版取引擎库（资产名按 tag+名称动态解析），从
+   Weasel 0.17.4 安装包取 Rime 数据（含 luna_pinyin_simp、opencc/），并补 wubi86 方案。
+   开发期 spike 版本（nightly + `spikes/librime-sys/` 目录）见 `spikes/librime-sys/README.md`。
+   结构：
+   ```
+   vendor/rime/(rime.dll | librime.dylib)
+   vendor/rime/data/            # schema/dict + opencc/
+   ```
+   `scripts/package.sh` 会把 `vendor/rime/` 打进 `Verba.app/Contents/MacOS/rime/`；
+   Windows 安装包（Inno Setup）把 `vendor/rime/` 装到 `{app}\rime\`。
 2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载；Windows `rime.dll` / macOS `librime.dylib`）：
    ```
    <daemon 同目录>/rime/(rime.dll | librime.dylib)

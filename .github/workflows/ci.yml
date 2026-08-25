@@ -80,3 +80,38 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+
+  # Rime vendor 获取脚本验证（仅脚本/本文件变更时运行；发布流水线复用同一产物）
+  vendor-rime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            vendor:
+              - 'scripts/fetch-rime-vendor.*'
+      - name: 获取 Rime vendor（Windows）
+        if: runner.os == 'Windows' && steps.changes.outputs.vendor == 'true'
+        shell: pwsh
+        run: ./scripts/fetch-rime-vendor.ps1
+      - name: 获取 Rime vendor（macOS）
+        if: runner.os == 'macOS' && steps.changes.outputs.vendor == 'true'
+        run: bash scripts/fetch-rime-vendor.sh
+      - name: 结构断言
+        if: steps.changes.outputs.vendor == 'true'
+        shell: bash
+        run: |
+          test -d vendor/rime/data/opencc
+          test -f vendor/rime/data/default.yaml
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            test -f vendor/rime/rime.dll
+          else
+            test -f vendor/rime/librime.dylib
+          fi
+          echo "vendor/rime 结构完整"
