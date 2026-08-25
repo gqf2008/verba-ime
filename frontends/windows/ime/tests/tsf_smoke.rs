@@ -229,26 +229,35 @@ fn tsf_streaming_preedit() {
         // 注入流式事件（定时器路径）
         {
             let mut q = data.chunks.lock().unwrap();
-            q.push_back(verba_protos::StreamEvent {
-                id: 1,
-                kind: Some(verba_protos::stream_event::Kind::Chunk(
-                    verba_protos::Chunk { text: "你".into() },
-                )),
-            });
-            q.push_back(verba_protos::StreamEvent {
-                id: 1,
-                kind: Some(verba_protos::stream_event::Kind::Chunk(
-                    verba_protos::Chunk { text: "好".into() },
-                )),
-            });
-            q.push_back(verba_protos::StreamEvent {
-                id: 1,
-                kind: Some(verba_protos::stream_event::Kind::Final(
-                    verba_protos::Final {
-                        text: "你好".into(),
-                    },
-                )),
-            });
+            q.push_back((
+                0,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Chunk(
+                        verba_protos::Chunk { text: "你".into() },
+                    )),
+                },
+            ));
+            q.push_back((
+                0,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Chunk(
+                        verba_protos::Chunk { text: "好".into() },
+                    )),
+                },
+            ));
+            q.push_back((
+                0,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Final(
+                        verba_protos::Final {
+                            text: "你好".into(),
+                        },
+                    )),
+                },
+            ));
         }
         data.on_timer();
         assert_eq!(

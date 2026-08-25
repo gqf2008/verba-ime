@@ -11,6 +11,7 @@
 //!   跨用户不可见不可连；命名用 `FilesystemUdSocket`（完整路径）。
 //! - Windows：管道名带用户名后缀 `verba-ime-{USERNAME}`（per-user 隔离）。
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// 默认 socket 规格：

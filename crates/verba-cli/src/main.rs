@@ -147,7 +147,7 @@ fn cmd_ai(args: &[String]) -> i32 {
     }
     let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
     with_client(|c| {
-        let id = c.llm_start(&prompt, None, None, None, image_ref)?;
+        let id = c.llm_start(&prompt, None, None, None, image_ref, 0)?;
         let mut any_chunk = false;
         loop {
             let evt = c.next_event(id)?;

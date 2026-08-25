@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::os::windows::process::CommandExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
@@ -50,6 +50,38 @@ const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布�
 const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿后发起 LLM 候选融合请求
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
+
+/// 全局自增会话序号（从 1 起）：进程内每个输入上下文独占一个 AI 多轮上下文会话，
+/// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
+static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 每进程随机盐（惰性生成一次）。本 IME 是 in-proc COM DLL（InprocServer32），被
+/// 加载进**每个应用进程**，而 daemon 是按用户单例、按 session_id 分组历史。用
+/// 随机盐而非裸 pid：避免 pid 复用后新进程撞回旧进程的历史槽（复审 LOW——裸
+/// pid 下撞槽会**继承**陈旧上下文而非覆盖）。盐含时间纳秒+pid 熵，跨进程（含
+/// pid 复用）实际不碰撞。无 rand 依赖，同 name.rs 的本地熵方案（无需密码学强度，
+/// 同用户同机本地隔离即可）。
+fn process_salt() -> u32 {
+    static SALT: OnceLock<u32> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ (std::process::id() as u64) << 32;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
+    })
+}
+
+/// 分配全局唯一的 AI 会话 id：高 32 位为每进程随机盐、低 32 位为进程内自增序号，
+/// 跨进程（含 in-proc DLL 各应用进程）不串 daemon 历史槽。
+fn alloc_session_id() -> u64 {
+    let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
+    ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
+}
 
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
@@ -98,6 +130,9 @@ pub struct TextServiceData {
     pub stream_epoch: Arc<AtomicU64>,
     /// 在途候选融合请求 id（0 = 无）。
     pub candidate_request_id: Arc<AtomicU64>,
+    /// 本输入上下文的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按
+    /// session_id 分组隔离历史：多应用文本域各自独立多轮，互不串上下文（B4b）。
+    pub session_id: Cell<u64>,
     /// 待触发的候选融合请求（防抖中）。
     candidate_req_pending: RefCell<Option<PendingCandidateReq>>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
@@ -132,6 +167,7 @@ impl TextServiceData {
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
+            session_id: Cell::new(alloc_session_id()),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
@@ -884,13 +920,19 @@ fn start_llm(
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
+    let session_id = data.session_id.get();
     let handle = std::thread::spawn(move || {
         // 新流代际：本流所有事件带此 epoch，on_timer 只消费当前代际
         let epoch = stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
-                push_chunk(&chunks, epoch, 0, error_event(&format!("无法连接 daemon: {e}")));
+                push_chunk(
+                    &chunks,
+                    epoch,
+                    0,
+                    error_event(&format!("无法连接 daemon: {e}")),
+                );
                 return;
             }
         };
@@ -919,10 +961,22 @@ fn start_llm(
         }
 
         let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
-        let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref) {
+        let id = match client.llm_start(
+            &prompt,
+            system.as_deref(),
+            None,
+            None,
+            image_ref,
+            session_id,
+        ) {
             Ok(id) => id,
             Err(e) => {
-                push_chunk(&chunks, epoch, 0, error_event(&format!("LLM 启动失败: {e}")));
+                push_chunk(
+                    &chunks,
+                    epoch,
+                    0,
+                    error_event(&format!("LLM 启动失败: {e}")),
+                );
                 return;
             }
         };
@@ -942,7 +996,12 @@ fn start_llm(
                     }
                 }
                 Err(e) => {
-                    push_chunk(&chunks, epoch, id, error_event(&format!("LLM 连接中断: {e}")));
+                    push_chunk(
+                        &chunks,
+                        epoch,
+                        id,
+                        error_event(&format!("LLM 连接中断: {e}")),
+                    );
                     break;
                 }
             }

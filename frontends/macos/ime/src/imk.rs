@@ -73,6 +73,10 @@ fn llm_queue() -> &'static Mutex<VecDeque<LlmItem>> {
 /// 各控制器按自己的活跃 seq 消费，互不干扰（架构审查 P2-1 per-controller）。
 static LLM_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 全局自增会话 id（从 1 起）：每个输入控制器独占一个 AI 多轮上下文会话，
+/// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
+static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
 /// 无法访问控制器 Ivars（主线程独占），经此表传递 daemon id。
 fn daemon_ids() -> &'static Mutex<HashMap<u64, u64>> {
@@ -117,6 +121,9 @@ struct Ivars {
     /// 届时 active_stream 已归 0 无法匹配——按此序号在 drain 丢弃（防残留
     /// 无界累积；只记最近一个——更早的流其 worker 已退出、无在途事件）。
     dead_stream: Cell<u64>,
+    /// 本控制器的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按此
+    /// 隔离历史：多文本域（多应用）各自独立多轮，互不串上下文（B4b）。
+    session_id: Cell<u64>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -136,6 +143,7 @@ impl Default for Ivars {
             active_stream: Cell::new(0),
             active_candidates: Cell::new(0),
             dead_stream: Cell::new(0),
+            session_id: Cell::new(SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst)),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
         }
@@ -570,6 +578,7 @@ impl VerbaIMKController {
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
         self.ivars().dead_stream.set(0);
+        let session_id = self.ivars().session_id.get();
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
@@ -579,13 +588,14 @@ impl VerbaIMKController {
                     return;
                 }
             };
-            let id = match client.llm_start(&prompt, system.as_deref(), None, None, None) {
-                Ok(id) => id,
-                Err(e) => {
-                    push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
-                    return;
-                }
-            };
+            let id =
+                match client.llm_start(&prompt, system.as_deref(), None, None, None, session_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
+                        return;
+                    }
+                };
             daemon_ids().lock().unwrap().insert(seq, id);
             // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
             // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
