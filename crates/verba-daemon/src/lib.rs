@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use verba_ai::{LlmClient, LlmConfig};
 use verba_config::{ApiKeyStore, ConfigManager, VerbaDirs};
-use verba_ipc::DEFAULT_SOCKET_NAME;
 
 /// 日志 tee：同时写 stderr 与文件（便于故障诊断）。
 struct TeeLog {
@@ -36,6 +35,13 @@ impl Write for TeeLog {
 pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dirs = VerbaDirs::locate()?;
     dirs.ensure()?;
+    // IPC 信任边界（架构审查 P0-1）：Unix 下 socket 位于用户数据目录，
+    // 目录收紧为 0700，其他用户不可见不可连（跨用户劫持/DoS 面关闭）。
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        dirs.data_dir(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
     let log_path = dirs.log_dir().join("verba-daemon.log");
     let log_file = OpenOptions::new()
         .create(true)
@@ -79,7 +85,7 @@ pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(runtime.block_on(verba_ipc::server::serve(socket_name, handler))?)
 }
 
-/// 使用默认套接字名运行。
+/// 使用默认套接字（Unix 用户数据目录全路径 / Windows per-user 管道）运行。
 pub fn run_default() -> Result<(), Box<dyn std::error::Error>> {
-    run(DEFAULT_SOCKET_NAME)
+    run(&verba_ipc::default_socket_spec())
 }

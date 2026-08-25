@@ -11,11 +11,19 @@ use verba_protos::{
 };
 
 fn unique_name(tag: &str) -> String {
-    format!(
-        "verba-test-{tag}-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("t")
-    )
+    // 短后缀（进程 pid + 原子计数）：避免线程名过长导致 sun_path 超限
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = format!("verba-test-{tag}-{}-{n}", std::process::id());
+    // Unix 用文件系统 socket（完整路径，测试临时目录）；Windows 用 `\\.\pipe\` 管道名。
+    #[cfg(unix)]
+    {
+        std::env::temp_dir().join(base).display().to_string()
+    }
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\{base}")
+    }
 }
 
 /// 带整体时限的连接重试（Windows 命名管道对不存在目标立即报错）。

@@ -8,8 +8,7 @@ use std::sync::Arc;
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::tokio::Stream as TokioStream;
 use interprocess::local_socket::traits::tokio::Listener as _;
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions};
-use prost::Message;
+use interprocess::local_socket::{GenericFilePath, ListenerOptions};use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use verba_protos::{Request, Response, StreamEvent};
@@ -56,7 +55,9 @@ pub trait RequestHandler: Send + Sync + 'static {
 /// 启动服务端，持续接受连接。
 pub async fn serve(name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), IpcError> {
     log::info!("IPC 服务启动: {name}");
-    let name = name.to_ns_name::<GenericNamespaced>()?;
+    // GenericFilePath：Unix 原样作为 UDS 路径（daemon 侧目录已 chmod 0700）；
+    // Windows 把 `\\.\pipe\` 前缀映射为命名管道（per-user 名称隔离）。
+    let name = name.to_fs_name::<GenericFilePath>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
     loop {
         match listener.accept().await {

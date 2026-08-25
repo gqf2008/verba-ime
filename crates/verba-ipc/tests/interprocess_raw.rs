@@ -4,16 +4,31 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ConnectOptions, GenericNamespaced, ListenerOptions};
+use interprocess::local_socket::{ConnectOptions, ListenerOptions};
 use interprocess::ConnectWaitMode;
+
+fn test_name(tag: &str) -> String {
+    let base = format!("verba-raw-{tag}-{}", std::process::id());
+    // Unix 用文件系统 socket（完整路径，测试临时目录）；Windows 用 `\\.\pipe\` 管道名。
+    #[cfg(unix)]
+    {
+        std::env::temp_dir().join(base).display().to_string()
+    }
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\{base}")
+    }
+}
 
 #[test]
 fn raw_sync_echo() {
-    let name = format!("verba-raw-{}", std::process::id());
+    let name = test_name("echo");
     let server_name = name.clone();
     let (ready_tx, ready_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
-        let n = server_name.to_ns_name::<GenericNamespaced>().unwrap();
+        let n = server_name
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
         let listener = ListenerOptions::new().name(n).create_sync().unwrap();
         ready_tx.send(()).unwrap();
         let mut conn = listener.accept().unwrap();
@@ -22,7 +37,9 @@ fn raw_sync_echo() {
         conn.write_all(&buf).unwrap();
     });
     ready_rx.recv().unwrap();
-    let n = name.to_ns_name::<GenericNamespaced>().unwrap();
+    let n = name
+        .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+        .unwrap();
     let mut client = ConnectOptions::new()
         .name(n)
         .wait_mode(ConnectWaitMode::Unbounded)

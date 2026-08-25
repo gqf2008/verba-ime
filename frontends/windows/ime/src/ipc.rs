@@ -26,7 +26,11 @@ pub fn daemon_exe_path() -> Option<PathBuf> {
 
 /// 尝试连接 daemon。
 pub fn try_connect() -> Result<VerbaClient, IpcError> {
-    VerbaClient::connect()
+    let mut client = VerbaClient::connect()?;
+    // 验活握手（架构审查 P0-1）：连接成功不代表对端是真实 daemon；
+    // 能回 Pong 的才信任。socket 已移入用户私有目录（0700），此检查为纵深防御。
+    client.ping()?;
+    Ok(client)
 }
 
 /// 确保 daemon 运行并返回连接（带重试）。

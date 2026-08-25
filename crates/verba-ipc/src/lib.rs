@@ -9,7 +9,9 @@
 pub mod client;
 pub mod codec;
 pub mod error;
+pub mod name;
 pub mod server;
 
 pub use client::{ConnectWait, VerbaClient, DEFAULT_SOCKET_NAME};
 pub use error::IpcError;
+pub use name::default_socket_spec;

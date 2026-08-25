@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream as LocalSocketStream};
+use interprocess::local_socket::{ConnectOptions, GenericFilePath, Stream as LocalSocketStream};
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
@@ -27,8 +27,9 @@ use verba_protos::{
 
 use crate::codec::{encode_frame, read_frame};
 use crate::error::IpcError;
+use crate::name::default_socket_spec;
 
-/// 默认套接字名（Windows 映射为命名管道 `\\.\pipe\verba-ime`）。
+/// 默认套接字名（旧值，保持兼容导出；实际默认见 [`default_socket_spec`]）。
 pub const DEFAULT_SOCKET_NAME: &str = "verba-ime";
 
 /// 连接等待策略。
@@ -53,17 +54,19 @@ pub struct VerbaClient {
 }
 
 impl VerbaClient {
-    /// 连接默认套接字。
+    /// 连接默认套接字（Unix 为用户数据目录全路径 / Windows per-user 管道）。
     pub fn connect() -> Result<Self, IpcError> {
-        Self::connect_named(DEFAULT_SOCKET_NAME, ConnectWait::Nonblocking)
+        Self::connect_named(&default_socket_spec(), ConnectWait::Nonblocking)
     }
 
-    /// 连接指定套接字名。
+    /// 连接指定套接字名（Unix 为文件系统路径；Windows 为 `\\.\pipe\...` 管道名）。
     pub fn connect_named(name: &str, wait: ConnectWait) -> Result<Self, IpcError> {
-        let name = name.to_ns_name::<GenericNamespaced>()?;
         let wait_mode = match wait {
             ConnectWait::Nonblocking | ConnectWait::Block => ConnectWaitMode::Unbounded,
         };
+        // GenericFilePath：Unix 原样作为 UDS 路径（权限受用户数据目录保护）；
+        // Windows 把 `\\.\pipe\` 前缀映射为命名管道（per-user 名称隔离）。
+        let name = name.to_fs_name::<GenericFilePath>()?;
         let stream = ConnectOptions::new()
             .name(name)
             .wait_mode(wait_mode)
