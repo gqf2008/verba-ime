@@ -5,7 +5,10 @@
 # 产物: vendor/rime/{rime.dll, data/}
 # 用法: pwsh scripts/fetch-rime-vendor.ps1   （需 PowerShell 7+，utf8NoBOM）
 # 说明: librime 资产名嵌 commit hash，按 tag + 名称动态解析，不写死 URL。
+# 需 gh CLI（GitHub runner 预装，本地 `gh auth login`）。
 $ErrorActionPreference = "Stop"
+# 让 gh api 等原生命令的非零退出码直接抛错（错误 JSON 会写在 stdout，尽早浮出真因）
+$PSNativeCommandUseErrorActionPreference = $true
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $vendor = Join-Path $repoRoot "vendor\rime"
@@ -28,7 +31,9 @@ function Get-7z {
 $7z = Get-7z
 
 # 1) librime 1.17.0 stable
-$rel = Invoke-RestMethod -Uri "https://api.github.com/repos/rime/librime/releases/tags/1.17.0"
+# 用 gh api（认证，5000 次/时）而非裸 Invoke-RestMethod api.github.com（未认证
+# 60 次/时/IP，CI 共享 IP 曾 403 限流）；需 gh CLI（GitHub runner 预装）
+$rel = (gh api repos/rime/librime/releases/tags/1.17.0 | ConvertFrom-Json)
 # 排除 rime-deps-*（后缀相同但只含 opencc 工具与 include，无 rime.dll）
 $asset = $rel.assets | Where-Object { $_.name -match "Windows-msvc-x64\.7z$" -and $_.name -notmatch "^rime-deps-" } | Select-Object -First 1
 if (-not $asset) { throw "未找到 librime 1.17.0 Windows-msvc-x64 资产" }

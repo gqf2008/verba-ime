@@ -36,7 +36,9 @@ resolve_7zz() {
 mkdir -p "$VENDOR"
 
 # 1) librime 1.17.0 stable（macOS-universal 覆盖 arm64 + x86_64）
-REL="$(curl -fsSL "https://api.github.com/repos/rime/librime/releases/tags/1.17.0")"
+# 用 gh api（认证，5000 次/时）而非裸 curl api.github.com（未认证 60 次/时/IP，
+# CI 共享 IP 曾 403 限流）；需 gh CLI（GitHub runner 预装，本地 `gh auth login`）
+REL="$(gh api repos/rime/librime/releases/tags/1.17.0)"
 # 排除 rime-deps-*（后缀相同但只含 opencc 工具与 include，无 librime.dylib）
 ASSET_URL="$(printf '%s' "$REL" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(next(a["browser_download_url"] for a in r["assets"] if a["name"].endswith("macOS-universal.tar.bz2") and not a["name"].startswith("rime-deps-")))')"
 echo "下载 librime: $ASSET_URL"
