@@ -333,25 +333,34 @@ define_class!(
             }
         }
 
-        /// 主线程定时器：排空 daemon 流事件。
+        /// 主线程定时器：排空本控制器的事件。
+        ///
+        /// 只取走本控制器活跃序号的事件，其余留在队列（多会话场景下另一控制器
+        /// 的定时器会消费自己的部分——整体清空会互相丢弃事件）。
         #[unsafe(method(drainVerbaStream))]
         fn drain_stream(&self) {
-            let items: Vec<LlmItem> = {
-                let mut q = llm_queue().lock().unwrap();
-                q.drain(..).collect()
-            };
-            if items.is_empty() {
-                return;
-            }
             let stream_seq = self.ivars().active_stream.get();
             let cand_seq = self.ivars().active_candidates.get();
-            for item in items {
+            let mine: Vec<LlmItem> = {
+                let mut q = llm_queue().lock().unwrap();
+                let mut kept = VecDeque::new();
+                let mut mine = Vec::new();
+                for item in q.drain(..) {
+                    if item.seq == stream_seq || item.seq == cand_seq {
+                        mine.push(item);
+                    } else {
+                        kept.push_back(item);
+                    }
+                }
+                *q = kept;
+                mine
+            };
+            for item in mine {
                 if item.seq == stream_seq {
                     self.feed_stream_event(item.event);
-                } else if item.seq == cand_seq {
+                } else {
                     self.feed_candidates_event(item.event);
                 }
-                // 其它序号的旧事件（已被新请求替代）直接丢弃。
             }
         }
     }
@@ -569,6 +578,7 @@ impl VerbaIMKController {
             // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
             // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
             if cancelled_seqs().lock().unwrap().remove(&seq) {
+                daemon_ids().lock().unwrap().remove(&seq);
                 let _ = client.llm_cancel(id);
                 return;
             }
@@ -673,8 +683,12 @@ impl VerbaIMKController {
             Some(stream_event::Kind::Chunk(ch)) => {
                 self.ivars().machine.borrow_mut().on_llm_chunk(&ch.text)
             }
-            Some(stream_event::Kind::Final(_)) => self.ivars().machine.borrow_mut().on_llm_done(),
+            Some(stream_event::Kind::Final(_)) => {
+                self.ivars().active_stream.set(0);
+                self.ivars().machine.borrow_mut().on_llm_done()
+            }
             Some(stream_event::Kind::Error(e)) => {
+                self.ivars().active_stream.set(0);
                 self.ivars().machine.borrow_mut().on_llm_error(&e.message)
             }
             _ => Action::None,
@@ -744,24 +758,28 @@ impl VerbaIMKController {
     }
 
     fn cancel_stream(&self) {
-        // 登记本控制器当前活跃的 seq 到取消集合（闭合启动竞态：llm_start 返回
-        // 前取消时 daemon id 尚不可知，worker 检查集合后立即取消）。
         let stream_seq = self.ivars().active_stream.get();
-        if stream_seq != 0 {
-            cancelled_seqs().lock().unwrap().insert(stream_seq);
-        }
         self.ivars().active_stream.set(0);
         self.ivars().active_candidates.set(0);
         self.ivars().candidate_pinyin.borrow_mut().take();
-        // 尽力向 daemon 取消在途请求（经 seq→daemon id 映射），让工作线程
-        // 尽快退出、停止生成资源。
+        if stream_seq == 0 {
+            return;
+        }
+        // 取本流的 daemon id：拿到则直接取消；拿不到（llm_start 未返回，daemon id
+        // 尚不可知）才登记到取消集合（闭合启动竞态窗口）。避免对已完成流重复
+        // 登记（防止 cancelled_seqs 泄漏）。
         let stream_id = daemon_ids().lock().unwrap().remove(&stream_seq);
-        if let Some(stream_id) = stream_id {
-            std::thread::spawn(move || {
-                if let Ok(mut c) = ipc::try_connect() {
-                    let _ = c.llm_cancel(stream_id);
-                }
-            });
+        match stream_id {
+            Some(stream_id) => {
+                std::thread::spawn(move || {
+                    if let Ok(mut c) = ipc::try_connect() {
+                        let _ = c.llm_cancel(stream_id);
+                    }
+                });
+            }
+            None => {
+                cancelled_seqs().lock().unwrap().insert(stream_seq);
+            }
         }
     }
 
