@@ -3,7 +3,7 @@
 #   2) Weasel 0.17.4 安装包 → Rime 数据（luna_pinyin_simp / opencc / …）
 #   3) rime-wubi → wubi86 五笔方案
 # 产物: vendor/rime/{rime.dll, data/}
-# 用法: pwsh scripts/fetch-rime-vendor.ps1
+# 用法: pwsh scripts/fetch-rime-vendor.ps1   （需 PowerShell 7+，utf8NoBOM）
 # 说明: librime 资产名嵌 commit hash，按 tag + 名称动态解析，不写死 URL。
 $ErrorActionPreference = "Stop"
 
@@ -29,7 +29,8 @@ $7z = Get-7z
 
 # 1) librime 1.17.0 stable
 $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/rime/librime/releases/tags/1.17.0"
-$asset = $rel.assets | Where-Object { $_.name -match "Windows-msvc-x64\.7z$" } | Select-Object -First 1
+# 排除 rime-deps-*（后缀相同但只含 opencc 工具与 include，无 rime.dll）
+$asset = $rel.assets | Where-Object { $_.name -match "Windows-msvc-x64\.7z$" -and $_.name -notmatch "^rime-deps-" } | Select-Object -First 1
 if (-not $asset) { throw "未找到 librime 1.17.0 Windows-msvc-x64 资产" }
 Write-Host "下载 librime: $($asset.name)"
 Invoke-WebRequest -Uri $asset.browser_download_url -OutFile (Join-Path $tmp "rime-x64.7z") -UseBasicParsing

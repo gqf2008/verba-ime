@@ -35,15 +35,16 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ### Windows 安装包（Inno Setup）
 1. 构建产物：
-   - 前端（DLL + 注册工具）：`cd frontends/windows/ime && cargo build --release`
-   - daemon：根目录 `cargo build -p verba-daemon --release`
-2. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
-3. 编译：
+   - 前端（DLL + 注册/触发工具）：`cd frontends/windows/ime && cargo build --release`
+   - daemon + 设置面板：根目录 `cargo build -p verba-daemon --release && cargo build -p verba-settings --release`
+2. 获取 Rime 运行时：`pwsh scripts/fetch-rime-vendor.ps1`（见下节）。
+3. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
+4. 编译（`/DMyAppVersion` 可选，默认 0.1.0；发布流水线注入根 Cargo.toml 版本）：
    ```powershell
    cd frontends/windows/installer
-   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" verba-ime.iss
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.1.0 verba-ime.iss
    ```
-   产物：`frontends/windows/installer/output/verba-ime-setup.exe`（需管理员运行安装）。
+   产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
 
 ### Rime 引擎（单引擎，librime）
 

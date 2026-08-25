@@ -37,7 +37,8 @@ mkdir -p "$VENDOR"
 
 # 1) librime 1.17.0 stable（macOS-universal 覆盖 arm64 + x86_64）
 REL="$(curl -fsSL "https://api.github.com/repos/rime/librime/releases/tags/1.17.0")"
-ASSET_URL="$(printf '%s' "$REL" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(next(a["browser_download_url"] for a in r["assets"] if a["name"].endswith("macOS-universal.tar.bz2")))')"
+# 排除 rime-deps-*（后缀相同但只含 opencc 工具与 include，无 librime.dylib）
+ASSET_URL="$(printf '%s' "$REL" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(next(a["browser_download_url"] for a in r["assets"] if a["name"].endswith("macOS-universal.tar.bz2") and not a["name"].startswith("rime-deps-")))')"
 echo "下载 librime: $ASSET_URL"
 curl -fsSL -o "$TMP/rime-macos.tar.bz2" "$ASSET_URL"
 tar -xjf "$TMP/rime-macos.tar.bz2" -C "$TMP"
