@@ -80,7 +80,7 @@ pub struct TextServiceData {
     keysink: RefCell<Option<ITfKeyEventSink>>,
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
-    pub chunks: Arc<Mutex<VecDeque<StreamEvent>>>,
+    pub chunks: Arc<Mutex<VecDeque<(u64, StreamEvent)>>>,
     /// 触发任务（截图 OCR / 录音 ASR）结果，定时器消费并上屏。
     pub trigger_results: Arc<Mutex<VecDeque<TriggerResult>>>,
     pub candidate_window: RefCell<Option<crate::candidate_window::CandidateWindow>>,
@@ -93,6 +93,9 @@ pub struct TextServiceData {
     /// 配置文件上次 mtime（用于热更新检测）。
     theme_config_mtime: Cell<Option<std::time::SystemTime>>,
     pub stream_request_id: Arc<AtomicU64>,
+    /// 流代际（epoch）：每次发起新 LLM 流 +1；chunks 队列事件携带 epoch，
+    /// 过滤只消费当前代际——请求 id 每连接从 1 自增（恒为 2），不能作跨流依据。
+    pub stream_epoch: Arc<AtomicU64>,
     /// 在途候选融合请求 id（0 = 无）。
     pub candidate_request_id: Arc<AtomicU64>,
     /// 待触发的候选融合请求（防抖中）。
@@ -127,6 +130,7 @@ impl TextServiceData {
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".into()),
             theme_config_mtime: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
+            stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
@@ -879,11 +883,14 @@ fn start_llm(
 ) {
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
+    let stream_epoch = Arc::clone(&data.stream_epoch);
     let handle = std::thread::spawn(move || {
+        // 新流代际：本流所有事件带此 epoch，on_timer 只消费当前代际
+        let epoch = stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
-                push_chunk(&chunks, 0, error_event(&format!("无法连接 daemon: {e}")));
+                push_chunk(&chunks, epoch, 0, error_event(&format!("无法连接 daemon: {e}")));
                 return;
             }
         };
@@ -915,7 +922,7 @@ fn start_llm(
         let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref) {
             Ok(id) => id,
             Err(e) => {
-                push_chunk(&chunks, 0, error_event(&format!("LLM 启动失败: {e}")));
+                push_chunk(&chunks, epoch, 0, error_event(&format!("LLM 启动失败: {e}")));
                 return;
             }
         };
@@ -928,14 +935,14 @@ fn start_llm(
                         Some(stream_event::Kind::Final(_)) | Some(stream_event::Kind::Error(_))
                     );
                     if let Ok(mut q) = chunks.lock() {
-                        q.push_back(evt);
+                        q.push_back((epoch, evt));
                     }
                     if done {
                         break;
                     }
                 }
                 Err(e) => {
-                    push_chunk(&chunks, id, error_event(&format!("LLM 连接中断: {e}")));
+                    push_chunk(&chunks, epoch, id, error_event(&format!("LLM 连接中断: {e}")));
                     break;
                 }
             }
@@ -944,11 +951,18 @@ fn start_llm(
     *data.stream_thread.borrow_mut() = Some(handle);
 }
 
-fn push_chunk(chunks: &Arc<Mutex<VecDeque<StreamEvent>>>, id: u64, kind: stream_event::Kind) {
+fn push_chunk(
+    chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>,
+    epoch: u64,
+    id: u64,
+    kind: stream_event::Kind,
+) {
     if let Ok(mut q) = chunks.lock() {
-        q.push_back(StreamEvent {
-            id,
-            kind: Some(kind),
+        q.push_back((
+            epoch,
+            StreamEvent {
+                id,
+                kind: Some(kind),
         });
     }
 }
@@ -965,7 +979,14 @@ fn cancel_stream(data: &Rc<TextServiceData>) {
         *client = ipc::try_connect().ok();
     }
     if let Some(c) = client.as_mut() {
-        let _ = c.llm_cancel(id);
+        if c.llm_cancel(id).is_err() {
+            // 控制连接已死（服务端 idle 超时回收等）：重建并重试一次，
+            // 保证本次取消生效（架构审查 P2-3 回归防护）
+            *client = ipc::try_connect().ok();
+            if let Some(c2) = client.as_mut() {
+                let _ = c2.llm_cancel(id);
+            }
+        }
     }
 }
 
@@ -981,7 +1002,14 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
         *client = ipc::try_connect().ok();
     }
     if let Some(c) = client.as_mut() {
-        let _ = c.llm_cancel(id);
+        if c.llm_cancel(id).is_err() {
+            // 控制连接已死（服务端 idle 超时回收等）：重建并重试一次，
+            // 保证本次取消生效（架构审查 P2-3 回归防护）
+            *client = ipc::try_connect().ok();
+            if let Some(c2) = client.as_mut() {
+                let _ = c2.llm_cancel(id);
+            }
+        }
     }
 }
 
@@ -1048,14 +1076,18 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
             }
         };
         if let Ok(mut q) = chunks.lock() {
-            q.push_back(StreamEvent {
-                id: 0,
-                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
-                    pinyin,
-                    candidates: cands,
-                    done: true,
-                })),
-            });
+            // epoch=0：Rime 候选恒保留（不归属任何 LLM 流代际）
+            q.push_back((
+                0,
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                        pinyin,
+                        candidates: cands,
+                        done: true,
+                    })),
+                },
+            ));
         }
     });
     *data.candidate_thread.borrow_mut() = Some(handle);
@@ -1432,13 +1464,16 @@ impl TextServiceData {
         // 触发任务（截图 OCR / 录音 ASR）结果上屏
         self.drain_trigger_results();
 
-        // 流 id 校验（架构审查 P2-2）：跳过旧流在途 chunk，防止「提交后立即新流」
-        // 窗口内旧流残留污染新结果。Rime 候选与错误事件 id=0 恒保留。
-        let current_stream = self.stream_request_id.load(Ordering::SeqCst);
+        // 流代际过滤（架构审查 P2-2）：只消费当前代际事件，跳过旧流残留
+        // （提交后立即新流的窗口内，旧流在途 chunk 会混入队列——请求 id 每
+        // 连接从 1 自增恒为 2，不能作跨流依据；epoch 单调递增可靠隔离）。
+        // epoch=0（Rime 候选/无代际事件）恒保留。
+        let current_epoch = self.stream_epoch.load(Ordering::SeqCst);
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
             q.drain(..)
-                .filter(|evt| evt.id == 0 || evt.id == current_stream)
+                .filter(|(epoch, _)| *epoch == 0 || *epoch == current_epoch)
+                .map(|(_, evt)| evt)
                 .collect()
         };
         if events.is_empty() {
