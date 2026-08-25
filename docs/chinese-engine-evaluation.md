@@ -48,6 +48,8 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 
 ## 4. 决策建议（阶段化）
 
+> ⚠️ 本节为 2026-08-23 阶段建议，**已被 2026-08-24「单引擎 Rime」决策取代**（见文首）；`config 引擎=builtin|rime` 开关与「候选融合自动触发」均未落地，内置 `verba-pinyin` 已移除。
+
 1. **M5-默认**：保持 `verba-pinyin` 自研引擎为默认（已满足 M5 拼音需求）。
 2. **M5-评估**：用 librime-sys 在 daemon 内做一个**可选引擎 spike**，验证：整句质量（octagram）、五笔/注音方案加载、Rime 词库生态。能跑通且质量明显更好 → 提供 `config 引擎=rime|builtin` 开关；否则维持自研。
 3. **M5-融合**：候选融合 = **词库候选（自研/librime）+ LLM 候选**（经 daemon 的 verba-ai）。LLM 候选按需触发（如候选页 2 提供 AI 联想），控制延迟与成本。
