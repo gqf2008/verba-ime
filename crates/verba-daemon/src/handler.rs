@@ -163,8 +163,19 @@ impl RequestHandler for DaemonHandler {
             Some(request::Kind::AsrTranscribe(g)) => self.handle_asr_transcribe(id, g, out).await,
             Some(request::Kind::ApiKeySet(g)) => self.handle_api_key_set(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
-                // 只取消本连接注册的流（架构审查 P1-1：跨连接 id 碰撞互踩）
-                let token = self.cancels.lock().unwrap().remove(&(conn_id, id));
+                // 优先精确键（P1-1 修复：只取消本连接注册的流，跨连接 id 碰撞互踩）。
+                // 精确查不到时按 id 全局 fallback（#27：Windows 前端取消走独立控制
+                // 连接，流注册在 worker 连接——键控隔离使取消永远查不到）。本地 IPC
+                // 已按用户隔离（B1），同用户内全局匹配可接受；碰撞时取消第一个匹配。
+                // 注意：guard 须在 await 前 drop（MutexGuard 不 Send）。
+                let token = {
+                    let mut cancels = self.cancels.lock().unwrap();
+                    cancels.remove(&(conn_id, id)).or_else(|| {
+                        // 先取 key 再 remove（避免 iter 借用与可变借用冲突）
+                        let key = cancels.iter().find(|(k, _)| k.1 == id).map(|(k, _)| *k);
+                        key.and_then(|k| cancels.remove(&k))
+                    })
+                };
                 if let Some(token) = token {
                     token.cancel();
                 }
