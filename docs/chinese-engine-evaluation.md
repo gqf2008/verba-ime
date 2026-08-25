@@ -5,8 +5,9 @@
 > 本文件评估是否/如何引入 librime 等成熟引擎，以及候选融合路线。
 
 > **决策已定（2026-08-24）**：中文引擎收敛为**单引擎 Rime（librime）**。内置自研 `verba-pinyin`
-> 已从运行时移除（不再生成候选；`config engine` 默认 `rime`）。本文件历史评估保留，结论以
-> 「§ 单引擎化」为准：候选由 daemon 内 Rime 提供，启动预热（`warmup_rime`）避免首次冷启动。
+> 已从运行时移除（不再生成候选），`config engine` 开关亦已删除。本文件历史评估保留，
+> 最终决策见 [roadmap.md 变更记录（2026-08-24）](roadmap.md)：候选由 daemon 内 Rime 提供，
+> 启动预热（`warmup_rime`）避免首次冷启动。
 
 
 > 手感/交互参考：关于「输入法为什么丝滑」（异步不阻塞、容错候选、分段承诺），见 [libpinyin-mir2x 手感参考](libpinyin-mir2x-smoothness.md)。
@@ -47,6 +48,8 @@ librime 的护城河是 **schema 生态 + 十年跨平台打磨**，因此**用 
 **建议：M5 采用 B（daemon 内）做验证**——不增加前端 DLL 体积、引擎崩溃可隔离、三端一致；若延迟不可接受再回退 A（参考 Weasel 模式）。
 
 ## 4. 决策建议（阶段化）
+
+> ⚠️ 本节为 2026-08-23 阶段建议，**已被 2026-08-24「单引擎 Rime」决策取代**（见文首）；`config 引擎=builtin|rime` 开关与「候选融合自动触发」均未落地，内置 `verba-pinyin` 已移除。
 
 1. **M5-默认**：保持 `verba-pinyin` 自研引擎为默认（已满足 M5 拼音需求）。
 2. **M5-评估**：用 librime-sys 在 daemon 内做一个**可选引擎 spike**，验证：整句质量（octagram）、五笔/注音方案加载、Rime 词库生态。能跑通且质量明显更好 → 提供 `config 引擎=rime|builtin` 开关；否则维持自研。

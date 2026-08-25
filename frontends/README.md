@@ -7,7 +7,7 @@
 | 目录 | 平台 | 框架 | 技术 |
 | --- | --- | --- | --- |
 | `windows/` | Windows 10/11 | TSF | Rust（`windows` crate） |
-| `macos/` | macOS 12+ | IMK | Swift 薄壳 + Rust 核心 |
+| `macos/` | macOS 12+ | IMK | 全 Rust（objc2 + objc2-input-method-kit） |
 | `linux/` | Linux | Fcitx5 / IBus / Wayland / XIM | C++ shim + Rust（corrosion）/ imekit |
 
 各端说明见子目录 README。**各端通用验收标准**：
