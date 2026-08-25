@@ -7,7 +7,7 @@
 #![cfg(target_os = "macos")]
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -69,16 +69,24 @@ fn llm_queue() -> &'static Mutex<VecDeque<LlmItem>> {
     Q.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// 全局自增序号（从 1 起，0 表示「无活跃请求」）。
+/// 全局自增序号（从 1 起，0 表示「无活跃请求」）。序号全局唯一：事件带 seq，
+/// 各控制器按自己的活跃 seq 消费，互不干扰（架构审查 P2-1 per-controller）。
 static LLM_SEQ: AtomicU64 = AtomicU64::new(1);
-/// 当前活跃的 LLM 流式请求序号。
-static ACTIVE_STREAM: AtomicU64 = AtomicU64::new(0);
-/// 当前活跃的候选融合请求序号。
-static ACTIVE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
-/// 活跃流式请求的 daemon 侧 id（用于取消，0=无）。
-static STREAM_DAEMON_ID: AtomicU64 = AtomicU64::new(0);
-/// 活跃候选请求的 daemon 侧 id（用于取消，0=无）。
-static CAND_DAEMON_ID: AtomicU64 = AtomicU64::new(0);
+
+/// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
+/// 无法访问控制器 Ivars（主线程独占），经此表传递 daemon id。
+fn daemon_ids() -> &'static Mutex<HashMap<u64, u64>> {
+    static M: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 已取消的 seq 集合：cancel_stream 先登记，工作线程在 llm_start 返回后检查——
+/// 闭合「取消发生在 llm_start 返回前」的竞态窗口（此时 daemon id 尚不可知，
+/// 无法直接取消；worker 检查到后立即取消并退出）。
+fn cancelled_seqs() -> &'static Mutex<HashSet<u64>> {
+    static S: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 fn push_llm(seq: u64, event: StreamEvent) {
     if let Ok(mut q) = llm_queue().lock() {
@@ -100,6 +108,15 @@ struct Ivars {
     candidate_pinyin: RefCell<Option<String>>,
     /// 当前组合文本（composedString: 数据源，供 updateComposition 使用）。
     composed: RefCell<String>,
+    /// 本控制器的活跃 LLM 流序号（0=无）。per-controller（架构审查 P2-1）：
+    /// 多会话（多应用文本域）各自消费自己 seq 的事件，互不串流。
+    active_stream: Cell<u64>,
+    /// 本控制器的活跃候选请求序号（0=无）。
+    active_candidates: Cell<u64>,
+    /// 最近废弃的流序号（取消/失活时记录）：补发的 Final 在之后才入队，
+    /// 届时 active_stream 已归 0 无法匹配——按此序号在 drain 丢弃（防残留
+    /// 无界累积；只记最近一个——更早的流其 worker 已退出、无在途事件）。
+    dead_stream: Cell<u64>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -116,6 +133,9 @@ impl Default for Ivars {
             timer: RefCell::new(None),
             candidate_pinyin: RefCell::new(None),
             composed: RefCell::new(String::new()),
+            active_stream: Cell::new(0),
+            active_candidates: Cell::new(0),
+            dead_stream: Cell::new(0),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
         }
@@ -318,25 +338,40 @@ define_class!(
             }
         }
 
-        /// 主线程定时器：排空 daemon 流事件。
+        /// 主线程定时器：排空本控制器的事件。
+        ///
+        /// 只取走本控制器活跃序号的事件，其余留在队列（多会话场景下另一控制器
+        /// 的定时器会消费自己的部分——整体清空会互相丢弃事件）。
         #[unsafe(method(drainVerbaStream))]
         fn drain_stream(&self) {
-            let items: Vec<LlmItem> = {
+            let stream_seq = self.ivars().active_stream.get();
+            let cand_seq = self.ivars().active_candidates.get();
+            let dead_seq = self.ivars().dead_stream.get();
+            let mine: Vec<LlmItem> = {
                 let mut q = llm_queue().lock().unwrap();
-                q.drain(..).collect()
+                let mut kept = VecDeque::new();
+                let mut mine = Vec::new();
+                for item in q.drain(..) {
+                    if item.seq == dead_seq {
+                        // 本控制器废弃流的残留事件（取消后补发的 Final）：丢弃，
+                        // 防无界累积。
+                        continue;
+                    }
+                    if item.seq == stream_seq || item.seq == cand_seq {
+                        mine.push(item);
+                    } else {
+                        kept.push_back(item);
+                    }
+                }
+                *q = kept;
+                mine
             };
-            if items.is_empty() {
-                return;
-            }
-            let stream_seq = ACTIVE_STREAM.load(Ordering::SeqCst);
-            let cand_seq = ACTIVE_CANDIDATES.load(Ordering::SeqCst);
-            for item in items {
+            for item in mine {
                 if item.seq == stream_seq {
                     self.feed_stream_event(item.event);
-                } else if item.seq == cand_seq {
+                } else {
                     self.feed_candidates_event(item.event);
                 }
-                // 其它序号的旧事件（已被新请求替代）直接丢弃。
             }
         }
     }
@@ -533,7 +568,8 @@ impl VerbaIMKController {
     fn start_llm(&self, prompt: String, system: Option<String>) {
         self.cancel_stream();
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
-        ACTIVE_STREAM.store(seq, Ordering::SeqCst);
+        self.ivars().active_stream.set(seq);
+        self.ivars().dead_stream.set(0);
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
@@ -550,9 +586,11 @@ impl VerbaIMKController {
                     return;
                 }
             };
-            STREAM_DAEMON_ID.store(id, Ordering::SeqCst);
-            // 启动期间已被取消：立即向 daemon 取消并退出，避免空转。
-            if ACTIVE_STREAM.load(Ordering::SeqCst) != seq {
+            daemon_ids().lock().unwrap().insert(seq, id);
+            // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
+            // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
+            if cancelled_seqs().lock().unwrap().remove(&seq) {
+                daemon_ids().lock().unwrap().remove(&seq);
                 let _ = client.llm_cancel(id);
                 return;
             }
@@ -574,6 +612,8 @@ impl VerbaIMKController {
                     }
                 }
             }
+            // 流结束：清理 daemon id 映射（取消路径已 remove；此处防正常结束残留累积）
+            daemon_ids().lock().unwrap().remove(&seq);
         });
 
         self.ensure_timer();
@@ -610,23 +650,15 @@ impl VerbaIMKController {
     /// Rime 为 daemon 内本地同步查询，拼音变更即触发（不防抖），保证「整句候选」即时呈现，
     /// 与其它平台 engine=rime 行为一致。请求结果经 `feed_candidates_event` 融合/去重。
     fn start_rime_candidates(&self, pinyin: String, schema: String) {
-        // 取消上一在途候选请求（含 LLM 融合），避免旧候选回流。
-        let old_cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
-        ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
-        if old_cand_id != 0 {
-            let old = old_cand_id;
-            std::thread::spawn(move || {
-                if let Ok(mut c) = ipc::try_connect() {
-                    let _ = c.llm_cancel(old);
-                }
-            });
-        }
+        // Rime 为本地同步查询，无 daemon 侧 token 注册（无需取消）；
+        // 旧候选回流由 seq 过滤防住（feed_candidates_event 只消费本控制器
+        // 当前 active_candidates 序号的事件）。
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars()
             .candidate_pinyin
             .borrow_mut()
             .replace(pinyin.clone());
-        ACTIVE_CANDIDATES.store(seq, Ordering::SeqCst);
+        self.ivars().active_candidates.set(seq);
         self.ensure_timer();
 
         std::thread::spawn(move || {
@@ -663,8 +695,12 @@ impl VerbaIMKController {
             Some(stream_event::Kind::Chunk(ch)) => {
                 self.ivars().machine.borrow_mut().on_llm_chunk(&ch.text)
             }
-            Some(stream_event::Kind::Final(_)) => self.ivars().machine.borrow_mut().on_llm_done(),
+            Some(stream_event::Kind::Final(_)) => {
+                self.ivars().active_stream.set(0);
+                self.ivars().machine.borrow_mut().on_llm_done()
+            }
             Some(stream_event::Kind::Error(e)) => {
+                self.ivars().active_stream.set(0);
                 self.ivars().machine.borrow_mut().on_llm_error(&e.message)
             }
             _ => Action::None,
@@ -720,37 +756,45 @@ impl VerbaIMKController {
                 }
                 if c.done {
                     self.ivars().candidate_pinyin.borrow_mut().take();
-                    ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+                    self.ivars().active_candidates.set(0);
                 }
             }
             stream_event::Kind::Error(e) => {
                 // Rime 候选错误：不再静默空白，落到日志便于排查（如 librime 未部署）。
                 log::warn!("[VerbaIMK] Rime 候选错误: {}", e.message);
                 self.ivars().candidate_pinyin.borrow_mut().take();
-                ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
+                self.ivars().active_candidates.set(0);
             }
             _ => {}
         }
     }
 
     fn cancel_stream(&self) {
-        ACTIVE_STREAM.store(0, Ordering::SeqCst);
-        ACTIVE_CANDIDATES.store(0, Ordering::SeqCst);
-        let stream_id = STREAM_DAEMON_ID.swap(0, Ordering::SeqCst);
-        let cand_id = CAND_DAEMON_ID.swap(0, Ordering::SeqCst);
+        let stream_seq = self.ivars().active_stream.get();
+        self.ivars().active_stream.set(0);
+        self.ivars().active_candidates.set(0);
         self.ivars().candidate_pinyin.borrow_mut().take();
-        // 尽力向 daemon 取消在途请求，让工作线程尽快退出、停止生成资源。
-        if stream_id != 0 || cand_id != 0 {
-            std::thread::spawn(move || {
-                if let Ok(mut c) = ipc::try_connect() {
-                    if stream_id != 0 {
+        if stream_seq == 0 {
+            return;
+        }
+        // 记录废弃流序号：补发的 Final 之后才入队，届时按此序号在 drain 丢弃，
+        // 防残留无界累积（审查 P3）。仅在有活跃流取消时覆盖（防清掉未回收的旧残留记录）。
+        self.ivars().dead_stream.set(stream_seq);
+        // 取本流的 daemon id：拿到则直接取消；拿不到（llm_start 未返回，daemon id
+        // 尚不可知）才登记到取消集合（闭合启动竞态窗口）。避免对已完成流重复
+        // 登记（防止 cancelled_seqs 泄漏）。
+        let stream_id = daemon_ids().lock().unwrap().remove(&stream_seq);
+        match stream_id {
+            Some(stream_id) => {
+                std::thread::spawn(move || {
+                    if let Ok(mut c) = ipc::try_connect() {
                         let _ = c.llm_cancel(stream_id);
                     }
-                    if cand_id != 0 {
-                        let _ = c.llm_cancel(cand_id);
-                    }
-                }
-            });
+                });
+            }
+            None => {
+                cancelled_seqs().lock().unwrap().insert(stream_seq);
+            }
         }
     }
 
