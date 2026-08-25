@@ -8,6 +8,9 @@ dist/
 build/
 *.log
 
+# 第三方运行时（scripts/fetch-rime-vendor.* 产出，不入库）
+/vendor/
+
 # 密钥 / 本地配置（勿提交）
 .env
 .env.*
