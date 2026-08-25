@@ -93,6 +93,9 @@ impl VerbaClient {
     }
 
     /// 发起 LLM 流式生成，返回请求 id；服务端以 Ok 确认后开始推送事件。
+    ///
+    /// `session_id`：多轮上下文会话标识（每控制器/前端生成唯一值；0 = 旧客户端
+    /// 默认共享槽）。服务端按此分组 AI 历史，实现多会话上下文隔离（架构审查会话维度）。
     pub fn llm_start(
         &mut self,
         prompt: &str,
@@ -100,6 +103,7 @@ impl VerbaClient {
         temperature: Option<f32>,
         max_tokens: Option<i32>,
         image: Option<(&str, &[u8])>,
+        session_id: u64,
     ) -> Result<u64, IpcError> {
         let id = self.new_id();
         let req = Request {
@@ -112,6 +116,7 @@ impl VerbaClient {
                 stream: true,
                 image: image.map(|(_, data)| data.to_vec()),
                 image_mime: image.map(|(mime, _)| mime.to_owned()),
+                session_id,
             })),
         };
         self.write_request(&req)?;

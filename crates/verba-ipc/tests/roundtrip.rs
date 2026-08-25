@@ -139,7 +139,7 @@ async fn llm_stream_roundtrip() {
 
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let id = client
-        .llm_start("你好", None, None, None, None)
+        .llm_start("你好", None, None, None, None, 0)
         .expect("llm_start");
     let mut parts = Vec::new();
     loop {
@@ -226,7 +226,7 @@ async fn llm_vision_image_roundtrip() {
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let img = b"\x89PNG fake vision bytes".to_vec();
     let id = client
-        .llm_start("看图", None, None, None, Some(("image/png", &img)))
+        .llm_start("看图", None, None, None, Some(("image/png", &img)), 0)
         .expect("llm_start image");
     loop {
         let evt = client.next_event(id).expect("next_event");
@@ -303,7 +303,7 @@ async fn llm_cancel_uses_target_request_id() {
 
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let target = client
-        .llm_start("你好", None, None, None, None)
+        .llm_start("你好", None, None, None, None, 0)
         .expect("llm_start");
     client.llm_cancel(target).expect("llm_cancel 成功");
 

@@ -49,6 +49,9 @@ message LlmGenerate {
   // 多模态图像（vision）：mime 如 image/png，字节内容。
   optional bytes image = 6;
   optional string image_mime = 7;
+  // 会话标识：多轮上下文按此分组隔离（每控制器/前端生成唯一值）。
+  // 0 = 旧客户端/未分配的默认共享槽（向后兼容，行为同修复前的单一全局历史）。
+  uint64 session_id = 8;
 }
 
 message LlmCancel {}

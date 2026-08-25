@@ -51,6 +51,10 @@ const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿�
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
 
+/// 全局自增会话 id（从 1 起）：每个输入上下文独占一个 AI 多轮上下文会话，
+/// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
+static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
     context: ITfContext,
@@ -98,6 +102,9 @@ pub struct TextServiceData {
     pub stream_epoch: Arc<AtomicU64>,
     /// 在途候选融合请求 id（0 = 无）。
     pub candidate_request_id: Arc<AtomicU64>,
+    /// 本输入上下文的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按
+    /// session_id 分组隔离历史：多应用文本域各自独立多轮，互不串上下文（B4b）。
+    pub session_id: Cell<u64>,
     /// 待触发的候选融合请求（防抖中）。
     candidate_req_pending: RefCell<Option<PendingCandidateReq>>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
@@ -132,6 +139,7 @@ impl TextServiceData {
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
+            session_id: Cell::new(SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst)),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
@@ -884,13 +892,19 @@ fn start_llm(
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
+    let session_id = data.session_id.get();
     let handle = std::thread::spawn(move || {
         // 新流代际：本流所有事件带此 epoch，on_timer 只消费当前代际
         let epoch = stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
-                push_chunk(&chunks, epoch, 0, error_event(&format!("无法连接 daemon: {e}")));
+                push_chunk(
+                    &chunks,
+                    epoch,
+                    0,
+                    error_event(&format!("无法连接 daemon: {e}")),
+                );
                 return;
             }
         };
@@ -919,10 +933,22 @@ fn start_llm(
         }
 
         let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
-        let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref) {
+        let id = match client.llm_start(
+            &prompt,
+            system.as_deref(),
+            None,
+            None,
+            image_ref,
+            session_id,
+        ) {
             Ok(id) => id,
             Err(e) => {
-                push_chunk(&chunks, epoch, 0, error_event(&format!("LLM 启动失败: {e}")));
+                push_chunk(
+                    &chunks,
+                    epoch,
+                    0,
+                    error_event(&format!("LLM 启动失败: {e}")),
+                );
                 return;
             }
         };
@@ -942,7 +968,12 @@ fn start_llm(
                     }
                 }
                 Err(e) => {
-                    push_chunk(&chunks, epoch, id, error_event(&format!("LLM 连接中断: {e}")));
+                    push_chunk(
+                        &chunks,
+                        epoch,
+                        id,
+                        error_event(&format!("LLM 连接中断: {e}")),
+                    );
                     break;
                 }
             }
