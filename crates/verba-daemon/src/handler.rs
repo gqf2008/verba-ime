@@ -37,7 +37,8 @@ pub struct DaemonHandler {
     /// 全局键会跨连接互踩（架构审查 P1-1）。
     cancels: Arc<Mutex<HashMap<(u64, u64), CancellationToken>>>,
     /// 可选 Rime 引擎（config 引擎=rime 时惰性加载；串行化访问）。
-    rime: Mutex<Option<RimeEngine>>,
+    /// Arc 包裹：同步 FFI 查询走 spawn_blocking（架构审查 P2-3，避免阻塞 tokio worker）。
+    rime: Arc<Mutex<Option<RimeEngine>>>,
     /// AI 多轮上下文（role, content）；config ai_context_turns>0 时使用。
     history: Mutex<VecDeque<(String, String)>>,
     /// 最近若干条 OCR 结果（供 `//上次OCR` / `//OCR <序号>` 复用）。
@@ -65,7 +66,7 @@ impl DaemonHandler {
             llm_config: Arc::new(RwLock::new(llm_config)),
             llm,
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            rime: Mutex::new(None),
+            rime: Arc::new(Mutex::new(None)),
             history: Mutex::new(VecDeque::new()),
             ocr_history: Mutex::new(VecDeque::new()),
         }
@@ -567,28 +568,20 @@ impl DaemonHandler {
     ) -> Result<(), verba_ipc::IpcError> {
         let max = (g.max_candidates as usize).clamp(1, 27);
         let schema = if g.schema.is_empty() {
-            "luna_pinyin_simp"
+            "luna_pinyin_simp".to_owned()
         } else {
-            g.schema.as_str()
+            g.schema.clone()
         };
-        match self.rime_query(|e| e.candidates(&g.input, schema, max)) {
-            Ok(cands) => {
-                out.response(&Response {
-                    id,
-                    kind: Some(response::Kind::Ok(OkMsg {})),
-                })
-                .await?;
-                out.event(&StreamEvent {
-                    id,
-                    kind: Some(stream_event::Kind::Candidates(Candidates {
-                        pinyin: g.input.clone(),
-                        candidates: cands.into_iter().map(|c| c.text).collect(),
-                        done: true,
-                    })),
-                })
-                .await
-            }
-            Err(e) => {
+        // 同步 FFI 查询走 spawn_blocking（架构审查 P2-3）：首次部署 2-5s，
+        // 直接跑在 async 处理器上会阻塞该 tokio worker 上的一切请求。
+        let rime = Arc::clone(&self.rime);
+        let input = g.input.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            Self::rime_query_sync(&rime, |e| e.candidates(&input, &schema, max))
+        });
+        let cands = match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+            Ok(Ok(Ok(cands))) => cands,
+            Ok(Ok(Err(e))) => {
                 out.response(&Response {
                     id,
                     kind: Some(response::Kind::Error(ProtoError {
@@ -596,9 +589,47 @@ impl DaemonHandler {
                         message: e,
                     })),
                 })
-                .await
+                .await?;
+                return Ok(());
             }
-        }
+            Ok(Err(_)) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 500,
+                        message: "Rime 查询任务异常".into(),
+                    })),
+                })
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                // 超时：调用方不再等待（阻塞线程继续运行，由下次查询的互斥体接管）
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 504,
+                        message: "Rime 查询超时".into(),
+                    })),
+                })
+                .await?;
+                return Ok(());
+            }
+        };
+        out.response(&Response {
+            id,
+            kind: Some(response::Kind::Ok(OkMsg {})),
+        })
+        .await?;
+        out.event(&StreamEvent {
+            id,
+            kind: Some(stream_event::Kind::Candidates(Candidates {
+                pinyin: g.input,
+                candidates: cands.into_iter().map(|c| c.text).collect(),
+                done: true,
+            })),
+        })
+        .await
     }
 
     /// TTS 合成：按 config tts_provider/tts_voice 分发，返回音频字节。
@@ -839,18 +870,21 @@ impl DaemonHandler {
     /// 后台预热 Rime 引擎（单引擎，daemon 启动时调用）：提前触发首次部署，
     /// 使首次候选查询免于等待部署（2-5 秒），避免用户误以为无反应。
     pub fn warmup_rime(&self) {
-        match self.rime_query(|_| Ok(())) {
+        // 预热同样走 spawn_blocking：首次部署 2-5s，不能占用 tokio worker
+        let rime = Arc::clone(&self.rime);
+        tokio::task::spawn_blocking(move || match Self::rime_query_sync(&rime, |_| Ok(())) {
             Ok(()) => log::info!("Rime 引擎预热完成"),
             Err(e) => log::warn!("Rime 引擎预热失败（首次查询时会重试）: {e}"),
-        }
+        });
     }
 
     /// 惰性加载并串行执行 Rime 查询（无 await，锁不跨异步点）。
-    fn rime_query<T>(
-        &self,
+    /// Rime 引擎查询（同步 FFI + 互斥体，须在 spawn_blocking 内调用）。
+    fn rime_query_sync<T>(
+        rime: &Mutex<Option<RimeEngine>>,
         f: impl FnOnce(&RimeEngine) -> Result<T, verba_librime::RimeError>,
     ) -> Result<T, String> {
-        let mut guard = self.rime.lock().unwrap();
+        let mut guard = rime.lock().unwrap();
         if guard.is_none() {
             let (dll, shared, user) = rime_paths();
             log::info!(
