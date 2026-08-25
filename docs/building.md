@@ -102,13 +102,35 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 `cargo fmt --check` → `cargo clippy -D warnings` → `cargo test`。
 本地可完整验证的仓库以本地门禁为准，CI 主要作为发布前强制门禁。
 
-## 发布产物与签名
+## 发布产物与签名（M6）
 
 | 平台 | 产物 | 签名 / 公证 |
 | --- | --- | --- |
-| Windows | MSI / exe（Inno Setup） | EV 代码签名（可选）；SmartScreen 提示需证书 |
-| macOS | dmg（内含 .app + .appex） | Developer ID + notarization（必需） |
-| Linux | .deb / .rpm / AppImage | GPG 签名（可选） |
+| Windows | `verba-ime-setup-<版本>.exe`（Inno Setup） | Authenticode 代码签名（可选，`WIN_SIGN_PFX` 配置时启用）；未签名 SmartScreen 会提示 |
+| macOS | `Verba-<版本>.dmg`（内含 Verba.app + Applications 快捷方式） | Developer ID + notarization + staple（必需，`APPLE_*` secrets 配置时启用）；未配置时产出未签名 DMG（仅 dry-run） |
+
+### 发布流程（`.github/workflows/release.yml`）
+
+打 tag `v*`（如 `git tag v0.1.0 && git push origin v0.1.0`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
+
+1. **macOS job**（macos-14，Apple Silicon）：拉取 Rime vendor → `package.sh` 组装（版本注入 + Rime 捆绑）→ 逐二进制 + .app 签名（hardened runtime + timestamp）→ notarytool 公证 + staple → Rime 冒烟 → 打包 DMG + 签名 + 公证 + staple
+2. **Windows job**（windows-latest，MSVC）：构建 workspace + 前端 → PE 子系统守卫（daemon 必须 GUI 子系统，防控制台回归）→ Inno Setup 打包（`/DMyAppVersion` 注入）→ Rime 冒烟 → 可选 signtool 签名
+3. **release job**（仅 tag 触发）：下载两平台产物 → SHA256SUMS → 自动生成 release notes（前置「仅 Apple Silicon」提示）→ 发布 GitHub Release
+
+### secrets 配置（一次性，值复用 abb/ossfs 同一套凭证）
+
+```bash
+gh secret set APPLE_CERT_P12 APPLE_CERT_PASSWORD APPLE_TEAM_ID APPLE_ID APPLE_APP_PASSWORD -R gqf2008/verba-ime
+```
+
+- `APPLE_CERT_P12`：Developer ID Application 证书导出为 PKCS12 的 base64（`security export -k login.keychain -t certs -f pkcs12 -P <密码> cert.p12 && base64 < cert.p12`）
+- `APPLE_CERT_PASSWORD`：P12 导出密码；`APPLE_TEAM_ID` / `APPLE_ID` / `APPLE_APP_PASSWORD`：Apple 账号与 App 专用密码
+- `WIN_SIGN_PFX`（可选）：Windows 代码签名证书 base64 + `WIN_SIGN_PASSWORD`
+
+### 产物校验（发布前）
+
+- macOS：`codesign -dv --strict`、`spctl -a -t open --context context:primary-signature`、`stapler validate`、逐个二进制 `codesign -dvv | grep Timestamp`
+- Windows：PE 子系统断言（流水线内自动）、安装后切换输入法无控制台、`verba-cli rime nishishui` 出词
 
 ## 调试建议
 
