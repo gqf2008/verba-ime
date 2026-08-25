@@ -76,10 +76,15 @@ jobs:
           xcrun stapler staple frontends/macos/ime/dist/Verba.app
           spctl --assess --type execute --verbose=4 frontends/macos/ime/dist/Verba.app || true
 
-      - name: Rime 冒烟（daemon 从 .app 启动，同目录 rime/ 加载）
+      - name: Rime 冒烟（daemon 从 .app 副本启动，不写坏已签名 bundle）
         run: |
           cargo build --release -p verba-cli
-          "$PWD/frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon" >/dev/null 2>&1 &
+          # 必须用 .app 副本冒烟：daemon 默认把 user_data/ 写在 exe 同目录 rime/ 下，
+          # 直接运行会改动已签名 bundle 破坏 seal → 后续 DMG 公证报 "signature of the
+          # binary is invalid"（32849155322 实测：verba-mac 签名无效）。
+          SMOKE_APP="$(mktemp -d)/Verba.app"
+          cp -R frontends/macos/ime/dist/Verba.app "$SMOKE_APP"
+          "$SMOKE_APP/Contents/MacOS/verba-daemon" >/dev/null 2>&1 &
           DPID=$!
           trap 'kill $DPID 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do
@@ -97,6 +102,8 @@ jobs:
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # 显式校验 bundle 签名未被冒烟等步骤破坏（seal 失效会直接导致 DMG 公证 Invalid）
+          codesign --verify --deep --strict frontends/macos/ime/dist/Verba.app
           mkdir -p dmg-staging
           cp -R frontends/macos/ime/dist/Verba.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
