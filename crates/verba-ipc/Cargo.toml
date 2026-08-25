@@ -18,6 +18,8 @@ tokio.workspace = true
 log.workspace = true
 thiserror.workspace = true
 async-trait = "0.1"
+# 用户数据目录定位（socket 按用户隔离，见 src/name.rs）
+directories = "5"
 
 [dev-dependencies]
 tokio.workspace = true
