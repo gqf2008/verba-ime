@@ -963,7 +963,8 @@ fn push_chunk(
             StreamEvent {
                 id,
                 kind: Some(kind),
-        });
+            },
+        ));
     }
 }
 
