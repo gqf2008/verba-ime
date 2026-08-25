@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::os::windows::process::CommandExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
@@ -55,14 +55,32 @@ const ASR_RECORD_SECONDS: f32 = 3.0;
 /// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
 static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// 分配全局唯一的 AI 会话 id。本 IME 是 in-proc COM DLL（InprocServer32），被
-/// 加载进**每个应用进程**，而 daemon 是按用户单例、按 session_id 分组历史——
-/// 进程内序号在不同进程会重号（都为 1,2,…），故高 32 位折叠进程 id，跨进程
-/// 不串槽（复审 HIGH）。pid 复用导致的罕见撞槽由 daemon 侧 LRU 逐出兜底，
-/// 且新会话 append 即覆盖，无害。
+/// 每进程随机盐（惰性生成一次）。本 IME 是 in-proc COM DLL（InprocServer32），被
+/// 加载进**每个应用进程**，而 daemon 是按用户单例、按 session_id 分组历史。用
+/// 随机盐而非裸 pid：避免 pid 复用后新进程撞回旧进程的历史槽（复审 LOW——裸
+/// pid 下撞槽会**继承**陈旧上下文而非覆盖）。盐含时间纳秒+pid 熵，跨进程（含
+/// pid 复用）实际不碰撞。无 rand 依赖，同 name.rs 的本地熵方案（无需密码学强度，
+/// 同用户同机本地隔离即可）。
+fn process_salt() -> u32 {
+    static SALT: OnceLock<u32> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ (std::process::id() as u64) << 32;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
+    })
+}
+
+/// 分配全局唯一的 AI 会话 id：高 32 位为每进程随机盐、低 32 位为进程内自增序号，
+/// 跨进程（含 in-proc DLL 各应用进程）不串 daemon 历史槽。
 fn alloc_session_id() -> u64 {
     let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
-    ((std::process::id() as u64) << 32) | (seq & 0xffff_ffff)
+    ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
 }
 
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
