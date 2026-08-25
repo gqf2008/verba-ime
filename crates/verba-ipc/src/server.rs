@@ -8,7 +8,8 @@ use std::sync::Arc;
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::tokio::Stream as TokioStream;
 use interprocess::local_socket::traits::tokio::Listener as _;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions};use prost::Message;
+use interprocess::local_socket::{GenericFilePath, ListenerOptions};
+use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use verba_protos::{Request, Response, StreamEvent};
@@ -56,9 +57,23 @@ pub trait RequestHandler: Send + Sync + 'static {
 pub async fn serve(name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), IpcError> {
     log::info!("IPC 服务启动: {name}");
     // GenericFilePath：Unix 原样作为 UDS 路径（daemon 侧目录已 chmod 0700）；
-    // Windows 把 `\\.\pipe\` 前缀映射为命名管道（per-user 名称隔离）。
-    let name = name.to_fs_name::<GenericFilePath>()?;
-    let listener = ListenerOptions::new().name(name).create_tokio()?;
+    // Windows 把 `\\.\pipe\` 前缀映射为命名管道（per-user + token 名称隔离）。
+    let ns_name = name.to_fs_name::<GenericFilePath>()?;
+    // stale socket 自愈（架构审查 P1-4）：异常退出（Ctrl-C/SIGKILL 不触发 drop
+    // 清理）残留文件 → 下次 bind 得 EADDRINUSE。先探测：已有活 daemon（能回
+    // Pong）则拒绝启动防双实例；否则 unlink 残留文件再 bind。
+    #[cfg(unix)]
+    {
+        if let Ok(mut probe) =
+            crate::client::VerbaClient::connect_named(name, crate::ConnectWait::Nonblocking)
+        {
+            if probe.ping().is_ok() {
+                return Err(IpcError::Protocol("已有 daemon 实例在运行".into()));
+            }
+        }
+        let _ = std::fs::remove_file(name);
+    }
+    let listener = ListenerOptions::new().name(ns_name).create_tokio()?;
     loop {
         match listener.accept().await {
             Ok(stream) => {

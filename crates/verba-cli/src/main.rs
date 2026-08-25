@@ -80,13 +80,21 @@ where
     F: FnOnce(&mut VerbaClient) -> Result<(), IpcError>,
 {
     match VerbaClient::connect() {
-        Ok(mut client) => match f(&mut client) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("命令失败: {e}");
-                1
+        Ok(mut client) => {
+            // 验活握手（架构审查 P0-1）：连接成功不代表对端是真实 daemon，
+            // 能回 Pong 的才信任（防冒充者窃取 `key set` 的密钥）。
+            if let Err(e) = client.ping() {
+                eprintln!("连接 daemon 失败: {e}");
+                return 1;
             }
-        },
+            match f(&mut client) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("命令失败: {e}");
+                    1
+                }
+            }
+        }
         Err(e) => {
             eprintln!("连接 daemon 失败（先运行 `verba-cli daemon`）: {e}");
             1
