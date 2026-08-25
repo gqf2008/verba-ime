@@ -44,7 +44,7 @@ struct TestHandler;
 
 #[async_trait::async_trait]
 impl RequestHandler for TestHandler {
-    async fn handle(&self, req: Request, out: Outbound) {
+    async fn handle(&self, _conn_id: u64, req: Request, out: Outbound) {
         let id = req.id;
         match req.kind {
             Some(request::Kind::Ping(_)) => {
@@ -179,7 +179,7 @@ struct CapturingHandler {
 
 #[async_trait::async_trait]
 impl RequestHandler for CapturingHandler {
-    async fn handle(&self, req: Request, out: Outbound) {
+    async fn handle(&self, _conn_id: u64, req: Request, out: Outbound) {
         match req.kind {
             Some(request::Kind::LlmGenerate(g)) => {
                 *self.captured.lock().unwrap() = Some(g.clone());
@@ -253,7 +253,7 @@ struct CancelCapturingHandler {
 
 #[async_trait::async_trait]
 impl RequestHandler for CancelCapturingHandler {
-    async fn handle(&self, req: Request, out: Outbound) {
+    async fn handle(&self, _conn_id: u64, req: Request, out: Outbound) {
         match req.kind {
             Some(request::Kind::LlmGenerate(_)) => {
                 let _ = out
@@ -264,7 +264,7 @@ impl RequestHandler for CancelCapturingHandler {
                     .await;
             }
             Some(request::Kind::LlmCancel(_)) => {
-                // daemon 端正是用 req.id 从 cancels 表移除 token。
+                // daemon 端正是用 (conn_id, req.id) 从 cancels 表移除 token。
                 *self.captured.lock().unwrap() = Some(req.id);
                 let _ = out
                     .response(&Response {

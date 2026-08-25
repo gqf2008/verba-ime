@@ -181,6 +181,28 @@ define_class!(
                 return Bool::new(false);
             }
 
+            // 多字符粘贴（keyCode=0 时整串到达）：逐字符喂入状态机并逐步应用动作。
+            // 此前 classify_key 只取首字符，其余全部丢失（架构审查 P1-2）。
+            let is_multi_paste = key_code == 0
+                && string
+                    .map(|s| s.to_string().chars().count() > 1)
+                    .unwrap_or(false);
+            if is_multi_paste {
+                if let Some(s) = string {
+                    let mut applied = false;
+                    for ch in s.to_string().chars() {
+                        // 与控制字符过滤一致（classify_key 同款规则）
+                        if ch < ' ' || (0xF700..=0xF8FF).contains(&(ch as u32)) {
+                            continue;
+                        }
+                        let action = self.ivars().machine.borrow_mut().feed_char(ch);
+                        self.apply_action(action);
+                        applied = true;
+                    }
+                    return Bool::new(applied);
+                }
+            }
+
             let was_idle = matches!(self.ivars().machine.borrow().state(), MachineState::Idle);
             let action = match key {
                 Some(ImkKey::Char(c)) => {

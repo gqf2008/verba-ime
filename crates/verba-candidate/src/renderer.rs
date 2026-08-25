@@ -417,10 +417,13 @@ impl CpuCandidateRenderer {
                     None => continue,
                 };
                 for (i, &a) in mask.iter().enumerate() {
+                    // 预乘必须用宽类型中间量：u8 `wrapping_mul` 在 255×255 溢出
+                    // （mod 256 → 1 → 1/255=0），所有字形像素会塌成不透明黑，
+                    // 暗色主题文字完全不可见（架构审查 P1-3）。
                     gp.pixels_mut()[i] = tiny_skia::PremultipliedColorU8::from_rgba(
-                        r8.wrapping_mul(a) / 255,
-                        g8.wrapping_mul(a) / 255,
-                        b8.wrapping_mul(a) / 255,
+                        premultiply_channel(r8, a),
+                        premultiply_channel(g8, a),
+                        premultiply_channel(b8, a),
                         a,
                     )
                     .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
@@ -510,5 +513,25 @@ pub fn window_size(ctrl: &CandidateWindowController) -> (u32, u32) {
             theme.max_width,
             theme.padding * 2 + header + item_count as u32 * theme.item_height + footer + status,
         )
+    }
+}
+
+/// 单通道预乘（宽类型中间量，避免 u8 `wrapping_mul` 溢出塌成 0）。
+fn premultiply_channel(v: u8, a: u8) -> u8 {
+    (v as u16 * a as u16 / 255) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::premultiply_channel;
+
+    #[test]
+    fn premultiply_boundaries() {
+        // 回归：u8 wrapping_mul 下 255×255 mod 256 = 1 → 1/255 = 0（恒黑 bug）
+        assert_eq!(premultiply_channel(255, 255), 255);
+        assert_eq!(premultiply_channel(255, 0), 0);
+        assert_eq!(premultiply_channel(128, 255), 128);
+        assert_eq!(premultiply_channel(255, 128), 128);
+        assert_eq!(premultiply_channel(200, 100), 78); // 200*100/255 = 78.4 → 78
     }
 }

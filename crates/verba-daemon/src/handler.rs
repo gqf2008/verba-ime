@@ -33,13 +33,28 @@ pub struct DaemonHandler {
     config: Arc<RwLock<Config>>,
     llm_config: Arc<RwLock<LlmConfig>>,
     llm: LlmClient,
-    cancels: Mutex<HashMap<u64, CancellationToken>>,
+    /// 取消注册表：键为 `(conn_id, req_id)`——请求 id 每连接从 1 自增，
+    /// 全局键会跨连接互踩（架构审查 P1-1）。
+    cancels: Arc<Mutex<HashMap<(u64, u64), CancellationToken>>>,
     /// 可选 Rime 引擎（config 引擎=rime 时惰性加载；串行化访问）。
     rime: Mutex<Option<RimeEngine>>,
     /// AI 多轮上下文（role, content）；config ai_context_turns>0 时使用。
     history: Mutex<VecDeque<(String, String)>>,
     /// 最近若干条 OCR 结果（供 `//上次OCR` / `//OCR <序号>` 复用）。
     ocr_history: Mutex<VecDeque<String>>,
+}
+
+/// 取消注册 RAII 守卫：函数任何退出路径（含 early-return）都移除注册，
+/// 防止取消表无界泄漏（架构审查 P2-8）。
+struct CancelGuard {
+    cancels: Arc<Mutex<HashMap<(u64, u64), CancellationToken>>>,
+    key: (u64, u64),
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl DaemonHandler {
@@ -49,7 +64,7 @@ impl DaemonHandler {
             config: Arc::new(RwLock::new(config)),
             llm_config: Arc::new(RwLock::new(llm_config)),
             llm,
-            cancels: Mutex::new(HashMap::new()),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
             rime: Mutex::new(None),
             history: Mutex::new(VecDeque::new()),
             ocr_history: Mutex::new(VecDeque::new()),
@@ -73,7 +88,7 @@ impl DaemonHandler {
 
 #[async_trait::async_trait]
 impl RequestHandler for DaemonHandler {
-    async fn handle(&self, req: verba_protos::Request, out: Outbound) {
+    async fn handle(&self, conn_id: u64, req: verba_protos::Request, out: Outbound) {
         let id = req.id;
         let result = match req.kind {
             Some(request::Kind::Ping(_)) => {
@@ -136,15 +151,20 @@ impl RequestHandler for DaemonHandler {
                 })
                 .await
             }
-            Some(request::Kind::LlmGenerate(g)) => self.handle_llm_generate(id, g, out).await,
-            Some(request::Kind::LlmCandidates(g)) => self.handle_llm_candidates(id, g, out).await,
+            Some(request::Kind::LlmGenerate(g)) => {
+                self.handle_llm_generate(conn_id, id, g, out).await
+            }
+            Some(request::Kind::LlmCandidates(g)) => {
+                self.handle_llm_candidates(conn_id, id, g, out).await
+            }
             Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
             Some(request::Kind::TtsSynthesize(g)) => self.handle_tts_synthesize(id, g, out).await,
             Some(request::Kind::OcrRecognize(g)) => self.handle_ocr_recognize(id, g, out).await,
             Some(request::Kind::AsrTranscribe(g)) => self.handle_asr_transcribe(id, g, out).await,
             Some(request::Kind::ApiKeySet(g)) => self.handle_api_key_set(id, g, out).await,
             Some(request::Kind::LlmCancel(_)) => {
-                let token = self.cancels.lock().unwrap().remove(&id);
+                // 只取消本连接注册的流（架构审查 P1-1：跨连接 id 碰撞互踩）
+                let token = self.cancels.lock().unwrap().remove(&(conn_id, id));
                 if let Some(token) = token {
                     token.cancel();
                 }
@@ -174,12 +194,19 @@ impl RequestHandler for DaemonHandler {
 impl DaemonHandler {
     async fn handle_llm_generate(
         &self,
+        conn_id: u64,
         id: u64,
         g: verba_protos::LlmGenerate,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
+        let key = (conn_id, id);
         let token = CancellationToken::new();
-        self.cancels.lock().unwrap().insert(id, token.clone());
+        self.cancels.lock().unwrap().insert(key, token.clone());
+        // RAII 守卫：任何退出路径（early-return/错误）都移除注册，防取消表泄漏
+        let _guard = CancelGuard {
+            cancels: Arc::clone(&self.cancels),
+            key,
+        };
 
         out.response(&Response {
             id,
@@ -321,9 +348,11 @@ impl DaemonHandler {
         match self.llm.stream(&llm_cfg, &req).await {
             Ok(mut stream) => {
                 let mut failed = false;
+                let mut cancelled = false;
                 let mut final_text = String::new();
                 tokio::select! {
                     _ = token.cancelled() => {
+                        cancelled = true;
                         log::info!("LLM 请求 {id} 已取消");
                     }
                     _ = async {
@@ -364,6 +393,8 @@ impl DaemonHandler {
                     } => {}
                 }
                 // 取消时也补发 Final，保证客户端流线程能退出阻塞读。
+                // 但取消轮不写入 AI 上下文——截断文本进历史会把半截回答
+                // 当完整一轮发给下一轮（架构审查 P1-6）。
                 if !failed {
                     let _ = out
                         .event(&StreamEvent {
@@ -374,7 +405,7 @@ impl DaemonHandler {
                         })
                         .await;
                     // 记录这一轮（文本 AI），供下一轮上下文；图像请求不入历史。
-                    if !has_image && context_turns > 0 {
+                    if !cancelled && !has_image && context_turns > 0 {
                         let mut guard = self.history.lock().unwrap();
                         guard.push_back(("user".to_owned(), user_prompt.clone()));
                         guard.push_back(("assistant".to_owned(), final_text.clone()));
@@ -398,7 +429,6 @@ impl DaemonHandler {
             }
         }
 
-        self.cancels.lock().unwrap().remove(&id);
         Ok(())
     }
 
@@ -406,12 +436,19 @@ impl DaemonHandler {
     /// `Candidates` 事件（去重 + 去编号），结束（含取消）时补发 `done=true`。
     async fn handle_llm_candidates(
         &self,
+        conn_id: u64,
         id: u64,
         g: verba_protos::LlmCandidates,
         out: Outbound,
     ) -> Result<(), verba_ipc::IpcError> {
+        let key = (conn_id, id);
         let token = CancellationToken::new();
-        self.cancels.lock().unwrap().insert(id, token.clone());
+        self.cancels.lock().unwrap().insert(key, token.clone());
+        // RAII 守卫：任何退出路径都移除注册，防取消表泄漏
+        let _guard = CancelGuard {
+            cancels: Arc::clone(&self.cancels),
+            key,
+        };
 
         out.response(&Response {
             id,
@@ -518,7 +555,6 @@ impl DaemonHandler {
             }
         }
 
-        self.cancels.lock().unwrap().remove(&id);
         Ok(())
     }
 
