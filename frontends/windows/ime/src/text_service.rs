@@ -51,9 +51,19 @@ const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿�
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
 
-/// 全局自增会话 id（从 1 起）：每个输入上下文独占一个 AI 多轮上下文会话，
+/// 全局自增会话序号（从 1 起）：进程内每个输入上下文独占一个 AI 多轮上下文会话，
 /// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
 static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 分配全局唯一的 AI 会话 id。本 IME 是 in-proc COM DLL（InprocServer32），被
+/// 加载进**每个应用进程**，而 daemon 是按用户单例、按 session_id 分组历史——
+/// 进程内序号在不同进程会重号（都为 1,2,…），故高 32 位折叠进程 id，跨进程
+/// 不串槽（复审 HIGH）。pid 复用导致的罕见撞槽由 daemon 侧 LRU 逐出兜底，
+/// 且新会话 append 即覆盖，无害。
+fn alloc_session_id() -> u64 {
+    let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
+    ((std::process::id() as u64) << 32) | (seq & 0xffff_ffff)
+}
 
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
@@ -139,7 +149,7 @@ impl TextServiceData {
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
-            session_id: Cell::new(SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst)),
+            session_id: Cell::new(alloc_session_id()),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
