@@ -53,6 +53,8 @@ jobs:
           echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
       - name: 获取 Rime vendor（librime.dylib + data/）
+        env:
+          GH_TOKEN: ${{ github.token }} # gh api 认证（runner 上 gh 不自动读 GITHUB_TOKEN）
         run: bash scripts/fetch-rime-vendor.sh
 
       - name: 组装 Verba.app（构建 + 版本注入 + Rime 捆绑 + ad-hoc 签名）
@@ -161,6 +163,8 @@ jobs:
           Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
 
       - name: 获取 Rime vendor（rime.dll + data/）
+        env:
+          GH_TOKEN: ${{ github.token }} # gh api 认证（runner 上 gh 不自动读 GITHUB_TOKEN）
         shell: pwsh
         run: ./scripts/fetch-rime-vendor.ps1
 
