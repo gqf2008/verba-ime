@@ -88,7 +88,12 @@ pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(runtime.block_on(verba_ipc::server::serve(socket_name, handler))?)
 }
 
-/// 使用默认套接字（Unix 用户数据目录全路径 / Windows per-user 管道）运行。
+/// 使用默认套接字（Unix 用户数据目录全路径 / Windows per-user+token 管道）运行。
 pub fn run_default() -> Result<(), Box<dyn std::error::Error>> {
+    // Windows 首启顺序（复核 P1）：必须先写 token 再取 spec——spec 在调用前求值，
+    // 若首启时文件不存在会绑定 fallback 名，而 client 重试读文件拿到真实 token 名，
+    // 两者永不匹配（首启失败 + 孤儿 daemon）。
+    #[cfg(windows)]
+    verba_ipc::name::ensure_ipc_token()?;
     run(&verba_ipc::default_socket_spec())
 }

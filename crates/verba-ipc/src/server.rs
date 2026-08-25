@@ -60,18 +60,22 @@ pub async fn serve(name: &str, handler: Arc<dyn RequestHandler>) -> Result<(), I
     // Windows 把 `\\.\pipe\` 前缀映射为命名管道（per-user + token 名称隔离）。
     let ns_name = name.to_fs_name::<GenericFilePath>()?;
     // stale socket 自愈（架构审查 P1-4）：异常退出（Ctrl-C/SIGKILL 不触发 drop
-    // 清理）残留文件 → 下次 bind 得 EADDRINUSE。先探测：已有活 daemon（能回
-    // Pong）则拒绝启动防双实例；否则 unlink 残留文件再 bind。
+    // 清理）残留文件 → 下次 bind 得 EADDRINUSE。先探测：connect 成功即视为已有
+    // daemon（保守拒绝，避免无超时 ping 挂死）；否则仅当残留的是 socket 文件时
+    // unlink 再 bind（不误删普通文件）。
     #[cfg(unix)]
     {
-        if let Ok(mut probe) =
-            crate::client::VerbaClient::connect_named(name, crate::ConnectWait::Nonblocking)
+        use std::os::unix::fs::FileTypeExt;
+        if crate::client::VerbaClient::connect_named(name, crate::ConnectWait::Nonblocking).is_ok()
         {
-            if probe.ping().is_ok() {
-                return Err(IpcError::Protocol("已有 daemon 实例在运行".into()));
-            }
+            return Err(IpcError::Protocol("已有 daemon 实例在运行".into()));
         }
-        let _ = std::fs::remove_file(name);
+        if std::fs::symlink_metadata(name)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(name);
+        }
     }
     let listener = ListenerOptions::new().name(ns_name).create_tokio()?;
     loop {
