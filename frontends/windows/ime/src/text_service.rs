@@ -1432,9 +1432,14 @@ impl TextServiceData {
         // 触发任务（截图 OCR / 录音 ASR）结果上屏
         self.drain_trigger_results();
 
+        // 流 id 校验（架构审查 P2-2）：跳过旧流在途 chunk，防止「提交后立即新流」
+        // 窗口内旧流残留污染新结果。Rime 候选与错误事件 id=0 恒保留。
+        let current_stream = self.stream_request_id.load(Ordering::SeqCst);
         let events: Vec<StreamEvent> = {
             let mut q = self.chunks.lock().unwrap();
-            q.drain(..).collect()
+            q.drain(..)
+                .filter(|evt| evt.id == 0 || evt.id == current_stream)
+                .collect()
         };
         if events.is_empty() {
             return;

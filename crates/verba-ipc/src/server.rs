@@ -123,10 +123,21 @@ async fn handle_connection(
 
     loop {
         let mut conn = &*stream;
-        let payload = match read_frame_async(&mut conn).await {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(IpcError::Io(e)),
+        // 读帧 idle 超时（架构审查 P2-3）：慢/死客户端挂连接不回收会堆积
+        // reader/writer 任务；60s 无请求即断开。
+        let payload = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            read_frame_async(&mut conn),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(e)) => return Err(IpcError::Io(e)),
+            Err(_) => {
+                log::debug!("连接读空闲超时，回收");
+                break;
+            }
         };
         let req = match Request::decode(payload.as_slice()) {
             Ok(r) => r,
