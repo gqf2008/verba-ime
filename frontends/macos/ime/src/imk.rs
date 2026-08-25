@@ -113,6 +113,10 @@ struct Ivars {
     active_stream: Cell<u64>,
     /// 本控制器的活跃候选请求序号（0=无）。
     active_candidates: Cell<u64>,
+    /// 最近废弃的流序号（取消/失活时记录）：补发的 Final 在之后才入队，
+    /// 届时 active_stream 已归 0 无法匹配——按此序号在 drain 丢弃（防残留
+    /// 无界累积；只记最近一个——更早的流其 worker 已退出、无在途事件）。
+    dead_stream: Cell<u64>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -131,6 +135,7 @@ impl Default for Ivars {
             composed: RefCell::new(String::new()),
             active_stream: Cell::new(0),
             active_candidates: Cell::new(0),
+            dead_stream: Cell::new(0),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
         }
@@ -341,11 +346,17 @@ define_class!(
         fn drain_stream(&self) {
             let stream_seq = self.ivars().active_stream.get();
             let cand_seq = self.ivars().active_candidates.get();
+            let dead_seq = self.ivars().dead_stream.get();
             let mine: Vec<LlmItem> = {
                 let mut q = llm_queue().lock().unwrap();
                 let mut kept = VecDeque::new();
                 let mut mine = Vec::new();
                 for item in q.drain(..) {
+                    if item.seq == dead_seq {
+                        // 本控制器废弃流的残留事件（取消后补发的 Final）：丢弃，
+                        // 防无界累积。
+                        continue;
+                    }
                     if item.seq == stream_seq || item.seq == cand_seq {
                         mine.push(item);
                     } else {
@@ -558,6 +569,7 @@ impl VerbaIMKController {
         self.cancel_stream();
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
+        self.ivars().dead_stream.set(0);
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
@@ -765,6 +777,9 @@ impl VerbaIMKController {
         if stream_seq == 0 {
             return;
         }
+        // 记录废弃流序号：补发的 Final 之后才入队，届时按此序号在 drain 丢弃，
+        // 防残留无界累积（审查 P3）。仅在有活跃流取消时覆盖（防清掉未回收的旧残留记录）。
+        self.ivars().dead_stream.set(stream_seq);
         // 取本流的 daemon id：拿到则直接取消；拿不到（llm_start 未返回，daemon id
         // 尚不可知）才登记到取消集合（闭合启动竞态窗口）。避免对已完成流重复
         // 登记（防止 cancelled_seqs 泄漏）。
