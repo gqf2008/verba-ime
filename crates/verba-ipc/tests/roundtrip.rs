@@ -264,7 +264,7 @@ impl RequestHandler for CancelCapturingHandler {
                     .await;
             }
             Some(request::Kind::LlmCancel(_)) => {
-                // daemon 端正是用 req.id 从 cancels 表移除 token。
+                // daemon 端正是用 (conn_id, req.id) 从 cancels 表移除 token。
                 *self.captured.lock().unwrap() = Some(req.id);
                 let _ = out
                     .response(&Response {
