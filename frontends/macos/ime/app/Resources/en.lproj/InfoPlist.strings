@@ -1,0 +1,7 @@
+/* Input source display names (TIS lookup by TISInputSourceID; macOS 26 verified).
+   Without this mapping the input source list falls back to showing the raw ID.
+   zh-Hans.lproj covers Chinese users; zh_CN.lproj is the development-region fallback. */
+"CFBundleName" = "拾言输入法";
+"CFBundleDisplayName" = "拾言输入法";
+"dev.verba.inputmethod.Verba" = "拾言输入法";
+"dev.verba.inputmethod.Verba.Pinyin" = "拾言输入法";

@@ -24,6 +24,9 @@ cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
+# 输入源显示名本地化（InfoPlist.strings：TIS 按 TISInputSourceID 取值，
+# 缺失时系统设置列表回退显示原始 ID，见 app/Resources/）
+cp -R "$IME_ROOT/app/Resources" "$APP/Contents/Resources"
 
 # 版本注入：以根 Cargo.toml 的 workspace 版本为唯一版本源，同步
 # CFBundleShortVersionString / CFBundleVersion（只改拷贝，不弄脏源码树）。

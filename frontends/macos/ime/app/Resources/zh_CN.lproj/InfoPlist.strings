@@ -1,0 +1,5 @@
+/* 输入源显示名（开发区域 zh_CN 回退：其他语言系统兜底，见 zh-Hans.lproj 同名文件说明） */
+"CFBundleName" = "拾言输入法";
+"CFBundleDisplayName" = "拾言输入法";
+"dev.verba.inputmethod.Verba" = "拾言输入法";
+"dev.verba.inputmethod.Verba.Pinyin" = "拾言输入法";

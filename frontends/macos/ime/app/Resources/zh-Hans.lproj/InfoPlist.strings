@@ -1,0 +1,9 @@
+/* 输入源显示名本地化（TIS 显示名机制，macOS 26 实测）：
+   模式行显示名按 TISInputSourceID 从此文件取值，缺省时系统设置
+   的输入源列表回退显示原始 ID（dev.verba.inputmethod.Verba.Pinyin）。
+   CFBundleName/CFBundleDisplayName 亦在此本地化。
+   另有 en.lproj 覆盖英文用户；zh_CN.lproj 为开发区域回退（兜底其他语言）。 */
+"CFBundleName" = "拾言输入法";
+"CFBundleDisplayName" = "拾言输入法";
+"dev.verba.inputmethod.Verba" = "拾言输入法";
+"dev.verba.inputmethod.Verba.Pinyin" = "拾言输入法";
