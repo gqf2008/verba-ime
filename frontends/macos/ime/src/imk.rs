@@ -25,6 +25,7 @@ use objc2_foundation::{
 use objc2_input_method_kit::{IMKInputController, IMKServer, IMKStateSetting};
 
 use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
+use verba_ipc::name::local_entropy_u64;
 use verba_protos::{stream_event, StreamEvent};
 
 use crate::ipc;
@@ -85,17 +86,9 @@ static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// 同 Windows text_service.rs 的本地熵方案。
 fn process_salt() -> u32 {
     static SALT: OnceLock<u32> = OnceLock::new();
-    *SALT.get_or_init(|| {
-        let mut s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ (std::process::id() as u64) << 32;
-        s ^= s >> 12;
-        s ^= s << 25;
-        s ^= s >> 27;
-        (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
-    })
+    // 本地熵实现统一收敛到 verba-ipc name::local_entropy_u64（复用评审：
+    // 原三处内联 xorshift 实现合一，便于审计与保持一致）。
+    *SALT.get_or_init(|| (local_entropy_u64() >> 32) as u32)
 }
 
 /// 分配全局唯一的 AI 会话 id：高 32 位进程随机盐、低 32 位进程内自增序号，
@@ -259,12 +252,11 @@ define_class!(
 
             // 多字符粘贴（keyCode=0 时整串到达）：逐字符喂入状态机并逐步应用动作。
             // 此前 classify_key 只取首字符，其余全部丢失（架构审查 P1-2）。
-            // 已知限制（复审 sweep，暂留）：逐字符 apply_action 会对每个 UpdatePinyin
-            // 触发一次 start_candidates → 每字符一个 Rime worker 线程 + 一次 daemon
-            // 查询，超长粘贴（数百字）会瞬时放大为同等规模的线程/查询/主线程
-            // marked-text 更新，可能让宿主卡顿。击键节奏不会触发，仅机器节奏的粘贴会。
-            // 正确的修法是给候选请求加防抖/合并（与 Windows 端 debounce 对齐），属
-            // 行为变更，留作后续；seq 过滤已保证只有最新候选结果被消费，正确性无碍。
+            // 候选查询按粘贴整体合并为一次（见下）：原先每字符一个 UpdatePinyin
+            // 触发一次 start_candidates → Rime worker 线程 + daemon 查询，超长
+            // 粘贴（数百字）会瞬时放大为同等规模的线程/查询/主线程 marked-text
+            // 更新风暴（复审发现）；中间态仅按状态机候选刷新显示，循环结束后
+            // 对最终拼音补发一次查询，候选结果由 seq 过滤保证只消费最新代。
             let pasted = if key_code == 0 {
                 string.map(|s| s.to_string())
             } else {
@@ -272,10 +264,18 @@ define_class!(
             };
             if let Some(text) = pasted.filter(|t| t.chars().count() > 1) {
                 let mut applied = false;
+                let mut last_candidate_req: Option<LlmCandidateRequest> = None;
                 for ch in text.chars().filter(|&ch| is_pasteable_char(ch)) {
-                    let action = self.ivars().machine.borrow_mut().feed_char(ch);
+                    let mut action = self.ivars().machine.borrow_mut().feed_char(ch);
+                    // 摘出候选请求合并到循环末尾一次发送；余下动作照常逐步应用。
+                    if let Action::UpdatePinyin { llm_request, .. } = &mut action {
+                        last_candidate_req = llm_request.take();
+                    }
                     self.apply_action(action);
                     applied = true;
+                }
+                if let Some(req) = last_candidate_req {
+                    self.start_candidates(req);
                 }
                 return Bool::new(applied);
             }
@@ -434,6 +434,18 @@ define_class!(
                     }
                 }
                 *q = kept;
+                // 全局队列上限：既不属于本控制器活跃序号、也不在任何控制器的
+                // dead_seqs 的孤儿事件（控制器 deallocated 前未 drain 的残留）
+                // 无人回收，长期运行会无界滞留且每次 tick 全量遍历（复审发现）。
+                // 超限丢弃最旧条目——常规下活跃流事件每 50ms 被其控制器取走，
+                // 滞留的几乎全是孤儿/迟到事件；极端场景（主线程被长粘贴阻塞且
+                // 多控制器并发大流）也可能丢到活跃流头部 chunk，但需数千事件
+                // 积压才触发，取舍可接受（对抗审查 F2）。
+                const LLM_QUEUE_MAX: usize = 1024;
+                let len = q.len();
+                if len > LLM_QUEUE_MAX {
+                    q.drain(..len - LLM_QUEUE_MAX);
+                }
                 if !dead_hit.is_empty() {
                     // 只清 cancelled_seqs；dead_seqs 条目保留（见上），供后续 tick
                     // 继续丢弃同一取消流的迟到事件。

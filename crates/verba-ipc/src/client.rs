@@ -29,9 +29,6 @@ use crate::codec::{encode_frame, read_frame};
 use crate::error::IpcError;
 use crate::name::default_socket_spec;
 
-/// 默认套接字名（旧值，保持兼容导出；实际默认见 [`default_socket_spec`]）。
-pub const DEFAULT_SOCKET_NAME: &str = "verba-ime";
-
 /// `connect_verified` 验活握手的读超时：仅作用于握手期间（防对端接受连接但
 /// 永不应答时把前端 UI 线程一起挂起）。正常 daemon 本地回 Pong 为微秒级，
 /// 取宽裕的 5s 仅为兜底卡死场景。仅 Unix 使用（Windows 命名管道不支持 I/O 超时）。
