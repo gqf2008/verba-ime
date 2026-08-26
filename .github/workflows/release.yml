@@ -112,6 +112,13 @@ jobs:
             exit 1
           fi
           echo "Rime 冒烟通过：$OUT"
+          OUT2="$(./target/release/verba-cli rime biang luna_pinyin_simp 2>&1 || true)"
+          BIANG="$(python3 -c 'import sys; sys.stdout.write(chr(0x30EDD))')"
+          if ! printf '%s' "$OUT2" | grep -qF "$BIANG"; then
+            echo "::error::biang 词条冒烟失败：$OUT2" >&2
+            exit 1
+          fi
+          echo "biang 词条冒烟通过：$OUT2"
 
       - name: 打包 DMG（有身份时签名 + 公证 + staple）
         run: |
@@ -240,6 +247,11 @@ jobs:
             $out = & "target\release\verba-cli.exe" rime nishishui luna_pinyin_simp 2>&1 | Out-String
             if ($out -notmatch "你是谁") { throw "Rime 冒烟失败: $out" }
             Write-Host "Rime 冒烟通过: $($out.Trim())"
+            $out2 = & "target\release\verba-cli.exe" rime biang luna_pinyin_simp 2>&1 | Out-String
+            # U+30EDD 属增补平面：[char] 数值转换对 >0xFFFF 抛 OverflowException，须用 ConvertFromUtf32
+            $biang = [string][char]::ConvertFromUtf32(0x30EDD)
+            if ($out2 -notmatch [regex]::Escape($biang)) { throw "biang 词条冒烟失败: $out2" }
+            Write-Host "biang 词条冒烟通过: $($out2.Trim())"
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
           }

@@ -1,0 +1,15 @@
+# Verba 补充自定义短语（scripts/rime-extra/，由 fetch-rime-vendor 注入 vendor/rime/data/）
+# Rime table 格式：文字 TAB 编码 [ TAB 权重 ]（librime table_db.cc：code = row[1]）
+# 陕西 biángbiáng 面：繁体形 U+30EDD（主词库无）、简体形 U+30EDE（主词库已有，
+# 此处显式收录便于顺序可控）；权重须非负（负值=删除标记，librime user_dictionary.cc）
+# 显示（候选窗/上屏）依赖系统装有含 CJK Ext G 字形的字体
+# encoding: utf-8
+
+---
+name: custom_phrase
+version: "2026.08"
+sort: by_weight
+use_preset_vocabulary: false
+
+𰻝	biang
+𰻞	biang
