@@ -93,7 +93,7 @@
 - [x] 内置轻量拼音引擎（`verba-pinyin`：hanzi_db 字频 + CC-CEDICT 词库，音节切分、频率排序、前缀补全、模糊音、简拼、整句 DP、提示词拼音）——**已于 2026-08-24 单引擎化时移除**（保留作历史记录）
 - [x] Windows 前端拼音组合：字母进拼音、内联候选、数字/空格选候选上屏、`//` 提示词内拼音输中文（2026-08-22）
 - [x] 选型评估：[中文引擎选型与集成评估](chinese-engine-evaluation.md)——结论：librime FFI > 重写；最终定案 **单引擎 Rime**（2026-08-24）
-- [x] 独立候选窗（跟随光标 + 智能避让）——tiny-skia 自绘置顶弹窗，锚点取组合屏幕坐标（只读编辑会话内 GetTextExt），默认正下方、放不下翻上方、水平防越界（2026-08-23 实机验收通过）
+- [x] 独立候选窗（跟随光标 + 智能避让）——tiny-skia 自绘置顶弹窗，锚点取组合屏幕坐标（只读编辑会话内 GetTextExt），默认正下方、放不下翻上方、水平防越界（2026-08-23 实机验收通过；选型理由见 [architecture.md](architecture.md) §12.2）
 - [x] 候选窗分页（9→27 候选，`-`/`=` 与 PageUp/PageDown 翻页、页码脚）与主题/皮肤（light/dark 预设 + 逐项覆盖、圆角、配置热更新）（2026-08-23）
 | 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；`verba-candidate` renderer 重构） |
 - [x] librime-sys spike（Windows）：预编译 rime.dll FFI 验证——拼音 luna_pinyin + 五笔 wubi86
