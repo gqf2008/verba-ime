@@ -248,7 +248,10 @@ fn save_fields(values: HashMap<String, String>, new_key: &str) -> String {
 fn with_client<T>(
     f: impl FnOnce(&mut VerbaClient) -> Result<T, verba_ipc::IpcError>,
 ) -> Result<T, String> {
-    let mut client = VerbaClient::connect().map_err(|e| format!("连接 daemon 失败: {e}"))?;
+    // connect_verified：验活握手后才信任对端（本面板会发送 API key——
+    // 全仓库最敏感的调用方，架构审查 P0-1 不得缺席）。
+    let mut client =
+        VerbaClient::connect_verified().map_err(|e| format!("连接 daemon 失败: {e}"))?;
     f(&mut client).map_err(|e| e.to_string())
 }
 

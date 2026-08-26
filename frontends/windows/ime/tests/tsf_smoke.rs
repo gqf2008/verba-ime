@@ -282,6 +282,91 @@ fn tsf_streaming_preedit() {
     }
 }
 
+/// 回归（复审 V6 / P2-2）：on_timer 的流代际过滤必须丢弃旧代际事件——
+/// 已作废流的 chunk/Final 不得混入当前流会话（epoch=0 的无代际事件恒保留）。
+#[test]
+fn tsf_stream_epoch_filter_drops_stale_events() {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        assert_eq!(hr.0, 0);
+        let tm: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).expect("ThreadMgr");
+        let tid = tm.Activate().expect("Activate");
+        let doc = tm.CreateDocumentMgr().expect("DocumentMgr");
+        let mut ctx_out: Option<ITfContext> = None;
+        let mut cookie = 0u32;
+        doc.CreateContext(tid, 0, None, &mut ctx_out, &mut cookie)
+            .expect("CreateContext");
+        let ctx = ctx_out.expect("context");
+        doc.Push(&ctx).expect("Push");
+        let _ = tm.SetFocus(&doc);
+
+        let svc_struct = verba_ime_windows::text_service::TextService::new();
+        let data = svc_struct.data.clone();
+        let svc: ITfTextInputProcessor = svc_struct.into();
+        svc.Activate(&tm, tid).expect("Activate");
+        *data.context.borrow_mut() = Some(ctx.clone());
+
+        // 状态机直接进入 Streaming（模拟新流已发起）
+        {
+            let mut m = data.machine.borrow_mut();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_char('翻');
+            m.feed_char('译');
+            m.feed_enter();
+            assert!(matches!(
+                m.state(),
+                verba_core::machine::MachineState::Streaming
+            ));
+        }
+
+        // 当前代际=2：注入旧代际(1)的残留 chunk 与当前代际(2)的 chunk+Final
+        data.stream_epoch
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut q = data.chunks.lock().unwrap();
+            q.push_back((
+                1,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Chunk(
+                        verba_protos::Chunk { text: "旧".into() },
+                    )),
+                },
+            ));
+            q.push_back((
+                2,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Chunk(
+                        verba_protos::Chunk { text: "新".into() },
+                    )),
+                },
+            ));
+            q.push_back((
+                2,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Final(
+                        verba_protos::Final { text: "新".into() },
+                    )),
+                },
+            ));
+        }
+        data.on_timer();
+        assert_eq!(
+            read_context_text(&ctx, tid),
+            "新",
+            "旧代际事件应被过滤（若混入则结果为 旧新）"
+        );
+
+        svc.Deactivate().expect("Deactivate");
+        let _ = tm.Deactivate();
+        CoUninitialize();
+    }
+}
+
 #[test]
 fn should_claim_key_idle_slash_and_letters() {
     use verba_core::machine::MachineState;

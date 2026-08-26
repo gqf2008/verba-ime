@@ -186,15 +186,23 @@ jobs:
       - name: 安装 Inno Setup（含中文语言文件补丁）
         shell: pwsh
         run: |
+          # choco 安装不会刷新本步骤的 PATH（进程环境在步骤启动时继承），也建不出
+          # 已在 PATH 目录的 ISCC shim——直接用安装目录的全路径解析，存进 GITHUB_ENV
+          # 供「构建安装包」步骤使用（复审 sweep：裸 ISCC.exe 在未预装镜像上必失败）。
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
           if (-not $iscc) {
             choco install innosetup -y --no-progress
+            $isccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          } else {
+            $isccPath = $iscc.Source
           }
+          if (-not (Test-Path $isccPath)) { throw "ISCC.exe 未找到（$isccPath）" }
+          Write-Host "ISCC=$isccPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
           if (-not (Test-Path "$langDir\ChineseSimplified.isl")) {
             Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile "$langDir\ChineseSimplified.isl"
           }
-          Write-Host "ISCC found: $((Get-Command ISCC.exe).Source)"
+          Write-Host "ISCC found: $isccPath"
 
       - name: 获取 Rime vendor（rime.dll + data/）
         env:
@@ -207,7 +215,8 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & ISCC.exe /DMyAppVersion=$version frontends\windows\installer\verba-ime.iss
+          # 用安装步骤解析出的全路径 ISCC（choco 装的 ISCC 不在 PATH 上）
+          & $env:ISCC /DMyAppVersion=$version frontends\windows\installer\verba-ime.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败（exit=$LASTEXITCODE）" }
 
       - name: Rime 冒烟（daemon + vendor/rime）
@@ -244,10 +253,19 @@ jobs:
             Write-Host "未配置 WIN_SIGN_PFX，跳过 Windows 代码签名"
             exit 0
           }
-          $pfx = [IO.File]::WriteAllBytes("$env:TEMP\cert.pfx", [Convert]::FromBase64String($env:WIN_SIGN_PFX))
+          # [IO.File]::WriteAllBytes 返回 void：赋给 $pfx 会得到 $null，signtool 的 /f
+          # 收到空路径而失败（PowerShell 对原生命令丢弃 $null 实参）。路径与写文件分两行。
+          $pfx = "$env:TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_PFX))
           $exe = Get-ChildItem frontends\windows\installer\output\verba-ime-setup-*.exe | Select-Object -First 1
-          & signtool sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
+          if (-not $exe) { throw "未找到待签名安装包 frontends\windows\installer\output\verba-ime-setup-*.exe" }
+          # signtool 不保证在 PATH：从 Windows Kits 安装目录解析（取最新版本 x64）。
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { $signtool = "signtool" } # 回退到 PATH（本地自托管 runner）
+          & $signtool sign /f $pfx /p $env:WIN_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe.FullName
           if ($LASTEXITCODE -ne 0) { throw "signtool sign 失败（exit=$LASTEXITCODE）" }
+          Remove-Item $pfx -ErrorAction SilentlyContinue
 
       - uses: actions/upload-artifact@v4
         with:

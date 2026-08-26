@@ -73,9 +73,37 @@ fn llm_queue() -> &'static Mutex<VecDeque<LlmItem>> {
 /// 各控制器按自己的活跃 seq 消费，互不干扰（架构审查 P2-1 per-controller）。
 static LLM_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// 全局自增会话 id（从 1 起）：每个输入控制器独占一个 AI 多轮上下文会话，
+/// 全局自增会话序号（从 1 起）：每个输入控制器独占一个 AI 多轮上下文会话，
 /// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
 static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 每进程随机盐（惰性生成一次）：daemon 是按用户单例、按 session_id 分组历史，
+/// 而本 IME 进程可独立于 daemon 重启（崩溃/重装/系统回收）——重启后
+/// SESSION_ID_SEQ 从 1 重排，会撞回 daemon 侧残留的历史槽并**继承**陈旧上下文
+/// （与 Windows 端 process_salt 同源问题，复审 V4 对称修复；macOS 为单进程
+/// 多控制器模型，无需防进程间碰撞，盐只为跨重启唯一性）。无 rand 依赖，
+/// 同 Windows text_service.rs 的本地熵方案。
+fn process_salt() -> u32 {
+    static SALT: OnceLock<u32> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ (std::process::id() as u64) << 32;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
+    })
+}
+
+/// 分配全局唯一的 AI 会话 id：高 32 位进程随机盐、低 32 位进程内自增序号，
+/// IME 进程重启后不撞 daemon 侧残留历史槽。
+fn alloc_session_id() -> u64 {
+    let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
+    ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
+}
 
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
 /// 无法访问控制器 Ivars（主线程独占），经此表传递 daemon id。
@@ -98,6 +126,22 @@ fn push_llm(seq: u64, event: StreamEvent) {
     }
 }
 
+/// 废弃序号集合容量上限：超出时丢弃最旧记录（其 worker 早已退出、无在途事件）。
+const DEAD_SEQ_MAX: usize = 32;
+
+/// 把序号记入本控制器的废弃集合（0 忽略）：其迟到事件将在 drain 丢弃，
+/// 防全局 llm_queue 无界滞留（复审 V7）。
+fn record_dead(ivars: &Ivars, seq: u64) {
+    if seq == 0 {
+        return;
+    }
+    let mut dead = ivars.dead_seqs.borrow_mut();
+    if dead.len() >= DEAD_SEQ_MAX {
+        dead.pop_front();
+    }
+    dead.push_back(seq);
+}
+
 /// 控制器实例变量（主线程独占；define_class 只暴露 `&Ivars`，故用内部可变性）。
 struct Ivars {
     machine: RefCell<CompositionMachine>,
@@ -117,10 +161,11 @@ struct Ivars {
     active_stream: Cell<u64>,
     /// 本控制器的活跃候选请求序号（0=无）。
     active_candidates: Cell<u64>,
-    /// 最近废弃的流序号（取消/失活时记录）：补发的 Final 在之后才入队，
-    /// 届时 active_stream 已归 0 无法匹配——按此序号在 drain 丢弃（防残留
-    /// 无界累积；只记最近一个——更早的流其 worker 已退出、无在途事件）。
-    dead_stream: Cell<u64>,
+    /// 最近废弃的序号集合（取消的流 / 被取代的候选请求）：迟到事件（取消后
+    /// 补发的 Final、慢响应的旧候选）入队时 active_* 已归 0/换号无法匹配——
+    /// 按此集合在 drain 丢弃，防全局队列无界滞留（复审 V7）。有界（32 条）：
+    /// 更早的序号其 worker 早已退出、无在途事件。
+    dead_seqs: RefCell<VecDeque<u64>>,
     /// 本控制器的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按此
     /// 隔离历史：多文本域（多应用）各自独立多轮，互不串上下文（B4b）。
     session_id: Cell<u64>,
@@ -142,8 +187,8 @@ impl Default for Ivars {
             composed: RefCell::new(String::new()),
             active_stream: Cell::new(0),
             active_candidates: Cell::new(0),
-            dead_stream: Cell::new(0),
-            session_id: Cell::new(SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst)),
+            dead_seqs: RefCell::new(VecDeque::new()),
+            session_id: Cell::new(alloc_session_id()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
         }
@@ -211,24 +256,25 @@ define_class!(
 
             // 多字符粘贴（keyCode=0 时整串到达）：逐字符喂入状态机并逐步应用动作。
             // 此前 classify_key 只取首字符，其余全部丢失（架构审查 P1-2）。
-            let is_multi_paste = key_code == 0
-                && string
-                    .map(|s| s.to_string().chars().count() > 1)
-                    .unwrap_or(false);
-            if is_multi_paste {
-                if let Some(s) = string {
-                    let mut applied = false;
-                    for ch in s.to_string().chars() {
-                        // 与控制字符过滤一致（classify_key 同款规则）
-                        if ch < ' ' || (0xF700..=0xF8FF).contains(&(ch as u32)) {
-                            continue;
-                        }
-                        let action = self.ivars().machine.borrow_mut().feed_char(ch);
-                        self.apply_action(action);
-                        applied = true;
-                    }
-                    return Bool::new(applied);
+            // 已知限制（复审 sweep，暂留）：逐字符 apply_action 会对每个 UpdatePinyin
+            // 触发一次 start_candidates → 每字符一个 Rime worker 线程 + 一次 daemon
+            // 查询，超长粘贴（数百字）会瞬时放大为同等规模的线程/查询/主线程
+            // marked-text 更新，可能让宿主卡顿。击键节奏不会触发，仅机器节奏的粘贴会。
+            // 正确的修法是给候选请求加防抖/合并（与 Windows 端 debounce 对齐），属
+            // 行为变更，留作后续；seq 过滤已保证只有最新候选结果被消费，正确性无碍。
+            let pasted = if key_code == 0 {
+                string.map(|s| s.to_string())
+            } else {
+                None
+            };
+            if let Some(text) = pasted.filter(|t| t.chars().count() > 1) {
+                let mut applied = false;
+                for ch in text.chars().filter(|&ch| is_pasteable_char(ch)) {
+                    let action = self.ivars().machine.borrow_mut().feed_char(ch);
+                    self.apply_action(action);
+                    applied = true;
                 }
+                return Bool::new(applied);
             }
 
             let was_idle = matches!(self.ivars().machine.borrow().state(), MachineState::Idle);
@@ -349,20 +395,32 @@ define_class!(
         /// 主线程定时器：排空本控制器的事件。
         ///
         /// 只取走本控制器活跃序号的事件，其余留在队列（多会话场景下另一控制器
-        /// 的定时器会消费自己的部分——整体清空会互相丢弃事件）。
+        /// 的定时器会消费自己的部分——整体清空会互相丢弃事件）。废弃序号
+        /// （已取消流、被取代的旧候选）的残留事件直接丢弃，防全局队列无界滞留。
         #[unsafe(method(drainVerbaStream))]
         fn drain_stream(&self) {
             let stream_seq = self.ivars().active_stream.get();
             let cand_seq = self.ivars().active_candidates.get();
-            let dead_seq = self.ivars().dead_stream.get();
+            // 空队列快速路径：避免每 50ms 无事件时仍 borrow dead_seqs。
+            if llm_queue().lock().unwrap().is_empty() {
+                return;
+            }
+            let dead_any = {
+                let dead = self.ivars().dead_seqs.borrow();
+                !dead.is_empty()
+            };
             let mine: Vec<LlmItem> = {
                 let mut q = llm_queue().lock().unwrap();
                 let mut kept = VecDeque::new();
                 let mut mine = Vec::new();
+                let mut dead_hit = Vec::new();
                 for item in q.drain(..) {
-                    if item.seq == dead_seq {
-                        // 本控制器废弃流的残留事件（取消后补发的 Final）：丢弃，
-                        // 防无界累积。
+                    if dead_any && self.ivars().dead_seqs.borrow().contains(&item.seq) {
+                        // 本控制器废弃序号的残留事件（取消后补发的 Final、旧候选迟到
+                        // 响应）：丢弃并记录，随后一并清出废弃集与 cancelled_seqs
+                        // （废弃集只需防「已入队」残留，清掉后序号不会复用——seq 全局
+                        // 单调递增）。
+                        dead_hit.push(item.seq);
                         continue;
                     }
                     if item.seq == stream_seq || item.seq == cand_seq {
@@ -372,6 +430,16 @@ define_class!(
                     }
                 }
                 *q = kept;
+                if !dead_hit.is_empty() {
+                    let mut dead = self.ivars().dead_seqs.borrow_mut();
+                    let mut cancelled = cancelled_seqs().lock().unwrap();
+                    for seq in dead_hit {
+                        if let Some(pos) = dead.iter().position(|&s| s == seq) {
+                            dead.remove(pos);
+                        }
+                        cancelled.remove(&seq);
+                    }
+                }
                 mine
             };
             for item in mine {
@@ -420,6 +488,12 @@ fn selection_digit(global_idx: usize, page: usize, page_size: usize) -> Option<c
     }
 }
 
+/// 可喂入状态机的字符判定：与 classify_key 的字符过滤同款规则
+/// （排除控制字符与 NS*FunctionKey 私有区 0xF700..=0xF8FF）。
+fn is_pasteable_char(c: char) -> bool {
+    c >= ' ' && !(0xF700..=0xF8FF).contains(&(c as u32))
+}
+
 fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey> {
     match key_code {
         // delete / backspace
@@ -437,7 +511,7 @@ fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey
             .filter(|c| {
                 // 过滤控制字符与 NS*FunctionKey（0xF700..0xF8FF）：这些走 keyCode 已处理，
                 // 避免被误当作可打印字符提交。
-                *c >= ' ' && !(0xF700..=0xF8FF).contains(&(*c as u32))
+                is_pasteable_char(*c)
             })
             .map(ImkKey::Char),
     }
@@ -577,7 +651,6 @@ impl VerbaIMKController {
         self.cancel_stream();
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
-        self.ivars().dead_stream.set(0);
         let session_id = self.ivars().session_id.get();
 
         std::thread::spawn(move || {
@@ -585,6 +658,8 @@ impl VerbaIMKController {
                 Ok(c) => c,
                 Err(e) => {
                     push_llm(seq, error_event(&format!("无法连接 daemon: {e}")));
+                    // 启动失败也要清掉可能的取消登记，防 cancelled_seqs 滞留（复审 V8）
+                    cancelled_seqs().lock().unwrap().remove(&seq);
                     return;
                 }
             };
@@ -593,6 +668,7 @@ impl VerbaIMKController {
                     Ok(id) => id,
                     Err(e) => {
                         push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
+                        cancelled_seqs().lock().unwrap().remove(&seq);
                         return;
                     }
                 };
@@ -622,8 +698,10 @@ impl VerbaIMKController {
                     }
                 }
             }
-            // 流结束：清理 daemon id 映射（取消路径已 remove；此处防正常结束残留累积）
+            // 流结束：清理 daemon id 映射（取消路径已 remove；此处防正常结束残留累积）。
+            // 取消登记一并清掉——worker 退出后不再有消费者，迟到登记会永久滞留（复审 V8）。
             daemon_ids().lock().unwrap().remove(&seq);
+            cancelled_seqs().lock().unwrap().remove(&seq);
         });
 
         self.ensure_timer();
@@ -668,7 +746,10 @@ impl VerbaIMKController {
             .candidate_pinyin
             .borrow_mut()
             .replace(pinyin.clone());
-        self.ivars().active_candidates.set(seq);
+        // 被取代的旧候选请求序号入废弃集：其迟到响应（首次部署可达数秒，慢于
+        // 击键间隔）在 drain 丢弃，不再永久滞留全局队列（复审 V7-b）。
+        let old_cand = self.ivars().active_candidates.replace(seq);
+        record_dead(self.ivars(), old_cand);
         self.ensure_timer();
 
         std::thread::spawn(move || {
@@ -781,15 +862,18 @@ impl VerbaIMKController {
 
     fn cancel_stream(&self) {
         let stream_seq = self.ivars().active_stream.get();
+        let cand_seq = self.ivars().active_candidates.get();
         self.ivars().active_stream.set(0);
         self.ivars().active_candidates.set(0);
         self.ivars().candidate_pinyin.borrow_mut().take();
+        // 废弃序号入集：取消的流补发的 Final、在途旧候选响应，之后才入队，
+        // 届时 active_* 已归 0 无法匹配——按废弃集在 drain 丢弃（防全局队列
+        // 无界滞留，复审 V7；原单槽 dead_stream 会被 start_llm 立即清 0 失效）。
+        record_dead(self.ivars(), stream_seq);
+        record_dead(self.ivars(), cand_seq);
         if stream_seq == 0 {
             return;
         }
-        // 记录废弃流序号：补发的 Final 之后才入队，届时按此序号在 drain 丢弃，
-        // 防残留无界累积（审查 P3）。仅在有活跃流取消时覆盖（防清掉未回收的旧残留记录）。
-        self.ivars().dead_stream.set(stream_seq);
         // 取本流的 daemon id：拿到则直接取消；拿不到（llm_start 未返回，daemon id
         // 尚不可知）才登记到取消集合（闭合启动竞态窗口）。避免对已完成流重复
         // 登记（防止 cancelled_seqs 泄漏）。
@@ -976,5 +1060,29 @@ mod tests {
         // 读取失败/成功均返回非空 scheme；不 panic。
         let schema = load_rime_schema();
         assert!(!schema.is_empty());
+    }
+
+    #[test]
+    fn pasteable_char_matches_classify_filter() {
+        // 与 classify_key 字符过滤一致：控制字符与 NS*FunctionKey 私有区被拒
+        assert!(is_pasteable_char('a'));
+        assert!(is_pasteable_char('你'));
+        assert!(is_pasteable_char(' '));
+        assert!(!is_pasteable_char('\u{3}'));
+        assert!(!is_pasteable_char('\u{F702}'));
+        assert!(!is_pasteable_char('\u{F8FF}'));
+    }
+
+    #[test]
+    fn session_id_unique_and_carries_process_salt() {
+        // 高 32 位为进程盐（本次进程内恒定），低 32 位单调递增：同进程内
+        // session_id 唯一，跨进程（IME 重启）盐不同 → 不与 daemon 侧旧历史槽碰撞
+        // （复审 V4）。
+        let a = alloc_session_id();
+        let b = alloc_session_id();
+        assert_ne!(a, b);
+        assert_eq!(a >> 32, b >> 32, "同进程盐应一致");
+        assert_eq!((a >> 32) as u32, process_salt());
+        assert!((b as u32) > (a as u32), "低 32 位应递增");
     }
 }

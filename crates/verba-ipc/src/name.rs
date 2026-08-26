@@ -61,8 +61,18 @@ pub fn ensure_ipc_token() -> std::io::Result<()> {
         .unwrap_or_else(|| std::env::temp_dir().join("verba-ime"));
     std::fs::create_dir_all(&data_dir)?;
     let token_path = data_dir.join("ipc-token");
-    if token_path.exists() {
-        return Ok(());
+    // 仅当文件存在**且内容合法**（32 位十六进制）才复用。崩溃/断电留下 0 字节或
+    // 截断文件时，`ipc_token()` 会拒绝该内容并退回全零后缀（管道名可预测 → 防预占
+    // 失效）；此处若只看 exists() 会永久卡住不重建（复审 sweep）。内容非法则重建。
+    if let Ok(s) = std::fs::read_to_string(&token_path) {
+        let t = s.trim();
+        if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+        log::warn!(
+            "ipc-token 内容非法（截断/损坏），重新生成: {}",
+            token_path.display()
+        );
     }
     let mut bytes = [0u8; 16];
     // 无 rand 依赖：用系统时间 + pid + 地址熵（本地防预占足够；无需密码学强度）

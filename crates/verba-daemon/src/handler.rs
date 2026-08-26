@@ -49,17 +49,26 @@ pub struct DaemonHandler {
 
 /// 取消解析：精确键 `(conn_id, id)` 优先（P1-1 同连接隔离语义），查不到时按
 /// id 全局 fallback（#27：Windows 前端取消走独立控制连接，流注册在 worker
-/// 连接——键控隔离使取消永远查不到）。本地 IPC 已按用户隔离（B1），同用户
-/// 内全局匹配可接受。
+/// 连接——键控隔离使取消永远查不到）。本地 IPC 已按用户隔离（B1）。
+/// fallback 仅在 id **唯一匹配**时启用：请求 id 每连接从 1 自增（前端 ping
+/// 占用 id=1，首条流恒为 2），并发流同 id 是常态——歧义时任意挑选会误杀
+/// 其它前端的在途流（复审 V5），此时放弃取消并告警（交由调用方重试/超时兜底）。
 fn resolve_cancel(
     cancels: &mut HashMap<(u64, u64), CancellationToken>,
     conn_id: u64,
     id: u64,
 ) -> Option<CancellationToken> {
     cancels.remove(&(conn_id, id)).or_else(|| {
-        // 先取 key 再 remove（避免 iter 借用与可变借用冲突）
-        let key = cancels.iter().find(|(k, _)| k.1 == id).map(|(k, _)| *k);
-        key.and_then(|k| cancels.remove(&k))
+        let mut matches = cancels.keys().filter(|k| k.1 == id);
+        let key = match (matches.next(), matches.next()) {
+            (Some(&k), None) => k,
+            (Some(_), Some(_)) => {
+                log::warn!("取消请求 id={id} 跨连接 fallback 匹配歧义（多个同 id 在途流），放弃");
+                return None;
+            }
+            _ => return None,
+        };
+        cancels.remove(&key)
     })
 }
 
@@ -142,7 +151,11 @@ struct CancelGuard {
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        self.cancels.lock().unwrap().remove(&self.key);
+        // 不在 Drop 里 unwrap：锁中毒（或 panic  unwind 中再 panic）会把
+        // 单个请求的失败升级为整个 daemon 进程 abort（复审 V10）。
+        if let Ok(mut cancels) = self.cancels.lock() {
+            cancels.remove(&self.key);
+        }
     }
 }
 
@@ -680,7 +693,10 @@ impl DaemonHandler {
         let task = tokio::task::spawn_blocking(move || {
             Self::rime_query_sync(&rime, |e| e.candidates(&input, &schema, max))
         });
-        let cands = match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+        // 30s 而非 10s：超时窗口包含互斥体排队——启动预热/首次部署持锁期间
+        // （文档值 2-5s，冷 CI 更久）所有查询串行等待，10s 会对健康引擎误报
+        // 504 并级联（复审 V9）。
+        let cands = match tokio::time::timeout(std::time::Duration::from_secs(30), task).await {
             Ok(Ok(Ok(cands))) => cands,
             Ok(Ok(Err(e))) => {
                 out.response(&Response {
@@ -985,7 +1001,9 @@ impl DaemonHandler {
         rime: &Mutex<Option<RimeEngine>>,
         f: impl FnOnce(&RimeEngine) -> Result<T, verba_librime::RimeError>,
     ) -> Result<T, String> {
-        let mut guard = rime.lock().unwrap();
+        // 锁中毒自愈：FFI 路径一旦 panic 会毒化互斥体，unwrap 会让之后所有
+        // 查询永远 500 直到重启 daemon（复审 V10）；into_inner 夺回引擎继续用。
+        let mut guard = rime.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
             let (dll, shared, user) = rime_paths();
             log::info!(
@@ -1045,8 +1063,12 @@ impl DaemonHandler {
     }
 }
 
-/// Rime 资源定位：环境变量优先，缺省取 daemon 同目录 `rime/` 下
-/// `librime` 库、`data/`、`user_data/`（按平台：Windows `rime.dll` / macOS `librime.dylib`）。
+/// Rime 资源定位：环境变量优先，缺省取 daemon 同目录 `rime/` 下的
+/// `librime` 库与 `data/`（按平台：Windows `rime.dll` / macOS `librime.dylib`）。
+/// `user_data` 默认落**用户数据目录**（可写）：安装态下 exe 同目录在
+/// `C:\Program Files\Verba` / `Verba.app` 包内——标准用户不可写（首次部署
+/// create_dir_all 失败 → 永远 502），macOS 管理员可写又会改动已签名 bundle
+/// 破坏 seal（复审 V1）。`VERBA_RIME_*` 环境变量仍可整体覆盖三要素。
 fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let from_env = || -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
         let d = std::env::var("VERBA_RIME_DLL")
@@ -1071,11 +1093,11 @@ fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) 
     } else {
         "librime.so"
     };
-    (
-        rime_dir.join(lib_name),
-        rime_dir.join("data"),
-        rime_dir.join("user_data"),
-    )
+    // 用户数据目录优先；定位失败（如 HOME 缺失）才退回 exe 同目录旧行为。
+    let user_dir = verba_config::VerbaDirs::locate()
+        .map(|d| d.data_dir().join("rime"))
+        .unwrap_or_else(|_| rime_dir.join("user_data"));
+    (rime_dir.join(lib_name), rime_dir.join("data"), user_dir)
 }
 
 #[cfg(test)]
@@ -1115,6 +1137,22 @@ mod tests {
         cancels.insert((7, 2), CancellationToken::new());
         assert!(resolve_cancel(&mut cancels, 3, 9).is_none());
         assert_eq!(cancels.len(), 1);
+    }
+
+    #[test]
+    fn cancel_fallback_ambiguous_id_aborts() {
+        // 复审 V5：两个不同连接注册相同 req id（请求 id 每连接从 1 自增，
+        // 并发流同 id 是常态），fallback 不得任意挑选受害者——歧义时放弃，
+        // 两条流均不受误伤。
+        let mut cancels = HashMap::new();
+        let a = CancellationToken::new();
+        let b = CancellationToken::new();
+        cancels.insert((1, 2), a.clone());
+        cancels.insert((2, 2), b.clone());
+        assert!(resolve_cancel(&mut cancels, 3, 2).is_none());
+        assert!(!a.is_cancelled());
+        assert!(!b.is_cancelled());
+        assert_eq!(cancels.len(), 2);
     }
 
     #[test]

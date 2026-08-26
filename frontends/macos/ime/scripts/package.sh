@@ -28,7 +28,16 @@ cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 # 版本注入：以根 Cargo.toml 的 workspace 版本为唯一版本源，同步
 # CFBundleShortVersionString / CFBundleVersion（只改拷贝，不弄脏源码树）。
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml")"
-sed -i '' -E "s|<string>[0-9]+\.[0-9]+\.[0-9]+</string>|<string>$VERSION</string>|g" "$APP/Contents/Info.plist"
+# 空版本会产出 <string></string>（非法/空版本），先用守卫阻断（复审 V15）。
+if [ -z "$VERSION" ]; then
+    echo "::error::未能从根 Cargo.toml 解析 workspace 版本（version = \"...\"），拒绝注入空版本" >&2
+    exit 1
+fi
+# 用 PlistBuddy 精确写两个版本键：原全局 sed 会替换 plist 中所有 x.y.z 字符串
+# （一旦未来加入其他版本字段会被误改），定向写入只动这两个键。
+PLIST="$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST"
 
 # 可选：捆绑 Rime（librime.dylib + data/），daemon 从 $APP/Contents/MacOS/rime/ 加载。
 # 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。

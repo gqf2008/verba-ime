@@ -27,7 +27,7 @@
 ```
 ┌─────────────┐ ┌─────────────┐ ┌──────────────────────┐
 │ Windows TSF │ │  macOS IMK  │ │ Linux (Fcitx5 / IBus  │
-│  (Rust)     │ │ (Swift+Rust)│ │  / Wayland / XIM)     │
+│  (Rust)     │ │   (Rust)    │ │  / Wayland / XIM)     │
 └──────┬──────┘ └──────┬──────┘ └──────────┬───────────┘
        │               │                   │
        └───────────────┼───────────────────┘
@@ -80,11 +80,10 @@
 - 注意：TSF 要求 STA；所有回调尽快返回，重活交给 daemon。
 
 ### macOS — IMK（Input Method Kit）
-- `IMKInputController` 子类，`.appex` 装入 `~/Library/Input Methods`，用户需在系统设置中启用。
-- 实现方案 A（推荐）：Swift / ObjC 薄壳 + Unix Socket 连 daemon。
-- 实现方案 B：纯 Rust `objc2-input-method-kit`（成熟度评估中，作备选）。
+- `IMKInputController` 子类，`.app`（单进程托管全部控制器）装入 `~/Library/Input Methods`，用户需在系统设置中启用。
+- 实现：纯 Rust `objc2-input-method-kit`（`frontends/macos/ime`），经 Unix Socket 连 daemon。
 - 权限：基础输入无需辅助功能权限；麦克风需 `NSMicrophoneUsageDescription`（TCC 弹窗）；截图 OCR 需屏幕录制权限（ScreenCaptureKit）。
-- 打包：`.app` 内含 `.appex`，Developer ID 签名 + 公证（发布必需）。
+- 打包：`.app`，Developer ID 签名 + 公证（发布必需）。
 
 ### Linux
 - 首选 **Fcitx5 原生插件**：C++ shim + Rust 静态库（fcitx5-afrim / corrosion 范式），覆盖 KDE 与多数中文发行版。
@@ -96,7 +95,7 @@
 
 ## 5. IPC 协议（草案）
 
-- 传输：Windows NamedPipe（interprocess local_socket，名称 `verba-ime`）；macOS / Linux Unix Socket。
+- 传输：Windows NamedPipe（interprocess local_socket，名称 `verba-ime-{USERNAME}-{token}`）；macOS / Linux Unix Socket（用户数据目录，0700）。详见 [协议](protocol.md) §1。
 - 编码：Protobuf（`verba-protos`），u32 LE 长度前缀分帧。
 - 模型：`Request { id, oneof }` / `Response { id, oneof }`，`StreamEvent { id, chunk }` 支持流式（LLM token、ASR 增量）。
 - 消息清单草案见 [protocol.md](protocol.md)。

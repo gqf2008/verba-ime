@@ -49,6 +49,10 @@ $weaselUrl = "https://github.com/rime/weasel/releases/download/0.17.4/weasel-0.1
 Invoke-WebRequest -Uri $weaselUrl -OutFile (Join-Path $tmp "weasel.exe") -UseBasicParsing
 & $7z x (Join-Path $tmp "weasel.exe") ("-o" + (Join-Path $tmp "weasel")) -y | Out-Null
 if (-not (Test-Path (Join-Path $tmp "weasel\data"))) { throw "Weasel 安装包中未找到 data 目录" }
+# 先清空再拷贝：增量合并会让上一版残留文件（Weasel 升级删除/改名的 schema/dict/
+# opencc）静默留在 vendor 并随安装包发布、被 Rime 加载（复审 sweep）。data/ 为本
+# 脚本独占产物，整体重建最安全。
+if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
 # 目标目录须先创建：Copy-Item 通配符 + -Recurse 到不存在的目标会对子目录条目报
 # "Container cannot be copied onto existing leaf item"（PowerShell 已知行为）
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
@@ -66,6 +70,10 @@ if ($c -notmatch "wubi86") {
     $c = $c -replace "  - schema: terra_pinyin", "  - schema: terra_pinyin`n  - schema: wubi86"
     Set-Content -LiteralPath $default -Value $c -Encoding utf8NoBOM
 }
+# 回归守卫：-replace 以 terra_pinyin 为锚，若上游 default.yaml 改版/换锚则静默不
+# 插入，五笔方案不会被部署编译——必须断言插入成功（复审 V23）。
+$c2 = Get-Content $default -Raw
+if ($c2 -notmatch "wubi86") { throw "wubi86 未能插入 default.yaml 的 schema_list（锚点 terra_pinyin 可能已变）" }
 
 # 5) 结构校验（发布构建依赖）
 if (-not (Test-Path (Join-Path $vendor "rime.dll"))) { throw "vendor/rime/rime.dll 缺失" }

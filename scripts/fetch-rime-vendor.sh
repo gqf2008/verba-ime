@@ -27,7 +27,7 @@ resolve_7zz() {
             return
         fi
     fi
-    echo "::warning::brew 不可用/失败，下载 7-Zip 官方静态 7zz（26.02）"
+    echo "::warning::brew 不可用/失败，下载 7-Zip 官方静态 7zz（26.02）" >&2
     curl -fsSL -o "$TMP/7z.tar.xz" "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-mac.tar.xz"
     tar -xJf "$TMP/7z.tar.xz" -C "$TMP"
     echo "$TMP/7zz"
@@ -65,6 +65,10 @@ if [ ! -d "$TMP/weasel/data" ]; then
     echo "::error::Weasel 安装包中未找到 data 目录" >&2
     exit 1
 fi
+# 先清空再拷贝：增量合并会让上一版残留文件（Weasel 升级删除/改名的 schema/dict/
+# opencc）静默留在 vendor 并随安装包发布、被 Rime 加载（复审 sweep）。data/ 为本
+# 脚本独占产物，整体重建最安全。
+rm -rf "$DATA"
 mkdir -p "$DATA"
 cp -R "$TMP/weasel/data/." "$DATA/"
 
@@ -77,6 +81,9 @@ done
 if ! grep -q "wubi86" "$DATA/default.yaml"; then
     sed -i '' 's|  - schema: terra_pinyin|  - schema: terra_pinyin\n  - schema: wubi86|' "$DATA/default.yaml"
 fi
+# 回归守卫：sed 以 terra_pinyin 为锚，若上游 default.yaml 改版/换锚则静默不插入，
+# 五笔方案不会被部署编译——必须断言插入成功（复审 V23）。
+grep -q "wubi86" "$DATA/default.yaml" || { echo "::error::wubi86 未能插入 default.yaml 的 schema_list（锚点 terra_pinyin 可能已变）" >&2; exit 1; }
 
 # 5) 结构校验（发布构建依赖）
 [ -f "$VENDOR/librime.dylib" ] || { echo "::error::vendor/rime/librime.dylib 缺失" >&2; exit 1; }

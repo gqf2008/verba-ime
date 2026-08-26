@@ -32,6 +32,11 @@ use crate::name::default_socket_spec;
 /// 默认套接字名（旧值，保持兼容导出；实际默认见 [`default_socket_spec`]）。
 pub const DEFAULT_SOCKET_NAME: &str = "verba-ime";
 
+/// `connect_verified` 验活握手的读超时：仅作用于握手期间（防对端接受连接但
+/// 永不应答时把前端 UI 线程一起挂起）。正常 daemon 本地回 Pong 为微秒级，
+/// 取宽裕的 5s 仅为兜底卡死场景。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 连接等待策略。
 ///
 /// 注意：Windows 命名管道对「目标管道不存在」总是立即报错，
@@ -57,6 +62,27 @@ impl VerbaClient {
     /// 连接默认套接字（Unix 为用户数据目录全路径 / Windows per-user 管道）。
     pub fn connect() -> Result<Self, IpcError> {
         Self::connect_named(&default_socket_spec(), ConnectWait::Nonblocking)
+    }
+
+    /// 连接默认套接字并做验活握手（架构审查 P0-1）：连接成功不代表对端是
+    /// 真实 daemon，能回 Pong 的才信任（防冒充者窃取 `key set` 的密钥、
+    /// 提示词、截图、录音）。**发送敏感数据的所有调用方都应使用本构造函数**，
+    /// 而不是裸 [`VerbaClient::connect`]（socket 目录 0700 / per-user 管道
+    /// 之上，握手是纵深防御）。
+    ///
+    /// 握手带**有界读超时**（`HANDSHAKE_TIMEOUT`）：本函数跑在前端 UI 线程
+    /// （TSF/IMK 回调），对端「接受连接但永不应答」（daemon 卡死但进程/socket
+    /// 仍在）时，无超时的阻塞 `ping` 会把宿主应用一起挂起。超时即放弃并返回
+    /// 错误（上层 `ensure_daemon` 重启 daemon / 重试）。超时仅在握手期间设置，
+    /// 完成后清除，避免影响后续流式读取。
+    pub fn connect_verified() -> Result<Self, IpcError> {
+        let mut client = Self::connect()?;
+        client.stream.set_recv_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let ping_result = client.ping();
+        // 无论握手成败都清除超时，恢复后续流式读的阻塞语义。
+        let _ = client.stream.set_recv_timeout(None);
+        ping_result?;
+        Ok(client)
     }
 
     /// 连接指定套接字名（Unix 为文件系统路径；Windows 为 `\\.\pipe\...` 管道名）。

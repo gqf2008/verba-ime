@@ -65,13 +65,19 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    ```
    `scripts/package.sh` 会把 `vendor/rime/` 打进 `Verba.app/Contents/MacOS/rime/`；
    Windows 安装包（Inno Setup）把 `vendor/rime/` 装到 `{app}\rime\`。
-2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载；Windows `rime.dll` / macOS `librime.dylib`）：
+2. 部署到 daemon 同目录 `rime/`（daemon 默认从此加载**引擎库与共享数据**；Windows `rime.dll` / macOS `librime.dylib`）：
    ```
    <daemon 同目录>/rime/(rime.dll | librime.dylib)
-   <daemon 同目录>/rime/data/            # schema/dict + opencc/
-   <daemon 同目录>/rime/user_data/       # 首次查询自动部署生成
+   <daemon 同目录>/rime/data/            # schema/dict + opencc/（只读共享数据）
    ```
-   或指定 `VERBA_RIME_DLL` / `VERBA_RIME_DYLIB` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量。
+   **`user_data`（首次查询部署生成的用户词库/编译产物）默认落用户数据目录**，
+   不在 daemon 同目录：安装态下 `C:\Program Files\Verba` / `Verba.app` 包内标准用户
+   不可写（会 502），macOS 管理员可写又会改动已签名 bundle 破坏 seal。实际位置：
+   - Windows：`%APPDATA%\verba\rime\`
+   - macOS：`~/Library/Application Support/Verba/rime/`
+   - Linux：`~/.local/share/verba/rime/`
+
+   或指定 `VERBA_RIME_DLL` / `VERBA_RIME_DYLIB` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量整体覆盖三要素。
 3. 配置方案：`verba-cli config set rime_schema=luna_pinyin_simp`
    （五笔：`rime_schema=wubi86`）。
 4. 验证：`verba-cli rime nishishui luna_pinyin`（→ 你是谁）、`verba-cli rime wqvb wubi86`（→ 你好）。

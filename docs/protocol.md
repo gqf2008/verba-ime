@@ -4,11 +4,19 @@
 
 ## 1. 传输层
 
-- **Windows**：Named Pipe `\\.\pipe\verba-<uid>`（uid 为每用户实例后缀，避免多用户冲突）。
-- **macOS / Linux**：Unix Domain Socket `$XDG_RUNTIME_DIR/verba.sock`，回退 `/tmp/verba.sock`。
+- **Windows**：Named Pipe `\\.\pipe\verba-ime-{USERNAME}-{token}`。`USERNAME` 做 per-user
+  隔离；`token` 为 daemon 首启生成并写入用户数据目录（`%APPDATA%\verba\ipc-token`，0700）
+  的不可预测后缀，client 读取后拼入管道名——防其他用户预占/假冒 daemon（架构审查 P0-1）。
+- **macOS / Linux**：Unix Domain Socket 放**用户数据目录**
+  （macOS `~/Library/Application Support/Verba/verba-ipc.sock`、
+  Linux `~/.local/share/verba/verba-ipc.sock`），daemon 启动时创建目录并 `chmod 0700`，
+  跨用户不可见不可连。命名用完整路径（`FilesystemUdSocket`/`GenericFilePath`），
+  非 `$XDG_RUNTIME_DIR`/`/tmp`（全局共享目录可被预占）。
 - **帧格式**：`u32 LE 长度前缀 + Protobuf message`。
 - **连接模型**：全双工；客户端发起 `Request`，服务端回 `Response`；流式结果由服务端主动推 `StreamEvent`（带请求 id 关联）。
-- **并发**：单连接多请求并发，靠 `id` 关联；`id` 由客户端自增分配。
+- **并发**：单连接多请求并发，靠 `id` 关联；`id` 由客户端自增分配（每连接从 1 起）。
+- **连接验证**：`connect_verified()` 在 TCP/UDS 连接后发 `Ping` 等 `Pong`，确认对端是真实
+  daemon 再信任（socket 已按用户隔离，此为纵深防御）。发送 API key 等敏感字段前必须经验证连接。
 
 ## 2. 消息模型（Protobuf，见 `crates/verba-protos/proto/verba.proto`）
 
@@ -27,7 +35,14 @@ message Request {
     TtsSynthesize tts_synthesize = 24;    // TTS 合成（config tts_provider）
     OcrRecognize ocr_recognize = 25;    // OCR 识别（config ocr_provider）
     AsrTranscribe asr_transcribe = 26;   // ASR 转写（config asr_provider）
+    ApiKeySet api_key_set = 27;          // 设置/清除 API Key（写系统密钥库 + 热更新）
   }
+}
+
+// 设置/清除 API Key（空字符串 = 删除）：写系统密钥库并热更新 daemon 内存，
+// 无需重启 daemon 即可让 LLM / 在线 ASR / 在线 TTS 生效。须经 connect_verified 连接发送。
+message ApiKeySet {
+  string key = 1;
 }
 
 message LlmCandidates {
@@ -62,13 +77,17 @@ message AsrTranscribe {
 message Response {
   uint64 id = 1;
   oneof kind {
-    Pong pong = 2;
+    Pong pong = 2;                 // 含 version（连接验证握手回包）
     Ok ok = 3;
     Error error = 4;               // code + message
     Text text = 5;                 // 一次性结果（OCR / ASR 整段，预留）
     Config config = 6;
     Audio audio = 7;               // TTS 音频输出
   }
+}
+
+message Pong {
+  string version = 1;              // daemon 版本，供 connect_verified 验活
 }
 
 message Audio {
@@ -101,6 +120,10 @@ message Candidates {
 - **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）；
   可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` / `eye_mode=vision` 使用。
   多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空本轮会话）。
+  **`session_id`（field 8）**：多轮上下文按此分组隔离，每控制器/前端生成唯一值
+  （Windows/macOS 均为「进程盐 << 32 | 进程内自增序号」，IME 重启后不撞 daemon 侧残留历史槽）。
+  `0` = 旧客户端/未分配的默认共享槽（向后兼容，行为同隔离前的单一全局历史）。
+  daemon 侧 `SessionHistory` 按 `session_id` 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：前端把拼音/五笔码发到 daemon，daemon 内 librime（单引擎）
@@ -110,7 +133,10 @@ message Candidates {
 - **OcrRecognize**：`image` 图像字节；daemon 按 `config ocr_provider` 选择 provider（`mock` 确定性 /
   `windows` = Windows.Media.Ocr 本地识别 / `rapid` = 本地 RapidOCR（PaddleOCR+ONNXRuntime，经 Python 子进程）），一次性回 `Text`（整段文字，多行以换行拼接）。
 - **AsrTranscribe**：`audio` 音频字节；daemon 按 `config asr_provider` 选择 provider（当前 `mock` 确定性），一次性回 `Text`。
-- **取消**：任何流式请求可 `LlmCancel` 按全局请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
+- **取消**：任何流式请求可 `LlmCancel` 按请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
+  取消注册表键为 `(conn_id, req_id)`（请求 id 每连接从 1 自增，跨连接会重复），解析时**精确键优先**；
+  查不到时按 `id` 全局 fallback（#27：Windows 前端取消走独立控制连接，流注册在 worker 连接上），
+  且 fallback **仅在 id 唯一匹配时**生效——多个同 id 在途流歧义时放弃取消并告警（防止误取消他人流）。
 - **断线重连**：客户端检测连接断开后按退避重连，并重新同步当前模式与配置。
 - **背压**：大文件 / 高吞吐用分块 + 流控，避免管道阻塞（参照数据通道背压经验）。
 
