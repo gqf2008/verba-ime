@@ -1,6 +1,6 @@
 # 路线图
 
-> 更新：2026-08-25 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
+> 更新：2026-08-26 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
 > librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；多模态（OCR/ASR）与
 > TTS（edge-tts / OpenAI 兼容）已打通；Slint 设置面板已落地（apps/settings）。剩余：whisper.cpp / audio.cpp
 > 本地 ASR（可选）、Piper / 系统 TTS、性能预算、日志脱敏、M6 发布（签名/公证/安装包）。
@@ -16,7 +16,7 @@
 | M3 | 多模态 | OCR（截图）与 ASR（语音）在至少一个平台跑通，其余平台跟进 | M1 / M2 |
 | M4 | 体验打磨 | TTS（在线）、候选窗口、Slint 设置面板、性能预算、隐私开关 | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
-| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营 | M5 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0 发布进行中，2026-08-26） | M5 |
 
 ## M0 详细任务（已完成）
 
@@ -147,3 +147,4 @@
 | 2026-08-24 | 关闭「候选即时性」议题：单引擎下候选依赖 daemon Rime 查询返回（本地、启动预热），候选窗在返回前为空是正常状态；防抖是后端优化，不构成 UX「延时」问题，实测 mir2x 无延时，不再打点/调整 |
 | 2026-08-24 | macOS 支持 librime（`librime.dylib`）：`verba-librime` 由 Windows-only 重构为跨平台 `platform.rs`（libloading 统一加载 rime.dll / librime.dylib）；daemon `rime_paths` 平台化；打包捆绑 `vendor/rime`。修复 macOS 单引擎化后候选为空（P1 审查项） |
 | 2026-08-25 | 文档对齐（docs-only）：README 平台状态/快速开始/架构图、M0/M1 勾选、M5 单引擎化表述收口（`config 引擎=builtin|rime`、`verba-pinyin` 现状化）、macOS 多会话限制入风险、评估文档过期建议标注 |
+| 2026-08-26 | v0.2.0 发布准备：版本号统一 0.2.0（根 workspace + 两前端 Cargo.toml），building.md 版本示例同步 |
