@@ -71,11 +71,12 @@ impl VerbaClient {
     /// 而不是裸 [`VerbaClient::connect`]（socket 目录 0700 / per-user 管道
     /// 之上，握手是纵深防御）。
     ///
-    /// 握手带**有界读超时**（`HANDSHAKE_TIMEOUT`）：本函数跑在前端 UI 线程
-    /// （TSF/IMK 回调），对端「接受连接但永不应答」（daemon 卡死但进程/socket
+    /// 握手在 **Unix** 带**有界读超时**（`HANDSHAKE_TIMEOUT`）：本函数跑在前端 UI
+    /// 线程（TSF/IMK 回调），对端「接受连接但永不应答」（daemon 卡死但进程/socket
     /// 仍在）时，无超时的阻塞 `ping` 会把宿主应用一起挂起。超时即放弃并返回
     /// 错误（上层 `ensure_daemon` 重启 daemon / 重试）。超时仅在握手期间设置，
-    /// 完成后清除，避免影响后续流式读取。
+    /// 完成后清除，避免影响后续流式读取。**Windows 命名管道不支持 I/O 超时**，
+    /// 故仅做 Pong 验活、无有界超时（阻塞语义同裸 [`VerbaClient::connect`]）。
     pub fn connect_verified() -> Result<Self, IpcError> {
         let mut client = Self::connect()?;
         // 读超时仅在 Unix 设置：interprocess 的 Windows 命名管道不支持 I/O 超时
