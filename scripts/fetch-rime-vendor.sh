@@ -85,7 +85,32 @@ fi
 # 五笔方案不会被部署编译——必须断言插入成功（复审 V23）。
 grep -q "wubi86" "$DATA/default.yaml" || { echo "::error::wubi86 未能插入 default.yaml 的 schema_list（锚点 terra_pinyin 可能已变）" >&2; exit 1; }
 
-# 5) 结构校验（发布构建依赖）
+# 5) Verba 自定义短语（scripts/rime-extra/，biáng 等）：
+#    luna_pinyin_simp 经 __include 继承 luna_pinyin.schema，而后者已内置
+#    table_translator@custom_phrase 接线（rime-luna-pinyin 上游，2026-08 核实），
+#    因此只需注入词条文件；接线存在性由回归守卫断言，上游改版时响亮失败。
+EXTRA="$REPO_ROOT/scripts/rime-extra"
+if [ -f "$DATA/custom_phrase.txt" ]; then
+    # 上游已带 custom_phrase.txt：先补尾换行（防词条粘连到末行），再补缺失
+    # 词条行（幂等），不覆盖上游内容
+    [ -n "$(tail -c 1 "$DATA/custom_phrase.txt")" ] && printf '\n' >> "$DATA/custom_phrase.txt"
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac        # 跳过注释/空行
+        case "$line" in *$'\t'*) ;; *) continue ;; esac  # 只取含制表符的词条行
+        grep -Fqx "$line" "$DATA/custom_phrase.txt" || printf '%s\n' "$line" >> "$DATA/custom_phrase.txt"
+    done < "$EXTRA/custom_phrase.txt"
+else
+    cp "$EXTRA/custom_phrase.txt" "$DATA/"
+fi
+# 回归守卫：接线（simp 或基 schema 含 custom_phrase）与词条必须落地，
+# 上游改版导致落空时此处为红（防静默失效）
+{ grep -q "custom_phrase" "$DATA/luna_pinyin_simp.schema.yaml" \
+    || grep -q "custom_phrase" "$DATA/luna_pinyin.schema.yaml"; } \
+    || { echo "::error::custom_phrase 接线缺失（上游 schema 已变）" >&2; exit 1; }
+grep -Fq $'\tbiang' "$DATA/custom_phrase.txt" \
+    || { echo "::error::biang 词条未注入 custom_phrase.txt" >&2; exit 1; }
+
+# 6) 结构校验（发布构建依赖）
 [ -f "$VENDOR/librime.dylib" ] || { echo "::error::vendor/rime/librime.dylib 缺失" >&2; exit 1; }
 [ -d "$DATA/opencc" ] || { echo "::error::vendor/rime/data/opencc 缺失" >&2; exit 1; }
 [ -f "$DATA/default.yaml" ] || { echo "::error::vendor/rime/data/default.yaml 缺失" >&2; exit 1; }

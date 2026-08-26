@@ -75,7 +75,43 @@ if ($c -notmatch "wubi86") {
 $c2 = Get-Content $default -Raw
 if ($c2 -notmatch "wubi86") { throw "wubi86 未能插入 default.yaml 的 schema_list（锚点 terra_pinyin 可能已变）" }
 
-# 5) 结构校验（发布构建依赖）
+# 5) Verba 自定义短语（scripts/rime-extra/，biáng 等）：
+#    luna_pinyin_simp 经 __include 继承 luna_pinyin.schema，而后者已内置
+#    table_translator@custom_phrase 接线（rime-luna-pinyin 上游，2026-08 核实），
+#    因此只需注入词条文件；接线存在性由回归守卫断言，上游改版时响亮失败。
+$extra = Join-Path $repoRoot "scripts\rime-extra"
+$targetTxt = Join-Path $dataDir "custom_phrase.txt"
+$sourceTxt = Join-Path $extra "custom_phrase.txt"
+if (Test-Path $targetTxt) {
+    # 上游已带 custom_phrase.txt：先补尾换行（防词条粘连到末行），再补缺失
+    # 词条行（幂等），不覆盖上游内容
+    $existing = Get-Content $targetTxt -Raw
+    if ($existing -and -not $existing.EndsWith("`n")) {
+        Set-Content -LiteralPath $targetTxt -Value ($existing + "`n") -Encoding utf8NoBOM -NoNewline
+        $existing = Get-Content $targetTxt -Raw
+    }
+    foreach ($line in (Get-Content $sourceTxt)) {
+        if ($line -match "^\s*#" -or $line -notmatch "`t") { continue }
+        if ($existing -notmatch [regex]::Escape($line)) {
+            Add-Content -LiteralPath $targetTxt -Value $line -Encoding utf8NoBOM
+            $existing = Get-Content $targetTxt -Raw
+        }
+    }
+} else {
+    Copy-Item $sourceTxt $targetTxt -Force
+}
+# 回归守卫：接线（simp 或基 schema 含 custom_phrase）与词条必须落地，
+# 上游改版导致落空时此处为红（防静默失效）
+$simpRaw = Get-Content (Join-Path $dataDir "luna_pinyin_simp.schema.yaml") -Raw
+$baseRaw = Get-Content (Join-Path $dataDir "luna_pinyin.schema.yaml") -Raw
+if (($simpRaw -notmatch "custom_phrase") -and ($baseRaw -notmatch "custom_phrase")) {
+    throw "custom_phrase 接线缺失（上游 schema 已变）"
+}
+if ((Get-Content $targetTxt -Raw) -notmatch "`tbiang") {
+    throw "biang 词条未注入 custom_phrase.txt"
+}
+
+# 6) 结构校验（发布构建依赖）
 if (-not (Test-Path (Join-Path $vendor "rime.dll"))) { throw "vendor/rime/rime.dll 缺失" }
 if (-not (Test-Path (Join-Path $dataDir "opencc"))) { throw "vendor/rime/data/opencc 缺失" }
 if (-not (Test-Path (Join-Path $dataDir "default.yaml"))) { throw "vendor/rime/data/default.yaml 缺失" }
