@@ -68,6 +68,7 @@
 | `verba-config` | 配置读写（TOML）、默认值、密钥库（keyring） |
 | `verba-daemon` | 后台进程：启动核心、任务队列、事件分发、健康检查、自动重启 |
 | `verba-cli` | 调试 CLI：直接驱动 core，模拟按键 / 命令，预览候选 |
+| `verba-candidate` | 候选窗共享逻辑与 CPU 渲染器（tiny-skia：分页 / 主题；`render_png` example 无窗口渲染验证；光标避让在 Windows 前端实现） |
 | `frontends/*` | 平台前端（独立于 workspace，各自构建） |
 
 ## 4. 平台前端
@@ -75,7 +76,7 @@
 ### Windows — TSF（Text Services Framework）
 - 用 `windows` crate 实现 `ITfTextInputProcessorEx` 等 TSF 接口（参考 khiin-rs `windows/ime` 与 imekit 的 TSF 实现）。
 - 注册：`ITfInputProcessorProfiles::Register` 注册 GUID + 语言栏按钮；IMM32 仅作兼容回退。
-- 候选窗口：TSF `ITfCandidateListUIElement` 或自绘置顶窗口（开放问题 2）。
+- 候选窗口：**自绘置顶弹窗**（`verba-candidate` tiny-skia 光栅化 + 裸 Win32 置顶窗贴图；选型理由见 §12.2，曾评估 `ITfCandidateListUIElement`，弃用）。
 - 安装：Inno Setup / WiX，注册 COM + 输入法。
 - 注意：TSF 要求 STA；所有回调尽快返回，重活交给 daemon。
 
@@ -184,7 +185,11 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 ## 12. 开放问题（实现中决策）
 
 1. 中文拼音引擎：**单引擎 = Rime（librime）**（daemon 内，启动预热）；此前内置 `verba-pinyin` 已移除。
-2. TSF 候选窗口：原生 `ITfCandidateListUIElement` vs 自绘 overlay。
+2. ~~TSF 候选窗口：原生 `ITfCandidateListUIElement` vs 自绘 overlay~~ → **已定：自绘置顶弹窗 + tiny-skia CPU 光栅化**（2026-08-23 落地，实机验收）。
+   - 弃用系统候选 UI：TSF `ITfCandidateListUIElement` 样式受限、生命周期与焦点管理复杂；macOS `IMKCandidates` 是老 AppKit 面板，主题/分页/光标避让接不上，且两端 UX 分叉——自绘对齐微软拼音/搜狗的可主题化路线。
+   - 渲染器选 tiny-skia 而非：① 系统绘制 API（CoreGraphics / Direct2D 要写两套实现，且无法跨平台无头验证）；② Slint/femtovg（候选窗运行在注入宿主进程的 TSF DLL 内——Slint 自带 winit 事件循环会与宿主消息循环冲突，femtovg 面向 OpenGL 上下文、宿主进程内起 GL 上下文代价高；候选窗只要光栅化器，不要 UI 框架）。
+   - tiny-skia：纯 Rust、CPU 光栅化、无上下文、像素确定性，`render_png` example 可在无窗口环境（含 CI）渲染验证；前端用裸 Win32 置顶弹窗（`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`）贴图，不抢焦点、不激活宿主应用。
+   - Slint 用于独立进程的设置面板（apps/settings，默认 femtovg 渲染）——两者运行环境不同，各取所需。
 3. macOS appex 常驻限制下的 daemon 启动 / 生命周期策略。
 4. 截图实现：Windows Graphics Capture vs GDI；macOS ScreenCaptureKit vs CGWindowList。
 5. imekit 是否作为 Linux / Wayland 基座（评估后决定依赖 or fork，Apache/MIT 双许可）。
