@@ -26,11 +26,9 @@ pub fn daemon_exe_path() -> Option<PathBuf> {
 
 /// 尝试连接 daemon。
 pub fn try_connect() -> Result<VerbaClient, IpcError> {
-    let mut client = VerbaClient::connect()?;
-    // 验活握手（架构审查 P0-1）：连接成功不代表对端是真实 daemon；
-    // 能回 Pong 的才信任。socket 已移入用户私有目录（0700），此检查为纵深防御。
-    client.ping()?;
-    Ok(client)
+    // connect_verified 内含验活握手（架构审查 P0-1）：连接成功不代表对端是
+    // 真实 daemon；能回 Pong 的才信任。socket 已按用户隔离，此检查为纵深防御。
+    VerbaClient::connect_verified()
 }
 
 /// 确保 daemon 运行并返回连接（带重试）。
@@ -43,7 +41,7 @@ pub fn ensure_daemon() -> Result<VerbaClient, IpcError> {
         // CREATE_NO_WINDOW：由 TSF 切换输入法激活时拉起，绝不允许出现控制台窗口
         // （与 text_service.rs 的 trigger spawn 一致）。
         let _ = std::process::Command::new(&path)
-            .creation_flags(0x08000000)
+            .creation_flags(crate::text_service::CREATE_NO_WINDOW)
             .spawn();
     }
     for _ in 0..50 {

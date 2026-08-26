@@ -50,11 +50,14 @@ security export -k "$KEYCHAIN" -t identities -f pkcs12 -P "$P12_PW" -o "$TMP/ver
 P12_B64="$(base64 < "$TMP/verba-cert.p12")"
 
 echo "==> 设置 secrets 到 $REPO"
-gh secret set APPLE_CERT_P12       -R "$REPO" --body "$P12_B64"
-gh secret set APPLE_CERT_PASSWORD  -R "$REPO" --body "$P12_PW"
-gh secret set APPLE_TEAM_ID        -R "$REPO" --body "$TEAM_ID"
-gh secret set APPLE_ID             -R "$REPO" --body "$APPLE_ID"
-gh secret set APPLE_APP_PASSWORD   -R "$REPO" --body "$APP_PW"
+# 经 stdin 传入（gh 省略 --body 且 stdin 为管道时从 stdin 读值）：--body 会把密钥
+# 摆上进程 argv，本机任意进程 ps 可读——与脚本「不落盘、不进历史」的目标相悖
+# （复审 sweep）。
+printf '%s' "$P12_B64"  | gh secret set APPLE_CERT_P12       -R "$REPO"
+printf '%s' "$P12_PW"   | gh secret set APPLE_CERT_PASSWORD  -R "$REPO"
+printf '%s' "$TEAM_ID"  | gh secret set APPLE_TEAM_ID        -R "$REPO"
+printf '%s' "$APPLE_ID" | gh secret set APPLE_ID             -R "$REPO"
+printf '%s' "$APP_PW"   | gh secret set APPLE_APP_PASSWORD   -R "$REPO"
 
 echo "==> 完成。核对:"
 gh secret list -R "$REPO"

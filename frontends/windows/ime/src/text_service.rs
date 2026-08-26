@@ -51,6 +51,11 @@ const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿�
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
 
+/// Win32 CREATE_NO_WINDOW 进程创建标志（0x08000000）：由 IME/TSF 上下文拉起
+/// 子进程（daemon / verba-trigger）时绝不允许出现控制台窗口。三处 spawn 共用，
+/// 勿再散落魔术数。
+pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// 全局自增会话序号（从 1 起）：进程内每个输入上下文独占一个 AI 多轮上下文会话，
 /// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
 static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -921,16 +926,17 @@ fn start_llm(
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
     let session_id = data.session_id.get();
+    // 新流代际必须在发起线程（spawn 之前）领取：在 worker 内领取时，两个快速
+    // 连续的 start_llm 的 epoch 顺序由 OS 线程调度决定，可能新旧颠倒——
+    // on_timer 过滤会丢弃当前流、放行已作废流（复审 V6，P2-2 回归）。
+    let epoch = stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     let handle = std::thread::spawn(move || {
-        // 新流代际：本流所有事件带此 epoch，on_timer 只消费当前代际
-        let epoch = stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
                 push_chunk(
                     &chunks,
                     epoch,
-                    0,
                     error_event(&format!("无法连接 daemon: {e}")),
                 );
                 return;
@@ -971,12 +977,7 @@ fn start_llm(
         ) {
             Ok(id) => id,
             Err(e) => {
-                push_chunk(
-                    &chunks,
-                    epoch,
-                    0,
-                    error_event(&format!("LLM 启动失败: {e}")),
-                );
+                push_chunk(&chunks, epoch, error_event(&format!("LLM 启动失败: {e}")));
                 return;
             }
         };
@@ -996,12 +997,7 @@ fn start_llm(
                     }
                 }
                 Err(e) => {
-                    push_chunk(
-                        &chunks,
-                        epoch,
-                        id,
-                        error_event(&format!("LLM 连接中断: {e}")),
-                    );
+                    push_chunk(&chunks, epoch, error_event(&format!("LLM 连接中断: {e}")));
                     break;
                 }
             }
@@ -1010,17 +1006,18 @@ fn start_llm(
     *data.stream_thread.borrow_mut() = Some(handle);
 }
 
+/// 推送合成错误事件：epoch 为唯一流判别依据（请求 id 每连接自增，不可跨流
+/// 使用，on_timer 也只按 kind 消费），事件 id 恒 0。
 fn push_chunk(
     chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>,
     epoch: u64,
-    id: u64,
     kind: stream_event::Kind,
 ) {
     if let Ok(mut q) = chunks.lock() {
         q.push_back((
             epoch,
             StreamEvent {
-                id,
+                id: 0,
                 kind: Some(kind),
             },
         ));
@@ -1034,14 +1031,21 @@ fn cancel_stream(data: &Rc<TextServiceData>) {
     if id == 0 {
         return;
     }
-    let mut client = data.control.borrow_mut();
+    // 作废旧流代际：daemon 取消后补发的 Final 与迟到 chunk 不再通过
+    // on_timer 的 epoch 过滤（复审 V6——取消不 bump 时旧流残留会进新会话）。
+    data.stream_epoch.fetch_add(1, Ordering::SeqCst);
+    cancel_with_retry(&data.control, id);
+}
+
+/// 经控制连接取消指定请求；连接已死（服务端 idle 超时回收等）时重建并重试
+/// 一次，保证本次取消生效（架构审查 P2-3 回归防护）。
+fn cancel_with_retry(control: &RefCell<Option<verba_ipc::VerbaClient>>, id: u64) {
+    let mut client = control.borrow_mut();
     if client.is_none() {
         *client = ipc::try_connect().ok();
     }
     if let Some(c) = client.as_mut() {
         if c.llm_cancel(id).is_err() {
-            // 控制连接已死（服务端 idle 超时回收等）：重建并重试一次，
-            // 保证本次取消生效（架构审查 P2-3 回归防护）
             *client = ipc::try_connect().ok();
             if let Some(c2) = client.as_mut() {
                 let _ = c2.llm_cancel(id);
@@ -1057,20 +1061,7 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
     if id == 0 {
         return;
     }
-    let mut client = data.control.borrow_mut();
-    if client.is_none() {
-        *client = ipc::try_connect().ok();
-    }
-    if let Some(c) = client.as_mut() {
-        if c.llm_cancel(id).is_err() {
-            // 控制连接已死（服务端 idle 超时回收等）：重建并重试一次，
-            // 保证本次取消生效（架构审查 P2-3 回归防护）
-            *client = ipc::try_connect().ok();
-            if let Some(c2) = client.as_mut() {
-                let _ = c2.llm_cancel(id);
-            }
-        }
-    }
+    cancel_with_retry(&data.control, id);
 }
 
 /// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
@@ -1283,7 +1274,7 @@ fn run_region_ocr() -> std::result::Result<Option<String>, String> {
     let out = std::process::Command::new(&exe)
         .arg("region-ocr")
         // CREATE_NO_WINDOW：隐藏控制台窗口，遮罩 GUI 照常显示。
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1326,7 +1317,7 @@ fn run_region_ocr_rect(
         .arg("region-ocr")
         .arg("--rect")
         .arg(rect_arg)
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1642,5 +1633,17 @@ mod tests {
         assert_eq!("截图".trim(), "截图");
         assert_eq!("听写".trim(), "听写");
         assert_ne!("翻译：你好".trim(), "截图");
+    }
+
+    #[test]
+    fn session_id_is_unique_and_carries_process_salt() {
+        // B4b 回归：会话 id 低 32 位进程内自增（互不相同），高 32 位为每进程
+        // 随机盐——in-proc DLL 加载进各应用进程，跨进程不串 daemon 历史槽。
+        let a = alloc_session_id();
+        let b = alloc_session_id();
+        assert_ne!(a, b);
+        assert_eq!(a >> 32, process_salt() as u64);
+        assert_eq!(b >> 32, process_salt() as u64);
+        assert_ne!(a & 0xffff_ffff, b & 0xffff_ffff);
     }
 }

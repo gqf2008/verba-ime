@@ -35,9 +35,6 @@ impl Write for TeeLog {
 pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dirs = VerbaDirs::locate()?;
     dirs.ensure()?;
-    // Windows：生成/复用不可预测 IPC 管道 token（防其他用户预占管道名，见 name.rs）
-    #[cfg(windows)]
-    verba_ipc::name::ensure_ipc_token()?;
     // IPC 信任边界（架构审查 P0-1）：Unix 下 socket 位于用户数据目录，
     // 目录收紧为 0700，其他用户不可见不可连（跨用户劫持/DoS 面关闭）。
     #[cfg(unix)]

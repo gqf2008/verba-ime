@@ -13,9 +13,9 @@ pub struct VerbaDirs {
 }
 
 impl VerbaDirs {
-    /// 依据平台约定计算目录：
-    /// - Windows: `%APPDATA%\Verba`
-    /// - macOS: `~/Library/Application Support/Verba`
+    /// 依据平台约定计算目录（`ProjectDirs("dev","verba","Verba")`）：
+    /// - Windows: `%APPDATA%\verba\Verba\data`
+    /// - macOS: `~/Library/Application Support/dev.verba.Verba`
     /// - Linux: `~/.config/verba` / `~/.local/share/verba`
     pub fn locate() -> Result<Self, std::io::Error> {
         let dirs = ProjectDirs::from("dev", "verba", "Verba")
