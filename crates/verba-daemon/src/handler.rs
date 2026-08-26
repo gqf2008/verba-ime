@@ -1101,9 +1101,67 @@ fn rime_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) 
     };
     // 用户数据目录优先；定位失败（如 HOME 缺失）才退回 exe 同目录旧行为。
     let user_dir = verba_config::VerbaDirs::locate()
-        .map(|d| d.data_dir().join("rime"))
+        .map(|d| {
+            let dir = d.data_dir().join("rime");
+            // 升级迁移（v0.2.0 起 user_data 从 exe 同目录迁到用户数据目录）：
+            // 0.1.x 在 exe 旁积累的词库/自造词在首启时一次性复制过来，防止
+            // 静默丢失（复审发现）；仅当新目录不存在时执行，失败不阻塞
+            // （首次部署会以空目录继续）。
+            migrate_legacy_user_data(&exe_dir, &dir);
+            dir
+        })
         .unwrap_or_else(|_| rime_dir.join("user_data"));
     (rime_dir.join(lib_name), rime_dir.join("data"), user_dir)
+}
+
+/// 升级迁移：把旧位置的 `rime/user_data`（exe 同目录，0.1.x 布局）复制到
+/// 新的用户数据目录位置。新目录已存在（已迁移/已初始化）则跳过；复制失败
+/// 仅告警——Rime 会以空 user_data 重新部署，build 可重建，不阻塞启动。
+fn migrate_legacy_user_data(exe_dir: &std::path::Path, new_user_dir: &std::path::Path) {
+    let old = exe_dir.join("rime").join("user_data");
+    if !old.is_dir() || new_user_dir.exists() {
+        return;
+    }
+    let copy = || -> std::io::Result<()> {
+        std::fs::create_dir_all(new_user_dir)?;
+        for entry in std::fs::read_dir(&old)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dst = new_user_dir.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir_all(&src, &dst)?;
+            } else {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(())
+    };
+    match copy() {
+        Ok(()) => log::info!(
+            "Rime user_data 已从旧位置迁移: {} -> {}",
+            old.display(),
+            new_user_dir.display()
+        ),
+        Err(e) => log::warn!(
+            "Rime user_data 迁移失败（继续使用空目录，构建可重建）: {}: {e}",
+            old.display()
+        ),
+    }
+}
+
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

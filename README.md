@@ -4,7 +4,7 @@
 > 一款开源跨平台「多模态 AI 输入法」：把 **OCR（图片/截图转文字）、ASR（语音转文字）、LLM（远程大模型）、TTS（文字转语音）** 融为一体，支持 **Windows / macOS / Linux**。
 
 > 项目状态：**M0–M5 主体完成**——Windows TSF 前端 + LLM 直输实机验收通过；macOS IMK 前端已实现并打包（.app）；中文引擎为 **Rime（librime）单引擎**（候选窗/分页/主题随 M5 实机验收）；OCR（Windows.Media.Ocr/rapid）、ASR、TTS（edge-tts/OpenAI 兼容）与 Slint 设置面板已端到端打通。
-> 剩余：Linux 前端（低优先）、whisper.cpp 本地 ASR、性能预算与日志脱敏、M6 发布（签名/公证/安装包）。已知限制：macOS 多客户端会话（LLM 流/候选队列为进程级全局状态）。
+> 剩余：Linux 前端（低优先）、whisper.cpp 本地 ASR、性能预算与日志脱敏、M6 发布收尾（Alpha/Beta）。
 > 见 [Windows 手动验收清单](docs/manual-acceptance-windows.md) 与 [路线图](docs/roadmap.md)。
 
 ---
@@ -88,7 +88,7 @@ cargo run -p verba-cli -- --help
 - **M3 多模态**：OCR 与 ASR 已打通（mock + 在线 + 本地 rapid）✅；whisper.cpp 跟进
 - **M4 打磨发布**：TTS、设置面板、候选窗口已完成；性能预算/日志脱敏待办
 - **M5 中文引擎**：Rime 单引擎 + 候选窗/分页/主题 ✅
-- **M6 发布**：签名、公证、安装包、Alpha/Beta —— 未开始
+- **M6 发布**：签名、公证、安装包流水线已就绪（release.yml：macOS codesign/notary/DMG、Windows Inno Setup + signtool）—— Alpha/Beta 与社区运营进行中（见 docs/roadmap.md）
 
 ## 参考与同类项目
 

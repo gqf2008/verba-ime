@@ -68,17 +68,9 @@ static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// 同用户同机本地隔离即可）。
 fn process_salt() -> u32 {
     static SALT: OnceLock<u32> = OnceLock::new();
-    *SALT.get_or_init(|| {
-        let mut s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ (std::process::id() as u64) << 32;
-        s ^= s >> 12;
-        s ^= s << 25;
-        s ^= s >> 27;
-        (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
-    })
+    // 本地熵实现统一收敛到 verba-ipc name::local_entropy_u64（复用评审：
+    // 原三处内联 xorshift 实现合一，便于审计与保持一致）。
+    *SALT.get_or_init(|| (verba_ipc::name::local_entropy_u64() >> 32) as u32)
 }
 
 /// 分配全局唯一的 AI 会话 id：高 32 位为每进程随机盐、低 32 位为进程内自增序号，
@@ -706,7 +698,10 @@ pub fn apply_action(
             if let Some(comp) = data.composition.borrow_mut().take() {
                 edit_session::end_composition(context, clientid, &comp, &text)?;
             }
-            data.stream_request_id.store(0, Ordering::SeqCst);
+            // 提交时若流仍在途（用户中途 Enter）：取消流 + bump 代际，防僵尸
+            // chunk/Final 以当前代际混入下个会话、防 daemon 把未见到的尾巴
+            // 写进会话历史（原实现仅 store(0)，既不取消也不 bump，复审发现）。
+            cancel_stream(data);
             Ok(())
         }
         Action::Cancel => {
@@ -982,6 +977,17 @@ fn start_llm(
             }
         };
         request_id.store(id, Ordering::SeqCst);
+        // 启动窗口内被取消/被新流取代（cancel_stream 在 id 落盘前已 bump
+        // 代际）：立即在本连接补发取消——精确 (conn_id, id) 命中、无跨连接
+        // fallback 歧义，防僵尸流继续烧 token 并把用户未见到的尾巴写进
+        // daemon 会话历史。取消后直接退出：llm_cancel 的读循环可能已吞掉
+        // 流的收尾事件，且本流事件代际已过期（on_timer 按 epoch 过滤），
+        // 无需再消费。
+        if stream_epoch.load(Ordering::SeqCst) != epoch {
+            let _ = client.llm_cancel(id);
+            request_id.store(0, Ordering::SeqCst);
+            return;
+        }
         loop {
             match client.next_event(id) {
                 Ok(evt) => {
@@ -1002,6 +1008,9 @@ fn start_llm(
                 }
             }
         }
+        // 流已结束（正常完成/错误/连接断开）：清零 id。若此处残留，后续
+        // Cancel 拿陈旧 id 走跨连接 fallback，可能误杀另一连接上同 id 的流。
+        request_id.store(0, Ordering::SeqCst);
     });
     *data.stream_thread.borrow_mut() = Some(handle);
 }
@@ -1028,13 +1037,21 @@ fn cancel_stream(data: &Rc<TextServiceData>) {
     // 候选融合请求一并取消
     cancel_candidate_request(data);
     let id = data.stream_request_id.load(Ordering::SeqCst);
+    // 作废旧流代际：无论是否已取得请求 id 都必须 bump——取消发生在
+    // llm_start/OCR 在途（worker 尚未 store id）的窗口内时，id==0 提前
+    // 返回会漏掉 bump，旧流残留事件仍以「当前代际」通过 on_timer 的
+    // epoch 过滤（复审发现）；bump 后由 start_llm worker 在 id 落盘时
+    // 检测代际并补发 daemon 取消（见 start_llm）。
+    data.stream_epoch.fetch_add(1, Ordering::SeqCst);
     if id == 0 {
         return;
     }
-    // 作废旧流代际：daemon 取消后补发的 Final 与迟到 chunk 不再通过
-    // on_timer 的 epoch 过滤（复审 V6——取消不 bump 时旧流残留会进新会话）。
-    data.stream_epoch.fetch_add(1, Ordering::SeqCst);
     cancel_with_retry(&data.control, id);
+    // 取消已发出：清零 id。否则本流结束后（worker 尚未清零的窗口内或
+    // 任何遗漏路径）后续 Cancel/Commit 会拿陈旧 id 走跨连接 fallback，
+    // 唯一命中时误杀另一条连接上同 id 的并发流（复审发现，id 每连接
+    // 自增恒为 2，撞 id 是常态而非巧合）。
+    data.stream_request_id.store(0, Ordering::SeqCst);
 }
 
 /// 经控制连接取消指定请求；连接已死（服务端 idle 超时回收等）时重建并重试
