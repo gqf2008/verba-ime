@@ -72,9 +72,10 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    ```
    **`user_data`（首次查询部署生成的用户词库/编译产物）默认落用户数据目录**，
    不在 daemon 同目录：安装态下 `C:\Program Files\Verba` / `Verba.app` 包内标准用户
-   不可写（会 502），macOS 管理员可写又会改动已签名 bundle 破坏 seal。实际位置：
-   - Windows：`%APPDATA%\verba\rime\`
-   - macOS：`~/Library/Application Support/Verba/rime/`
+   不可写（会 502），macOS 管理员可写又会改动已签名 bundle 破坏 seal。实际位置
+   （`ProjectDirs("dev","verba","Verba")` 的 `data_dir()/rime`）：
+   - Windows：`%APPDATA%\verba\Verba\data\rime\`
+   - macOS：`~/Library/Application Support/dev.verba.Verba/rime/`
    - Linux：`~/.local/share/verba/rime/`
 
    或指定 `VERBA_RIME_DLL` / `VERBA_RIME_DYLIB` / `VERBA_RIME_SHARED` / `VERBA_RIME_USER` 环境变量整体覆盖三要素。

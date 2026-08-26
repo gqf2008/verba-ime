@@ -5,11 +5,12 @@
 ## 1. 传输层
 
 - **Windows**：Named Pipe `\\.\pipe\verba-ime-{USERNAME}-{token}`。`USERNAME` 做 per-user
-  隔离；`token` 为 daemon 首启生成并写入用户数据目录（`%APPDATA%\verba\ipc-token`，0700）
+  隔离；`token` 为 daemon 首启生成并写入用户数据目录（`%APPDATA%\verba\Verba\data\ipc-token`）
   的不可预测后缀，client 读取后拼入管道名——防其他用户预占/假冒 daemon（架构审查 P0-1）。
 - **macOS / Linux**：Unix Domain Socket 放**用户数据目录**
-  （macOS `~/Library/Application Support/Verba/verba-ipc.sock`、
-  Linux `~/.local/share/verba/verba-ipc.sock`），daemon 启动时创建目录并 `chmod 0700`，
+  （macOS `~/Library/Application Support/dev.verba.Verba/verba-ipc.sock`、
+  Linux `~/.local/share/verba/verba-ipc.sock`），daemon 启动时创建目录并 `chmod 0700`
+  （仅 Unix；Windows 无此 chmod，靠 per-user 管道名 + token 隔离），
   跨用户不可见不可连。命名用完整路径（`FilesystemUdSocket`/`GenericFilePath`），
   非 `$XDG_RUNTIME_DIR`/`/tmp`（全局共享目录可被预占）。
 - **帧格式**：`u32 LE 长度前缀 + Protobuf message`。

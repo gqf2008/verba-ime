@@ -34,7 +34,8 @@ pub const DEFAULT_SOCKET_NAME: &str = "verba-ime";
 
 /// `connect_verified` 验活握手的读超时：仅作用于握手期间（防对端接受连接但
 /// 永不应答时把前端 UI 线程一起挂起）。正常 daemon 本地回 Pong 为微秒级，
-/// 取宽裕的 5s 仅为兜底卡死场景。
+/// 取宽裕的 5s 仅为兜底卡死场景。仅 Unix 使用（Windows 命名管道不支持 I/O 超时）。
+#[cfg(unix)]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 连接等待策略。
@@ -77,10 +78,20 @@ impl VerbaClient {
     /// 完成后清除，避免影响后续流式读取。
     pub fn connect_verified() -> Result<Self, IpcError> {
         let mut client = Self::connect()?;
-        client.stream.set_recv_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // 读超时仅在 Unix 设置：interprocess 的 Windows 命名管道不支持 I/O 超时
+        // （set_recv_timeout 恒返回 Unsupported，复审 P0——若在 Windows 传播该错，
+        // 握手在发 Ping 前就失败，整个前端/settings 连不上 daemon）。Windows 下
+        // 握手仍做 Pong 验活，仅退化为无有界超时（与裸 connect 一致的阻塞语义）。
+        #[cfg(unix)]
+        {
+            client.stream.set_recv_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        }
         let ping_result = client.ping();
         // 无论握手成败都清除超时，恢复后续流式读的阻塞语义。
-        let _ = client.stream.set_recv_timeout(None);
+        #[cfg(unix)]
+        {
+            let _ = client.stream.set_recv_timeout(None);
+        }
         ping_result?;
         Ok(client)
     }

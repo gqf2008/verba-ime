@@ -126,8 +126,11 @@ fn push_llm(seq: u64, event: StreamEvent) {
     }
 }
 
-/// 废弃序号集合容量上限：超出时丢弃最旧记录（其 worker 早已退出、无在途事件）。
-const DEAD_SEQ_MAX: usize = 32;
+/// 废弃序号集合容量上限：超出时丢弃最旧记录。取较大值（256）：Rime 冷部署/守护
+/// 重启时首查可达数秒（守护侧超时 30s），期间每次按键都可能烧一个新候选序号——
+/// 容量太小会在响应到达前逐出旧序号，其迟到事件滞留全局队列（复审 LOW）。元素
+/// 仅 u64，常驻占用可忽略。
+const DEAD_SEQ_MAX: usize = 256;
 
 /// 把序号记入本控制器的废弃集合（0 忽略）：其迟到事件将在 drain 丢弃，
 /// 防全局 llm_queue 无界滞留（复审 V7）。
@@ -417,9 +420,10 @@ define_class!(
                 for item in q.drain(..) {
                     if dead_any && self.ivars().dead_seqs.borrow().contains(&item.seq) {
                         // 本控制器废弃序号的残留事件（取消后补发的 Final、旧候选迟到
-                        // 响应）：丢弃并记录，随后一并清出废弃集与 cancelled_seqs
-                        // （废弃集只需防「已入队」残留，清掉后序号不会复用——seq 全局
-                        // 单调递增）。
+                        // 响应）：丢弃并记录。dead_seqs 条目**保留**——取消流的迟到
+                        // 事件常跨多个 50ms tick（缓冲 chunk + 守护补发的 Final），
+                        // 首命中即删会让下一 tick 的 Final 无匹配而滞留（复审 LOW）；
+                        // 仅随后清 cancelled_seqs（其竞态窗口已闭合）。
                         dead_hit.push(item.seq);
                         continue;
                     }
@@ -431,12 +435,10 @@ define_class!(
                 }
                 *q = kept;
                 if !dead_hit.is_empty() {
-                    let mut dead = self.ivars().dead_seqs.borrow_mut();
+                    // 只清 cancelled_seqs；dead_seqs 条目保留（见上），供后续 tick
+                    // 继续丢弃同一取消流的迟到事件。
                     let mut cancelled = cancelled_seqs().lock().unwrap();
                     for seq in dead_hit {
-                        if let Some(pos) = dead.iter().position(|&s| s == seq) {
-                            dead.remove(pos);
-                        }
                         cancelled.remove(&seq);
                     }
                 }

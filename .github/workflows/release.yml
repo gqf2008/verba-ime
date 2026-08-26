@@ -197,7 +197,9 @@ jobs:
             $isccPath = $iscc.Source
           }
           if (-not (Test-Path $isccPath)) { throw "ISCC.exe 未找到（$isccPath）" }
-          Write-Host "ISCC=$isccPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # 写 GITHUB_ENV 必须用裸字符串进管道；Write-Host 走信息流（stream 6）不
+          # 进管道，Out-File 会写空（复审 HIGH——下一步 $env:ISCC 为空致构建失败）。
+          "ISCC=$isccPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
           if (-not (Test-Path "$langDir\ChineseSimplified.isl")) {
             Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile "$langDir\ChineseSimplified.isl"
@@ -214,7 +216,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          Write-Host "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
           # 用安装步骤解析出的全路径 ISCC（choco 装的 ISCC 不在 PATH 上）
           & $env:ISCC /DMyAppVersion=$version frontends\windows\installer\verba-ime.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败（exit=$LASTEXITCODE）" }
