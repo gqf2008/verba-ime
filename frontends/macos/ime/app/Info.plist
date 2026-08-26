@@ -8,6 +8,8 @@
     <string>verba-mac</string>
     <key>CFBundleIdentifier</key>
     <string>dev.verba.inputmethod.Verba</string>
+    <key>TISInputSourceID</key>
+    <string>dev.verba.inputmethod.Verba</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -45,7 +47,7 @@
                 <key>tsInputModeIsVisibleKey</key>
                 <true/>
                 <key>tsInputModePrimaryInScriptKey</key>
-                <false/>
+                <true/>
                 <key>tsInputModeScriptKey</key>
                 <string>smSimpChinese</string>
                 <key>tsInputModeCharacterRepertoireKey</key>
