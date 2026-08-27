@@ -266,6 +266,9 @@ impl RequestHandler for DaemonHandler {
                 self.handle_llm_candidates(conn_id, id, g, out).await
             }
             Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
+            Some(request::Kind::RimeInstallExtra(_)) => {
+                self.handle_rime_install_extra(id, out).await
+            }
             Some(request::Kind::TtsSynthesize(g)) => self.handle_tts_synthesize(id, g, out).await,
             Some(request::Kind::OcrRecognize(g)) => self.handle_ocr_recognize(id, g, out).await,
             Some(request::Kind::AsrTranscribe(g)) => self.handle_asr_transcribe(id, g, out).await,
@@ -755,6 +758,83 @@ impl DaemonHandler {
         .await
     }
 
+    /// 安装生僻字扩展（issue #48）：把内嵌的 Verba 补充词条合入用户 Rime 目录
+    /// 的 `custom_phrase.txt`，然后重置缓存引擎——下一次查询的惰性 `new()` 会
+    /// 重新走 maintenance 部署（检测词条变化并重编译词典），无需新增部署 API。
+    /// 合并语义与 `scripts/fetch-rime-vendor.sh` 的 vendor 注入同构（复用其管线）。
+    async fn handle_rime_install_extra(
+        &self,
+        id: u64,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let (_, _, user_dir) = rime_paths();
+        // 文件写入与引擎锁无关，走 spawn_blocking 不阻塞 worker；落盘成功后才
+        // 拿锁重置（持锁窗口极小，锁内无 await）。
+        let task = tokio::task::spawn_blocking(move || -> Result<(usize, bool), String> {
+            std::fs::create_dir_all(&user_dir).map_err(|e| format!("用户 Rime 目录不可用: {e}"))?;
+            merge_extra_phrases(&user_dir.join("custom_phrase.txt"))
+                .map_err(|e| format!("词条文件读写失败: {e}"))
+        });
+        let (appended, created) =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+                Ok(Ok(Ok(r))) => r,
+                Ok(Ok(Err(e))) => {
+                    out.response(&Response {
+                        id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 500,
+                            message: e,
+                        })),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => {
+                    out.response(&Response {
+                        id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 500,
+                            message: "生僻字安装任务异常".into(),
+                        })),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    // 超时：后台任务继续运行，词条可能已落盘但引擎未重置
+                    // （同 handle_rime_candidates 的 504 约定）；合并幂等，
+                    // 用户重试点击即可补齐重置，不会写坏文件。
+                    out.response(&Response {
+                        id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 504,
+                            message: "生僻字安装超时".into(),
+                        })),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            };
+        log::info!(
+            "生僻字扩展已安装: 追加 {appended} 行{}",
+            if created {
+                "（新建词条文件）"
+            } else {
+                ""
+            }
+        );
+        // 重置缓存引擎：下一次查询重新部署生效。中毒自愈同 rime_query_sync。
+        {
+            let mut guard = self.rime.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = None;
+        }
+        out.response(&Response {
+            id,
+            kind: Some(response::Kind::Ok(OkMsg {})),
+        })
+        .await
+    }
+
     /// TTS 合成：按 config tts_provider/tts_voice 分发，返回音频字节。
     async fn handle_tts_synthesize(
         &self,
@@ -1151,6 +1231,48 @@ fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
+/// Verba 补充词条（scripts/rime-extra/custom_phrase.txt，编译期内嵌，随 daemon 分发）。
+const RIME_EXTRA_PHRASES: &str = include_str!("../../../scripts/rime-extra/custom_phrase.txt");
+
+/// 把内嵌的 Verba 补充词条合入目标 `custom_phrase.txt`。
+///
+/// 语义与 `scripts/fetch-rime-vendor.sh` 的 vendor 合并同构（issue #48「复用
+/// 其管线」）：目标文件不存在则整体写入内嵌文件（含 yaml 头）；存在则只补
+/// 缺失的**词条行**——含制表符才计入（天然跳过注释/空行/yaml 头，不产生重复
+/// 文档头）、逐行精确匹配（容 \r\n 文件）、幂等且不覆盖用户自建词条。
+/// 返回（追加行数, 是否新建文件）。
+fn merge_extra_phrases(path: &std::path::Path) -> std::io::Result<(usize, bool)> {
+    if !path.exists() {
+        std::fs::write(path, RIME_EXTRA_PHRASES)?;
+        let entries = RIME_EXTRA_PHRASES
+            .lines()
+            .filter(|l| l.contains('\t'))
+            .count();
+        return Ok((entries, true));
+    }
+    let mut body = std::fs::read_to_string(path)?;
+    // 脚本先补尾换行防末行粘连（[ -n "$(tail -c 1)" ] && printf '\n'），此处同。
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    let mut appended = 0;
+    for line in RIME_EXTRA_PHRASES.lines() {
+        if line.is_empty() || line.starts_with('#') || !line.contains('\t') {
+            continue;
+        }
+        if body.lines().any(|l| l.trim_end_matches('\r') == line) {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+        appended += 1;
+    }
+    if appended > 0 {
+        std::fs::write(path, body)?;
+    }
+    Ok((appended, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +1449,57 @@ mod tests {
         let new_user = base.join("userdata");
         migrate_legacy_user_data(&exe_dir, &new_user);
         assert!(!new_user.exists(), "旧位置缺失时应完全不触碰新目录");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_extra_phrases_creates_file_verbatim_and_idempotent() {
+        let base = temp_dir("extra-new");
+        let target = base.join("custom_phrase.txt");
+        let (appended, created) = merge_extra_phrases(&target).unwrap();
+        assert!(created, "目标不存在应整体新建");
+        assert!(
+            appended >= 2,
+            "内嵌词条应至少 2 行（biang 两形）: {appended}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            RIME_EXTRA_PHRASES,
+            "新建文件应为内嵌文件原样（含 yaml 头）"
+        );
+        // 幂等：二次合并不再追加
+        let (again, created2) = merge_extra_phrases(&target).unwrap();
+        assert!(!created2);
+        assert_eq!(again, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_extra_phrases_appends_only_missing_entry_lines() {
+        // 已存在带自身 yaml 头与部分词条的文件（含 \r\n 行模拟 Windows 产物）：
+        // 只补缺失词条行——不重复文档头、不重复已有词条、不覆盖用户内容。
+        let base = temp_dir("extra-merge");
+        let target = base.join("custom_phrase.txt");
+        std::fs::write(
+            &target,
+            "---\nname: custom_phrase\nversion: \"2020.01\"\nsort: by_weight\nuse_preset_vocabulary: true\n\n𰻝\tbiang\r\nuser\tzi ding ci\n",
+        )
+        .unwrap();
+        let (appended, created) = merge_extra_phrases(&target).unwrap();
+        assert!(!created);
+        let out = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(out.matches("---\n").count(), 1, "yaml 文档头不得重复");
+        assert_eq!(
+            out.matches("𰻝\tbiang").count(),
+            1,
+            "已有词条（含 \\r\\n）不得重复追加"
+        );
+        assert_eq!(out.matches("𰻞\tbiang").count(), 1, "缺失词条应补上");
+        assert!(out.contains("user\tzi ding ci"), "用户自建词条不得被覆盖");
+        assert_eq!(appended, 1);
+        // 幂等
+        let (again, _) = merge_extra_phrases(&target).unwrap();
+        assert_eq!(again, 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -48,6 +48,7 @@ export component SettingsWindow inherits Window {
     callback refresh();
     callback set-api-key(string);
     callback clear-api-key();
+    callback install-rare-chars();
 
     VerticalBox {
         padding: 12px;
@@ -119,6 +120,19 @@ export component SettingsWindow inherits Window {
                         spacing: 6px;
                         HorizontalBox { spacing: 8px; Text { text: "Rime 方案"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.rime-schema; placeholder-text: "luna_pinyin_simp / wubi86"; } }
                         HorizontalBox { spacing: 8px; Text { text: "候选窗主题"; width: 130px; vertical-alignment: center; } ComboBox { model: ["light（浅色）", "dark（深色）"]; current-index <=> root.theme-index; } }
+                    }
+                }
+
+                GroupBox {
+                    title: "生僻字扩展";
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+                        Text { text: "把 Verba 补充词条（如 biáng 等生僻字）安装到 Rime 用户词库并重新部署，安装后可输入 biang 拼音直接上屏。"; wrap: word-wrap; }
+                        HorizontalBox {
+                            spacing: 8px;
+                            Button { text: "安装生僻字扩展"; clicked => { root.install-rare-chars(); } }
+                        }
                     }
                 }
 

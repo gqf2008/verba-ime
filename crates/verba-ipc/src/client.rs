@@ -512,4 +512,25 @@ impl VerbaClient {
             _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
         }
     }
+
+    /// 安装生僻字扩展：daemon 把内嵌的 Verba 补充词条合入用户 Rime 目录
+    /// 并重置引擎（下一次查询触发重新部署生效）。
+    pub fn rime_install_extra(&mut self) -> Result<(), IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::RimeInstallExtra(
+                verba_protos::RimeInstallExtra {},
+            )),
+        };
+        let resp = self.request(req)?;
+        match resp.kind {
+            Some(response::Kind::Ok(_)) => Ok(()),
+            Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                code: e.code,
+                message: e.message,
+            }),
+            _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
+        }
+    }
 }

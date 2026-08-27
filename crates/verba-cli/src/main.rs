@@ -52,6 +52,7 @@ fn print_help() {
          verba-cli ai <prompt>           流式调用 LLM 并打印（模拟 // AI 模式）\n  \\
          verba-cli candidates <拼音>    请求 LLM 融合候选并打印\n  \
          verba-cli rime <输入> [方案]  查询 Rime 引擎候选（单引擎）\n  \
+         verba-cli rime install-extra  安装生僻字扩展并重新部署\n  \
          verba-cli tts <文本> [输出] [语音]  TTS 合成音频并写文件（config tts_provider）\n  \
          verba-cli ocr <图像>          OCR 识别图像并打印文字（config ocr_provider）\n  \
          verba-cli asr <音频>          ASR 转写音频并打印文字（config asr_provider）\n  \
@@ -208,7 +209,15 @@ fn cmd_candidates(args: &[String]) -> i32 {
 }
 
 /// `verba-cli rime <输入> [方案]`：查询 daemon 内 Rime 引擎候选（单引擎）。
+/// `verba-cli rime install-extra`：安装生僻字扩展（词条落盘 + 引擎重置重部署）。
 fn cmd_rime(args: &[String]) -> i32 {
+    if args.get(1).map(|s| s.as_str()) == Some("install-extra") {
+        return with_client(|c| {
+            c.rime_install_extra()?;
+            println!("生僻字扩展已安装并重新部署（biang 拼音即刻可用）");
+            Ok(())
+        });
+    }
     let input = args.get(1).cloned().unwrap_or_default();
     if input.is_empty() {
         eprintln!("用法: verba-cli rime <输入> [方案]");
