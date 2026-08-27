@@ -139,7 +139,7 @@
 > 背景：PR #43/#45 审查遗留（issue #44）的代码部分已全部落地并 CI 钉住
 > （`install_stream_token_never_overwrites_newer_epoch` /
 > `collect_steps_settles_inflight_deferred_space` / `rime_fail_event_is_done_empty_candidates`
-> 三个测试跑在 windows-latest 真机 runner 上）。以下两项是唯一无法离线验证的
+> 三个测试跑在 windows-latest runner（虚拟 Windows）上）。以下两项是唯一无法离线验证的
 > TSF 路由副作用，在 Windows 真机上按步骤执行后即可收口 issue #44。
 
 ## 修饰键守卫（Ctrl/Alt 快捷组合不被吞）

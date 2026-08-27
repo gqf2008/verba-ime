@@ -1090,7 +1090,8 @@ fn stream_token_id(token: u64) -> u64 {
 /// 流注册槽安装：CAS 安装打包 token，**绝不覆盖同代或更新代的票**——
 /// 慢启动的旧流迟到安装时新流可能已接管槽位，此时返回 false 放弃安装
 /// （本流注定被代际检测回收）；若反向覆盖，会顶掉唯一能取消新流的凭据。
-/// 返回 true = 本 token 已落盘。
+/// 返回 true = 本 token 已落盘；false = 未安装（槽内同代票保留先到者，
+/// 或槽内已是更新代——当前调用方不区分这两者）。
 fn install_stream_token(slot: &AtomicU64, token: u64) -> bool {
     loop {
         let cur = slot.load(Ordering::SeqCst);
@@ -1890,6 +1891,32 @@ mod tests {
         );
         // 用户此刻看得见候选窗：再按空格才是知情回退
         assert_eq!(m.feed_char(' '), Action::CommitImmediate("ni".into()));
+    }
+
+    /// 布线语义钉住（issue #44，复审建议 S1）：暂缓空格后真实候选结算 →
+    /// 首候选提交动作走 Step::Act 派发、不得被静默丢弃（此前被吞掉、
+    /// 空格无效的复审发现——非刷新动作与 macOS 对齐走通用派发上屏）。
+    #[test]
+    fn collect_steps_real_candidates_emit_commit_act() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "在途空格应暂缓");
+        let steps = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin: "ni".into(),
+                    candidates: vec!["你".into()],
+                    done: true,
+                })),
+            }],
+        );
+        assert!(
+            matches!(&steps[..], [Step::Act(Action::CommitImmediate(t))] if t == "你"),
+            "真实候选结算应产出首候选提交步骤（不被丢弃），实际 {steps:?}"
+        );
     }
 
     /// 流 token 打包/安装属性（issue #44 真机项的可自动化部分）：
