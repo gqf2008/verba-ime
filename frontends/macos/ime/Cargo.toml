@@ -20,9 +20,13 @@ verba-ipc = { path = "../../../crates/verba-ipc" }
 verba-protos = { path = "../../../crates/verba-protos" }
 verba-config = { path = "../../../crates/verba-config" }
 log = { version = "0.4", features = ["std"] }
+env_logger = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
+# exception 特性：catch_void/host_call 捕获 IMK 客户端包装器抛出的 ObjC
+# 异常（unmarkText 等不被实现的选择器），防止异常穿透 Rust 帧在清理途中
+# abort——真机崩溃根因之一，正式依赖非调试开关。
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 objc2-input-method-kit = "0.3"
