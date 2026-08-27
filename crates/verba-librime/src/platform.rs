@@ -424,13 +424,18 @@ impl RimeEngine {
         // 5 条即「候选不全」（真机）；运行时 Page_Down 翻页不被方案保证接受，
         // 直接经 default.custom.yaml 把页大小提到 9 最稳。仅缺失时写入，
         // 不覆盖用户自定义（变更后 start_maintenance 的部署会检测并重编译）。
+        // 写失败只降级告警不中断引擎：candidates() 的分页收集循环本身就是
+        // 页大小为 5 时的兜底，故障面不应大于一项展示优化。
         let patch = cfg.user_data_dir.join("default.custom.yaml");
         if !patch.exists() {
-            std::fs::write(
+            if let Err(e) = std::fs::write(
                 &patch,
                 "# Verba 自动生成：候选菜单每页条数（与输入法面板一次展示的 9 条对齐）\npatch:\n  menu/page_size: 9\n",
-            )
-            .map_err(|e| RimeError::Init(format!("写入候选页大小补丁失败: {e}")))?;
+            ) {
+                log::warn!(
+                    "[verba-librime] 写入候选页大小补丁失败（按每页 5 条分页收集兜底）: {e}"
+                );
+            }
         }
 
         let shared_c = CString::new(cfg.shared_data_dir.to_str().unwrap_or_default())
@@ -548,11 +553,20 @@ impl RimeEngine {
                 // max（9）个——只读首页即「候选不全」的根因（真机：长句只剩
                 // 首页 5 条）。Page_Down 翻页直到末页或凑满 max。
                 let mut out = Vec::with_capacity(max);
+                // 翻页无推进防御：个别方案可能吞掉 Page_Down 却报告成功，
+                // menu 停在原页——不检测会把同一页候选反复收满 max（重复项）。
+                let mut prev_page_no: i32 = -1;
                 loop {
                     if ((*api).get_context)(session, &mut ctx) == 0 {
                         return Err(RimeError::Input("获取上下文失败".into()));
                     }
                     let n = ctx.menu.num_candidates.max(0) as usize;
+                    let cur_page_no = ctx.menu.page_no;
+                    if cur_page_no == prev_page_no {
+                        // 页码未前进：翻页未生效，放弃续翻（宁缺勿重复）。
+                        ((*api).free_context)(&mut ctx);
+                        break;
+                    }
                     let take = n.min(max - out.len());
                     for i in 0..take {
                         let c = &*ctx.menu.candidates.add(i);
@@ -572,6 +586,7 @@ impl RimeEngine {
                     {
                         break;
                     }
+                    prev_page_no = cur_page_no;
                 }
                 Ok(out)
             })();
