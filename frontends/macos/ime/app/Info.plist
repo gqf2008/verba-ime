@@ -10,6 +10,8 @@
     <string>dev.verba.inputmethod.Verba</string>
     <key>TISInputSourceID</key>
     <string>dev.verba.inputmethod.Verba</string>
+    <key>tsInputMethodIconFileKey</key>
+    <string>Icon.pdf</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -46,6 +48,8 @@
                 <string>zh-Hans</string>
                 <key>tsInputModeIsVisibleKey</key>
                 <true/>
+                <key>tsInputModeIconFileKey</key>
+                <string>Icon.pdf</string>
                 <key>tsInputModePrimaryInScriptKey</key>
                 <true/>
                 <key>tsInputModeScriptKey</key>
