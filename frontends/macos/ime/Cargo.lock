@@ -2331,7 +2331,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "verba-candidate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cosmic-text",
  "serde",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "verba-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "directories",
  "keyring",
@@ -2352,11 +2352,11 @@ dependencies = [
 
 [[package]]
 name = "verba-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "verba-ime-macos"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "env_logger",
  "log",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "verba-ipc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "verba-protos"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "prost-build",
