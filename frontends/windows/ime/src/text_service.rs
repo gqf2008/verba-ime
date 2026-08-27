@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
+use verba_core::machine::{
+    is_fullwidth_mapped_punct, Action, CompositionMachine, LlmCandidateRequest, MachineState,
+};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -319,7 +321,9 @@ impl KeyEventSink {
 ///
 /// TSF 只在测试阶段返回 TRUE 时才调用 `OnKeyDown`（实测 Notepad-- 等 TSF 应用：
 /// 一直返回 FALSE 会导致 `OnKeyDown` 永远不被调用，`//` 触发与直输全部失效）。
-/// - `Idle`：只认领 `/` 触发键，其余按键直通应用（不吞键、不进 IME）。
+/// - `Idle`：认领 `/` 触发键、字母（进入拼音组合）与状态机标点（全角输出，
+///   与 macOS 契约对齐——此前不认领时宿主直插半角，跨平台审查发现的不一致），
+///   其余按键直通应用（不吞键、不进 IME）。
 /// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady`：认领全部可打印字符
 ///   与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被吞/丢字符。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
@@ -332,8 +336,9 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
     match state {
         MachineState::Idle => match get_char_for_vk(vk, lparam) {
-            // 认领 `/`（AI 触发）与字母（进入拼音组合）
-            Some(c) => c == '/' || c.is_ascii_alphabetic(),
+            // 认领 `/`（AI 触发）、字母（进入拼音组合）、状态机标点（全角映射
+            // 与成对引号——与 verba-core::is_fullwidth_mapped_punct 同源）
+            Some(c) => idle_claim_char(c),
             None => false,
         },
         MachineState::Pinyin => {
@@ -343,15 +348,8 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
             }
             match get_char_for_vk(vk, lparam) {
                 // 拼音态认领：字母（缓冲）、数字（选候选）、空格（选首选）、`/`（提交+AI）、
-                // `-`/`=`（翻页）
-                Some(c) => {
-                    c == '/'
-                        || c.is_ascii_alphabetic()
-                        || c.is_ascii_digit()
-                        || c == ' '
-                        || c == '-'
-                        || c == '='
-                }
+                // `-`/`=`（翻页）及其它状态机标点（候选+全角 flush，同 macOS）
+                Some(c) => pinyin_claim_char(c),
                 None => false,
             }
         }
@@ -365,6 +363,22 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
             get_char_for_vk(vk, lparam).is_some()
         }
     }
+}
+
+/// Idle 态认领的字符判定（VK 解耦，单测直测；调用点见 `should_claim_key`）。
+fn idle_claim_char(c: char) -> bool {
+    c == '/' || c.is_ascii_alphabetic() || is_fullwidth_mapped_punct(c)
+}
+
+/// 拼音态认领的字符判定（VK 解耦，单测直测）。
+fn pinyin_claim_char(c: char) -> bool {
+    c == '/'
+        || c.is_ascii_alphabetic()
+        || c.is_ascii_digit()
+        || c == ' '
+        || c == '-'
+        || c == '='
+        || is_fullwidth_mapped_punct(c)
 }
 
 impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
@@ -1774,5 +1788,20 @@ mod tests {
         assert_eq!(a >> 32, process_salt() as u64);
         assert_eq!(b >> 32, process_salt() as u64);
         assert_ne!(a & 0xffff_ffff, b & 0xffff_ffff);
+    }
+
+    /// 键位认领的字符级判定：状态机标点在 Idle/Pinyin 两态都认领（全角输出，
+    /// 与 macOS 契约对齐）；未映射字符不认领。
+    #[test]
+    fn claim_chars_cover_machine_punct() {
+        for c in [',', '.', ';', ':', '?', '!', '(', ')', '[', ']', '"', '\'', '-', '=', '~'] {
+            assert!(idle_claim_char(c), "Idle 应认领 {c:?}");
+            assert!(pinyin_claim_char(c), "Pinyin 应认领 {c:?}");
+        }
+        assert!(idle_claim_char('/'));
+        assert!(!idle_claim_char('`'), "未映射符号不认领");
+        assert!(!idle_claim_char(' '), "空格 Idle 不认领（保持原语义）");
+        assert!(pinyin_claim_char('2') && pinyin_claim_char(' '));
+        assert!(pinyin_claim_char('0'), "数字行整体走拼音态通用通道");
     }
 }
