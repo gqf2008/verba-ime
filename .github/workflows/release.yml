@@ -129,6 +129,10 @@ jobs:
           mkdir -p dmg-staging
           cp -R frontends/macos/ime/dist/Verba.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
+          # 一键安装脚本（issue #48 项 3）：双击拷贝 app 到 ~/Library/Input Methods
+          # 并调 app 内 verba-register 注册/启用输入源（签名/公证覆盖整个 DMG）。
+          cp frontends/macos/ime/scripts/install-dmg.command dmg-staging/安装.command
+          chmod +x dmg-staging/安装.command
           hdiutil create -volname "Verba" -srcfolder dmg-staging -ov -format UDZO "Verba-$VERSION.dmg"
           if [ -n "$IDENTITY" ]; then
             # DMG 也要签名 + 公证（分发的盘片本身要过 Gatekeeper）

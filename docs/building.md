@@ -99,8 +99,10 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
   dlclose 会 SIGSEGV（Squirrel/Weasel 同样从不卸载）；`finalize()` 在 drop 时调用。
 
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
-- **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` 与 `verba-daemon`，ad-hoc 签名）
-  → `cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 系统设置「键盘 → 输入法」启用；正式发布需 Developer ID 签名 + 公证。
+- **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` / `verba-daemon` / `verba-register`，ad-hoc 签名）。
+  - **发布 DMG 一键安装**：双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 走 TIS C API 注册并启用输入源（系统弹一次确认，macOS 26 已验证）。卸载 = 删除 `~/Library/Input Methods/Verba.app`。
+  - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（或系统设置「键盘 → 输入法」手动启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
+  - 正式发布需 Developer ID 签名 + 公证。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
 
 ## CI（GitHub Actions）
