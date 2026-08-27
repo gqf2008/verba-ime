@@ -157,9 +157,11 @@ pub struct CompositionMachine {
     prompt: String,
     /// LLM 流式结果。
     result: String,
-    /// 成对引号交替开闭状态（false=下一个是开引号）。全角引号无左右键位，
-    /// 按 IME 惯例同键交替；跨组合延续（会话级，不复位）。
-    quote_open: bool,
+    /// 成对引号交替开闭状态，**双引号与单引号各自独立交替**（false=下一个是
+    /// 开引号）。全角引号无左右键位，按 IME 惯例同键交替；跨组合延续（会话级，
+    /// 不复位）。两键共用一个标志会让 `"` 后紧跟 `'` 产出「“’」错配对。
+    double_quote_open: bool,
+    single_quote_open: bool,
 }
 
 /// 半角 → 全角标点映射表（成对引号另由状态机交替处理，不入表；
@@ -210,7 +212,8 @@ impl CompositionMachine {
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
-            quote_open: false,
+            double_quote_open: false,
+            single_quote_open: false,
         }
     }
 
@@ -287,17 +290,17 @@ impl CompositionMachine {
 
     /// 输入一个可打印字符。
     /// 中文态标点 → 全角输出（Chinese IME 惯例）。未列入表中的符号
-    /// （@ # % ^ & * _ + = / | ~ \` 等）保持半角直通。
+    /// （@ # % ^ & * _ + = / | \` 等）保持半角直通。
     fn punct_commit_text(&mut self, c: char) -> String {
         match c {
-            // 成对引号同键交替开闭（全角引号无左右键位）
+            // 成对引号同键交替开闭（全角引号无左右键位）；双/单引号独立配对
             '"' => {
-                self.quote_open = !self.quote_open;
-                if self.quote_open { "“" } else { "”" }.to_owned()
+                self.double_quote_open = !self.double_quote_open;
+                if self.double_quote_open { "“" } else { "”" }.to_owned()
             }
             '\'' => {
-                self.quote_open = !self.quote_open;
-                if self.quote_open { "‘" } else { "’" }.to_owned()
+                self.single_quote_open = !self.single_quote_open;
+                if self.single_quote_open { "‘" } else { "’" }.to_owned()
             }
             other => fullwidth_punct(other).unwrap_or(other).to_string(),
         }
@@ -433,6 +436,12 @@ impl CompositionMachine {
                 return Action::None;
             }
             if c == ' ' || c == '/' {
+                // 不做在途暂缓（主组合有暂缓+双击回退，这里刻意保留即时
+                // 回退）：英文提示词逐键都会刷新候选查询，若首按空格被吞，
+                // 「//translate␣」这类整词输入永远无法出词（回归测试
+                // prompt_english_fallback_commits_raw 锁定此语义）。残余竞态：
+                // 中文拼音在提示词内于结果未达时按空格会先见原文——结果到达
+                // 后按退格重选的代价远小于英文路径被卡死。
                 // 空格/斜杠：提交候选（或原文）后，空格入提示词、斜杠交给 AI 触发判定
                 let text = self.commit_pinyin_text();
                 self.prompt.push_str(&text);
@@ -639,11 +648,22 @@ impl CompositionMachine {
         let (text, consumed) = match self.fused_segment(index) {
             Some(seg) => (seg.text.clone(), seg.consumed.min(active_len)),
             None if self.candidates_in_flight => {
-                // 候选在途（Rime 查询未回）：暂缓空格选择，结果到达后补执行。
+                // 候选在途（Rime 查询未回）：首个空格暂缓选择，结果到达后补执行。
                 // 真机竞态：worker 已拿到候选、事件尚未经主线程 drain 到达状态机，
                 // 此刻空格若走原文回退会把拼音字母上屏（快速输入偶发漏字母）。
-                self.space_deferred = true;
-                return Action::None;
+                //
+                // 暂缓后的**重复**空格 = 知情回退：结果迟迟未达（守护重启、查询
+                // 被更新的请求取代、连接失效等极端场景下可能永不回达），再按一次
+                // 空格说明用户明确要上屏——按原文提交并清掉暂缓标记，避免无限吞键。
+                // 与「终结空结果展示原文条目后，再按空格是知情选择」同一语义通道。
+                if !self.space_deferred {
+                    self.space_deferred = true;
+                    return Action::None;
+                }
+                self.space_deferred = false;
+                let text = format!("{}{}", self.committed_text(), self.active_pinyin());
+                self.reset_pinyin();
+                return Action::CommitImmediate(text);
             }
             None => (self.active_pinyin().to_owned(), active_len),
         };
@@ -977,6 +997,19 @@ mod tests {
         assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "“"));
         assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "”"));
         assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "‘"));
+        assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "’"));
+    }
+
+    #[test]
+    fn double_and_single_quotes_pair_independently() {
+        // 回归：双/单引号曾共用交替标志，`"` 后紧跟 `'` 会产出「“’」错配对。
+        let mut m = CompositionMachine::new();
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "“"));
+        assert!(
+            matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "‘"),
+            "单引号应独立从开引号开始"
+        );
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "”"));
         assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "’"));
     }
 
@@ -1863,5 +1896,21 @@ mod tests {
             Action::None,
             "组合已取消，迟到候选与暂缓空格都不应产生动作"
         );
+    }
+
+    /// 暂缓后的重复空格 = 知情回退：结果迟迟未达（守护重启/查询被取代/连接
+    /// 失效等）时按原文提交，不无限吞键。
+    #[test]
+    fn second_space_while_in_flight_commits_raw() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "首个在途空格应暂缓");
+        assert_eq!(
+            m.feed_char(' '),
+            Action::CommitImmediate("ni".into()),
+            "重复空格知情回退原文"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
     }
 }
