@@ -30,3 +30,6 @@ objc2 = { version = "0.6", features = ["exception"] }
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 objc2-input-method-kit = "0.3"
+# verba-register（src/bin/）：CFString/CFArray/CFURL 类型封装，配合 Carbon
+# framework 的 TextInputSources FFI（TISRegisterInputSource / TISEnableInputSource）。
+core-foundation = "0.10"

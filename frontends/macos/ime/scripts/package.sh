@@ -23,6 +23,9 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
+# 安装注册助手（issue #48 项 3）：DMG 内「安装.command」双击后由它注册/启用
+# 输入源（TIS C API），随 bundle 分发、由 release.yml 的逐二进制签名循环覆盖。
+cp "$IME_ROOT/target/release/verba-register" "$APP/Contents/MacOS/verba-register"
 cp "$IME_ROOT/app/Info.plist" "$APP/Contents/Info.plist"
 # 输入源显示名本地化（InfoPlist.strings：TIS 按 TISInputSourceID 取值，
 # 缺失时系统设置列表回退显示原始 ID，见 app/Resources/）
@@ -64,5 +67,7 @@ codesign --force --deep --sign - "$APP"
 codesign --verify "$APP" 
 
 echo "打包完成: $APP"
-echo "安装: cp -R '$APP' \"\$HOME/Library/Input Methods/\""
-echo "然后在 系统设置 → 键盘 → 输入法 中启用「拾言输入法」"
+echo "一键安装: DMG 内双击「安装.command」（release.yml 组装）；"
+echo "手动安装: cp -R '$APP' \"\$HOME/Library/Input Methods/\""
+echo "然后运行 \$HOME/Library/Input\\ Methods/Verba.app/Contents/MacOS/verba-register 注册并启用，"
+echo "或在 系统设置 → 键盘 → 输入法 中手动启用「拾言输入法」"
