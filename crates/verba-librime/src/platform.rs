@@ -411,6 +411,24 @@ fn to_rust(ptr: *const c_char) -> String {
     }
 }
 
+/// 候选页大小补丁内容（default.custom.yaml patch 形式，librime 部署时合并）。
+const PAGE_SIZE_PATCH_CONTENT: &str =
+    "# Verba 自动生成：候选菜单每页条数（与输入法面板一次展示的 9 条对齐）\npatch:\n  menu/page_size: 9\n";
+
+/// 部署前写入候选页大小补丁（幂等：已存在不覆盖用户自定义）。
+///
+/// 写失败只降级告警、不中断引擎初始化：`candidates()` 的分页收集循环本身
+/// 就是页大小 5 时的兜底，故障面不应大于一项展示优化。
+fn ensure_page_size_patch(user_data_dir: &Path) {
+    let patch = user_data_dir.join("default.custom.yaml");
+    if patch.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&patch, PAGE_SIZE_PATCH_CONTENT) {
+        log::warn!("[verba-librime] 写入候选页大小补丁失败（按每页 5 条分页收集兜底）: {e}");
+    }
+}
+
 impl RimeEngine {
     /// 加载 librime 并初始化 + 首次部署（同步等待完成）。
     pub fn new(cfg: &RimeConfig) -> Result<Self, RimeError> {
@@ -424,19 +442,7 @@ impl RimeEngine {
         // 5 条即「候选不全」（真机）；运行时 Page_Down 翻页不被方案保证接受，
         // 直接经 default.custom.yaml 把页大小提到 9 最稳。仅缺失时写入，
         // 不覆盖用户自定义（变更后 start_maintenance 的部署会检测并重编译）。
-        // 写失败只降级告警不中断引擎：candidates() 的分页收集循环本身就是
-        // 页大小为 5 时的兜底，故障面不应大于一项展示优化。
-        let patch = cfg.user_data_dir.join("default.custom.yaml");
-        if !patch.exists() {
-            if let Err(e) = std::fs::write(
-                &patch,
-                "# Verba 自动生成：候选菜单每页条数（与输入法面板一次展示的 9 条对齐）\npatch:\n  menu/page_size: 9\n",
-            ) {
-                log::warn!(
-                    "[verba-librime] 写入候选页大小补丁失败（按每页 5 条分页收集兜底）: {e}"
-                );
-            }
-        }
+        ensure_page_size_patch(&cfg.user_data_dir);
 
         let shared_c = CString::new(cfg.shared_data_dir.to_str().unwrap_or_default())
             .map_err(|e| RimeError::Init(e.to_string()))?;
@@ -647,5 +653,56 @@ mod tests {
             wubi.iter().any(|c| c.text == "你好"),
             "wqvb 应含「你好」，实际 {wubi:?}"
         );
+        // 跨页收集（部署补丁后每页 9）：max=9 应回填整页且无重复——
+        // 分页循环 + Page_Down 无推进防御的联合冒烟。
+        let full = engine
+            .candidates("nishishui", "luna_pinyin", 9)
+            .expect("跨页候选");
+        assert!(
+            full.len() >= 9,
+            "max=9 应回填满整页（page_size 补丁后首页即 9），实际 {full:?}"
+        );
+        let mut texts: Vec<&str> = full.iter().map(|c| c.text.as_str()).collect();
+        texts.sort_unstable();
+        texts.dedup();
+        assert_eq!(
+            texts.len(),
+            full.len(),
+            "翻页收集不得产生重复候选，实际 {full:?}"
+        );
+    }
+
+    /// 页大小补丁幂等：缺失时写入预期内容；已有文件（用户自定义）不覆盖。
+    #[test]
+    fn page_size_patch_idempotent_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "verba-librime-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let patch = dir.join("default.custom.yaml");
+
+        // 缺失 → 写入预期内容
+        ensure_page_size_patch(&dir);
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            PAGE_SIZE_PATCH_CONTENT,
+            "首次写入应为内置补丁内容"
+        );
+
+        // 已存在（用户改过）→ 保持原样不覆盖
+        let custom = "patch:\n  menu/page_size: 7\n";
+        std::fs::write(&patch, custom).unwrap();
+        ensure_page_size_patch(&dir);
+        assert_eq!(
+            std::fs::read_to_string(&patch).unwrap(),
+            custom,
+            "已存在的 default.custom.yaml 不得被覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
