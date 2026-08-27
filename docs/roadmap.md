@@ -95,7 +95,6 @@
 - [x] 选型评估：[中文引擎选型与集成评估](chinese-engine-evaluation.md)——结论：librime FFI > 重写；最终定案 **单引擎 Rime**（2026-08-24）
 - [x] 独立候选窗（跟随光标 + 智能避让）——tiny-skia 自绘置顶弹窗，锚点取组合屏幕坐标（只读编辑会话内 GetTextExt），默认正下方、放不下翻上方、水平防越界（2026-08-23 实机验收通过；选型理由见 [architecture.md](architecture.md) §12.2）
 - [x] 候选窗分页（9→27 候选，`-`/`=` 与 PageUp/PageDown 翻页、页码脚）与主题/皮肤（light/dark 预设 + 逐项覆盖、圆角、配置热更新）（2026-08-23）
-| 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；`verba-candidate` renderer 重构） |
 - [x] librime-sys spike（Windows）：预编译 rime.dll FFI 验证——拼音 luna_pinyin + 五笔 wubi86
   跑通（octagram 数据未捆绑，另配后再评估）（2026-08-23）
 - [x] librime daemon 集成：`verba-librime` crate（动态加载 rime.dll / librime.dylib，拼音/五笔候选）+ IPC
@@ -138,7 +137,7 @@
 | 2026-08-23 | 在线 ASR/TTS provider（OpenAI 兼容 `audio/transcriptions` + `audio/speech`，复用 LLM base_url+key；config 新增 `asr_base_url`/`asr_model`/`tts_base_url`/`tts_model`） |
 | 2026-08-23 | 修复 keyring 未启用平台后端（默认 mock 内存存储不跨进程）——启用 windows-native/apple-native/linux-native-sync-persistent |
 | 2026-08-23 | Slint 1.17 设置面板 `apps/settings`（替代 Tauri：LLM/多模态/引擎/快捷键/隐私 + GetConfig/SetConfig/ApiKeySet IPC 热生效；`verba-cli key` 查看/设置/清除密钥） |
-| 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；erba-candidate renderer 重构） |
+| 2026-08-23 | 候选窗 UI 现代化（横向候选栏 + 拼音组合头 + 页码脚，对齐微软拼音/手心；theme.layout 可切 vertical；`verba-candidate` renderer 重构） |
 | 2026-08-24 | 拼音分段承诺（`verba-pinyin::lookup_segmented` + `CompositionMachine` committed/commit_offset）：选子短语候选可保留剩余拼音继续组合、Backspace 弹回已选段、消费完自动整句提交；顺带实现 mir2x/libpinyin 手感参考（[libpinyin-mir2x-smoothness.md](libpinyin-mir2x-smoothness.md)） |
 | 2026-08-24 | macOS IMK 候选引擎对齐（engine=rime）：`start_candidates` 读取 config.engine/rime_schema，engine=rime 时经 `rime_candidates` IPC 一次性请求 Rime 整句候选并压入候选队列，与 Windows TSF 的候选策略一致（分段承诺/整句候选跨平台） |
 | 2026-08-24 | 候选只走本地引擎；移除打字过程的「LLM 候选融合」自动触发：前端不再在拼音变化时调 `llm_candidates_start`（Windows/macOS 一致），LLM 仅用于 `//` + 回车触发的 AI 直输（`StartLlm`），打字零 LLM 调用、零成本 |

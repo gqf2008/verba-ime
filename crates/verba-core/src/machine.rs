@@ -146,12 +146,48 @@ pub struct CompositionMachine {
     commit_offset: usize,
     /// 已发起 LLM 候选请求的拼音（避免同一拼音重复请求）。
     last_candidates_request: Option<String>,
+    /// 候选请求是否在途（已发出、Rime 结果未回）。
+    /// 快速输入时若此刻按空格选首候选，会把拼音原文上屏——须暂缓到结果到达。
+    candidates_in_flight: bool,
+    /// 在途期间按下的空格：候选回达后补执行候选 0 选择（无候选则按原文回退）。
+    space_deferred: bool,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
     result: String,
+    /// 成对引号交替开闭状态，**双引号与单引号各自独立交替**（false=下一个是
+    /// 开引号）。全角引号无左右键位，按 IME 惯例同键交替；跨组合延续（会话级，
+    /// 不复位）。两键共用一个标志会让 `"` 后紧跟 `'` 产出「“’」错配对。
+    double_quote_open: bool,
+    single_quote_open: bool,
+}
+
+/// 半角 → 全角标点映射表（成对引号另由状态机交替处理，不入表；
+/// `-`/`=` 在拼音组合中作翻页键优先消费，不会进入标点路径）。
+fn fullwidth_punct(c: char) -> Option<char> {
+    Some(match c {
+        ',' => '，',
+        '.' => '。',
+        ';' => '；',
+        ':' => '：',
+        '?' => '？',
+        '!' => '！',
+        '\\' => '、',
+        '(' => '（',
+        ')' => '）',
+        '[' => '【',
+        ']' => '】',
+        '{' => '｛',
+        '}' => '｝',
+        '<' => '《',
+        '>' => '》',
+        '-' => '－',
+        '$' => '￥',
+        '~' => '～',
+        _ => return None,
+    })
 }
 
 impl Default for CompositionMachine {
@@ -171,9 +207,13 @@ impl CompositionMachine {
             committed: Vec::new(),
             commit_offset: 0,
             last_candidates_request: None,
+            candidates_in_flight: false,
+            space_deferred: false,
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
+            double_quote_open: false,
+            single_quote_open: false,
         }
     }
 
@@ -209,6 +249,11 @@ impl CompositionMachine {
     /// 每页候选数（与候选窗主题 page_size 对齐）。
     pub const PINYIN_PAGE_SIZE: usize = 9;
 
+    /// 拼音组合缓冲上限（字母数）。手心式「装不下不再输入」：到顶后字母不再
+    /// 入缓冲（退格仍可删），同时约束 preedit/查询/候选面板规模——长句候选
+    /// 慢与不全的源头之一。
+    pub const MAX_PINYIN_BUFFER: usize = 48;
+
     /// 翻到上一页（仅拼音态；无候选或单页时无动作）。
     pub fn feed_page_up(&mut self) -> Action {
         self.paginate(false)
@@ -237,13 +282,30 @@ impl CompositionMachine {
         }
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
-            candidates: self.pinyin_candidate_texts(),
+            candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
             llm_request: None,
         }
     }
 
     /// 输入一个可打印字符。
+    /// 中文态标点 → 全角输出（Chinese IME 惯例）。未列入表中的符号
+    /// （@ # % ^ & * _ + = / | \` 等）保持半角直通。
+    fn punct_commit_text(&mut self, c: char) -> String {
+        match c {
+            // 成对引号同键交替开闭（全角引号无左右键位）；双/单引号独立配对
+            '"' => {
+                self.double_quote_open = !self.double_quote_open;
+                if self.double_quote_open { "“" } else { "”" }.to_owned()
+            }
+            '\'' => {
+                self.single_quote_open = !self.single_quote_open;
+                if self.single_quote_open { "‘" } else { "’" }.to_owned()
+            }
+            other => fullwidth_punct(other).unwrap_or(other).to_string(),
+        }
+    }
+
     pub fn feed_char(&mut self, c: char) -> Action {
         match self.state {
             MachineState::Idle => {
@@ -263,12 +325,13 @@ impl CompositionMachine {
                     self.refresh_candidates();
                     Action::UpdatePinyin {
                         preedit: self.pinyin_composition_preedit(),
-                        candidates: self.pinyin_candidate_texts(),
+                        candidates: self.display_candidate_texts(),
                         page: self.pinyin_page,
                         llm_request: self.request_llm_candidates_if_needed(),
                     }
                 } else {
-                    Action::CommitImmediate(c.to_string())
+                    // 可打印非字母：标点转全角（直通符号原样），见 punct_commit_text
+                    Action::CommitImmediate(self.punct_commit_text(c))
                 }
             }
             MachineState::PendingSlash => {
@@ -319,6 +382,10 @@ impl CompositionMachine {
                 self.reset_pinyin();
                 return Action::CommitImmediate(text);
             }
+            if self.pinyin_buffer.len() >= Self::MAX_PINYIN_BUFFER {
+                // 组合长度到顶：吞掉后续字母（装不下不再输入），退格仍可删
+                return Action::None;
+            }
             self.pinyin_buffer.push(c.to_ascii_lowercase());
             self.refresh_candidates();
             return self.pinyin_action();
@@ -327,8 +394,9 @@ impl CompositionMachine {
             // 空格：选当前首候选（是否整句提交由 select_candidate 决定）
             return self.select_candidate(0);
         }
-        // 其它可打印字符：提交候选 0 + 该字符，避免吞字
-        let text = format!("{}{c}", self.commit_pinyin_text());
+        // 其它可打印字符：提交候选 0 + 该字符，避免吞字；标点同时转全角
+        let punct = self.punct_commit_text(c);
+        let text = format!("{}{punct}", self.commit_pinyin_text());
         self.reset_pinyin();
         Action::CommitImmediate(text)
     }
@@ -347,6 +415,10 @@ impl CompositionMachine {
                         preedit: self.preedit(),
                     };
                 }
+                if self.pinyin_buffer.len() >= Self::MAX_PINYIN_BUFFER {
+                    // 组合长度到顶：吞掉后续字母（同主组合，见 MAX_PINYIN_BUFFER）
+                    return Action::None;
+                }
                 self.pinyin_buffer.push(c.to_ascii_lowercase());
                 self.refresh_candidates();
                 // 提示词内拼音组合：走 Rime 候选（与主组合一致），前端已能处理 UpdatePinyin。
@@ -364,6 +436,12 @@ impl CompositionMachine {
                 return Action::None;
             }
             if c == ' ' || c == '/' {
+                // 不做在途暂缓（主组合有暂缓+双击回退，这里刻意保留即时
+                // 回退）：英文提示词逐键都会刷新候选查询，若首按空格被吞，
+                // 「//translate␣」这类整词输入永远无法出词（回归测试
+                // prompt_english_fallback_commits_raw 锁定此语义）。残余竞态：
+                // 中文拼音在提示词内于结果未达时按空格会先见原文——结果到达
+                // 后按退格重选的代价远小于英文路径被卡死。
                 // 空格/斜杠：提交候选（或原文）后，空格入提示词、斜杠交给 AI 触发判定
                 let text = self.commit_pinyin_text();
                 self.prompt.push_str(&text);
@@ -470,14 +548,18 @@ impl CompositionMachine {
         match self.state {
             MachineState::Idle | MachineState::PendingSlash => Action::None,
             MachineState::Pinyin => {
-                let text = self.commit_pinyin_text();
+                // 回车：上屏原始输入（IME 惯例「英文通道」）。此前误取首选
+                // 候选——用户打英文串（如 soft）会被 Rime 切出的中文候选顶替
+                // 上屏。选中文请用空格/数字键。
+                let text = format!("{}{}", self.committed_text(), self.active_pinyin());
                 self.reset_pinyin();
                 Action::CommitImmediate(text)
             }
             MachineState::Prompt => {
                 if self.pinyin_composing() {
-                    // 组合中：先提交拼音（候选或原文）到提示词，不触发 LLM
-                    let text = self.commit_pinyin_text();
+                    // 组合中：回车提交原始字母到提示词（与主组合「回车=英文」
+                    // 一致；不触发 LLM）
+                    let text = format!("{}{}", self.committed_text(), self.active_pinyin());
                     self.prompt.push_str(&text);
                     self.clear_pinyin();
                     Action::UpdatePrompt {
@@ -514,6 +596,8 @@ impl CompositionMachine {
                 self.committed.clear();
                 self.commit_offset = 0;
                 self.last_candidates_request = None;
+                self.candidates_in_flight = false;
+                self.space_deferred = false;
                 self.prompt.clear();
                 self.result.clear();
                 Action::Cancel
@@ -543,7 +627,7 @@ impl CompositionMachine {
     fn pinyin_action(&mut self) -> Action {
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
-            candidates: self.pinyin_candidate_texts(),
+            candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
             llm_request: self.request_llm_candidates_if_needed(),
         }
@@ -563,6 +647,24 @@ impl CompositionMachine {
         let active_len = self.active_pinyin().len();
         let (text, consumed) = match self.fused_segment(index) {
             Some(seg) => (seg.text.clone(), seg.consumed.min(active_len)),
+            None if self.candidates_in_flight => {
+                // 候选在途（Rime 查询未回）：首个空格暂缓选择，结果到达后补执行。
+                // 真机竞态：worker 已拿到候选、事件尚未经主线程 drain 到达状态机，
+                // 此刻空格若走原文回退会把拼音字母上屏（快速输入偶发漏字母）。
+                //
+                // 暂缓后的**重复**空格 = 知情回退：结果迟迟未达（守护重启、查询
+                // 被更新的请求取代、连接失效等极端场景下可能永不回达），再按一次
+                // 空格说明用户明确要上屏——按原文提交并清掉暂缓标记，避免无限吞键。
+                // 与「终结空结果展示原文条目后，再按空格是知情选择」同一语义通道。
+                if !self.space_deferred {
+                    self.space_deferred = true;
+                    return Action::None;
+                }
+                self.space_deferred = false;
+                let text = format!("{}{}", self.committed_text(), self.active_pinyin());
+                self.reset_pinyin();
+                return Action::CommitImmediate(text);
+            }
             None => (self.active_pinyin().to_owned(), active_len),
         };
         if consumed >= active_len {
@@ -600,6 +702,8 @@ impl CompositionMachine {
         self.committed.clear();
         self.commit_offset = 0;
         self.last_candidates_request = None;
+        self.candidates_in_flight = false;
+        self.space_deferred = false;
         self.pinyin_page = 0;
     }
 
@@ -647,6 +751,8 @@ impl CompositionMachine {
         self.committed.clear();
         self.commit_offset = 0;
         self.last_candidates_request = None;
+        self.candidates_in_flight = false;
+        self.space_deferred = false;
         self.pinyin_page = 0;
     }
 
@@ -661,14 +767,37 @@ impl CompositionMachine {
         self.fuse_candidates();
     }
 
-    /// 融合展示候选 = 词库候选 ++ LLM 候选（LLM 侧已去重，此处再兜底）。
+    /// 融合可选候选 = 词库候选 ++ LLM 候选（LLM 侧已去重）。**只含真实
+    /// 结果**：合成的原文条目仅用于面板展示（display_candidate_texts），
+    /// 绝不进入本列表——否则在途空格会直接"选中"它提交原文，击穿防漏暂缓。
     fn fuse_candidates(&mut self) {
-        self.pinyin_candidates = self.dictionary_candidates.clone();
+        let mut out = self.dictionary_candidates.clone();
         for cand in &self.llm_candidates {
-            if !self.pinyin_candidates.iter().any(|c| c.text == cand.text) {
-                self.pinyin_candidates.push(cand.clone());
+            if !out.iter().any(|c| c.text == cand.text) {
+                out.push(cand.clone());
             }
         }
+        self.pinyin_candidates = out;
+    }
+
+    /// 面板展示候选：真实候选；本拼音查询已终结且确认为空时补一条当前
+    /// 字母串的「原文条目」（英文原文本身即候选）。仅在途不补——逐键闪现
+    /// 拼音字母、与随后到达的中文候选来回切换会让面板持续抖动（用户反馈）；
+    /// 在途空窗由前端「空数据保持原内容」策略自然盖住。仅展示不参与选择。
+    fn display_candidate_texts(&self) -> Vec<String> {
+        let mut v = self.pinyin_candidate_texts();
+        if v.is_empty() && self.pinyin_composing() {
+            let active = self.active_pinyin();
+            let settled = !self.candidates_in_flight
+                && self
+                    .last_candidates_request
+                    .as_ref()
+                    .is_some_and(|py| py == active);
+            if settled {
+                v.push(active.to_string());
+            }
+        }
+        v
     }
 
     /// 拼音变更后是否需要发起 LLM 候选请求（同一拼音只请求一次）。
@@ -682,6 +811,7 @@ impl CompositionMachine {
             return None;
         }
         self.last_candidates_request = Some(active.clone());
+        self.candidates_in_flight = true;
         Some(LlmCandidateRequest {
             pinyin: active,
             dictionary: self
@@ -734,12 +864,17 @@ impl CompositionMachine {
     /// LLM 候选融合增量：追加候选（去重），返回更新后的候选列表。
     /// `pinyin` 与当前组合不符时视为过期结果直接忽略。
     pub fn on_llm_candidates(&mut self, pinyin: &str, candidates: &[String], done: bool) -> Action {
-        let _ = done;
         // 单引擎（Rime）：在主组合（Pinyin）与提示词内拼音（Prompt 组合中）都接受 Rime 候选。
         if !self.pinyin_composing() || self.active_pinyin() != pinyin {
             return Action::None;
         }
+        if done {
+            // 本拼音查询终结（即使空结果）：释放在途标记，避免后续选择被无限暂缓。
+            self.candidates_in_flight = false;
+        }
         let active_len = self.active_pinyin().len();
+        // 融合前公开列表快照：判定终结结果是否真的改变了展示内容
+        let llm_before_texts = self.display_candidate_texts();
         let mut changed = false;
         for cand in candidates {
             let cand = cand.trim();
@@ -757,13 +892,38 @@ impl CompositionMachine {
             });
             changed = true;
         }
-        if !changed {
+        // done 必触发重融合：真实候选为空的终结结果会在此合成原文候选
+        // （见 fuse_candidates）。
+        if done || changed {
+            self.fuse_candidates();
+        }
+        // 在途期间暂缓的空格：结果到达后补执行。但若结果「全空、只剩合成
+        // 原文项」，不自动提交——按空格那一刻用户还没见过面板（快打场景），
+        // 盲提原文即漏字（真机：「kjf是埃迪卡拉纪」的前半段）。吞掉该键、
+        // 组合保留；原文条目此刻已在面板上，再按一次空格才是知情选择。
+        if self.space_deferred {
+            self.space_deferred = false;
+            let has_real =
+                !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
+            if has_real {
+                return self.select_candidate(0);
+            }
+            self.refresh_candidates();
+            return Action::UpdatePinyin {
+                preedit: self.pinyin_composition_preedit(),
+                candidates: self.display_candidate_texts(),
+                page: self.pinyin_page,
+                llm_request: None,
+            };
+        }
+        // 仅当公开候选列表实际变化时发刷新（done 但列表未变的重复注入
+        // 不重复推送），合成项的首次出现也走此通道到前端。
+        if !changed && self.display_candidate_texts() == llm_before_texts {
             return Action::None;
         }
-        self.fuse_candidates();
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
-            candidates: self.pinyin_candidate_texts(),
+            candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
             llm_request: None,
         }
@@ -802,6 +962,113 @@ mod tests {
     ];
 
     #[test]
+    fn idle_punct_commits_fullwidth() {
+        let mut m = CompositionMachine::new();
+        for (ascii, wide) in [(',', '，'), ('.', '。'), ('?', '？'), ('\\', '、')] {
+            let a = m.feed_char(ascii);
+            assert!(
+                matches!(&a, Action::CommitImmediate(t) if *t == wide.to_string()),
+                "{ascii} 应上屏全角 {wide}，实际 {a:?}"
+            );
+        }
+        // 未入表符号保持半角
+        assert!(
+            matches!(m.feed_char('@'), Action::CommitImmediate(t) if t == "@"),
+            "@ 应保持半角直通"
+        );
+    }
+
+    #[test]
+    fn punct_after_composition_flushes_with_fullwidth() {
+        let mut m = CompositionMachine::new();
+        let _ = m.feed_char('n');
+        rime(&mut m, "n", &["你"]);
+        let a = m.feed_char(',');
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
+            "组合中标点应提交「候选+全角标点」，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn paired_quotes_alternate() {
+        let mut m = CompositionMachine::new();
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "“"));
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "”"));
+        assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "‘"));
+        assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "’"));
+    }
+
+    #[test]
+    fn double_and_single_quotes_pair_independently() {
+        // 回归：双/单引号曾共用交替标志，`"` 后紧跟 `'` 会产出「“’」错配对。
+        let mut m = CompositionMachine::new();
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "“"));
+        assert!(
+            matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "‘"),
+            "单引号应独立从开引号开始"
+        );
+        assert!(matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "”"));
+        assert!(matches!(m.feed_char('\''), Action::CommitImmediate(t) if t == "’"));
+    }
+
+    #[test]
+    fn composing_flush_with_quote_keeps_pair_state() {
+        let mut m = CompositionMachine::new();
+        let _ = m.feed_char('n');
+        rime(&mut m, "n", &["你"]);
+        assert!(
+            matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "你“"),
+            "组合后引号按开引号输出"
+        );
+        assert!(
+            matches!(m.feed_char('"'), Action::CommitImmediate(t) if t == "”"),
+            "下一个引号交替为闭"
+        );
+    }
+
+    #[test]
+    fn zero_real_candidates_synth_raw_entry_and_space_commits_it() {
+        let mut m = CompositionMachine::new();
+        let _ = m.feed_char('x');
+        let _ = m.feed_char('q');
+        rime(&mut m, "xq", &[]);
+        // 真实候选为空：展示层补合成原文条目（英文原文本身即候选）
+        assert_eq!(m.display_candidate_texts(), ["xq"]);
+        // 空格选中它 = 显式选择原文
+        assert!(matches!(m.feed_char(' '), Action::CommitImmediate(ref t) if t == "xq"));
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn synthetic_entry_only_after_settled_empty() {
+        let mut m = CompositionMachine::new();
+        let a = m.feed_char('x'); // 查询在途
+                                  // 在途不合成：逐键闪现拼音字母会让面板持续抖动（用户反馈）
+        assert!(
+            matches!(&a, Action::UpdatePinyin { candidates, .. } if candidates.is_empty()),
+            "在途应为空展示，实际 {a:?}"
+        );
+        rime(&mut m, "x", &[]); // 本拼音查询终结且为空
+        assert_eq!(m.display_candidate_texts(), ["x"], "终结空后应补原文条目");
+    }
+
+    #[test]
+    fn pinyin_buffer_cap_stops_appending() {
+        let mut m = CompositionMachine::new();
+        for _ in 0..CompositionMachine::MAX_PINYIN_BUFFER + 5 {
+            let _ = m.feed_char('a');
+        }
+        assert_eq!(
+            m.pinyin_buffer.len(),
+            CompositionMachine::MAX_PINYIN_BUFFER,
+            "到顶后字母不再入缓冲"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin);
+    }
+
+    #[test]
     fn letters_start_pinyin_composition() {
         let mut m = CompositionMachine::new();
         let a = m.feed_char('h');
@@ -820,7 +1087,8 @@ mod tests {
     #[test]
     fn punctuation_and_digits_commit_directly_in_idle() {
         let mut m = CompositionMachine::new();
-        assert_eq!(m.feed_char('.'), Action::CommitImmediate(".".into()));
+        // 句号转全角（中文态标点惯例）；数字保持半角直通
+        assert_eq!(m.feed_char('.'), Action::CommitImmediate("。".into()));
         assert_eq!(m.feed_char('5'), Action::CommitImmediate("5".into()));
         assert_eq!(m.state(), MachineState::Idle);
     }
@@ -1046,12 +1314,13 @@ mod tests {
     }
 
     #[test]
-    fn pinyin_enter_commits_and_escape_cancels() {
+    fn pinyin_enter_commits_raw_and_escape_cancels() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
         rime(&mut m, "ni", &["你"]);
-        assert_eq!(m.feed_enter(), Action::CommitImmediate("你".into()));
+        // 回车 = 英文通道：上屏原始输入，绝不取候选（候选用空格/数字选）
+        assert_eq!(m.feed_enter(), Action::CommitImmediate("ni".into()));
         assert_eq!(m.state(), MachineState::Idle);
 
         let mut m2 = CompositionMachine::new();
@@ -1249,18 +1518,19 @@ mod tests {
             m.feed_char(c);
         }
         rime(&mut m, "nihao", &["你好"]);
-        // 第一次 Enter：提交拼音到提示词，不触发 LLM
+        // 第一次 Enter：上屏原始字母到提示词（与主组合「回车=英文」一致，
+        // 不触发 LLM）；要放中文用空格/数字选候选
         let a1 = m.feed_enter();
         assert!(
             matches!(a1, Action::UpdatePrompt { .. }),
-            "组合中 Enter 应先提交拼音: {a1:?}"
+            "组合中 Enter 应先提交拼音原文: {a1:?}"
         );
-        assert_eq!(m.prompt(), "你好");
+        assert_eq!(m.prompt(), "nihao");
         // 第二次 Enter：无组合 → 提交 LLM
         assert_eq!(
             m.feed_enter(),
             Action::StartLlm {
-                prompt: "你好".into(),
+                prompt: "nihao".into(),
                 system: None
             }
         );
@@ -1373,7 +1643,8 @@ mod tests {
             Action::UpdatePinyin { candidates, .. } => candidates,
             other => panic!("应进入拼音，实际 {other:?}"),
         };
-        assert!(dict.is_empty(), "单引擎 Rime 不应有内置候选");
+        // 单引擎无内置词库候选；在途也不合成（防抖动），结果到达后填充
+        assert!(dict.is_empty(), "实际 {dict:?}");
         match m.on_llm_candidates("n", &["你".into(), "你是".into()], true) {
             Action::UpdatePinyin { candidates, .. } => {
                 assert_eq!(candidates, vec!["你".to_string(), "你是".to_string()]);
@@ -1431,14 +1702,11 @@ mod tests {
     #[test]
     fn rime_mode_disables_dictionary_candidates() {
         let mut m = CompositionMachine::new();
-        // 内置词库被抑制：首候选为空，等 Rime 候选到达
         let a = m.feed_char('n');
         match a {
             Action::UpdatePinyin { candidates, .. } => {
-                assert!(
-                    candidates.is_empty(),
-                    "内置词库应被抑制，实际 {candidates:?}"
-                );
+                // 内置词库被抑制；在途不合成
+                assert!(candidates.is_empty(), "实际 {candidates:?}");
             }
             other => panic!("应进入拼音，实际 {other:?}"),
         }
@@ -1458,7 +1726,7 @@ mod tests {
     fn rime_mode_keeps_prompt_pinyin_dictionary() {
         // 单引擎 Rime：Pinyin 态与提示词拼音都经 Rime 候选。
         let mut m = CompositionMachine::new();
-        // Pinyin 态：无内置候选（等 Rime）
+        // Pinyin 态：无内置候选（合成原文项占位，等 Rime）
         match m.feed_char('n') {
             Action::UpdatePinyin { candidates, .. } => assert!(candidates.is_empty()),
             other => panic!("应进入拼音，实际 {other:?}"),
@@ -1520,6 +1788,7 @@ mod tests {
         for c in "ni".chars() {
             m.feed_char(c);
         }
+        rime(&mut m, "ni", &["你"]);
         let a = m.select_candidate(0);
         assert!(
             matches!(a, Action::CommitImmediate(_)),
@@ -1559,6 +1828,88 @@ mod tests {
         assert!(
             matches!(&a, Action::CommitImmediate(text) if text == "你是谁"),
             "应整句提交，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    // ---- 快速输入竞态：候选在途时按空格 ----
+
+    /// 空格在 Rime 候选回达前按下：不提交拼音原文，暂缓；候选到达后补执行。
+    /// 真机竞态：worker 已拿到候选、主线程 drain 尚未送达状态机，此刻空格
+    /// 若走原文回退会把拼音字母上屏（快速输入偶发漏字母）。
+    #[test]
+    fn space_while_candidates_in_flight_defers_then_selects() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "候选在途时空格应暂缓");
+        assert_eq!(m.state(), MachineState::Pinyin, "暂缓期间保持组合态");
+        assert_eq!(
+            m.on_llm_candidates("ni", &["你".into(), "拟".into()], true),
+            Action::CommitImmediate("你".into()),
+            "候选到达后应补执行首候选提交"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 空格暂缓后 Rime 回空结果（非法拼音）：不盲提原文（真机漏字场景——
+    /// 按空格那一刻用户还没见过面板）。组合保留、合成原文条目上板；
+    /// 再按一次空格才是知情选择。
+    #[test]
+    fn deferred_space_on_empty_result_shows_entry_without_commit() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('q');
+        m.feed_char('q');
+        assert_eq!(m.feed_char(' '), Action::None);
+        let a = m.on_llm_candidates("qq", &[], true);
+        assert!(
+            matches!(&a, Action::UpdatePinyin { candidates, .. }
+                if candidates == &vec!["qq".to_string()]),
+            "应上板原文条目，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin);
+        // 用户此刻看得见了：再按空格 = 知情选择原文
+        assert_eq!(m.feed_char(' '), Action::CommitImmediate("qq".into()));
+    }
+
+    /// 候选已回达（done 后）：空格立即提交首候选，无暂缓。
+    #[test]
+    fn space_after_candidates_done_commits_immediately() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        assert!(matches!(
+            m.on_llm_candidates("n", &["你".into()], true),
+            Action::UpdatePinyin { .. }
+        ));
+        assert_eq!(m.feed_char(' '), Action::CommitImmediate("你".into()));
+    }
+
+    /// 暂缓空格后 Esc：暂缓随之取消，不产生迟到的提交。
+    #[test]
+    fn escape_clears_deferred_space() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert_eq!(
+            m.on_llm_candidates("n", &["你".into()], true),
+            Action::None,
+            "组合已取消，迟到候选与暂缓空格都不应产生动作"
+        );
+    }
+
+    /// 暂缓后的重复空格 = 知情回退：结果迟迟未达（守护重启/查询被取代/连接
+    /// 失效等）时按原文提交，不无限吞键。
+    #[test]
+    fn second_space_while_in_flight_commits_raw() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "首个在途空格应暂缓");
+        assert_eq!(
+            m.feed_char(' '),
+            Action::CommitImmediate("ni".into()),
+            "重复空格知情回退原文"
         );
         assert_eq!(m.state(), MachineState::Idle);
     }

@@ -9,26 +9,124 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool};
+use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{
     define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
     MainThreadOnly,
 };
-use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
-use objc2_foundation::{
-    NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSInteger, NSNotFound,
-    NSObjectProtocol, NSRange, NSRunLoop, NSString, NSTimer, NSUInteger,
+use objc2_app_kit::{
+    NSApplication, NSEventModifierFlags, NSFont, NSFontAttributeName, NSMenu, NSMenuItem,
 };
-use objc2_input_method_kit::{IMKInputController, IMKServer, IMKStateSetting};
+use objc2_foundation::{
+    NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSDictionary, NSInteger,
+    NSNotFound, NSNumber, NSObject, NSObjectProtocol, NSRange, NSRunLoop, NSString, NSTimer,
+    NSUInteger,
+};
+use objc2_input_method_kit::{
+    kIMKLocateCandidatesBelowHint, kIMKSingleColumnScrollingCandidatePanel, IMKCandidates,
+    IMKCandidatesSendServerKeyEventFirst, IMKInputController, IMKServer, IMKStateSetting,
+};
 
 use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
 use verba_ipc::name::local_entropy_u64;
 use verba_protos::{stream_event, StreamEvent};
 
 use crate::ipc;
+
+/// 文件日志管道（verba-mac 由 launchd 拉起、无控制台，stderr 不可见）。
+struct LogPipe(std::sync::Mutex<std::fs::File>);
+impl std::io::Write for LogPipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut f = self.0.lock().unwrap();
+        f.write_all(buf)?;
+        f.flush()?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 启动文件日志：落盘到用户数据目录 logs/verba-mac.log（与 verba-daemon.log
+/// 同目录），超过 5MB 开机截断。排查输入链路问题与 `/usr/bin/log show`
+/// 宿主侧日志配合使用。
+fn init_file_logger() {
+    let Ok(dirs) = verba_config::VerbaDirs::locate() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dirs.log_dir());
+    let path = dirs.log_dir().join("verba-mac.log");
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 5 * 1024 * 1024 {
+        let _ = std::fs::remove_file(&path);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        .target(env_logger::Target::Pipe(Box::new(LogPipe(std::sync::Mutex::new(
+            file,
+        )))))
+        .init();
+}
+
+/// 关键链路调试日志（激活/按键/候选回达/提交），走文件日志 debug 级。
+fn dbg_log(msg: &str) {
+    log::debug!("{msg}");
+}
+
+/// 用 @try 语义捕获 ObjC 异常：IMK 客户端包装器对部分选择器会抛
+/// NSInvalidArgumentException（如已移除的 unmarkText），放任其穿透 Rust
+/// 帧会在异常清理途中 abort（真机崩溃）。所有发送点返回值均为 ()，
+/// 捕获后记录日志，不改变调用语义；host_call 以此为基座实现重入防护。
+fn catch_void(label: &str, f: impl FnOnce()) {
+    // 闭包捕获的 Retained<AnyObject> 非 UnwindSafe，此处仅用于诊断日志记录，
+    // 异常路径不改动共享状态，AssertUnwindSafe 可接受。
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => {}
+        Err(e) => {
+            let desc = e
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            log::warn!("[Verba] OBJC-EXC at {label}: {desc}");
+        }
+    }
+}
+
+/// 候选面板（IMK 私有 IMKUIPanel 窗口）外观校正：默认圆角过大（真机反馈）。
+/// 面板窗口不在 IMKCandidates API 暴露范围，经 [NSApp windows] 找到后把
+/// contentView 层的圆角收敛到 6pt 并裁剪。首个展示周期执行一次。
+fn style_candidate_panel(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    for win in app.windows().iter() {
+        // SAFETY: class 为 NSObject 方法，win 恒有效。
+        let cls: *const AnyClass = unsafe { msg_send![&*win, class] };
+        // SAFETY: cls 来自上一行对 win 的合法 msg_send（NSObject class），
+        // 指向的元类在进程生命周期内恒有效。
+        let name = unsafe { (*cls).name() }.to_string_lossy().into_owned();
+        if name.contains("IMKUIPanel") {
+            // SAFETY: contentView/setWantsLayer 为 NSView 公开方法，layer 经
+            // msg_send 读取 CALayer 公开属性；win 是当前应用窗口列表中的存活对象，
+            // 消息仅操作 layer 视觉参数。ObjC 异常由 catch_void 兜底。
+            catch_void("panel.style", || unsafe {
+                let Some(cv) = win.contentView() else { return };
+                cv.setWantsLayer(true);
+                let layer: Option<Retained<AnyObject>> = msg_send![&cv, layer];
+                if let Some(layer) = layer {
+                    let _: () = msg_send![&layer, setCornerRadius: 6.0f64];
+                    let _: () = msg_send![&layer, setMasksToBounds: true];
+                    log::debug!("[Verba] 候选面板圆角校正完成");
+                }
+            });
+        }
+    }
+}
 
 /// IMKServer 连接名（与 app/Info.plist 的 `InputMethodConnectionName` 保持一致）。
 pub const CONNECTION_NAME: &str = "Verba_1_Connection";
@@ -63,6 +161,21 @@ fn load_rime_schema() -> String {
 struct LlmItem {
     seq: u64,
     event: StreamEvent,
+}
+
+/// 重入窗口内到达的按键暂存项。`input_text`/`candidate_selected` 在
+/// `host_call_depth > 0`（正处于 show()/commit() 等会同步泵运行循环的宿主
+/// 调用段）时不得立即经 `apply_action` 对同一客户端发起嵌套调用——那正是
+/// 真机崩溃的形态之一；键先入队，退栈后由 16ms 定时器补放（认领事件防
+/// 宿主直插，无键丢失）。
+enum PendingKey {
+    Char(char),
+    Paste(String),
+    Backspace,
+    Enter,
+    Escape,
+    PageUp,
+    PageDown,
 }
 
 fn llm_queue() -> &'static Mutex<VecDeque<LlmItem>> {
@@ -119,6 +232,92 @@ fn push_llm(seq: u64, event: StreamEvent) {
     }
 }
 
+/// 最新候选查询请求（单槽位：新请求覆盖旧请求）。
+struct CandRequest {
+    seq: u64,
+    pinyin: String,
+    schema: String,
+}
+
+fn cand_slot() -> &'static (Mutex<Option<CandRequest>>, Condvar) {
+    static S: OnceLock<(Mutex<Option<CandRequest>>, Condvar)> = OnceLock::new();
+    S.get_or_init(|| (Mutex::new(None), Condvar::new()))
+}
+
+/// 全局单例候选查询 worker：只查槽位里的**最新**拼音，中间态自然合并。
+///
+/// 原先每次击键 spawn 一个线程并新建 daemon 连接：长拼音（数十字符）快速
+/// 连打时几十个查询在 daemon 侧排队，最新拼音的响应被积压在前序查询之后，
+/// 候选窗反应慢、空格也因候选未到而暂缓（「输入卡」）。改为单 worker +
+/// 单连接 + 最新槽位后：daemon 侧积压消失，响应延迟 ≈ 一次查询耗时
+/// （数 ms），中间拼音直接跳过（其序号进 dead_seqs，事件不来，无滞留）。
+fn ensure_cand_worker() {
+    static WORKER: Once = Once::new();
+    WORKER.call_once(|| {
+        std::thread::spawn(|| {
+            let mut client: Option<verba_ipc::VerbaClient> = None;
+            let mut last_seq: u64 = 0;
+            loop {
+                let (seq, pinyin, schema) = {
+                    let (lock, cv) = cand_slot();
+                    let mut slot = lock.lock().unwrap();
+                    loop {
+                        match slot.as_ref() {
+                            Some(req) if req.seq != last_seq => {
+                                break (req.seq, req.pinyin.clone(), req.schema.clone());
+                            }
+                            _ => slot = cv.wait(slot).unwrap(),
+                        }
+                    }
+                };
+                let result = (|| -> Result<Vec<String>, verba_ipc::IpcError> {
+                    if client.is_none() {
+                        // 首次/重连：完整 ensure_daemon（含拉起与退避重试）。
+                        client = Some(ipc::ensure_daemon()?);
+                    }
+                    match client
+                        .as_mut()
+                        .expect("刚填充")
+                        .rime_candidates(&pinyin, &schema, 9)
+                    {
+                        Ok(cands) => Ok(cands),
+                        Err(_) => {
+                            // 连接失效（daemon 重启 / 服务端回收空闲连接）：丢弃
+                            // 连接，先用新连接**静默重试一次**——旧连接失效属于
+                            // 传输层瞬态，直接上抛会让用户平白错过一轮候选（面板
+                            // 闪出合成原文条目）。重试仍失败才作为错误回传。
+                            client = None;
+                            match ipc::ensure_daemon() {
+                                Ok(mut c2) => {
+                                    let r = c2.rime_candidates(&pinyin, &schema, 9);
+                                    if r.is_ok() {
+                                        client = Some(c2);
+                                    }
+                                    r
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                })();
+                let event = match result {
+                    Ok(cands) => StreamEvent {
+                        id: 0,
+                        kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                            pinyin,
+                            candidates: cands,
+                            done: true,
+                        })),
+                    },
+                    Err(e) => error_event(&format!("Rime 候选查询失败: {e}")),
+                };
+                push_llm(seq, event);
+                last_seq = seq;
+            }
+        });
+    });
+}
+
 /// 废弃序号集合容量上限：超出时丢弃最旧记录。取较大值（256）：Rime 冷部署/守护
 /// 重启时首查可达数秒（守护侧超时 30s），期间每次按键都可能烧一个新候选序号——
 /// 容量太小会在响应到达前逐出旧序号，其迟到事件滞留全局队列（复审 LOW）。元素
@@ -159,8 +358,8 @@ struct Ivars {
     active_candidates: Cell<u64>,
     /// 最近废弃的序号集合（取消的流 / 被取代的候选请求）：迟到事件（取消后
     /// 补发的 Final、慢响应的旧候选）入队时 active_* 已归 0/换号无法匹配——
-    /// 按此集合在 drain 丢弃，防全局队列无界滞留（复审 V7）。有界（32 条）：
-    /// 更早的序号其 worker 早已退出、无在途事件。
+    /// 按此集合在 drain 丢弃，防全局队列无界滞留（复审 V7）。有界
+    /// （DEAD_SEQ_MAX = 256 条）：更早的序号其 worker 早已退出、无在途事件。
     dead_seqs: RefCell<VecDeque<u64>>,
     /// 本控制器的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按此
     /// 隔离历史：多文本域（多应用）各自独立多轮，互不串上下文（B4b）。
@@ -169,6 +368,14 @@ struct Ivars {
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
     candidate_config_mtime: Cell<Option<std::time::SystemTime>>,
+    /// IMK 候选窗（惰性创建；updateCandidates/show 驱动显示）。
+    candidates_ui: RefCell<Option<Retained<IMKCandidates>>>,
+    /// 候选面板外观校正是否已执行（仅首次展示时探针 + 设圆角）。
+    panel_probe_done: Cell<bool>,
+    /// 宿主调用深度（>0 表示正处于会泵运行循环的同步客户端/面板调用段）。
+    host_call_depth: Cell<usize>,
+    /// 重入窗内积压的待补放按键（见 `PendingKey` 与 drain 顶部的补放循环）。
+    pending_keys: RefCell<VecDeque<PendingKey>>,
 }
 
 impl Default for Ivars {
@@ -187,12 +394,21 @@ impl Default for Ivars {
             session_id: Cell::new(alloc_session_id()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
+            candidates_ui: RefCell::new(None),
+            panel_probe_done: Cell::new(false),
+            host_call_depth: Cell::new(0),
+            pending_keys: RefCell::new(VecDeque::new()),
         }
     }
 }
 
 define_class!(
     // SAFETY: IMKInputController 的子类化无需额外约束。
+    // 必须显式指定 ObjC 类名：objc2 未命名时自动生成「模块路径::结构名+版本号」
+    // 之类的名称，而 IMKServer 按 Info.plist 的 InputMethodServerControllerClass
+    // 用 NSClassFromString 查找类——查不到则不实例化控制器，按键直通上屏
+    // （真机排查：激活进不了 activateServer/inputText）。
+    #[name = "VerbaIMKController"]
     #[unsafe(super = IMKInputController)]
     #[thread_kind = MainThreadOnly]
     #[ivars = Ivars]
@@ -205,15 +421,46 @@ define_class!(
     unsafe impl IMKStateSetting for VerbaIMKController {
         #[unsafe(method(activateServer:))]
         fn activate_server(&self, sender: Option<&AnyObject>) {
+            dbg_log("activateServer");
+            // 预热 daemon：冷启动慢的根源是 daemon 懒拉起——首个候选请求才
+            // spawn 进程，tokio 启动 + IPC 绑定 + Rime 引擎加载全部落在首串
+            // 按键的窗口里（真机感知数秒，「候选框没出现就上屏」）。激活即
+            // 后台连一次（进程级一次；daemon 已在则快路径返回）。
+            static DAEMON_WARMED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DAEMON_WARMED.swap(true, Ordering::SeqCst) {
+                std::thread::spawn(|| match ipc::ensure_daemon() {
+                    Ok(_) => log::info!("[VerbaIMK] daemon 预热完成"),
+                    Err(e) => log::warn!("[VerbaIMK] daemon 预热失败（按键时重试）: {e}"),
+                });
+            }
             self.set_client(sender);
+            // 先重置再预置空标记文本：控制器可能跨会话复用，composed 残留
+            // 上一会话的拼音——若先 updateComposition 会把残留拼音标记进
+            // 新会话（随后被宿主当作普通文本上屏）。
             self.reset();
+            // 预置空标记文本：首个按键前建立 marked 状态，防首字母在标记状态
+            // 建立前被宿主当普通文本直插（快打/刚启动漏字，真机排查）。
+            self.host_call("activate_server.prime", || unsafe {
+                // SAFETY: updateComposition 为 IMKInputText 非正式协议方法，
+                // self 即 IMK 控制器对象。
+                let _: () = msg_send![self, updateComposition];
+            });
             log::info!("[VerbaIMK] activateServer");
         }
 
         #[unsafe(method(deactivateServer:))]
         fn deactivate_server(&self, _sender: Option<&AnyObject>) {
+            dbg_log("deactivateServer");
             self.cancel_stream();
             self.invalidate_timer();
+            // 重入窗内积压的键属于本会话：换会话（应用/输入位置）后语义已失效
+            // （原目标文本域可能已滚动/失焦），丢弃而非带入新会话。
+            self.ivars().pending_keys.borrow_mut().clear();
+            // 清宿主的标记文本再重置状态机：会话切换（换应用/换输入位置）时
+            // 宿主会把残留 marked text 当普通文本上屏——组合中的拼音字母漏进
+            // 文档（真机排查：「你 s会」中的 s）。丢弃组合，不提交原文。
+            self.clear_composition();
             self.reset();
             log::info!("[VerbaIMK] deactivateServer");
         }
@@ -221,6 +468,19 @@ define_class!(
 
     // SAFETY: 覆盖父类（NSObjectIMKServerInput 类别）的输入方法。
     impl VerbaIMKController {
+        /// 方式一：未映射到 action method 的按键以纯文本投递（IMKInputController
+        /// 三参变体）。不实现时父类默认返回 false → 宿主把字符直插文档——快速
+        /// 输入偶发「漏字母上屏」的候选根因（TEMP probe 验证中）。与四参变体
+        /// 同一处理链（无 keyCode/修饰键，按纯文本逐字符进入状态机）。
+        #[unsafe(method(inputText:client:))]
+        fn input_text_client(&self, string: Option<&NSString>, sender: Option<&AnyObject>) -> Bool {
+            dbg_log(&format!(
+                "inputText:client: 3-arg s={:?}",
+                string.map(|s| s.to_string())
+            ));
+            self.input_text(sel!(inputText:key:modifiers:client:), string, 0, 0, sender)
+        }
+
         /// 方式二：接收全部按键的 Unicode / keyCode / 修饰键。
         #[unsafe(method(inputText:key:modifiers:client:))]
         fn input_text(
@@ -231,6 +491,36 @@ define_class!(
             sender: Option<&AnyObject>,
         ) -> Bool {
             self.set_client(sender);
+            // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
+            // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
+            // 免去 16ms 定时器延迟被感知为「输入卡」。
+            self.drain_stream(sel!(drainVerbaStream));
+            let panel_visible = self
+                .ivars()
+                .candidates_ui
+                .borrow()
+                .as_ref()
+                // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法，ui 仅在主线程访问。
+                .map(|ui| unsafe { ui.isVisible() })
+                .unwrap_or(false);
+            // 调试日志：sender 类名辅助区分真宿主 client 与包装器（会话切
+            // 换排查时 sender 指针变化是关键线索）。
+            let sender_cls = sender.map(|s| {
+                // SAFETY: class 为 NSObject 公开方法，sender 由 IMK 回调传入且本帧存活。
+                let cls: &AnyClass = unsafe { msg_send![s, class] };
+                cls.name().to_string_lossy().into_owned()
+            });
+            dbg_log(&format!(
+                "inputText s={:?} key={} flags={:#x} state={:?} our_client={} panel_visible={} sender={:?} sender_ptr={:p}",
+                string.map(|s| s.to_string()),
+                key_code,
+                flags,
+                self.ivars().machine.borrow().state(),
+                self.ivars().client.borrow().is_some(),
+                panel_visible,
+                sender_cls,
+                sender.map_or(std::ptr::null(), |s| s as *const AnyObject),
+            ));
 
             // 带修饰键的组合键不吞（Cmd/Ctrl/Option 留给系统或宿主应用）。
             let mods = NSEventModifierFlags(flags);
@@ -250,6 +540,57 @@ define_class!(
                 return Bool::new(false);
             }
 
+            // 粘贴整串（keyCode=0 时到达）提前解析：重入门卫也需要据此分类。
+            let pasted = if key_code == 0 {
+                string.map(|s| s.to_string())
+            } else {
+                None
+            };
+
+            // 重入门卫（独立审查阻塞项①）：show()/commit() 等宿主调用段的
+            // XPC 泵循环会把新按键**嵌套**派发进来；此时继续 apply_action
+            // （setMarkedText/insertText/候选刷新会再次触泵）会与外层未完成
+            // 的客户端调用交错——定时器路径已被深度检查挡住，这里是另一条
+            // 同形态重入源。可处理的键入队待补放（返回 true 认领，防宿主
+            // 直插造成漏字）；直通类判定保持原语义原样放行。
+            if self.ivars().host_call_depth.get() > 0 {
+                let is_paste = pasted.as_ref().is_some_and(|t| t.chars().count() > 1);
+                let plain_char = !is_paste && matches!(key, Some(ImkKey::Char(_)));
+                let composing_control = matches!(
+                    self.ivars().machine.borrow().state(),
+                    MachineState::Pinyin
+                        | MachineState::PendingSlash
+                        | MachineState::Prompt
+                        | MachineState::Streaming
+                        | MachineState::ResultReady
+                ) && matches!(
+                    key,
+                    Some(ImkKey::Backspace | ImkKey::Enter | ImkKey::Escape)
+                        | Some(ImkKey::PageUp | ImkKey::PageDown)
+                );
+                if let Some(text) = pasted.filter(|_| is_paste) {
+                    self.ivars()
+                        .pending_keys
+                        .borrow_mut()
+                        .push_back(PendingKey::Paste(text));
+                    return Bool::new(true);
+                }
+                if plain_char || composing_control {
+                    let pk = match key.expect("上方 match 已确认 key 非空") {
+                        ImkKey::Char(c) => PendingKey::Char(c),
+                        ImkKey::Backspace => PendingKey::Backspace,
+                        ImkKey::Enter => PendingKey::Enter,
+                        ImkKey::Escape => PendingKey::Escape,
+                        ImkKey::PageUp => PendingKey::PageUp,
+                        ImkKey::PageDown => PendingKey::PageDown,
+                    };
+                    self.ivars().pending_keys.borrow_mut().push_back(pk);
+                    return Bool::new(true);
+                }
+                // 其余（Idle 控制键交宿主 / 未识别键直插）：维持原有 false 语义。
+                return Bool::new(false);
+            }
+
             // 多字符粘贴（keyCode=0 时整串到达）：逐字符喂入状态机并逐步应用动作。
             // 此前 classify_key 只取首字符，其余全部丢失（架构审查 P1-2）。
             // 候选查询按粘贴整体合并为一次（见下）：原先每字符一个 UpdatePinyin
@@ -257,11 +598,6 @@ define_class!(
             // 粘贴（数百字）会瞬时放大为同等规模的线程/查询/主线程 marked-text
             // 更新风暴（复审发现）；中间态仅按状态机候选刷新显示，循环结束后
             // 对最终拼音补发一次查询，候选结果由 seq 过滤保证只消费最新代。
-            let pasted = if key_code == 0 {
-                string.map(|s| s.to_string())
-            } else {
-                None
-            };
             if let Some(text) = pasted.filter(|t| t.chars().count() > 1) {
                 let mut applied = false;
                 let mut last_candidate_req: Option<LlmCandidateRequest> = None;
@@ -292,12 +628,17 @@ define_class!(
                 Some(ImkKey::Escape) => self.ivars().machine.borrow_mut().feed_escape(),
                 Some(ImkKey::PageUp) => self.ivars().machine.borrow_mut().feed_page_up(),
                 Some(ImkKey::PageDown) => self.ivars().machine.borrow_mut().feed_page_down(),
-                None => return Bool::new(false),
+                None => {
+                    dbg_log("inputText classify None -> return false（宿主直插）");
+                    return Bool::new(false);
+                }
             };
             // 空闲态且状态机无动作（如 Enter/Backspace/Esc）：交给宿主处理。
             if was_idle && matches!(action, Action::None) {
+                dbg_log("inputText idle+None -> return false");
                 return Bool::new(false);
             }
+            dbg_log(&format!("  -> key={:?} action={:?} was_idle={}", key, action, was_idle));
             let _ = self.apply_action(action);
             Bool::new(true)
         }
@@ -305,7 +646,9 @@ define_class!(
         /// 组合文本数据源：updateComposition 调用它取当前 preedit 发给 client。
         #[unsafe(method_id(composedString:))]
         fn composed_string(&self, _sender: Option<&AnyObject>) -> Option<Retained<NSString>> {
-            Some(NSString::from_str(&self.ivars().composed.borrow()))
+            let s = NSString::from_str(&self.ivars().composed.borrow());
+            dbg_log(&format!("composedString -> {}", s));
+            Some(s)
         }
 
         /// 候选窗数据源（0 参）：部分运行时按 `candidates` 查询。
@@ -327,22 +670,36 @@ define_class!(
                 return;
             };
             let text = attr.string().to_string();
+            dbg_log(&format!("candidateSelected text={}", text));
             let ivars = self.ivars();
             let Some(global_idx) = ivars.candidates.borrow().iter().position(|c| c == &text)
             else {
+                dbg_log("  -> 候选不在当前列表");
                 return;
             };
             let page = ivars.page.get();
             let Some(digit) = selection_digit(global_idx, page, CompositionMachine::PINYIN_PAGE_SIZE) else {
+                dbg_log("  -> 无对应数字键");
                 return;
             };
+            // 重入门卫（同 input_text）：面板定位完成前的抢点会把数字选字
+            // 嵌套进宿主调用段——入队退栈后补放。
+            if self.ivars().host_call_depth.get() > 0 {
+                self.ivars()
+                    .pending_keys
+                    .borrow_mut()
+                    .push_back(PendingKey::Char(digit));
+                return;
+            }
             let action = self.ivars().machine.borrow_mut().feed_char(digit);
+            dbg_log(&format!("  -> digit={} action={:?}", digit, action));
             let _ = self.apply_action(action);
         }
 
         /// 宿主要求结束组合（如焦点切换）：把当前组合内容提交。
         #[unsafe(method(commitComposition:))]
         fn commit_composition(&self, _sender: Option<&AnyObject>) {
+            dbg_log("commitComposition called");
             let text = {
                 let mut m = self.ivars().machine.borrow_mut();
                 let text = match m.state() {
@@ -366,6 +723,7 @@ define_class!(
             // SAFETY: IMK 回调均发生在主线程。
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Verba"));
+            // SAFETY: NSMenu/NSMenuItem 构造为主线程 AppKit 公开 API（mtm 已断言主线程）。
             let item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
@@ -378,6 +736,7 @@ define_class!(
             // NSMenuItem 对 target 为弱引用，生命周期安全。
             let target: &AnyObject =
                 unsafe { &*(self as *const VerbaIMKController as *const AnyObject) };
+            // SAFETY: setTarget 为 NSMenuItem 公开方法，target 刚借用于存活的 self。
             unsafe { item.setTarget(Some(target)) };
             menu.addItem(&item);
             Some(menu)
@@ -402,11 +761,35 @@ define_class!(
         /// （已取消流、被取代的旧候选）的残留事件直接丢弃，防全局队列无界滞留。
         #[unsafe(method(drainVerbaStream))]
         fn drain_stream(&self) {
+            // 重入保护：宿主调用段（标记文本/面板定位会同步泵运行循环）期间
+            // 嵌套触发本定时器时，不得再次对客户端发起调用——跳过本次，
+            // 退栈后下一个 tick 补排（见 host_call 与真机崩溃分析）。
+            if self.ivars().host_call_depth.get() > 0 {
+                return;
+            }
+            // 补放重入窗积压的键：必须先于事件排空（「键 → 由它触发的查询」
+            // 顺序不可倒置），也必须先于下方空队列快速路径（积压键 + 空事件
+            // 队列正是最常见的补放场景）。若补放中又被泵重入，新到的键安全
+            // 地回队等待下一 tick。
+            loop {
+                let next = self.ivars().pending_keys.borrow_mut().pop_front();
+                let Some(pk) = next else { break };
+                dbg_log("replay pending key");
+                self.replay_pending(pk);
+            }
+            static DRAIN_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             let stream_seq = self.ivars().active_stream.get();
             let cand_seq = self.ivars().active_candidates.get();
-            // 空队列快速路径：避免每 50ms 无事件时仍 borrow dead_seqs。
+            // 空队列快速路径：避免每 tick（16ms）无事件时仍 borrow dead_seqs。
             if llm_queue().lock().unwrap().is_empty() {
                 return;
+            }
+            if !DRAIN_LOGGED.swap(true, Ordering::SeqCst) {
+                dbg_log(&format!(
+                    "drain: first run stream_seq={} cand_seq={}",
+                    stream_seq, cand_seq
+                ));
             }
             let dead_any = {
                 let dead = self.ivars().dead_seqs.borrow();
@@ -421,7 +804,7 @@ define_class!(
                     if dead_any && self.ivars().dead_seqs.borrow().contains(&item.seq) {
                         // 本控制器废弃序号的残留事件（取消后补发的 Final、旧候选迟到
                         // 响应）：丢弃并记录。dead_seqs 条目**保留**——取消流的迟到
-                        // 事件常跨多个 50ms tick（缓冲 chunk + 守护补发的 Final），
+                        // 事件常跨多个 tick（缓冲 chunk + 守护补发的 Final），
                         // 首命中即删会让下一 tick 的 Final 无匹配而滞留（复审 LOW）；
                         // 仅随后清 cancelled_seqs（其竞态窗口已闭合）。
                         dead_hit.push(item.seq);
@@ -437,7 +820,7 @@ define_class!(
                 // 全局队列上限：既不属于本控制器活跃序号、也不在任何控制器的
                 // dead_seqs 的孤儿事件（控制器 deallocated 前未 drain 的残留）
                 // 无人回收，长期运行会无界滞留且每次 tick 全量遍历（复审发现）。
-                // 超限丢弃最旧条目——常规下活跃流事件每 50ms 被其控制器取走，
+                // 超限丢弃最旧条目——常规下活跃流事件每个 tick 被其控制器取走，
                 // 滞留的几乎全是孤儿/迟到事件；极端场景（主线程被长粘贴阻塞且
                 // 多控制器并发大流）也可能丢到活跃流头部 chunk，但需数千事件
                 // 积压才触发，取舍可接受（对抗审查 F2）。
@@ -584,12 +967,19 @@ impl VerbaIMKController {
                 page,
                 llm_request,
             } => {
-                self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                // 在途空候选不覆盖面板数据源：updateComposition 会按 candidates:
+                // 重绘面板，逐击键清空会让面板内容空闪（候选窗一闪一闪的根因）。
+                // 真实收起只发生在提交/清空组合/会话切换。
+                if !candidates.is_empty() {
+                    self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                }
                 self.ivars().page.set(page);
                 if let Some(req) = llm_request {
                     self.start_candidates(req);
                 }
                 self.set_marked(&preedit);
+                // 状态机同步候选先展示，Rime 结果到达后 feed_candidates_event 再刷新。
+                self.refresh_candidate_window();
                 true
             }
             Action::StartLlm { prompt, system } => {
@@ -611,52 +1001,258 @@ impl VerbaIMKController {
         }
     }
 
+    /// 包裹会对客户端/面板发起同步 XPC 的调用段（setMarkedText/insertText/
+    /// updateComposition/show：IMK 面板定位 attributesForCharacterIndex 是
+    /// 等待回复时**泵运行循环**的）。深度 >0 期间的重入源有三处，全部有闸：
+    /// ① 嵌套触发的 drain 定时器直接跳过（退栈后下一 tick 补排）；
+    /// ② `input_text` 入口把可处理的键转入 `pending_keys` 待补放队列；
+    /// ③ `candidate_selected` 的抢点选字同样入队。
+    /// 否则会在 XPC 等待中再次对同一客户端发起调用（重入），抛
+    /// NSInvalidArgumentException 且在异常清理途中 abort（真机崩溃
+    /// 00:18/00:19：16ms 定时器使重入窗口较 50ms 版放大 3 倍后撞上）。
+    /// ObjC 异常就地捕获记录（沿用 catch_void），不让外层 Rust 帧展开。
+    fn host_call(&self, label: &str, f: impl FnOnce()) {
+        /// RAII：无论正常返回还是 panic（Rust 层）都把重入深度退栈——
+        /// 深度一旦泄漏，drain 定时器会永久跳过，输入法整体哑火。
+        struct DepthGuard<'a>(&'a Cell<usize>);
+        impl Drop for DepthGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get().saturating_sub(1));
+            }
+        }
+        let d = &self.ivars().host_call_depth;
+        d.set(d.get() + 1);
+        let _guard = DepthGuard(d);
+        catch_void(label, f);
+    }
+
+    /// 补放一条重入窗内积压的按键：与 `input_text` 的正常处理尾部同构
+    /// （feed → apply）。空闲态 + 无动作的组合在入队时已被排除，这里不再
+    /// 复判；补放路径的宿主调用同样全部走 `apply_action` 内部的 host_call
+    /// 包装，再次被泵重入时新键会重新入队。
+    fn replay_pending(&self, pk: PendingKey) {
+        match pk {
+            PendingKey::Paste(text) => {
+                // 粘贴重放沿用 input_text 的合并查询逻辑；过滤后为空的粘贴
+                // （纯表情等）此窗口内已按认领处理，仅记录不回传宿主。
+                let mut applied = false;
+                let mut last_candidate_req: Option<LlmCandidateRequest> = None;
+                for ch in text.chars().filter(|&ch| is_pasteable_char(ch)) {
+                    let mut action = self.ivars().machine.borrow_mut().feed_char(ch);
+                    if let Action::UpdatePinyin { llm_request, .. } = &mut action {
+                        last_candidate_req = llm_request.take();
+                    }
+                    self.apply_action(action);
+                    applied = true;
+                }
+                if let Some(req) = last_candidate_req {
+                    self.start_candidates(req);
+                }
+                if !applied {
+                    dbg_log("replay paste: 过滤后无可入库字符");
+                }
+            }
+            _ => {
+                let action = {
+                    let mut m = self.ivars().machine.borrow_mut();
+                    match pk {
+                        PendingKey::Char(c) => m.feed_char(c),
+                        PendingKey::Backspace => m.feed_backspace(),
+                        PendingKey::Enter => m.feed_enter(),
+                        PendingKey::Escape => m.feed_escape(),
+                        PendingKey::PageUp => m.feed_page_up(),
+                        PendingKey::PageDown => m.feed_page_down(),
+                        PendingKey::Paste(_) => unreachable!("上方分支已处理"),
+                    }
+                };
+                let _ = self.apply_action(action);
+            }
+        }
+    }
+
     fn commit(&self, text: &str) {
-        if let Some(client) = self.ivars().client.borrow().clone() {
+        let client = self.ivars().client.borrow().clone();
+        dbg_log(&format!("commit text={} client={}", text, client.is_some()));
+        if let Some(client) = client {
             // 先清空标记文本，避免上屏后残留 preedit。
             let empty = NSString::from_str("");
             // SAFETY: client 是 IMK 输入会话客户端，setMarkedText/unmarkText/insertText
-            // 均为 IMKInputText 非正式协议方法；NSNotFound 表示替换当前插入点。
-            let _: () = unsafe {
-                msg_send![
+            // 均为 IMKInputText 非正式协议方法。
+            // 注意：replacementRange 长度必须为 NSNotFound（而非 0）——现代 IMK
+            // 的 _IPMDServerClientWrapperLegacy 会校验区间，{NSNotFound,0} 被当作
+            // 非法丢弃，导致 insertText 静默失败、候选词不上屏（真机排查）。
+            // setMarkedText 同样会经 updateComposition 触发 attributesForCharacterIndex
+            // 的 XPC 往返泵运行循环，必须与 insertText 一样纳住重入窗口。
+            self.host_call("commit.setMarkedText", || unsafe {
+                let _: () = msg_send![
                     &client,
                     setMarkedText: &*empty,
-                    selectionRange: NSRange::new(0, 0),
-                    replacementRange: NSRange::new(NSNotFound as NSUInteger, 0),
-                ]
-            };
-            let _: () = unsafe { msg_send![&client, unmarkText] };
+                    selectionRange: NSRange::new(NSNotFound as NSUInteger, 0),
+                    replacementRange: NSRange::new(NSNotFound as NSUInteger, NSNotFound as NSUInteger),
+                ];
+            });
             let ns = NSString::from_str(text);
-            let _: () = unsafe {
-                msg_send![
+            self.host_call("commit.insertText", || unsafe {
+                let _: () = msg_send![
                     &client,
                     insertText: &*ns,
-                    replacementRange: NSRange::new(NSNotFound as NSUInteger, 0),
-                ]
-            };
+                    replacementRange: NSRange::new(NSNotFound as NSUInteger, NSNotFound as NSUInteger),
+                ];
+            });
         }
         self.ivars().candidates.borrow_mut().clear();
         self.ivars().page.set(0);
         self.ivars().candidate_pinyin.borrow_mut().take();
         *self.ivars().composed.borrow_mut() = String::new();
+        self.hide_candidate_window();
     }
 
     fn set_marked(&self, text: &str) {
+        // 相邻动作常重推同一 preedit（状态机 UpdatePinyin 已标记，候选事件
+        // 融合后原样再推一遍）：文本未变则跳过 updateComposition 宿主往返。
+        // 长句时整串 setMarkedText 代价可观（真机：长句候选「慢」的因素之一）。
+        if *self.ivars().composed.borrow() == text {
+            return;
+        }
+        // SAFETY: client 为 IMKInputController 公开只读属性，self 恒有效。
+        let fc: Option<Retained<AnyObject>> = unsafe { msg_send![self, client] };
+        dbg_log(&format!(
+            "set_marked text={} framework_client={}",
+            text,
+            fc.is_some()
+        ));
         *self.ivars().composed.borrow_mut() = text.to_owned();
         // SAFETY: updateComposition 为 IMKInputController 方法：取 composedString:
         // 并经 client setMarkedText: 发送，同时触发候选窗刷新。
-        let _: () = unsafe { msg_send![self, updateComposition] };
+        self.host_call("set_marked.updateComposition", || unsafe {
+            let _: () = msg_send![self, updateComposition];
+        });
     }
 
     fn clear_composition(&self) {
         *self.ivars().composed.borrow_mut() = String::new();
-        // SAFETY: updateComposition 发空组合 → client 标记文本清空；再 unmark 兜底。
-        let _: () = unsafe { msg_send![self, updateComposition] };
-        if let Some(client) = self.ivars().client.borrow().clone() {
-            let _: () = unsafe { msg_send![&client, unmarkText] };
-        }
+        // 先清候选再推空组合：updateComposition 可能借 candidates: 数据源
+        // 刷新候选面板，必须先让数据源为空，否则旧候选在清除后复现。
         self.ivars().candidates.borrow_mut().clear();
         self.ivars().page.set(0);
+        self.hide_candidate_window();
+        // SAFETY: updateComposition 发空组合 → client 标记文本清空；再 unmark 兜底。
+        self.host_call("clear_composition.updateComposition", || unsafe {
+            let _: () = msg_send![self, updateComposition];
+        });
+        if let Some(client) = self.ivars().client.borrow().clone() {
+            // 显式清空标记文本兜底：现代 IMK 客户端包装器（
+            // _IPMDServerClientWrapperLegacy）不响应 unmarkText——此前每次
+            // deactivate 都抛 unrecognized selector（真机 OBJC-EXC 日志，
+            // 宿主日志中的 NSInvalidArgumentException 即此），可能把残留
+            // 标记态留在宿主导致拼音原文泄露上屏。setMarkedText:@"" 等效
+            // 且为已验证路径（commit 同款参数）。
+            let empty = NSString::from_str("");
+            self.host_call("clear_composition.setMarkedEmpty", || unsafe {
+                let _: () = msg_send![
+                    &client,
+                    setMarkedText: &*empty,
+                    selectionRange: NSRange::new(NSNotFound as NSUInteger, 0),
+                    replacementRange: NSRange::new(NSNotFound as NSUInteger, NSNotFound as NSUInteger),
+                ];
+            });
+        }
+    }
+
+    /// 刷新候选窗：首次惰性创建 IMKCandidates，之后 update + show。
+    /// 候选为空时不隐藏、保持原状：击键同步态 candidates 恒为空（Rime 查询
+    /// 在途），若每击键都隐藏、结果到达再显示，候选窗会一闪一闪；真正的
+    /// 收起只发生在提交/清空组合/会话切换（见 commit/clear_composition/
+    /// deactivate_server）与「当前拼音查询终结且无候选」（feed_candidates_event）。
+    /// IMK 候选窗需要控制器显式驱动（updateComposition 只推标记文本，
+    /// 不会自动弹候选窗）。
+    fn refresh_candidate_window(&self) {
+        if self.ivars().candidates.borrow().is_empty() {
+            return;
+        }
+        // SAFETY: drain 定时器 / 输入回调均在主线程。
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let mut ui = self.ivars().candidates_ui.borrow_mut();
+        if ui.is_none() {
+            // SAFETY: server 为 IMKInputController 的只读访问器。
+            let server: Option<Retained<IMKServer>> = unsafe { msg_send![self, server] };
+            let Some(server) = server else {
+                log::warn!("[VerbaIMK] 无法获取 IMKServer，候选窗不可用");
+                return;
+            };
+            // SAFETY: initWithServer:panelType: 的 server 必填（已判空）。
+            let created = unsafe {
+                IMKCandidates::initWithServer_panelType(
+                    IMKCandidates::alloc(mtm),
+                    Some(&server),
+                    kIMKSingleColumnScrollingCandidatePanel as NSUInteger,
+                )
+            };
+            let Some(c) = created else {
+                log::warn!("[VerbaIMK] IMKCandidates 创建失败");
+                return;
+            };
+            // 属性：按键先送控制器（默认面板优先——数字/退格被面板吞掉且不回调
+            // candidateSelected:，导致选词失效）；字体加大、近不透明，改善默认样式。
+            let font = NSFont::systemFontOfSize(17.0);
+            let yes: Retained<NSNumber> = unsafe { msg_send![NSNumber::class(), numberWithBool: true] };
+            let font_obj: &NSObject = &font;
+            let yes_obj: &NSObject = &yes;
+            // SAFETY: extern static 常量由系统框架提供，只读访问。
+            let font_key: &NSObject = unsafe { NSFontAttributeName };
+            let first_key: &NSObject = unsafe { IMKCandidatesSendServerKeyEventFirst };
+            let obj_arr: [&NSObject; 2] = [font_obj, yes_obj];
+            let key_arr: [&NSObject; 2] = [font_key, first_key];
+            // SAFETY: arrayWithObjects:count: 指针指向有效对象数组，count=2。
+            let objs: Retained<NSArray<NSObject>> = unsafe {
+                msg_send![NSArray::<NSObject>::class(), arrayWithObjects: obj_arr.as_ptr(), count: 2]
+            };
+            let keys: Retained<NSArray<NSObject>> = unsafe {
+                msg_send![NSArray::<NSObject>::class(), arrayWithObjects: key_arr.as_ptr(), count: 2]
+            };
+            // SAFETY: dictionaryWithObjects:forKeys: 两数组等长且键实现 NSCopying。
+            let dict: Retained<NSDictionary> = unsafe {
+                msg_send![
+                    NSDictionary::<AnyObject, AnyObject>::class(),
+                    dictionaryWithObjects: &*objs,
+                    forKeys: &*keys
+                ]
+            };
+            // SAFETY: 属性字典由本函数构造，键值类型正确。
+            unsafe { c.setAttributes(Some(&dict)) };
+            *ui = Some(c);
+        }
+        let ui_ref = ui.as_ref().expect("刚创建");
+        // SAFETY: updateCandidates/show 为无前置条件的 UI 方法；候选数据源
+        // 由本控制器实现（candidates / candidates:）。
+        self.host_call("refresh.updateCandidates", || unsafe {
+            ui_ref.updateCandidates()
+        });
+        // show 会向客户端同步查询面板定位（attributesForCharacterIndex，
+        // XPC 泵运行循环）：已在展示则跳过——此前每击键 show 两次，嵌套
+        // XPC 往返既拖慢长句刷新又放大重入窗口（见 host_call）。
+        // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（同上，主线程访问）。
+        if !unsafe { ui_ref.isVisible() } {
+            self.host_call("refresh.show", || unsafe {
+                ui_ref.show(kIMKLocateCandidatesBelowHint as NSUInteger)
+            });
+            // 面板窗口圆角校正：首个展示周期探针一次（IMKUIPanel 不在
+            // IMKCandidates API 暴露范围，只能经 [NSApp windows] 找到）。
+            if !self.ivars().panel_probe_done.replace(true) {
+                style_candidate_panel(mtm);
+            }
+        }
+    }
+
+    /// 隐藏候选窗（提交/清空组合/会话切换时调用；无窗则空操作）。
+    fn hide_candidate_window(&self) {
+        if let Some(ui) = self.ivars().candidates_ui.borrow().as_ref() {
+            // SAFETY: hide 为无前置条件的 UI 方法。
+            self.host_call("hide", || unsafe { ui.hide() });
+            // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（主线程）。
+            let still = unsafe { ui.isVisible() };
+            dbg_log(&format!("hide_candidate_window after-hide isVisible={}", still));
+        }
     }
 
     // ---- LLM 流式 ----
@@ -754,7 +1350,8 @@ impl VerbaIMKController {
     fn start_rime_candidates(&self, pinyin: String, schema: String) {
         // Rime 为本地同步查询，无 daemon 侧 token 注册（无需取消）；
         // 旧候选回流由 seq 过滤防住（feed_candidates_event 只消费本控制器
-        // 当前 active_candidates 序号的事件）。
+        // 当前 active_candidates 序号的事件）。查询由全局单例 worker 执行
+        // （只查最新拼音，见 ensure_cand_worker）。
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars()
             .candidate_pinyin
@@ -766,33 +1363,14 @@ impl VerbaIMKController {
         record_dead(self.ivars(), old_cand);
         self.ensure_timer();
 
-        std::thread::spawn(move || {
-            let mut client = match ipc::ensure_daemon() {
-                Ok(c) => c,
-                Err(e) => {
-                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
-                    return;
-                }
-            };
-            let cands = match client.rime_candidates(&pinyin, &schema, 9) {
-                Ok(c) => c,
-                Err(e) => {
-                    push_llm(seq, error_event(&format!("Rime 候选查询失败: {e}")));
-                    return;
-                }
-            };
-            push_llm(
-                seq,
-                StreamEvent {
-                    id: 0,
-                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
-                        pinyin,
-                        candidates: cands,
-                        done: true,
-                    })),
-                },
-            );
+        let (lock, cv) = cand_slot();
+        *lock.lock().unwrap() = Some(CandRequest {
+            seq,
+            pinyin,
+            schema,
         });
+        cv.notify_one();
+        ensure_cand_worker();
     }
 
     fn feed_stream_event(&self, evt: StreamEvent) {
@@ -832,6 +1410,7 @@ impl VerbaIMKController {
         let Some(kind) = evt.kind else {
             return;
         };
+        dbg_log(&format!("feed_candidates_event {:?}", kind));
         match kind {
             stream_event::Kind::Candidates(c) => {
                 // 优先用事件回显的拼音；为空时回退到本控制器记录的请求拼音。
@@ -843,32 +1422,59 @@ impl VerbaIMKController {
                 } else {
                     c.pinyin.clone()
                 };
+                // 是否当前请求的拼音（决定 done+空候选时能否收起候选窗：迟到事件
+                // 不得影响正在展示的新候选）。
+                let is_current = self.ivars().candidate_pinyin.borrow().as_deref() == Some(pinyin.as_str());
                 let action = self.ivars().machine.borrow_mut().on_llm_candidates(
                     &pinyin,
                     &c.candidates,
                     c.done,
                 );
-                if let Action::UpdatePinyin {
-                    preedit,
-                    candidates,
-                    page,
-                    ..
-                } = action
-                {
-                    self.ivars().candidates.borrow_mut().clone_from(&candidates);
-                    self.ivars().page.set(page);
-                    self.set_marked(&preedit);
+                match action {
+                    Action::UpdatePinyin {
+                        preedit,
+                        candidates,
+                        page,
+                        ..
+                    } => {
+                        self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                        self.ivars().page.set(page);
+                        self.set_marked(&preedit);
+                        self.refresh_candidate_window();
+                    }
+                    // 在途期间暂缓的空格补执行：候选（或原文回退）提交上屏。
+                    Action::CommitImmediate(text) => self.commit(&text),
+                    Action::None => {}
+                    other => log::debug!("[VerbaIMK] 候选事件产生其它动作: {other:?}"),
                 }
                 if c.done {
                     self.ivars().candidate_pinyin.borrow_mut().take();
                     self.ivars().active_candidates.set(0);
+                    // 查询终结且「有效候选」为空时才收起窗口：状态机会在真实
+                    // 候选全空时合成一条原文候选（英文原文本身即候选，手心/
+                    // 搜狗惯例）——此时面板应展示它而非收起；只有连合成项都
+                    // 没有的纯空态（如非组合输入错误回调）才收起防残影。
+                    let effective_empty = self.ivars().candidates.borrow().is_empty();
+                    if effective_empty && is_current {
+                        self.hide_candidate_window();
+                    }
                 }
             }
             stream_event::Kind::Error(e) => {
                 // Rime 候选错误：不再静默空白，落到日志便于排查（如 librime 未部署）。
                 log::warn!("[VerbaIMK] Rime 候选错误: {}", e.message);
-                self.ivars().candidate_pinyin.borrow_mut().take();
+                let pinyin = self.ivars().candidate_pinyin.borrow_mut().take();
                 self.ivars().active_candidates.set(0);
+                // 错误也是查询终结：以空结果通知状态机，释放在途标记并补执行
+                // 暂缓的空格（无候选按原文回退），避免按键被吞。
+                if let Some(py) = pinyin {
+                    let action = self
+                        .ivars()
+                        .machine
+                        .borrow_mut()
+                        .on_llm_candidates(&py, &[], true);
+                    let _ = self.apply_action(action);
+                }
             }
             _ => {}
         }
@@ -926,7 +1532,9 @@ impl VerbaIMKController {
             unsafe { &*(self as *const VerbaIMKController as *const AnyObject) };
         let timer = unsafe {
             NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                0.05,
+                // 16ms（约 60Hz）：上一版 50ms 让候选刷新滞后整帧以上，
+                // 感知为「候选框慢」。排空本身极轻（空队列快速路径）。
+                0.016,
                 target,
                 sel!(drainVerbaStream),
                 None,
@@ -955,6 +1563,9 @@ impl VerbaIMKController {
 /// 因此调用前必须确保 `VerbaIMKController` 类已注册。
 pub fn run_server() -> ! {
     use objc2::MainThreadMarker;
+
+    init_file_logger();
+    log::info!("[Verba] IMK 服务启动");
 
     // SAFETY: run_server 只能从 main()（主线程）调用。
     let mtm = unsafe { MainThreadMarker::new_unchecked() };

@@ -79,7 +79,12 @@ done
 
 # 4) default.yaml 的 schema_list 追加 wubi86（否则部署不会编译该方案）
 if ! grep -q "wubi86" "$DATA/default.yaml"; then
-    sed -i '' 's|  - schema: terra_pinyin|  - schema: terra_pinyin\n  - schema: wubi86|' "$DATA/default.yaml"
+    # 可移植注入：不用 sed——macOS 的 BSD sed 需要 `-i ''`（GNU 视 '' 为文件名）
+    # 且其替换串不解释 \n；awk + 临时文件在两端语义一致。
+    awk \
+        '/  - schema: terra_pinyin/ && !done { print; print "  - schema: wubi86"; done = 1; next } { print }' \
+        "$DATA/default.yaml" > "$DATA/default.yaml.tmp" &&
+        mv "$DATA/default.yaml.tmp" "$DATA/default.yaml"
 fi
 # 回归守卫：sed 以 terra_pinyin 为锚，若上游 default.yaml 改版/换锚则静默不插入，
 # 五笔方案不会被部署编译——必须断言插入成功（复审 V23）。
