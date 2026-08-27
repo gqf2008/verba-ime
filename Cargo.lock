@@ -7013,7 +7013,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "verba-ai"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "eventsource-stream",
@@ -7030,7 +7030,7 @@ dependencies = [
 
 [[package]]
 name = "verba-asr"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "reqwest",
@@ -7043,7 +7043,7 @@ dependencies = [
 
 [[package]]
 name = "verba-candidate"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cosmic-text",
  "png 0.17.16",
@@ -7054,7 +7054,7 @@ dependencies = [
 
 [[package]]
 name = "verba-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "verba-config",
  "verba-core",
@@ -7065,7 +7065,7 @@ dependencies = [
 
 [[package]]
 name = "verba-config"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "directories",
  "keyring",
@@ -7077,11 +7077,11 @@ dependencies = [
 
 [[package]]
 name = "verba-core"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "verba-daemon"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -7102,7 +7102,7 @@ dependencies = [
 
 [[package]]
 name = "verba-ipc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7117,7 +7117,7 @@ dependencies = [
 
 [[package]]
 name = "verba-librime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libloading",
  "log",
@@ -7126,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "verba-ocr"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures-executor",
  "log",
@@ -7140,7 +7140,7 @@ dependencies = [
 
 [[package]]
 name = "verba-protos"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "prost-build",
@@ -7150,7 +7150,7 @@ dependencies = [
 
 [[package]]
 name = "verba-settings"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "env_logger",
  "log",
@@ -7163,7 +7163,7 @@ dependencies = [
 
 [[package]]
 name = "verba-tts"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "futures-util",

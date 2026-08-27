@@ -2,8 +2,8 @@
 
 > 更新：2026-08-27 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
 > librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；多模态（OCR/ASR）与
-> TTS（edge-tts / OpenAI 兼容）已打通；Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0 / v0.2.1
-> 签名公证产物，v0.2.2 遗留清扫批次——菜单栏图标 / 生僻字安装 / 安装 UX 自动化——已合 main）。
+> TTS（edge-tts / OpenAI 兼容）已打通；Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.1
+> 签名公证产物）；**v0.2.2 发布中**（随版清扫批次：菜单栏图标 / 生僻字安装 / 安装 UX 自动化）。
 > 剩余：whisper.cpp / audio.cpp 本地 ASR（可选）、Piper / 系统 TTS、性能预算、日志脱敏。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
@@ -17,7 +17,7 @@
 | M3 | 多模态 | OCR（截图）与 ASR（语音）在至少一个平台跑通，其余平台跟进 | M1 / M2 |
 | M4 | 体验打磨 | TTS（在线）、候选窗口、Slint 设置面板、性能预算、隐私开关 | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
-| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0 / v0.2.1 已发布；v0.2.2 遗留清扫批次已合 main） | M5 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.1 已发布；v0.2.2 发布中，随版清扫批次：菜单栏图标 / 生僻字安装 / 安装 UX 自动化） | M5 |
 
 ## M0 详细任务（已完成）
 
@@ -150,3 +150,4 @@
 | 2026-08-26 | v0.2.0 发布准备：版本号统一 0.2.0（根 workspace + 两前端 Cargo.toml），building.md 版本示例同步 |
 | 2026-08-27 | v0.2.1 发布准备：CI rustfmt 1.98 漂移修复（rust-toolchain.toml pin 1.98.0 + 前端两独立 workspace 重排，#46/#47）；版本号统一 0.2.1（根 workspace + 两前端 Cargo.toml + ISS/Info.plist/building.md 示例同步）；随版内容：PR #43/#45 真机修复与复审批次、biang 词条（9aeac99） |
 | 2026-08-27 | v0.2.2 遗留清扫批次（issue #48 三项 + #44 收口）：菜单栏专属模板 PDF 图标（#50）；设置面板一键安装生僻字扩展——RimeInstallExtra IPC、合并语义与 fetch-rime-vendor 同构（#51）；安装 UX 自动化——DMG「安装.command」双击一步安装 + verba-register TIS 注册/启用输入源（#52）；#44 余项收口（'/' 盲窗裁决、Error 臂对齐、流 token CAS、Windows 真机两步移入 manual-acceptance-windows.md） |
+| 2026-08-27 | v0.2.2 发布准备：版本号统一 0.2.2（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容即上行清扫批次（#50/#51/#52 + #44） |
