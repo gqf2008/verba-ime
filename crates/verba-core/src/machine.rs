@@ -940,7 +940,10 @@ impl CompositionMachine {
         if done || changed {
             self.fuse_candidates();
         }
-        // 在途期间暂缓的意图：结果到达（done）后补执行。
+        // 查询终结（done）时补执行在途暂缓的意图。部分块（done=false，legacy
+        // 流式通道保留的入口）只累积候选、不触发重放——提前重放会以「原文+
+        // 后缀」直出，击穿防漏暂缓；当前唯一在用通道 rime_candidates 单事件
+        // 即终结（daemon handler），此处门控是对未来接入方的语义护栏。
         //
         // 空格的零结果分支不自动提交——按空格那一刻用户还没见过面板（快打
         // 场景），盲提原文即漏字（真机：「kjf是埃迪卡拉纪」的前半段）。吞掉
@@ -951,32 +954,34 @@ impl CompositionMachine {
         // 有则选中首候选再接后缀，无则原文接后缀（全角映射/引号交替照常，
         // 且恰好只翻转一次）。若查询永不回达则无 settle、无重放——该路径由
         // 「重复按键 = 最新意图覆盖」或 Esc 复位解除，不会无限挂起。
-        if let Some(intent) = self.deferred_intent.take() {
-            let has_real =
-                !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
-            match intent {
-                DeferredIntent::SelectSpace => {
-                    if has_real {
-                        return self.select_candidate(0);
+        if done {
+            if let Some(intent) = self.deferred_intent.take() {
+                let has_real =
+                    !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
+                match intent {
+                    DeferredIntent::SelectSpace => {
+                        if has_real {
+                            return self.select_candidate(0);
+                        }
+                        self.refresh_candidates();
+                        return Action::UpdatePinyin {
+                            preedit: self.pinyin_composition_preedit(),
+                            candidates: self.display_candidate_texts(),
+                            page: self.pinyin_page,
+                            llm_request: None,
+                        };
                     }
-                    self.refresh_candidates();
-                    return Action::UpdatePinyin {
-                        preedit: self.pinyin_composition_preedit(),
-                        candidates: self.display_candidate_texts(),
-                        page: self.pinyin_page,
-                        llm_request: None,
-                    };
-                }
-                DeferredIntent::Uppercase(ch) => {
-                    let text = format!("{}{ch}", self.commit_pinyin_text());
-                    self.reset_pinyin();
-                    return Action::CommitImmediate(text);
-                }
-                DeferredIntent::Punct(ch) => {
-                    let punct = self.punct_commit_text(ch);
-                    let text = format!("{}{punct}", self.commit_pinyin_text());
-                    self.reset_pinyin();
-                    return Action::CommitImmediate(text);
+                    DeferredIntent::Uppercase(ch) => {
+                        let text = format!("{}{ch}", self.commit_pinyin_text());
+                        self.reset_pinyin();
+                        return Action::CommitImmediate(text);
+                    }
+                    DeferredIntent::Punct(ch) => {
+                        let punct = self.punct_commit_text(ch);
+                        let text = format!("{}{punct}", self.commit_pinyin_text());
+                        self.reset_pinyin();
+                        return Action::CommitImmediate(text);
+                    }
                 }
             }
         }
