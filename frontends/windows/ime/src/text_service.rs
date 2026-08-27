@@ -121,6 +121,9 @@ pub struct TextServiceData {
     candidate_rime_schema: RefCell<String>,
     /// 配置文件上次 mtime（用于热更新检测）。
     theme_config_mtime: Cell<Option<std::time::SystemTime>>,
+    /// 当前流注册槽：打包 token `(epoch << 32) | 请求id`（见 pack_stream_token）。
+    /// 打包携带所属代际是为了让清理可「只认自己的票」——裸 id 会数值撞车
+    /// （每连接自增恒为 2），store(0)/store(new) 都可能误伤他流；0 = 空槽。
     pub stream_request_id: Arc<AtomicU64>,
     /// 流代际（epoch）：每次发起新 LLM 流 +1；chunks 队列事件携带 epoch，
     /// 过滤只消费当前代际——请求 id 每连接从 1 自增（恒为 2），不能作跨流依据。
@@ -736,8 +739,10 @@ fn update_candidate_window(
         return;
     };
     if candidates.is_empty() {
-        cw.hide();
-        data.candidate_pending_pos.borrow_mut().take();
+        // 与 macOS「空数据保持原内容」策略对齐（imk.rs refresh_candidate_window
+        // 同款）：组合中候选在途时每次击键都携带空列表，若此处收起会造成候选窗
+        // 逐键闪烁。真实收起由显式 hide 调用负责（提交/取消/会话终止路径）；
+        // 查询终结为空的场景状态机会合成原文条目（非空），不会走到这里。
         return;
     }
     let theme = data.candidate_theme.borrow().clone();
@@ -976,16 +981,35 @@ fn start_llm(
                 return;
             }
         };
-        request_id.store(id, Ordering::SeqCst);
+        // 注册取消目标：CAS 安装打包 token，绝不覆盖同代或更新代的票——
+        // 慢启动的旧流迟到安装时新流可能已接管槽位（旧代 epoch < 新代），
+        // 此时本流注定被下面的代际检测回收；若反过来覆盖，会顶掉唯一能
+        // 取消新流的凭据。
+        let my_token = pack_stream_token(epoch, id);
+        loop {
+            let cur = request_id.load(Ordering::SeqCst);
+            if cur != 0 && stream_token_epoch(cur) >= epoch {
+                break; // 槽内已是同/更新代，保留它
+            }
+            if request_id
+                .compare_exchange(cur, my_token, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        // 已把图交给 daemon（llm_start 已返回）：线程还要跑完整个流式读
+        // 循环，及时释放 PNG 缓冲——多屏截图可达数 MB，整个生成期驻留纯属浪费。
+        drop(image);
         // 启动窗口内被取消/被新流取代（cancel_stream 在 id 落盘前已 bump
         // 代际）：立即在本连接补发取消——精确 (conn_id, id) 命中、无跨连接
         // fallback 歧义，防僵尸流继续烧 token 并把用户未见到的尾巴写进
         // daemon 会话历史。取消后直接退出：llm_cancel 的读循环可能已吞掉
         // 流的收尾事件，且本流事件代际已过期（on_timer 按 epoch 过滤），
-        // 无需再消费。
+        // 无需再消费。槽内若是自己的票则一并清空。
         if stream_epoch.load(Ordering::SeqCst) != epoch {
             let _ = client.llm_cancel(id);
-            request_id.store(0, Ordering::SeqCst);
+            let _ = request_id.compare_exchange(my_token, 0, Ordering::SeqCst, Ordering::SeqCst);
             return;
         }
         loop {
@@ -1008,9 +1032,9 @@ fn start_llm(
                 }
             }
         }
-        // 流已结束（正常完成/错误/连接断开）：清零 id。若此处残留，后续
-        // Cancel 拿陈旧 id 走跨连接 fallback，可能误杀另一连接上同 id 的流。
-        request_id.store(0, Ordering::SeqCst);
+        // 流已结束（正常完成/错误/连接断开）：只清自己的票。若改用裸
+        // store(0)，迟到的旧流会把新流刚注册的取消凭据一并抹掉。
+        let _ = request_id.compare_exchange(my_token, 0, Ordering::SeqCst, Ordering::SeqCst);
     });
     *data.stream_thread.borrow_mut() = Some(handle);
 }
@@ -1033,25 +1057,49 @@ fn push_chunk(
     }
 }
 
+/// 流注册槽打包格式：`(epoch << 32) | (daemon请求id & 0xFFFF_FFFF)`。
+/// epoch 占高位使 token 自带代际：清理与取消都能核对「这张票是否仍属于
+/// 发起时的流」，杜绝裸 id 数值撞车（每连接自增，恒为 2）导致的误清/误杀。
+fn pack_stream_token(epoch: u64, daemon_id: u64) -> u64 {
+    (epoch << 32) | (daemon_id & 0xFFFF_FFFF)
+}
+
+fn stream_token_epoch(token: u64) -> u64 {
+    token >> 32
+}
+
+fn stream_token_id(token: u64) -> u64 {
+    token & 0xFFFF_FFFF
+}
+
 fn cancel_stream(data: &Rc<TextServiceData>) {
     // 候选融合请求一并取消
     cancel_candidate_request(data);
-    let id = data.stream_request_id.load(Ordering::SeqCst);
+    // 先取票后作废：token 自带代际，bump 前的 epoch 才是与票比对的有效
+    // 基准（先 bump 再读会把自己刚作废的新票误判为陈旧）。
+    let pre_bump_epoch = data.stream_epoch.load(Ordering::SeqCst);
+    let token = data.stream_request_id.load(Ordering::SeqCst);
     // 作废旧流代际：无论是否已取得请求 id 都必须 bump——取消发生在
-    // llm_start/OCR 在途（worker 尚未 store id）的窗口内时，id==0 提前
+    // llm_start/OCR 在途（worker 尚未安装 token）的窗口内时，提前
     // 返回会漏掉 bump，旧流残留事件仍以「当前代际」通过 on_timer 的
-    // epoch 过滤（复审发现）；bump 后由 start_llm worker 在 id 落盘时
+    // epoch 过滤（复审发现）；bump 后由 start_llm worker 在安装 token 时
     // 检测代际并补发 daemon 取消（见 start_llm）。
     data.stream_epoch.fetch_add(1, Ordering::SeqCst);
-    if id == 0 {
+    if token == 0 || stream_token_epoch(token) != pre_bump_epoch {
+        // 槽内为空或陈旧代际残留（正常情况下 worker 的 CAS 清理已兜住，
+        // 此处防御性清掉，且绝不发送跨代取消——裸 id 数值撞车会误杀别的流）。
+        let _ = data
+            .stream_request_id
+            .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
         return;
     }
-    cancel_with_retry(&data.control, id);
-    // 取消已发出：清零 id。否则本流结束后（worker 尚未清零的窗口内或
-    // 任何遗漏路径）后续 Cancel/Commit 会拿陈旧 id 走跨连接 fallback，
-    // 唯一命中时误杀另一条连接上同 id 的并发流（复审发现，id 每连接
-    // 自增恒为 2，撞 id 是常态而非巧合）。
-    data.stream_request_id.store(0, Ordering::SeqCst);
+    cancel_with_retry(&data.control, stream_token_id(token));
+    // 取消已发出：只清自己的票（CAS 校验代际）。否则后续 Cancel/Commit 会
+    // 拿陈旧 id 走跨连接 fallback，唯一命中时误杀另一条连接上同 id 的并发
+    // 流（复审发现，id 每连接自增恒为 2，撞 id 是常态而非巧合）。
+    let _ = data
+        .stream_request_id
+        .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
 /// 经控制连接取消指定请求；连接已死（服务端 idle 超时回收等）时重建并重试
@@ -1127,19 +1175,38 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
     cancel_candidate_request(data);
     let chunks = Arc::clone(&data.chunks);
     let busy = Arc::clone(&data.candidate_request_busy);
+    // 失败也必须回一个 done 空结果事件：状态机靠 Candidates(done=true) 释放
+    // candidates_in_flight（并合成原文候选），静默 return 会把组合永远卡在
+    // 「在途」——空格/选字全被暂缓（复审发现）。
+    let fail = |chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>, pinyin: &str, msg: &str| {
+        log::warn!("{msg}");
+        if let Ok(mut q) = chunks.lock() {
+            q.push_back((
+                0,
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                        pinyin: pinyin.to_owned(),
+                        candidates: vec![],
+                        done: true,
+                    })),
+                },
+            ));
+        }
+    };
     let handle = std::thread::spawn(move || {
         let _busy = BusyGuard::new(&busy);
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
-                log::warn!("Rime 候选无法连接 daemon: {e}");
+                fail(&chunks, &pinyin, &format!("Rime 候选无法连接 daemon: {e}"));
                 return;
             }
         };
         let cands = match client.rime_candidates(&pinyin, &schema, 9) {
             Ok(c) => c,
             Err(e) => {
-                log::warn!("Rime 候选查询失败: {e}");
+                fail(&chunks, &pinyin, &format!("Rime 候选查询失败: {e}"));
                 return;
             }
         };
@@ -1553,6 +1620,20 @@ impl TextServiceData {
         let clientid = self.clientid.get();
 
         let mut machine = self.machine.borrow_mut();
+        /// 两段式派发的中间步骤：第一遍（持状态机借锁）只收集动作，
+        /// 第二遍释放借锁后统一执行——apply_action 的部分分支会再次
+        /// borrow_mut(machine)（如 StartLlm 的重置），持锁直派必 panic。
+        enum Step {
+            Preedit(String),
+            Candidates {
+                preedit: String,
+                candidates: Vec<String>,
+                page: usize,
+            },
+            Act(Action),
+            EndCompositionQuiet,
+        }
+        let mut steps: Vec<Step> = Vec::new();
         // 合并 chunk 预编辑：每个胶子只调一次 set_preedit，降低 TSF 回调压力。
         let mut pending_preedit: Option<String> = None;
         for evt in events {
@@ -1567,33 +1648,64 @@ impl TextServiceData {
                     pending_preedit = Some(machine.result().to_owned());
                 }
                 Some(stream_event::Kind::Candidates(c)) => {
-                    if let Action::UpdatePinyin {
-                        preedit,
-                        candidates,
-                        page,
-                        ..
-                    } = machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done)
-                    {
-                        // 先刷干容尽的 chunk 预编辑，再显示候选。
-                        if let Some(p) = pending_preedit.take() {
-                            let _ = set_preedit(&rc, &context, clientid, &p);
-                        }
-                        let _ = set_preedit(&rc, &context, clientid, &preedit);
-                        update_candidate_window(&rc, &context, &preedit, &candidates, page);
+                    // 先刷干容尽的 chunk 预编辑，再显示候选。
+                    if let Some(p) = pending_preedit.take() {
+                        steps.push(Step::Preedit(p));
                     }
+                    steps.push(
+                        match machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done) {
+                            Action::UpdatePinyin {
+                                preedit,
+                                candidates,
+                                page,
+                                ..
+                            } => Step::Candidates {
+                                preedit,
+                                candidates,
+                                page,
+                            },
+                            // 在途暂缓后的知情回退（重复空格按原文提交）等
+                            // 非刷新动作不能丢弃：与 macOS feed_candidates_event
+                            // 的 CommitImmediate 处理对齐，走通用派发上屏
+                            // （复审发现：此前被静默吞掉，空格无效）。
+                            other => Step::Act(other),
+                        },
+                    );
                 }
                 Some(stream_event::Kind::Error(e)) => {
                     if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
-                        if let Some(comp) = self.composition.borrow_mut().take() {
-                            let _ = edit_session::end_composition(&context, clientid, &comp, "");
-                        }
+                        steps.push(Step::EndCompositionQuiet);
                     }
                 }
                 None => {}
             }
         }
         if let Some(p) = pending_preedit {
-            let _ = set_preedit(&rc, &context, clientid, &p);
+            steps.push(Step::Preedit(p));
+        }
+        drop(machine);
+        for step in steps {
+            match step {
+                Step::Preedit(p) => {
+                    let _ = set_preedit(&rc, &context, clientid, &p);
+                }
+                Step::Candidates {
+                    preedit,
+                    candidates,
+                    page,
+                } => {
+                    let _ = set_preedit(&rc, &context, clientid, &preedit);
+                    update_candidate_window(&rc, &context, &preedit, &candidates, page);
+                }
+                Step::Act(action) => {
+                    let _ = apply_action(&rc, &context, action);
+                }
+                Step::EndCompositionQuiet => {
+                    if let Some(comp) = self.composition.borrow_mut().take() {
+                        let _ = edit_session::end_composition(&context, clientid, &comp, "");
+                    }
+                }
+            }
         }
     }
 
