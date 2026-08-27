@@ -24,6 +24,7 @@ message Request {
     OcrRecognize ocr_recognize = 25;
     AsrTranscribe asr_transcribe = 26;
     ApiKeySet api_key_set = 27;
+    RimeInstallExtra rime_install_extra = 28;
   }
 }
 
@@ -69,6 +70,10 @@ message RimeCandidates {
   string schema = 2;
   int32 max_candidates = 3;
 }
+
+// 安装生僻字扩展：把 Verba 补充词条（scripts/rime-extra/custom_phrase.txt，
+// 编译期内嵌）合入用户 Rime 目录并重建引擎（下一次查询触发重新部署）。
+message RimeInstallExtra {}
 
 // ---------- 响应 ----------
 message Response {

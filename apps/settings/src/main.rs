@@ -122,6 +122,21 @@ fn wire_callbacks(ui: &SettingsWindow) {
     });
 
     let weak = ui.as_weak();
+    ui.on_install_rare_chars(move || {
+        let weak2 = weak.clone();
+        std::thread::spawn(move || {
+            let status = with_client(|c| c.rime_install_extra())
+                .map(|()| "生僻字扩展已安装并重新部署（biang 拼音即刻可用）".to_owned())
+                .unwrap_or_else(|e| format!("安装生僻字扩展失败: {e}"));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak2.upgrade() {
+                    ui.set_status_text(status.into());
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     ui.on_save_phrase(move || {
         let Some(ui) = weak.upgrade() else {
             return;
