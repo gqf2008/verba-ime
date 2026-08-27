@@ -1,0 +1,10 @@
+# 全仓库统一工具链：rustup 的工具链文件优先级高于 dtolnay/rust-toolchain 动作
+# 安装的 default（该动作不读本文件，是 rustup 自身在首次调用时按本文件解析并
+# 自动安装该版本，CI 与本地同源）。pin 到具体补丁版而非 stable 浮动：rustfmt
+# 各版本断行规则存在差异（1.98 曾改写窄行拆分），浮动会让「本地 fmt 过、
+# CI Format 红」反复出现。升级时同步改这一行，并在仓库根与
+# frontends/macos/ime、frontends/windows/ime 三个 workspace 各跑一轮
+# cargo fmt --all（两个前端是独立 workspace，根目录的 --all 覆盖不到它们）。
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

@@ -1117,9 +1117,9 @@ fn cancel_stream(data: &Rc<TextServiceData>) {
     if token == 0 || stream_token_epoch(token) != pre_bump_epoch {
         // 槽内为空或陈旧代际残留（正常情况下 worker 的 CAS 清理已兜住，
         // 此处防御性清掉，且绝不发送跨代取消——裸 id 数值撞车会误杀别的流）。
-        let _ = data
-            .stream_request_id
-            .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ =
+            data.stream_request_id
+                .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
         return;
     }
     cancel_with_retry(&data.control, stream_token_id(token));
@@ -1809,7 +1809,9 @@ mod tests {
     /// 与 macOS 契约对齐）；未映射字符不认领。
     #[test]
     fn claim_chars_cover_machine_punct() {
-        for c in [',', '.', ';', ':', '?', '!', '(', ')', '[', ']', '"', '\'', '-', '~'] {
+        for c in [
+            ',', '.', ';', ':', '?', '!', '(', ')', '[', ']', '"', '\'', '-', '~',
+        ] {
             assert!(idle_claim_char(c), "Idle 应认领 {c:?}");
             assert!(pinyin_claim_char(c), "Pinyin 应认领 {c:?}");
         }
