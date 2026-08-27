@@ -1010,23 +1010,9 @@ fn start_llm(
                 return;
             }
         };
-        // 注册取消目标：CAS 安装打包 token，绝不覆盖同代或更新代的票——
-        // 慢启动的旧流迟到安装时新流可能已接管槽位（旧代 epoch < 新代），
-        // 此时本流注定被下面的代际检测回收；若反过来覆盖，会顶掉唯一能
-        // 取消新流的凭据。
+        // 注册取消目标：CAS 安装打包 token（守卫语义见 install_stream_token）。
         let my_token = pack_stream_token(epoch, id);
-        loop {
-            let cur = request_id.load(Ordering::SeqCst);
-            if cur != 0 && stream_token_epoch(cur) >= epoch {
-                break; // 槽内已是同/更新代，保留它
-            }
-            if request_id
-                .compare_exchange(cur, my_token, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break;
-            }
-        }
+        let _ = install_stream_token(&request_id, my_token);
         // 已把图交给 daemon（llm_start 已返回）：线程还要跑完整个流式读
         // 循环，及时释放 PNG 缓冲——多屏截图可达数 MB，整个生成期驻留纯属浪费。
         drop(image);
@@ -1099,6 +1085,26 @@ fn stream_token_epoch(token: u64) -> u64 {
 
 fn stream_token_id(token: u64) -> u64 {
     token & 0xFFFF_FFFF
+}
+
+/// 流注册槽安装：CAS 安装打包 token，**绝不覆盖同代或更新代的票**——
+/// 慢启动的旧流迟到安装时新流可能已接管槽位，此时返回 false 放弃安装
+/// （本流注定被代际检测回收）；若反向覆盖，会顶掉唯一能取消新流的凭据。
+/// 返回 true = 本 token 已落盘；false = 未安装（槽内同代票保留先到者，
+/// 或槽内已是更新代——当前调用方不区分这两者）。
+fn install_stream_token(slot: &AtomicU64, token: u64) -> bool {
+    loop {
+        let cur = slot.load(Ordering::SeqCst);
+        if cur != 0 && stream_token_epoch(cur) >= stream_token_epoch(token) {
+            return false; // 槽内已是同/更新代，保留它
+        }
+        if slot
+            .compare_exchange(cur, token, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 fn cancel_stream(data: &Rc<TextServiceData>) {
@@ -1197,6 +1203,27 @@ fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
     }
 }
 
+/// Rime 候选查询失败也必须回一个 done=true 空结果事件：状态机靠
+/// Candidates(done=true) 释放 candidates_in_flight 并结算 deferred_intent
+/// （与 macOS imk.rs 的错误即空结果 done 结算对齐，issue #44），静默
+/// return 会把组合永远卡在「在途」——空格/选字全被暂缓（复审发现）。
+fn push_rime_fail(chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>, pinyin: &str, msg: &str) {
+    log::warn!("{msg}");
+    if let Ok(mut q) = chunks.lock() {
+        q.push_back((
+            0,
+            StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin: pinyin.to_owned(),
+                    candidates: vec![],
+                    done: true,
+                })),
+            },
+        ));
+    }
+}
+
 /// 发起 Rime 候选查询（单引擎；一次性返回候选，经 chunks 队列回流合并展示）。
 /// Rime 查询为本地同步调用，未使用候选请求 id（cancel_candidate_request 仅清理 pending）。
 fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: String) {
@@ -1204,38 +1231,19 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
     cancel_candidate_request(data);
     let chunks = Arc::clone(&data.chunks);
     let busy = Arc::clone(&data.candidate_request_busy);
-    // 失败也必须回一个 done 空结果事件：状态机靠 Candidates(done=true) 释放
-    // candidates_in_flight（并合成原文候选），静默 return 会把组合永远卡在
-    // 「在途」——空格/选字全被暂缓（复审发现）。
-    let fail = |chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>, pinyin: &str, msg: &str| {
-        log::warn!("{msg}");
-        if let Ok(mut q) = chunks.lock() {
-            q.push_back((
-                0,
-                StreamEvent {
-                    id: 0,
-                    kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
-                        pinyin: pinyin.to_owned(),
-                        candidates: vec![],
-                        done: true,
-                    })),
-                },
-            ));
-        }
-    };
     let handle = std::thread::spawn(move || {
         let _busy = BusyGuard::new(&busy);
         let mut client = match ipc::ensure_daemon() {
             Ok(c) => c,
             Err(e) => {
-                fail(&chunks, &pinyin, &format!("Rime 候选无法连接 daemon: {e}"));
+                push_rime_fail(&chunks, &pinyin, &format!("Rime 候选无法连接 daemon: {e}"));
                 return;
             }
         };
         let cands = match client.rime_candidates(&pinyin, &schema, 9) {
             Ok(c) => c,
             Err(e) => {
-                fail(&chunks, &pinyin, &format!("Rime 候选查询失败: {e}"));
+                push_rime_fail(&chunks, &pinyin, &format!("Rime 候选查询失败: {e}"));
                 return;
             }
         };
@@ -1612,6 +1620,78 @@ fn create_timer_window(data: &Rc<TextServiceData>) -> Result<()> {
     }
 }
 
+/// 两段式派发的中间步骤：第一遍（持状态机借锁）只收集动作，
+/// 第二遍释放借锁后统一执行——apply_action 的部分分支会再次
+/// borrow_mut(machine)（如 StartLlm 的重置），持锁直派必 panic。
+#[derive(Debug)]
+enum Step {
+    Preedit(String),
+    Candidates {
+        preedit: String,
+        candidates: Vec<String>,
+        page: usize,
+    },
+    Act(Action),
+    EndCompositionQuiet,
+}
+
+/// 把队列中捞出的流事件逐个喂给状态机，收集两段式派发步骤（纯函数，
+/// 供单测钉住「done=true 空结果事件结算在途暂缓」「非刷新动作不丢弃」
+/// 等布线语义，issue #44）。
+fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> Vec<Step> {
+    let mut steps: Vec<Step> = Vec::new();
+    // 合并 chunk 预编辑：每个胶子只调一次 set_preedit，降低 TSF 回调压力。
+    let mut pending_preedit: Option<String> = None;
+    for evt in events {
+        match evt.kind {
+            Some(stream_event::Kind::Chunk(ch)) => {
+                if let Action::UpdateResult { preedit } = machine.on_llm_chunk(&ch.text) {
+                    pending_preedit = Some(preedit);
+                }
+            }
+            Some(stream_event::Kind::Final(_)) => {
+                machine.on_llm_done();
+                pending_preedit = Some(machine.result().to_owned());
+            }
+            Some(stream_event::Kind::Candidates(c)) => {
+                // 先刷干容尽的 chunk 预编辑，再显示候选。
+                if let Some(p) = pending_preedit.take() {
+                    steps.push(Step::Preedit(p));
+                }
+                steps.push(
+                    match machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done) {
+                        Action::UpdatePinyin {
+                            preedit,
+                            candidates,
+                            page,
+                            ..
+                        } => Step::Candidates {
+                            preedit,
+                            candidates,
+                            page,
+                        },
+                        // 在途暂缓后的知情回退（重复空格按原文提交）等
+                        // 非刷新动作不能丢弃：与 macOS feed_candidates_event
+                        // 的 CommitImmediate 处理对齐，走通用派发上屏
+                        // （复审发现：此前被静默吞掉，空格无效）。
+                        other => Step::Act(other),
+                    },
+                );
+            }
+            Some(stream_event::Kind::Error(e)) => {
+                if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
+                    steps.push(Step::EndCompositionQuiet);
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some(p) = pending_preedit {
+        steps.push(Step::Preedit(p));
+    }
+    steps
+}
+
 impl TextServiceData {
     pub fn on_timer(&self) {
         let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
@@ -1649,69 +1729,9 @@ impl TextServiceData {
         let clientid = self.clientid.get();
 
         let mut machine = self.machine.borrow_mut();
-        /// 两段式派发的中间步骤：第一遍（持状态机借锁）只收集动作，
-        /// 第二遍释放借锁后统一执行——apply_action 的部分分支会再次
-        /// borrow_mut(machine)（如 StartLlm 的重置），持锁直派必 panic。
-        enum Step {
-            Preedit(String),
-            Candidates {
-                preedit: String,
-                candidates: Vec<String>,
-                page: usize,
-            },
-            Act(Action),
-            EndCompositionQuiet,
-        }
-        let mut steps: Vec<Step> = Vec::new();
-        // 合并 chunk 预编辑：每个胶子只调一次 set_preedit，降低 TSF 回调压力。
-        let mut pending_preedit: Option<String> = None;
-        for evt in events {
-            match evt.kind {
-                Some(stream_event::Kind::Chunk(ch)) => {
-                    if let Action::UpdateResult { preedit } = machine.on_llm_chunk(&ch.text) {
-                        pending_preedit = Some(preedit);
-                    }
-                }
-                Some(stream_event::Kind::Final(_)) => {
-                    machine.on_llm_done();
-                    pending_preedit = Some(machine.result().to_owned());
-                }
-                Some(stream_event::Kind::Candidates(c)) => {
-                    // 先刷干容尽的 chunk 预编辑，再显示候选。
-                    if let Some(p) = pending_preedit.take() {
-                        steps.push(Step::Preedit(p));
-                    }
-                    steps.push(
-                        match machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done) {
-                            Action::UpdatePinyin {
-                                preedit,
-                                candidates,
-                                page,
-                                ..
-                            } => Step::Candidates {
-                                preedit,
-                                candidates,
-                                page,
-                            },
-                            // 在途暂缓后的知情回退（重复空格按原文提交）等
-                            // 非刷新动作不能丢弃：与 macOS feed_candidates_event
-                            // 的 CommitImmediate 处理对齐，走通用派发上屏
-                            // （复审发现：此前被静默吞掉，空格无效）。
-                            other => Step::Act(other),
-                        },
-                    );
-                }
-                Some(stream_event::Kind::Error(e)) => {
-                    if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
-                        steps.push(Step::EndCompositionQuiet);
-                    }
-                }
-                None => {}
-            }
-        }
-        if let Some(p) = pending_preedit {
-            steps.push(Step::Preedit(p));
-        }
+        // 两段式派发：第一遍（持状态机借锁）只收集动作，第二遍释放借锁后
+        // 统一执行——收集逻辑见模块级纯函数 collect_steps（供单测钉住）。
+        let steps = collect_steps(&mut machine, events);
         drop(machine);
         for step in steps {
             match step {
@@ -1823,5 +1843,106 @@ mod tests {
         assert!(!idle_claim_char(' '), "空格 Idle 不认领（保持原语义）");
         assert!(pinyin_claim_char('2') && pinyin_claim_char(' '));
         assert!(pinyin_claim_char('0'), "数字行整体走拼音态通用通道");
+    }
+
+    /// Rime 失败通道与 macOS 对齐（issue #44）：查询失败也回 done=true
+    /// 空结果 Candidates 事件，状态机据此释放在途标记并结算暂缓意图。
+    #[test]
+    fn rime_fail_event_is_done_empty_candidates() {
+        let chunks = Arc::new(Mutex::new(VecDeque::new()));
+        push_rime_fail(&chunks, "ni", "模拟失败");
+        let q = chunks.lock().unwrap();
+        let (epoch, evt) = q.front().unwrap();
+        assert_eq!(*epoch, 0, "Rime 候选事件不归属任何流代际");
+        match evt.kind.as_ref().unwrap() {
+            stream_event::Kind::Candidates(c) => {
+                assert_eq!(c.pinyin, "ni");
+                assert!(c.candidates.is_empty());
+                assert!(c.done, "done=true 才能释放 in-flight 并结算暂缓");
+            }
+            other => panic!("应回 Candidates 事件，实际 {other:?}"),
+        }
+    }
+
+    /// 布线语义钉住（issue #44）：done=true 空结果候选事件经 collect_steps
+    /// 走到状态机，暂缓空格被结算为「上板原文条目」的刷新（而非被静默吞掉
+    /// 或盲提原文）——与 macOS feed_candidates_event 的错误结算对齐。
+    #[test]
+    fn collect_steps_settles_inflight_deferred_space() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "在途空格应暂缓");
+        let steps = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin: "ni".into(),
+                    candidates: vec![],
+                    done: true,
+                })),
+            }],
+        );
+        assert!(
+            matches!(&steps[..], [Step::Candidates { preedit, candidates, .. }]
+                if preedit == "ni" && candidates == &vec!["ni".to_string()]),
+            "空结果结算应上板合成原文条目（与 macOS 一致），实际 {steps:?}"
+        );
+        // 用户此刻看得见候选窗：再按空格才是知情回退
+        assert_eq!(m.feed_char(' '), Action::CommitImmediate("ni".into()));
+    }
+
+    /// 布线语义钉住（issue #44，复审建议 S1）：暂缓空格后真实候选结算 →
+    /// 首候选提交动作走 Step::Act 派发、不得被静默丢弃（此前被吞掉、
+    /// 空格无效的复审发现——非刷新动作与 macOS 对齐走通用派发上屏）。
+    #[test]
+    fn collect_steps_real_candidates_emit_commit_act() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "在途空格应暂缓");
+        let steps = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin: "ni".into(),
+                    candidates: vec!["你".into()],
+                    done: true,
+                })),
+            }],
+        );
+        assert!(
+            matches!(&steps[..], [Step::Act(Action::CommitImmediate(t))] if t == "你"),
+            "真实候选结算应产出首候选提交步骤（不被丢弃），实际 {steps:?}"
+        );
+    }
+
+    /// 流 token 打包/安装属性（issue #44 真机项的可自动化部分）：
+    /// 代际嵌入高位、id 嵌入低位；「同代保留先到者、旧代绝不覆盖新代、
+    /// 空槽正常安装」在交错序列下成立——真机验收仅剩 TSF 路由副作用。
+    #[test]
+    fn install_stream_token_never_overwrites_newer_epoch() {
+        let tok = pack_stream_token(7, 0x1234_5678);
+        assert_eq!(stream_token_epoch(tok), 7);
+        assert_eq!(stream_token_id(tok), 0x1234_5678);
+        assert_eq!(stream_token_epoch(0), 0, "0 = 空槽语义");
+
+        let slot = AtomicU64::new(0);
+        assert!(install_stream_token(&slot, pack_stream_token(1, 2)));
+        // 同代旧 id：保留先到者（不覆盖）
+        assert!(!install_stream_token(&slot, pack_stream_token(1, 99)));
+        assert_eq!(slot.load(Ordering::SeqCst), pack_stream_token(1, 2));
+        // 新代覆盖
+        assert!(install_stream_token(&slot, pack_stream_token(2, 3)));
+        assert_eq!(stream_token_epoch(slot.load(Ordering::SeqCst)), 2);
+        // 旧代迟到安装：必须放弃（槽位代际只前进不后退）
+        assert!(!install_stream_token(&slot, pack_stream_token(1, 5)));
+        assert_eq!(slot.load(Ordering::SeqCst), pack_stream_token(2, 3));
+        // 清空后正常安装
+        slot.store(0, Ordering::SeqCst);
+        assert!(install_stream_token(&slot, pack_stream_token(3, 7)));
+        assert_eq!(stream_token_id(slot.load(Ordering::SeqCst)), 7);
     }
 }

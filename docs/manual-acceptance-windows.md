@@ -133,3 +133,23 @@
 
 ## 判定
 - 候选窗出现 Rime 候选、五笔码可出字 → Rime 单引擎集成收口。
+
+# Windows 手动验收清单（v0.2.2 清扫批次：issue #44 真机两步）
+
+> 背景：PR #43/#45 审查遗留（issue #44）的代码部分已全部落地并 CI 钉住
+> （`install_stream_token_never_overwrites_newer_epoch` /
+> `collect_steps_settles_inflight_deferred_space` / `rime_fail_event_is_done_empty_candidates`
+> 三个测试跑在 windows-latest runner（虚拟 Windows）上）。以下两项是唯一无法离线验证的
+> TSF 路由副作用，在 Windows 真机上按步骤执行后即可收口 issue #44。
+
+## 修饰键守卫（Ctrl/Alt 快捷组合不被吞）
+- [ ] 在 VS Code 中按 `Ctrl+.`（快速修复）、`Ctrl+,`（设置）：应用动作必须触发
+      （输入法不得认领该键）
+- [ ] 在记事本中按住 `Ctrl` 连打字母：无残留组合、无候选窗弹出、无卡死
+- [ ] 正常输入（无修饰键）候选/上屏不受影响（回归）
+
+## 两段式派发 / 流 token 代际（快速流切换无旧流混入）
+- [ ] 连做 5 轮：输入 `//` 提示词 → 回车开流 → 流未结束即 Esc/切窗取消 → 立即
+      再开新流。每轮结束上屏文本应完整属于最新一轮（无旧流 chunk 混入），
+      daemon 日志无 panic/死锁（`verba-daemon.log`）
+- [ ] 慢网络下（可选）：开流后切到无网环境等 3 秒再取消，输入法无卡死
