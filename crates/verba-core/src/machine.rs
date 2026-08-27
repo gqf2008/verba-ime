@@ -378,6 +378,13 @@ impl CompositionMachine {
     /// 拼音状态下的字符输入。
     fn feed_pinyin_char(&mut self, c: char) -> Action {
         if c == '/' {
+            // 裁决（issue #44「'/' 通道盲窗直出标注」）：'/' 是显式模式切换键，
+            // 盲窗中保持直出、不同走暂缓——①用户按 '/' 的意图是进入提示词模式
+            // 而非「期望候选」，提交的只是自己刚敲的拼音字母，可感知、可退格
+            // 撤销，不属于盲窗保护针对的「静默退化漏字」；②若同走暂缓，settle
+            // 重放会把已解决的候选插进用户正在输入的提示词组合里（Prompt 态
+            // 活跃时插入文本），引入新的竞态与错序风险，收益远小于风险。
+            // 行为由 slash_in_blind_window_commits_raw_enters_pending 钉住。
             // 提交当前拼音，再进入 AI 触发
             let text = self.commit_pinyin_text();
             self.reset_pinyin();
@@ -2152,5 +2159,31 @@ mod tests {
         assert_eq!(m.feed_char('/'), Action::CommitImmediate("ni".into()));
         let a = m.feed_char(',');
         assert_eq!(a, Action::CommitImmediate("/,".into()), "斜杠通道半角直出");
+    }
+
+    /// '/' 盲窗直出裁决钉住（issue #44）：与空格/大写/标点不同，'/' 是显式
+    /// 模式切换键，盲窗中也立即提交当前拼音（候选未回达即原文）并进入
+    /// PendingSlash——暂缓重放会把候选插进用户正在输入的提示词组合里，
+    /// 收益远小于错序风险。见 feed_pinyin_char 的裁决注释。
+    #[test]
+    fn slash_in_blind_window_commits_raw_enters_pending() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        // 未注入候选：查询在途盲窗。'/' 直出原文拼音并切到 PendingSlash
+        assert_eq!(
+            m.feed_char('/'),
+            Action::CommitImmediate("ni".into()),
+            "盲窗中 '/' 应立即提交当前拼音（候选在途，原文兜底）"
+        );
+        assert_eq!(m.state(), MachineState::PendingSlash);
+        // 第二个 '/' 进入提示词模式，提示词组合从零开始
+        assert_eq!(
+            m.feed_char('/'),
+            Action::EnterPrompt {
+                preedit: "//".to_owned()
+            }
+        );
+        assert_eq!(m.state(), MachineState::Prompt);
     }
 }
