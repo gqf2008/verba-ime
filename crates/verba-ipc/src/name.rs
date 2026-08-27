@@ -65,6 +65,21 @@ pub fn local_entropy_u64() -> u64 {
 /// 连接令牌：daemon 首次启动生成并写入用户数据目录（0700），client 读取后拼入
 /// 管道名。管道名空间是机器级全局的，per-user 用户名不阻止其他用户预占
 /// （`FILE_FLAG_FIRST_PIPE_INSTANCE` 下同名已存在 → daemon bind 失败 = 永久 DoS）；
+/// 从本地熵源生成 16 字节 xorshift 流并序列化为 32 位十六进制（两个
+/// 调用点共用；抽取前为逐字重复块，曾修一处漏一处——复审 D7）。
+#[cfg(windows)]
+fn random_token_hex() -> String {
+    let mut s = local_entropy_u64();
+    let mut bytes = [0u8; 16];
+    for b in bytes.iter_mut() {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        *b = (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u8;
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 不可预测后缀使预占者无法提前创建目标管道（架构审查 P1）。文件缺失时
 /// 返回**一次性随机后缀**（每次调用不同）：首启期间客户端每次 connect 落到
 /// 不同名称上，全部失败即拉起 daemon（其生成真 token 后重试读到）。固定
@@ -80,15 +95,7 @@ fn ipc_token() -> String {
         }
     }
     // 一次性随机后缀（不可预测、不持久化）：语义同真实 token。
-    let mut s = local_entropy_u64();
-    let mut bytes = [0u8; 16];
-    for b in bytes.iter_mut() {
-        s ^= s >> 12;
-        s ^= s << 25;
-        s ^= s >> 27;
-        *b = (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u8;
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    random_token_hex()
 }
 
 /// 生成并持久化连接令牌（daemon 启动时调用；Unix 无管道名问题，返回空）。
@@ -109,15 +116,7 @@ pub fn ensure_ipc_token() -> std::io::Result<()> {
             token_path.display()
         );
     }
-    let mut s = local_entropy_u64();
-    let mut bytes = [0u8; 16];
-    for b in bytes.iter_mut() {
-        s ^= s >> 12;
-        s ^= s << 25;
-        s ^= s >> 27;
-        *b = (s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u8;
-    }
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = random_token_hex();
     std::fs::write(&token_path, hex)
 }
 

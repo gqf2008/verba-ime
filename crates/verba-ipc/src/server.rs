@@ -110,6 +110,11 @@ async fn handle_connection(
 ) -> Result<(), IpcError> {
     let stream = Arc::new(stream);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+    // 在途请求计数：读循环的空闲超时只回收「真正闲着」的连接——LLM 流式生成
+    // 期间客户端发完 llm_start 后只是被动等事件、不再发任何帧，若按纯空闲
+    // 判定会在 >60s 的长生成中途掐断连接（客户端只见「连接中断」，v0.1 无此
+    // 超时故为回归）。有在途 handler 时跳过本次回收，再续一个超时窗口等待。
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let writer_stream = Arc::clone(&stream);
     let writer = tokio::spawn(async move {
@@ -124,7 +129,7 @@ async fn handle_connection(
     loop {
         let mut conn = &*stream;
         // 读帧 idle 超时（架构审查 P2-3）：慢/死客户端挂连接不回收会堆积
-        // reader/writer 任务；60s 无请求即断开。
+        // reader/writer 任务；60s 无请求且无在途流式处理即断开。
         let payload = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             read_frame_async(&mut conn),
@@ -135,6 +140,11 @@ async fn handle_connection(
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Ok(Err(e)) => return Err(IpcError::Io(e)),
             Err(_) => {
+                use std::sync::atomic::Ordering;
+                if pending.load(Ordering::SeqCst) > 0 {
+                    // 有在途流式处理（如长时间 LLM 生成）：不回收，续期再等。
+                    continue;
+                }
                 log::debug!("连接读空闲超时，回收");
                 break;
             }
@@ -148,8 +158,11 @@ async fn handle_connection(
         };
         let out = Outbound { tx: out_tx.clone() };
         let handler = Arc::clone(&handler);
+        let pending = Arc::clone(&pending);
         tokio::spawn(async move {
+            pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             handler.handle(conn_id, req, out).await;
+            pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
