@@ -149,8 +149,10 @@ pub struct CompositionMachine {
     /// 候选请求是否在途（已发出、Rime 结果未回）。
     /// 快速输入时若此刻按空格选首候选，会把拼音原文上屏——须暂缓到结果到达。
     candidates_in_flight: bool,
-    /// 在途期间按下的空格：候选回达后补执行候选 0 选择（无候选则按原文回退）。
-    space_deferred: bool,
+    /// 盲按窗口内暂缓的意图：候选在途且零已知真实结果时，空格/大写/标点
+    /// 的提交通道都不立即按原文提交——记下最新一次按键，结果 settle 后重放。
+    /// 最新击键覆盖旧暂缓（被替换的键已被吞，属盲按保护的可接受损失）。
+    deferred_intent: Option<DeferredIntent>,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
     /// AI 提示词（不含 `//` 前缀）。
@@ -190,6 +192,27 @@ fn fullwidth_punct(c: char) -> Option<char> {
     })
 }
 
+/// 该字符会被状态机标点路径消费（全角映射或成对引号交替）。
+///
+/// 供前端「是否认领该键」的路由判定（Windows TSF should_claim_key）：认领
+/// 后按键经状态机输出全角——此前 Windows 宿主直插半角与 macOS 契约不一致
+/// （跨平台审查发现）。判定与映射表同源，杜绝两端清单漂移。
+pub fn is_fullwidth_mapped_punct(c: char) -> bool {
+    c == '"' || c == '\'' || fullwidth_punct(c).is_some()
+}
+
+/// 盲按窗口内暂缓的提交意图（见 `deferred_intent` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredIntent {
+    /// 空格：settle 后有真实结果则选首候选；零结果不提交（展示合成项，
+    /// 再按一次空格才是知情选择）。
+    SelectSpace,
+    /// 大写字符：settle 后按「候选 0（或原文）+ 字符」通道补执行。
+    Uppercase(char),
+    /// 标点：settle 后按「候选 0（或原文）+ 全角标点」通道补执行。
+    Punct(char),
+}
+
 impl Default for CompositionMachine {
     fn default() -> Self {
         Self::new()
@@ -208,7 +231,7 @@ impl CompositionMachine {
             commit_offset: 0,
             last_candidates_request: None,
             candidates_in_flight: false,
-            space_deferred: false,
+            deferred_intent: None,
             pinyin_page: 0,
             prompt: String::new(),
             result: String::new(),
@@ -378,6 +401,12 @@ impl CompositionMachine {
         if c.is_ascii_alphabetic() {
             if c.is_ascii_uppercase() {
                 // 大写：提交当前候选（或原文）+ 该字符，避免吞字（与其它可打印字符一致）
+                if self.blind_window() {
+                    // 盲窗（查询在途且零已知结果）：按原文提交会带上拼音字母——
+                    // 与空格同走暂缓，settle 后重放本通道。
+                    self.deferred_intent = Some(DeferredIntent::Uppercase(c));
+                    return self.pinyin_action();
+                }
                 let text = format!("{}{c}", self.commit_pinyin_text());
                 self.reset_pinyin();
                 return Action::CommitImmediate(text);
@@ -395,10 +424,24 @@ impl CompositionMachine {
             return self.select_candidate(0);
         }
         // 其它可打印字符：提交候选 0 + 该字符，避免吞字；标点同时转全角
+        if self.blind_window() {
+            // 盲窗同上：暂缓到 settle 重放（在 punct_commit_text 之前登记，
+            // 引号交替等映射状态留待重放时恰好翻转一次）。
+            self.deferred_intent = Some(DeferredIntent::Punct(c));
+            return self.pinyin_action();
+        }
         let punct = self.punct_commit_text(c);
         let text = format!("{}{punct}", self.commit_pinyin_text());
         self.reset_pinyin();
         Action::CommitImmediate(text)
+    }
+
+    /// 盲按窗口：查询在途且尚无任何已知真实结果。此刻所有「候选优先、
+    /// 原文兜底」的提交通道都会退化为原文提交——即漏字，须暂缓。
+    fn blind_window(&self) -> bool {
+        self.candidates_in_flight
+            && self.dictionary_candidates.is_empty()
+            && self.llm_candidates.is_empty()
     }
 
     /// 提示词态的字符输入：支持拼音组合（字母→候选→选中上屏到提示词）。
@@ -597,7 +640,7 @@ impl CompositionMachine {
                 self.commit_offset = 0;
                 self.last_candidates_request = None;
                 self.candidates_in_flight = false;
-                self.space_deferred = false;
+                self.deferred_intent = None;
                 self.prompt.clear();
                 self.result.clear();
                 Action::Cancel
@@ -654,13 +697,13 @@ impl CompositionMachine {
                 //
                 // 暂缓后的**重复**空格 = 知情回退：结果迟迟未达（守护重启、查询
                 // 被更新的请求取代、连接失效等极端场景下可能永不回达），再按一次
-                // 空格说明用户明确要上屏——按原文提交并清掉暂缓标记，避免无限吞键。
+                // 空格说明用户明确要上屏——按原文提交并清掉暂缓，避免无限吞键。
                 // 与「终结空结果展示原文条目后，再按空格是知情选择」同一语义通道。
-                if !self.space_deferred {
-                    self.space_deferred = true;
+                if self.deferred_intent != Some(DeferredIntent::SelectSpace) {
+                    self.deferred_intent = Some(DeferredIntent::SelectSpace);
                     return Action::None;
                 }
-                self.space_deferred = false;
+                self.deferred_intent = None;
                 let text = format!("{}{}", self.committed_text(), self.active_pinyin());
                 self.reset_pinyin();
                 return Action::CommitImmediate(text);
@@ -703,7 +746,7 @@ impl CompositionMachine {
         self.commit_offset = 0;
         self.last_candidates_request = None;
         self.candidates_in_flight = false;
-        self.space_deferred = false;
+        self.deferred_intent = None;
         self.pinyin_page = 0;
     }
 
@@ -752,7 +795,7 @@ impl CompositionMachine {
         self.commit_offset = 0;
         self.last_candidates_request = None;
         self.candidates_in_flight = false;
-        self.space_deferred = false;
+        self.deferred_intent = None;
         self.pinyin_page = 0;
     }
 
@@ -897,24 +940,45 @@ impl CompositionMachine {
         if done || changed {
             self.fuse_candidates();
         }
-        // 在途期间暂缓的空格：结果到达后补执行。但若结果「全空、只剩合成
-        // 原文项」，不自动提交——按空格那一刻用户还没见过面板（快打场景），
-        // 盲提原文即漏字（真机：「kjf是埃迪卡拉纪」的前半段）。吞掉该键、
-        // 组合保留；原文条目此刻已在面板上，再按一次空格才是知情选择。
-        if self.space_deferred {
-            self.space_deferred = false;
+        // 在途期间暂缓的意图：结果到达（done）后补执行。
+        //
+        // 空格的零结果分支不自动提交——按空格那一刻用户还没见过面板（快打
+        // 场景），盲提原文即漏字（真机：「kjf是埃迪卡拉纪」的前半段）。吞掉
+        // 该键、组合保留；原文条目此刻已在面板上，再按一次空格才是知情选择。
+        //
+        // 大写/标点不同：按下的是明确的「收尾字符」，意图是「文本＋后缀」
+        // 完整单元。settle 时刻合成项已可见，无论有无真实候选都执行提交：
+        // 有则选中首候选再接后缀，无则原文接后缀（全角映射/引号交替照常，
+        // 且恰好只翻转一次）。若查询永不回达则无 settle、无重放——该路径由
+        // 「重复按键 = 最新意图覆盖」或 Esc 复位解除，不会无限挂起。
+        if let Some(intent) = self.deferred_intent.take() {
             let has_real =
                 !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
-            if has_real {
-                return self.select_candidate(0);
+            match intent {
+                DeferredIntent::SelectSpace => {
+                    if has_real {
+                        return self.select_candidate(0);
+                    }
+                    self.refresh_candidates();
+                    return Action::UpdatePinyin {
+                        preedit: self.pinyin_composition_preedit(),
+                        candidates: self.display_candidate_texts(),
+                        page: self.pinyin_page,
+                        llm_request: None,
+                    };
+                }
+                DeferredIntent::Uppercase(ch) => {
+                    let text = format!("{}{ch}", self.commit_pinyin_text());
+                    self.reset_pinyin();
+                    return Action::CommitImmediate(text);
+                }
+                DeferredIntent::Punct(ch) => {
+                    let punct = self.punct_commit_text(ch);
+                    let text = format!("{}{punct}", self.commit_pinyin_text());
+                    self.reset_pinyin();
+                    return Action::CommitImmediate(text);
+                }
             }
-            self.refresh_candidates();
-            return Action::UpdatePinyin {
-                preedit: self.pinyin_composition_preedit(),
-                candidates: self.display_candidate_texts(),
-                page: self.pinyin_page,
-                llm_request: None,
-            };
         }
         // 仅当公开候选列表实际变化时发刷新（done 但列表未变的重复注入
         // 不重复推送），合成项的首次出现也走此通道到前端。
@@ -1336,10 +1400,33 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
+        // 有真实结果（非盲窗）：候选优先 + 全角标点
+        rime(&mut m, "ni", &["你"]);
         let a = m.feed_char(',');
         assert!(
-            matches!(a, Action::CommitImmediate(_)),
+            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
             "标点应提交候选+标点，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    #[test]
+    fn pinyin_punctuation_blind_window_defers_then_settles() {
+        // 盲窗（在途且零已知结果）：标点不立即按原文提交，暂缓到 settle 重放。
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        let a = m.feed_char(',');
+        assert!(
+            matches!(a, Action::UpdatePinyin { .. }),
+            "盲窗应暂缓，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin);
+        // settle 空结果：原文 + 全角后缀（此刻合成项已可见，知情提交）
+        let a = m.on_llm_candidates("ni", &[], true);
+        assert!(
+            matches!(a, Action::CommitImmediate(ref t) if t == "ni，"),
+            "settle 应重放为原文+全角，实际 {a:?}"
         );
         assert_eq!(m.state(), MachineState::Idle);
     }
@@ -1912,5 +1999,153 @@ mod tests {
             "重复空格知情回退原文"
         );
         assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 大写盲窗暂缓：settle 有真实结果 → 首候选 + 大写字符。
+    #[test]
+    fn uppercase_blind_window_defers_then_appends_candidate() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        let a = m.feed_char('A');
+        assert!(
+            matches!(a, Action::UpdatePinyin { .. }),
+            "盲窗大写应暂缓，实际 {a:?}"
+        );
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你A"),
+            "settle 应重放为候选+大写，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 大写盲窗暂缓、settle 空结果 → 原文 + 大写字符（收尾单元知情提交，
+    /// 与空格的「展示后二次确认」分流——按下即明确的文本+后缀意图）。
+    #[test]
+    fn uppercase_blind_window_settles_empty_commits_raw() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char('A'), Action::UpdatePinyin { .. }));
+        let a = m.on_llm_candidates("ni", &[], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "niA"),
+            "settle 空结果应原文+大写，实际 {a:?}"
+        );
+    }
+
+    /// 标点盲窗暂缓、settle 有结果 → 候选 + 全角标点。
+    #[test]
+    fn punct_blind_window_defers_then_fullwidth() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
+            "settle 应重放为候选+全角，实际 {a:?}"
+        );
+    }
+
+    /// 最新意图覆盖旧暂缓：在途按了空格又按标点，settle 只重放标点
+    /// （被替换的键已被吞，属盲按保护的可接受损失），且只产生一次提交。
+    #[test]
+    fn latest_intent_replaces_pending() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "空格先暂缓");
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
+            "应只重放最新的标点意图，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 成对引号跨暂缓重放：交替状态恰好在重放时翻转一次，之后延续。
+    #[test]
+    fn paired_quote_alternates_across_deferred_flush() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char('"'), Action::UpdatePinyin { .. }));
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你“"),
+            "重放应为候选+开引号，实际 {a:?}"
+        );
+        // 组合已复回 Idle：下一个双引号是闭引号（交替延续）
+        assert_eq!(
+            m.feed_char('"'),
+            Action::CommitImmediate("”".into()),
+            "重放外的下一引号应为闭引号"
+        );
+    }
+
+    /// 在途暂缓期间缓冲继续增长：settle 按当前全长拼音补执行（选择/回退
+    /// 都以增长后的 buffer 为准，行为与无暂缓的即时路径一致）。
+    #[test]
+    fn deferred_space_settles_against_grown_buffer() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        assert_eq!(m.feed_char(' '), Action::None, "在途空格暂缓");
+        m.feed_char('i');
+        m.feed_char('k');
+        // 结果针对增长后的 "nik" 到达：整段提交
+        let a = m.on_llm_candidates("nik", &["你好".into()], true);
+        assert!(
+            matches!(&a, Action::CommitImmediate(t) if t == "你好"),
+            "增长后的 settle 应选全长首候选，实际 {a:?}"
+        );
+    }
+
+    /// 数字选字在途忽略行为钉住：查询未达时数字键无效且不吞组合；结果到达
+    /// 后同一数字正常选词。
+    #[test]
+    fn digit_while_in_flight_ignored_until_results() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(
+            m.feed_char('2'),
+            Action::None,
+            "在途数字键应忽略（idx 越界保护）"
+        );
+        assert_eq!(m.state(), MachineState::Pinyin, "忽略不得破坏组合");
+        rime(&mut m, "ni", &["你", "呢"]);
+        assert_eq!(m.feed_char('2'), Action::CommitImmediate("呢".into()));
+    }
+
+    /// 组合长度到顶（48）后：继续输入被吞，退格仍可删（P2 语义承诺）。
+    #[test]
+    fn cap_backspace_still_deletes_at_max_buffer() {
+        let mut m = CompositionMachine::new();
+        for _ in 0..CompositionMachine::MAX_PINYIN_BUFFER {
+            m.feed_char('a');
+        }
+        let before_len = CompositionMachine::MAX_PINYIN_BUFFER;
+        m.feed_char('b');
+        let remains = match m.feed_backspace() {
+            Action::UpdatePinyin { preedit, .. } => preedit,
+            other => panic!("退格应刷新组合，实际 {other:?}"),
+        };
+        assert_eq!(remains.len(), before_len - 1, "封顶后退格应删掉一个字母");
+    }
+
+    /// PendingSlash 回退保持半角字面前缀语义（产品裁决 2026-08-27）：
+    /// '/' 后的非 '/' 字符（含标点）恒以 "/x" 半角直出，不走全角映射。
+    #[test]
+    fn slash_fallback_keeps_halfwidth_literal() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        // '/' 先提交拼音并进入 PendingSlash
+        assert_eq!(m.feed_char('/'), Action::CommitImmediate("ni".into()));
+        let a = m.feed_char(',');
+        assert_eq!(a, Action::CommitImmediate("/,".into()), "斜杠通道半角直出");
     }
 }
