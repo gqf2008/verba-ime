@@ -1,0 +1,7 @@
+# 全仓库统一工具链（CI 的 dtolnay/rust-toolchain 会优先读本文件；本地 rustup
+# 自动按此版本解析）。pin 到具体补丁版而非 stable 浮动：rustfmt 各版本断行
+# 规则存在差异（1.98 曾改写窄行拆分），浮动会让「本地 fmt 过、CI Format 红」
+# 反复出现。升级时同步改这一行并全仓 cargo fmt 一轮。
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

@@ -70,9 +70,9 @@ fn init_file_logger() {
         return;
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-        .target(env_logger::Target::Pipe(Box::new(LogPipe(std::sync::Mutex::new(
-            file,
-        )))))
+        .target(env_logger::Target::Pipe(Box::new(LogPipe(
+            std::sync::Mutex::new(file),
+        ))))
         .init();
 }
 
@@ -1195,7 +1195,8 @@ impl VerbaIMKController {
             // 属性：按键先送控制器（默认面板优先——数字/退格被面板吞掉且不回调
             // candidateSelected:，导致选词失效）；字体加大、近不透明，改善默认样式。
             let font = NSFont::systemFontOfSize(17.0);
-            let yes: Retained<NSNumber> = unsafe { msg_send![NSNumber::class(), numberWithBool: true] };
+            let yes: Retained<NSNumber> =
+                unsafe { msg_send![NSNumber::class(), numberWithBool: true] };
             let font_obj: &NSObject = &font;
             let yes_obj: &NSObject = &yes;
             // SAFETY: extern static 常量由系统框架提供，只读访问。
@@ -1251,7 +1252,10 @@ impl VerbaIMKController {
             self.host_call("hide", || unsafe { ui.hide() });
             // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（主线程）。
             let still = unsafe { ui.isVisible() };
-            dbg_log(&format!("hide_candidate_window after-hide isVisible={}", still));
+            dbg_log(&format!(
+                "hide_candidate_window after-hide isVisible={}",
+                still
+            ));
         }
     }
 
@@ -1424,7 +1428,8 @@ impl VerbaIMKController {
                 };
                 // 是否当前请求的拼音（决定 done+空候选时能否收起候选窗：迟到事件
                 // 不得影响正在展示的新候选）。
-                let is_current = self.ivars().candidate_pinyin.borrow().as_deref() == Some(pinyin.as_str());
+                let is_current =
+                    self.ivars().candidate_pinyin.borrow().as_deref() == Some(pinyin.as_str());
                 let action = self.ivars().machine.borrow_mut().on_llm_candidates(
                     &pinyin,
                     &c.candidates,
@@ -1468,11 +1473,11 @@ impl VerbaIMKController {
                 // 错误也是查询终结：以空结果通知状态机，释放在途标记并补执行
                 // 暂缓的空格（无候选按原文回退），避免按键被吞。
                 if let Some(py) = pinyin {
-                    let action = self
-                        .ivars()
-                        .machine
-                        .borrow_mut()
-                        .on_llm_candidates(&py, &[], true);
+                    let action =
+                        self.ivars()
+                            .machine
+                            .borrow_mut()
+                            .on_llm_candidates(&py, &[], true);
                     let _ = self.apply_action(action);
                 }
             }
