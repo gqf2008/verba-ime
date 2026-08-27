@@ -1122,21 +1122,8 @@ fn migrate_legacy_user_data(exe_dir: &std::path::Path, new_user_dir: &std::path:
     if !old.is_dir() || new_user_dir.exists() {
         return;
     }
-    let copy = || -> std::io::Result<()> {
-        std::fs::create_dir_all(new_user_dir)?;
-        for entry in std::fs::read_dir(&old)? {
-            let entry = entry?;
-            let src = entry.path();
-            let dst = new_user_dir.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                copy_dir_all(&src, &dst)?;
-            } else {
-                std::fs::copy(&src, &dst)?;
-            }
-        }
-        Ok(())
-    };
-    match copy() {
+    // copy_dir_all 自带 create_dir_all(to)，无需外层再建目录。
+    match copy_dir_all(&old, new_user_dir) {
         Ok(()) => log::info!(
             "Rime user_data 已从旧位置迁移: {} -> {}",
             old.display(),
@@ -1283,5 +1270,63 @@ mod tests {
         assert!(!history_snapshot(&store, 9999, 2).is_empty(), "新会话保留");
         // 次旧的 session 2 仍在（只逐出一个）。
         assert!(!history_snapshot(&store, 2, 2).is_empty());
+    }
+
+    /// 构造一个唯一的临时目录（测试结束由调用方自行清理）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "verba-mig-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn migrate_legacy_user_data_copies_tree() {
+        // 复审发现的缺口：迁移函数此前无任何测试。锁定「目录树整体搬迁 +
+        // 嵌套子目录 + 新目录已存在时跳过」三个行为。
+        let base = temp_dir("copy");
+        let exe_dir = base.join("app");
+        let old = exe_dir.join("rime").join("user_data");
+        std::fs::create_dir_all(old.join("opencc")).unwrap();
+        std::fs::write(old.join("default.custom.yaml"), "patch:\n").unwrap();
+        std::fs::write(old.join("opencc").join("t2s.txt"), "中→忠\n").unwrap();
+        let new_user = base.join("userdata");
+
+        migrate_legacy_user_data(&exe_dir, &new_user);
+        assert_eq!(
+            std::fs::read_to_string(new_user.join("default.custom.yaml")).unwrap(),
+            "patch:\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_user.join("opencc").join("t2s.txt")).unwrap(),
+            "中→忠\n",
+            "嵌套子目录应一并复制"
+        );
+
+        // 已迁移（新目录存在）：再次执行不得改动新目录内容。
+        std::fs::write(new_user.join("marker"), "kept").unwrap();
+        migrate_legacy_user_data(&exe_dir, &new_user);
+        assert_eq!(
+            std::fs::read_to_string(new_user.join("marker")).unwrap(),
+            "kept"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_legacy_user_data_missing_old_is_noop() {
+        let base = temp_dir("noop");
+        let exe_dir = base.join("app"); // 不存在 rime/user_data
+        let new_user = base.join("userdata");
+        migrate_legacy_user_data(&exe_dir, &new_user);
+        assert!(!new_user.exists(), "旧位置缺失时应完全不触碰新目录");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
