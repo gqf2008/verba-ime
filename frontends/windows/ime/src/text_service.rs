@@ -334,6 +334,13 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     }
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
+    // Ctrl/Alt 按下时不做字符认领：字母键在 Ctrl 下 ToUnicodeEx 返回控制字符
+    // 本就不命中认领，但 OEM 标点（. , 等）仍返回普通字符——Idle/Pinyin 新
+    // 认领的标点会把应用快捷键吞掉（如 VS Code 的 Ctrl+. 快速修复）。热键与
+    // 控制/翻页键分支不受影响（沿用既有语义；实机验收项在 issue #44）。
+    if ctrl_or_alt_held() {
+        return false;
+    }
     match state {
         MachineState::Idle => match get_char_for_vk(vk, lparam) {
             // 认领 `/`（AI 触发）、字母（进入拼音组合）、状态机标点（全角映射
@@ -362,6 +369,14 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
             }
             get_char_for_vk(vk, lparam).is_some()
         }
+    }
+}
+
+/// Ctrl 或 Alt 当前按下（GetKeyState 高位；与既有热键判定同一套位约定）。
+fn ctrl_or_alt_held() -> bool {
+    unsafe {
+        (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            || (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
     }
 }
 
@@ -1794,11 +1809,14 @@ mod tests {
     /// 与 macOS 契约对齐）；未映射字符不认领。
     #[test]
     fn claim_chars_cover_machine_punct() {
-        for c in [',', '.', ';', ':', '?', '!', '(', ')', '[', ']', '"', '\'', '-', '=', '~'] {
+        for c in [',', '.', ';', ':', '?', '!', '(', ')', '[', ']', '"', '\'', '-', '~'] {
             assert!(idle_claim_char(c), "Idle 应认领 {c:?}");
             assert!(pinyin_claim_char(c), "Pinyin 应认领 {c:?}");
         }
         assert!(idle_claim_char('/'));
+        // '=' 不在映射表内（仅拼音态翻页键）：两态差异钉住
+        assert!(pinyin_claim_char('='));
+        assert!(!idle_claim_char('='), "'=' 非映射标点，Idle 不认领");
         assert!(!idle_claim_char('`'), "未映射符号不认领");
         assert!(!idle_claim_char(' '), "空格 Idle 不认领（保持原语义）");
         assert!(pinyin_claim_char('2') && pinyin_claim_char(' '));
