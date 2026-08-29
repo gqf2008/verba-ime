@@ -3,7 +3,7 @@
 ; 版本: 发布流水线用 /DMyAppVersion 注入根 Cargo.toml 的 workspace 版本（见 docs/building.md）。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.2"
+  #define MyAppVersion "0.2.3"
 #endif
 
 #define AppName "Verba 拾言输入法"
