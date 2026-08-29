@@ -561,7 +561,11 @@ mod tests {
         ];
         for (y, x) in samples {
             let i = (y * out.width + x) as usize * 4;
-            assert_eq!(out.pixels[i + 3], 255, "({x},{y}) alpha 应为 255，实际全透明");
+            assert_eq!(
+                out.pixels[i + 3],
+                255,
+                "({x},{y}) alpha 应为 255，实际全透明"
+            );
         }
         // 恒等对照：scale=1.0 的输出同样不透明（原路径回归保护）。
         let out1 = renderer.render(&ctrl);
