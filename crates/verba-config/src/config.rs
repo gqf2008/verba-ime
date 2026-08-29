@@ -14,7 +14,7 @@ const KEYRING_USER: &str = "llm_api_key";
 const ENV_API_KEY: &str = "VERBA_API_KEY";
 
 const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com/v1";
-const DEFAULT_LLM_MODEL: &str = "deepseek-chat";
+const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_MAX_TOKENS: i32 = 1024;
 const DEFAULT_ASR_MODEL: &str = "whisper-1";
