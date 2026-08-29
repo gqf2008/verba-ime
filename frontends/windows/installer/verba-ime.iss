@@ -23,6 +23,7 @@ SolidCompression=yes
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
+SetupIconFile=..\..\..\assets\branding\verba.ico
 
 [Files]
 ; 先构建（见 docs/building.md），产物路径依 release 构建调整
@@ -43,4 +44,5 @@ Filename: "{app}\verba-reg.exe"; Parameters: "register ""{app}\verba_ime_windows
 Filename: "{app}\verba-reg.exe"; Parameters: "unregister"; Flags: runhidden
 
 [Icons]
-Name: "{autoprograms}\Verba 设置"; Filename: "{app}\verba-settings.exe"
+Name: "{autoprograms}\Verba 设置"; Filename: "{app}\verba-settings.exe"; IconFilename: "{app}\verba-settings.exe"
+Name: "{autodesktop}\Verba 设置"; Filename: "{app}\verba-settings.exe"; IconFilename: "{app}\verba-settings.exe"

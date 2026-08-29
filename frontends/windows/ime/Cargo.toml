@@ -10,6 +10,9 @@ description = "Verba Windows TSF 文本服务前端（输入法 DLL）"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+embed-resource = "2"
+
 [[bin]]
 name = "verba-reg"
 path = "src/bin/verba-reg.rs"

@@ -23,4 +23,5 @@ env_logger.workspace = true
 
 [build-dependencies]
 slint-build = "=1.17.1"
+embed-resource = "2"
 
