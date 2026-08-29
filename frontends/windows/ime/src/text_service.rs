@@ -23,7 +23,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_UP,
+    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_UP,
 };
 
 use crate::capture::capture_primary_screen;
@@ -1362,7 +1362,9 @@ fn prewarm_daemon(data: &Rc<TextServiceData>) {
 
 /// 触发热键判定（需 Ctrl+Alt 修饰）：Ctrl+Alt+O = 截图 OCR，Ctrl+Alt+M = 录音 ASR。
 fn is_trigger_hotkey(vk: u32) -> bool {
-    if vk != VK_O.0 as u32 && vk != VK_M.0 as u32 {
+    // Ctrl+Alt+O = 截图 OCR；Ctrl+Alt+S = 打开设置面板。
+    // Ctrl+Alt+M（听写 ASR）随 ASR 冻结为实验性移除（#78 范围决策）。
+    if vk != VK_O.0 as u32 && vk != VK_S.0 as u32 {
         return false;
     }
     unsafe {
@@ -1376,10 +1378,16 @@ fn trigger_kind_for_vk(vk: u32) -> Option<TriggerKind> {
     if !is_trigger_hotkey(vk) {
         return None;
     }
+    trigger_kind_for_hotkey_vk(vk)
+}
+
+/// 热键键集合内的按键 → 任务类型（纯函数，供单测钉住；
+/// Ctrl+Alt 修饰在位性由 is_trigger_hotkey 判定）。
+fn trigger_kind_for_hotkey_vk(vk: u32) -> Option<TriggerKind> {
     if vk == VK_O.0 as u32 {
         Some(TriggerKind::Ocr)
-    } else if vk == VK_M.0 as u32 {
-        Some(TriggerKind::Asr)
+    } else if vk == VK_S.0 as u32 {
+        Some(TriggerKind::OpenSettings)
     } else {
         None
     }
@@ -1392,8 +1400,36 @@ enum TriggerKind {
     Ocr,
     /// 全屏截图 OCR（`//截图`，无遴罩）。
     OcrFullScreen,
-    /// 录音 ASR。
+    /// 打开设置面板（Ctrl+Alt+S）。
+    OpenSettings,
+    /// 录音 ASR（`//听写` 命令保留；热键随 ASR 冻结移除）。
     Asr,
+}
+
+/// 启动设置面板（verba-settings.exe）：DLL 同目录 → 安装目录 → 稳定目录
+/// （%LOCALAPPDATA%\Verba\ime）。GUI 应用，spawn 后分离（不阻塞 TSF 线程）。
+fn open_settings() {
+    use std::path::PathBuf;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(dll) = crate::reg::dll_path() {
+        candidates.push(dll.with_file_name("verba-settings.exe"));
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files\Verba\verba-settings.exe"));
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(appdata).join("Verba").join("ime").join("verba-settings.exe"));
+    }
+    for p in &candidates {
+        if p.exists() {
+            match std::process::Command::new(p).spawn() {
+                Ok(_) => {
+                    log::info!("打开设置面板: {}", p.display());
+                    return;
+                }
+                Err(e) => log::warn!("启动设置面板失败 {}: {e}", p.display()),
+            }
+        }
+    }
+    log::warn!("未找到 verba-settings.exe（候选: {candidates:?}）");
 }
 
 /// 后台执行触发任务（采集 + daemon 识别），结果入队由定时器上屏。
@@ -1410,6 +1446,10 @@ fn trigger_async(data: &Rc<TextServiceData>, kind: TriggerKind) {
                 }
             },
             TriggerKind::OcrFullScreen => ocr_full_screen(),
+            TriggerKind::OpenSettings => {
+                open_settings();
+                return;
+            }
             TriggerKind::Asr => {
                 let wav = match record_seconds(ASR_RECORD_SECONDS) {
                     Ok(w) => w,
@@ -1869,7 +1909,25 @@ mod tests {
     fn trigger_kind_requires_modifier_but_maps_vk() {
         // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
         assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
+        // Ctrl+Alt+M（听写）随 ASR 冻结移除（#78）；S = 打开设置。
         assert_eq!(trigger_kind_for_vk(VK_M.0 as u32), None);
+        assert_eq!(trigger_kind_for_vk(VK_S.0 as u32), None);
+    }
+
+    #[test]
+    fn settings_hotkey_maps_open_settings_kind() {
+        // 热键映射纯函数：O → Ocr，S → OpenSettings，M → 已移除（None）。
+        assert_eq!(
+            trigger_kind_for_hotkey_vk(VK_O.0 as u32),
+            Some(TriggerKind::Ocr)
+        );
+        assert_eq!(
+            trigger_kind_for_hotkey_vk(VK_S.0 as u32),
+            Some(TriggerKind::OpenSettings)
+        );
+        assert_eq!(trigger_kind_for_hotkey_vk(VK_M.0 as u32), None, "M 热键已移除");
+        // 其他键不在热键集合
+        assert_eq!(trigger_kind_for_hotkey_vk(VK_UP.0 as u32), None);
     }
 
     #[test]
