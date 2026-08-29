@@ -176,6 +176,8 @@ enum PendingKey {
     Escape,
     PageUp,
     PageDown,
+    ArrowUp,
+    ArrowDown,
 }
 
 fn llm_queue() -> &'static Mutex<VecDeque<LlmItem>> {
@@ -583,6 +585,8 @@ define_class!(
                         ImkKey::Escape => PendingKey::Escape,
                         ImkKey::PageUp => PendingKey::PageUp,
                         ImkKey::PageDown => PendingKey::PageDown,
+                        ImkKey::ArrowUp => PendingKey::ArrowUp,
+                        ImkKey::ArrowDown => PendingKey::ArrowDown,
                     };
                     self.ivars().pending_keys.borrow_mut().push_back(pk);
                     return Bool::new(true);
@@ -628,6 +632,18 @@ define_class!(
                 Some(ImkKey::Escape) => self.ivars().machine.borrow_mut().feed_escape(),
                 Some(ImkKey::PageUp) => self.ivars().machine.borrow_mut().feed_page_up(),
                 Some(ImkKey::PageDown) => self.ivars().machine.borrow_mut().feed_page_down(),
+                Some(ImkKey::ArrowUp) | Some(ImkKey::ArrowDown) => {
+                    // 无候选时方向键交宿主（光标在组合串内移动）；有候选才选字。
+                    if self.ivars().candidates.borrow().is_empty() {
+                        dbg_log("inputText arrow without candidates -> return false（宿主光标）");
+                        return Bool::new(false);
+                    }
+                    if matches!(key, Some(ImkKey::ArrowUp)) {
+                        self.ivars().machine.borrow_mut().feed_arrow_up()
+                    } else {
+                        self.ivars().machine.borrow_mut().feed_arrow_down()
+                    }
+                }
                 None => {
                     dbg_log("inputText classify None -> return false（宿主直插）");
                     return Bool::new(false);
@@ -859,6 +875,8 @@ enum ImkKey {
     Escape,
     PageUp,
     PageDown,
+    ArrowUp,
+    ArrowDown,
 }
 
 /// 候选分页切片（纯逻辑，供 candidates: 数据源与测试复用）。
@@ -902,6 +920,9 @@ fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey
         // 左箭头：上一页；右箭头：下一页
         123 => Some(ImkKey::PageUp),
         124 => Some(ImkKey::PageDown),
+        // 上/下箭头：候选选中移动（跨页遍历）
+        126 => Some(ImkKey::ArrowUp),
+        125 => Some(ImkKey::ArrowDown),
         // 其余 keyCode 交给字符分支
         _ => string
             .and_then(|s| s.to_string().chars().next())
@@ -1064,6 +1085,8 @@ impl VerbaIMKController {
                         PendingKey::Escape => m.feed_escape(),
                         PendingKey::PageUp => m.feed_page_up(),
                         PendingKey::PageDown => m.feed_page_down(),
+                        PendingKey::ArrowUp => m.feed_arrow_up(),
+                        PendingKey::ArrowDown => m.feed_arrow_down(),
                         PendingKey::Paste(_) => unreachable!("上方分支已处理"),
                     }
                 };
