@@ -211,6 +211,7 @@ impl ITfDisplayAttributeProvider_Impl for TextService_Impl {
         unsafe { p.EnumDisplayAttributeInfo() }
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn GetDisplayAttributeInfo(
         &self,
         guid: *const windows::core::GUID,
@@ -1321,7 +1322,7 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
         if let Some(raw) = timer_hwnd {
             unsafe {
                 let hwnd = HWND(raw as *mut core::ffi::c_void);
-                let _ = PostMessageW(Some(hwnd), WM_TIMER, WPARAM(TIMER_ID as usize), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_TIMER, WPARAM(TIMER_ID), LPARAM(0));
             }
         }
     });

@@ -481,12 +481,18 @@ mod tests {
         assert_eq!(s.font_size, (t.font_size as f32 * 1.5).round() as u32);
         assert_eq!(s.padding, (t.padding as f32 * 1.5).round() as u32);
         assert_eq!(s.item_height, (t.item_height as f32 * 1.5).round() as u32);
-        assert_eq!(s.header_height, (t.header_height as f32 * 1.5).round() as u32);
+        assert_eq!(
+            s.header_height,
+            (t.header_height as f32 * 1.5).round() as u32
+        );
         assert_eq!(
             s.max_width_horizontal,
             (t.max_width_horizontal as f32 * 1.5).round() as u32
         );
-        assert_eq!(s.corner_radius, (t.corner_radius as f32 * 1.5).round() as u32);
+        assert_eq!(
+            s.corner_radius,
+            (t.corner_radius as f32 * 1.5).round() as u32
+        );
         assert_eq!(s.page_size, t.page_size, "候选数量不缩放");
         assert_eq!(s.background, t.background, "颜色不缩放");
         assert_eq!(s.layout, t.layout, "布局不缩放");
