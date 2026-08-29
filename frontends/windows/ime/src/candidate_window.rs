@@ -12,10 +12,12 @@ use windows::Win32::Graphics::Gdi::{
     StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, RegisterClassW, SetWindowPos,
+    ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::dll;
@@ -40,6 +42,9 @@ pub struct CandidateWindow {
     renderer: CpuCandidateRenderer,
     width: u32,
     height: u32,
+    /// 已设置的窗口区域参数 (w, h, radius)；(0, 0, 0) = 尚未设置。
+    /// SetWindowRgn 即使同区域也会触发表面重绘，参数未变时必须跳过。
+    region_state: (u32, u32, u32),
 }
 
 impl CandidateWindow {
@@ -91,6 +96,7 @@ impl CandidateWindow {
                 renderer: CpuCandidateRenderer::new(),
                 width: 10,
                 height: 10,
+                region_state: (0, 0, 0),
             })
         }
     }
@@ -102,36 +108,73 @@ impl CandidateWindow {
             self.hide();
             return;
         }
-        let (w, h) = window_size(ctrl);
+        // DPI 缩放：候选窗在物理像素坐标系渲染（DPI-aware 进程的 HWND），
+        // 高分屏（Windows 缩放 > 100%）下须把逻辑主题 × scale 输出，否则
+        // 窗口和文字只有期望的 1/scale 大小（实测 150% 屏上候选框小 1/3）。
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        // GetDpiForWindow 失败返回 0（窗口 DPI 上下文异常/未初始化时），
+        // 按 96（1:1）兜底——绝不让 scale=0 把主题尺寸全部缩成 1px
+        // （候选窗将不可见）。日志记录实际 dpi 便于真机排查。
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        let ctrl = if (scale - 1.0).abs() > f32::EPSILON {
+            ctrl.scaled(scale)
+        } else {
+            ctrl.clone()
+        };
+        let (w, h) = window_size(&ctrl);
         let (px, py) = fit_position(
             anchor,
             w as i32,
             h as i32,
             monitor_work_area(anchor.0, anchor.2),
         );
-        let out = self.renderer.render(ctrl);
-        unsafe {
-            // RGBA（预乘）→ BGRA（GDI 32bpp 内存序）
-            let mut bgra = vec![0u8; out.pixels.len()];
-            for (i, px) in out.pixels.as_chunks::<4>().0.iter().enumerate() {
-                let o = i * 4;
-                bgra[o] = px[2];
-                bgra[o + 1] = px[1];
-                bgra[o + 2] = px[0];
-                bgra[o + 3] = px[3];
-            }
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(h as i32), // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
+        log::info!(
+            "候选窗渲染 dpi={dpi} scale={scale} size={w}x{h} pos=({px},{py}) anchor=({},{},{})",
+            anchor.0,
+            anchor.1,
+            anchor.2
+        );
+        let out = self.renderer.render(&ctrl);
+        // RGBA（预乘）→ BGRA（GDI 32bpp 内存序）
+        let mut bgra = vec![0u8; out.pixels.len()];
+        for (i, px) in out.pixels.as_chunks::<4>().0.iter().enumerate() {
+            let o = i * 4;
+            bgra[o] = px[2];
+            bgra[o + 1] = px[1];
+            bgra[o + 2] = px[0];
+            bgra[o + 3] = px[3];
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
                 ..Default::default()
-            };
+            },
+            ..Default::default()
+        };
+        unsafe {
+            // 顺序（真机踩坑）：①定位+显示 ②圆角裁剪 ③最后 blit 内容。
+            // SetWindowRgn(bRedraw=true) 会触发窗口表面重绘，若在 blit 之后
+            // 调用会清掉刚画的内容（GDI 窗口不走 WM_PAINT，无人补画）——
+            // 真机表现为候选窗时隐时现：首次显示空表面，下次击键重画才恢复。
+            let pos_result = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                px,
+                py,
+                w as i32,
+                h as i32,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let shown = ShowWindow(self.hwnd, SW_SHOWNA);
+            if self.region_state != (w, h, ctrl.theme().corner_radius) {
+                apply_window_region(self.hwnd, w, h, ctrl.theme().corner_radius);
+                self.region_state = (w, h, ctrl.theme().corner_radius);
+            }
             let dc = GetDC(Some(self.hwnd));
             let _ = StretchDIBits(
                 dc,
@@ -149,22 +192,17 @@ impl CandidateWindow {
                 SRCCOPY,
             );
             let _ = ReleaseDC(Some(self.hwnd), dc);
-
+            log::info!(
+                "候选窗 SetWindowPos={:?} ShowWindow(prev_visible={}) 现可见={}",
+                pos_result,
+                shown.as_bool(),
+                IsWindowVisible(self.hwnd).as_bool()
+            );
             if w != self.width || h != self.height {
                 self.width = w;
                 self.height = h;
             }
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                px,
-                py,
-                w as i32,
-                h as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
         }
-        apply_window_region(self.hwnd, w, h, ctrl.theme().corner_radius);
     }
 
     /// 仅移动位置（组合布局就绪后定时器重试精确定位时调用）。
@@ -198,14 +236,30 @@ impl CandidateWindow {
 /// 智能定位：默认候选窗出现在光标正下方；下方放不下翻到上方；
 /// 上下都放不下时选空间更大的一侧贴边；水平越界平移回工作区内。
 /// `anchor` = (x, top, bottom)，`work` 为光标所在显示器工作区（不含任务栏）。
+///
+/// 防御：部分应用的 TSF 布局实现（Windows Terminal 的 GetTextExt 实测
+/// 会把滚动偏移算进坐标，光标在底部时返回 y 超出屏幕数百像素）会给出
+/// 越界锚点。此时先把锚点整行平移钳进工作区（保持行高，避免逐键漂移），
+/// 再按常规逻辑定位——保证候选窗永远落在工作区内（宁可贴边可见，
+/// 不可丢出屏幕）。
 fn fit_position(anchor: (i32, i32, i32), w: i32, h: i32, work: RECT) -> (i32, i32) {
-    let (x, top, bottom) = anchor;
+    let (x, mut top, mut bottom) = anchor;
+    // 锚点钳制（垂直）：整行越界时平移进工作区，保持行高。
+    let line_h = (bottom - top).max(1);
+    if bottom > work.bottom {
+        bottom = work.bottom;
+        top = (bottom - line_h).max(work.top);
+    } else if top < work.top {
+        top = work.top;
+        bottom = (top + line_h).min(work.bottom);
+    }
     // 水平：默认与光标左对齐，越界平移进工作区（窗口比工作区宽时贴左缘）。
     let px = x.clamp(work.left, (work.right - w).max(work.left));
-    // 垂直：默认正下方。
+    // 垂直：默认正下方；下方放不下翻到上方；上下都放不下选空间更大的一侧贴边。
+    // 翻上方前须保证窗口完整可见（top 本身不得超出工作区下缘）。
     let py = if bottom + h <= work.bottom {
         bottom
-    } else if top - h >= work.top {
+    } else if top - h >= work.top && top <= work.bottom {
         top - h
     } else if top - work.top >= work.bottom - bottom {
         // 上方空间更大：贴工作区顶部。
@@ -358,6 +412,41 @@ mod tests {
             fit_position((-100, 480, 500), 300, 200, work(0, 0, 1920, 1040)),
             (0, 500)
         );
+    }
+
+    /// 回归（Windows Terminal TSF 坐标 bug）：GetTextExt 返回的锚点整行落在
+    /// 工作区外（光标在窗口底部时 y 超出屏幕，实测 (29,1981,2009) 超出
+    /// 2560x1440 屏幕）。此前 fit_position 把候选窗定位到 y=1923/2009——
+    /// 屏幕外完全不可见。现在锚点先钳进工作区（保持行高），候选窗必须
+    /// 完整落在工作区内。
+    #[test]
+    fn anchor_below_workarea_clamped_into_work() {
+        // Terminal 真实场景：work 高 1400（任务栏 40px），锚点行在 1981..2009。
+        let work_rect = work(0, 0, 2560, 1400);
+        let (px, py) = fit_position((29, 1981, 2009), 560, 58, work_rect);
+        assert_eq!((px, py), (29, 1314), "锚点钳到工作区底行上方，窗口位于该行上方");
+        assert!(
+            py >= work_rect.top && py + 58 <= work_rect.bottom,
+            "候选窗必须完整落在工作区内，实际 py={py}"
+        );
+        assert!(px >= 0 && px + 560 <= 2560, "水平方向也须在工作区内");
+    }
+
+    /// 锚点整行在工作区上方（极端布局异常）→ 钳进工作区后正常定位。
+    #[test]
+    fn anchor_above_workarea_clamped_into_work() {
+        let work_rect = work(0, 0, 1920, 1040);
+        let (px, py) = fit_position((100, -120, -92), 300, 200, work_rect);
+        // 钳制后 top=0, bottom=28；下方放得下（28+200=228 <= 1040）→ 正下方。
+        assert_eq!((px, py), (100, 28));
+    }
+
+    /// 行高大于工作区高度的极端情况：钳制后仍须落回工作区内。
+    #[test]
+    fn anchor_line_taller_than_workarea_still_visible() {
+        let work_rect = work(0, 0, 1920, 200);
+        let (_, py) = fit_position((100, 500, 2000), 300, 200, work_rect);
+        assert!(py >= 0 && py + 200 <= 200, "超高行也须钳回工作区内，实际 py={py}");
     }
 
     #[test]
