@@ -13,6 +13,7 @@ mod candidate_window;
 pub mod capture;
 mod class_factory;
 mod clipboard;
+mod display_attribute;
 mod dll;
 mod edit_session;
 mod filelog;

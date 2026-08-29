@@ -30,10 +30,11 @@ use crate::capture::capture_primary_screen;
 use crate::play::play_audio;
 use crate::record::record_seconds;
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
-    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl,
-    ITfThreadMgr,
+    IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
+    ITfContext, ITfContextView, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
+    ITfDisplayAttributeProvider_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfTextInputProcessor_Impl, ITfThreadMgr,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, PostMessageW,
@@ -180,7 +181,11 @@ impl TextServiceData {
     }
 }
 
-#[implement(ITfTextInputProcessorEx, ITfTextInputProcessor)]
+#[implement(
+    ITfTextInputProcessorEx,
+    ITfTextInputProcessor,
+    ITfDisplayAttributeProvider
+)]
 pub struct TextService {
     pub data: Rc<TextServiceData>,
 }
@@ -196,6 +201,23 @@ impl TextService {
 impl Default for TextService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ITfDisplayAttributeProvider_Impl for TextService_Impl {
+    fn EnumDisplayAttributeInfo(&self) -> windows::core::Result<IEnumTfDisplayAttributeInfo> {
+        let p: ITfDisplayAttributeProvider =
+            crate::display_attribute::DisplayAttributeProvider.into();
+        unsafe { p.EnumDisplayAttributeInfo() }
+    }
+
+    fn GetDisplayAttributeInfo(
+        &self,
+        guid: *const windows::core::GUID,
+    ) -> windows::core::Result<ITfDisplayAttributeInfo> {
+        let p: ITfDisplayAttributeProvider =
+            crate::display_attribute::DisplayAttributeProvider.into();
+        unsafe { p.GetDisplayAttributeInfo(guid) }
     }
 }
 
@@ -257,6 +279,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     create_timer_window(data)?;
     // 预拉起 daemon（daemon 启动即预热 Rime），避免首次输入等冷启动。
     prewarm_daemon(data);
+    // 注册显示属性提供者（组合下划线；幂等，失败仅告警）。
+    crate::display_attribute::register_provider();
     // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
     reload_candidate_config(data);
     // 候选窗（懒创建：失败不影响激活）

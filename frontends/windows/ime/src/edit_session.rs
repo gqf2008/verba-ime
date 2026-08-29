@@ -146,6 +146,12 @@ impl ITfEditSession_Impl for StartPreeditSession_Impl {
             let comp_ctx: ITfContextComposition = self.context.cast()?;
             let new_comp = comp_ctx.StartComposition(ec, &range, &self.sink)?;
             new_comp.GetRange()?.SetText(ec, 0, &self.text)?;
+            // 组合下划线（显示属性）；失败不阻断组合（锦上添花）。
+            let _ = crate::display_attribute::apply_composition_attribute(
+                &self.context,
+                ec,
+                &new_comp,
+            );
             *self.out.0 = Some(new_comp);
             Ok(())
         }
@@ -156,12 +162,22 @@ impl ITfEditSession_Impl for StartPreeditSession_Impl {
 #[implement(ITfEditSession)]
 pub struct UpdatePreeditSession {
     pub text: Vec<u16>,
+    pub context: ITfContext,
     pub composition: ITfComposition,
 }
 
 impl ITfEditSession_Impl for UpdatePreeditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        unsafe { self.composition.GetRange()?.SetText(ec, 0, &self.text) }
+        unsafe {
+            self.composition.GetRange()?.SetText(ec, 0, &self.text)?;
+            // 文本更新后重新设置显示属性（范围/属性随编辑会话更新）。
+            let _ = crate::display_attribute::apply_composition_attribute(
+                &self.context,
+                ec,
+                &self.composition,
+            );
+            Ok(())
+        }
     }
 }
 
@@ -221,6 +237,7 @@ pub fn update_composition(
     let text: Vec<u16> = text.encode_utf16().collect();
     let session: ITfEditSession = UpdatePreeditSession {
         text,
+        context: context.clone(),
         composition: composition.clone(),
     }
     .into();
