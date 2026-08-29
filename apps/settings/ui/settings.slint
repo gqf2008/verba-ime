@@ -96,18 +96,11 @@ export component SettingsWindow inherits Window {
                 }
 
                 GroupBox {
-                    title: "多模态（OCR / ASR / TTS）";
+                    title: "多模态（OCR / Vision）";
                     VerticalBox {
                         padding: 8px;
                         spacing: 6px;
                         HorizontalBox { spacing: 8px; Text { text: "OCR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "windows（Windows 本地识别）", "rapid（本地 ONNX/PaddleOCR，原生 Rust，无需 Python）"]; current-index <=> root.ocr-provider-index; } }
-                        HorizontalBox { spacing: 8px; Text { text: "ASR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "openai（在线转写）"]; current-index <=> root.asr-provider-index; } }
-                        HorizontalBox { spacing: 8px; Text { text: "ASR Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "ASR 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.asr-model; placeholder-text: "whisper-1"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "TTS"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "edge（微软在线音色）", "openai（OpenAI 兼容音色）"]; current-index <=> root.tts-provider-index; } }
-                        HorizontalBox { spacing: 8px; Text { text: "TTS Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-base-url; placeholder-text: "留空复用 LLM Base URL"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "TTS 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-model; placeholder-text: "tts-1"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "TTS 音色"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.tts-voice; placeholder-text: "edge: zh-CN-XiaoxiaoNeural / openai: alloy"; } }
                         HorizontalBox { spacing: 8px; Text { text: "Vision 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-vision-model; placeholder-text: "留空复用 LLM 模型（需 vision 模型）/ gpt-4o-mini"; } }
                         HorizontalBox { spacing: 8px; Text { text: "眼睛喂给 LLM"; width: 130px; vertical-alignment: center; } ComboBox { model: ["ocr（本地/在线 OCR → 文字）", "vision（多模态 LLM 直读图像）"]; current-index <=> root.eye-mode-index; } }
                     }
@@ -142,9 +135,8 @@ export component SettingsWindow inherits Window {
                         padding: 8px;
                         spacing: 4px;
                         Text { text: "Ctrl+Alt+O：选区截图 → OCR 上屏"; }
-                        Text { text: "Ctrl+Alt+M：录音 → ASR 听写上屏"; }
-                        Text { text: "//朗读 文本   //截图   //听写"; }
-                        Text { text: "// 前缀进入 AI 模式（LLM 流式，Enter 上屏）"; }
+                        Text { text: "Ctrl+Alt+S：打开设置面板"; }
+                        Text { text: "//截图   // 前缀进入 AI 模式（LLM 流式，Enter 上屏）"; }
                     }
                 }
 
@@ -171,7 +163,7 @@ export component SettingsWindow inherits Window {
                     VerticalBox {
                         padding: 8px;
                         spacing: 4px;
-                        Text { text: "LLM / 在线 ASR / 在线 TTS 会把文本或音频发送到你配置的远程服务商。"; wrap: word-wrap; }
+                        Text { text: "LLM / 在线 OCR 会把文本发送到你配置的远程服务商。"; wrap: word-wrap; }
                         Text { text: "API Key 存入系统密钥库（keyring），config.toml 不保存明文。"; wrap: word-wrap; }
                         Text { text: "mock / windows OCR 等本地 provider 不联网。"; wrap: word-wrap; }
                     }
