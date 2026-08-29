@@ -1,10 +1,10 @@
 # 路线图
 
-> 更新：2026-08-27 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
-> librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；多模态（OCR/ASR）与
-> TTS（edge-tts / OpenAI 兼容）已打通；Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.2
+> 更新：2026-08-29 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
+> librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；**OCR（截图/看图）为正式能力**；**ASR/TTS 冻结为实验性（2026-08-29 Owner 决策：代码保留、默认关闭、入口隐藏，不承诺）**；
+> Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.2
 > 签名公证产物；v0.2.2 含清扫批次：菜单栏图标 / 生僻字安装 / 安装 UX 自动化）。
-> 剩余：whisper.cpp / audio.cpp 本地 ASR（可选）、Piper / 系统 TTS、性能预算、日志脱敏。
+> 剩余：性能预算（范围缩减为 LLM 核心输入链路 + OCR）、日志脱敏。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -14,8 +14,8 @@
 | M0 | 地基 | 仓库骨架、Cargo workspace、CI、verba-cli、core 状态机雏形 | — |
 | M1 | Windows 垂直切片 | Windows TSF 前端 + LLM 远程直输：安装输入法 → 打字上屏 → `//` 唤起 AI → 流式上屏 | M0 |
 | M2 | 三端齐平 | macOS IMK、Linux Fcitx5 / IBus 前端，直输 + LLM 与 M1 对齐 | M1 |
-| M3 | 多模态 | OCR（截图）与 ASR（语音）在至少一个平台跑通，其余平台跟进 | M1 / M2 |
-| M4 | 体验打磨 | TTS（在线）、候选窗口、Slint 设置面板、性能预算、隐私开关 | M3 |
+| M3 | 多模态 | OCR（截图/看图）在至少一个平台跑通（ASR 冻结为实验性，不在 M6 承诺） | M1 / M2 |
+| M4 | 体验打磨 | 候选窗口、Slint 设置面板、性能预算（LLM 核心输入链路 + OCR）、隐私开关（TTS 冻结为实验性） | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
 | M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.2 已发布；v0.2.2 随版清扫批次：菜单栏图标 / 生僻字安装 / 安装 UX 自动化） | M5 |
 
@@ -66,25 +66,25 @@
   - [x] **TSF 热键/`//截图` 命令接线**（2026-08-23：Ctrl+Alt+O 或 `//截图` → 截图 OCR 结果上屏；待实机验收）
   - [x] **选区截图（工具层）**（2026-08-23：`verba-trigger region-shot/region-ocr`，交互拖选 + `--rect` 脚本化；`--rect` 实机验证，交互拖选待验收）
   - [x] **TSF 内接线**（2026-08-23：`//截图` / Ctrl+Alt+O 改为调 `verba-trigger region-ocr` 选区拖选 → OCR 上屏，失败回退全屏；新 DLL target_dev16，待实机验收）
-- [ ] ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端
+- [ ] ~~ASR provider：本地 whisper.cpp（whisper-rs）+ 可选云端~~ **（2026-08-29 冻结为实验性：代码保留、默认关闭、入口隐藏，不在 M6 承诺）**
   - [x] **mock**（确定性，2026-08-23：`verba-asr` crate + IPC `AsrTranscribe` + daemon 路由 + `verba-cli asr`）
   - [x] **openai 在线**（OpenAI 兼容 `audio/transcriptions`，复用 LLM base_url+key；config `asr_provider=openai` + `asr_model`/`asr_base_url`，2026-08-23）
-  - [ ] whisper.cpp（whisper-rs，本地模型）/ audio.cpp 子进程（本地，可选）
-- [ ] 语音链路：快捷键、录音、流式转写、上屏
+  - [ ] ~~whisper.cpp（whisper-rs，本地模型）/ audio.cpp 子进程（本地，可选）~~ **（冻结，不实现）**
+- [ ] ~~语音链路：快捷键、录音、流式转写、上屏~~ **（同上冻结；`//听写`/`//朗读` 入口隐藏）**
   - [x] **触发能力地基**（2026-08-23：`verba-trigger` 麦克风录音→WAV→daemon ASR、TTS 合成→播放（rodio）端到端实机验证）
   - [x] **TSF 热键/`//听写` `//朗读` 命令接线**（2026-08-23：Ctrl+Alt+M 或 `//听写` → 录音 ASR 上屏；`//朗读 <文本>` → TTS 播放；待实机验收）
-  - [ ] 流式转写：边录边出字
+  - [ ] ~~流式转写：边录边出字~~ **（冻结）**
 
 ## M4 详细任务（体验）
 
-- [ ] TTS provider：系统 TTS / edge-tts / Piper（可选）
+- [ ] ~~TTS provider：系统 TTS / edge-tts / Piper（可选）~~ **（2026-08-29 冻结为实验性：代码保留、默认关闭、入口隐藏，不在 M6 承诺）**
   - [x] **mock**（确定性 WAV，2026-08-23：`verba-tts` crate + IPC `TtsSynthesize`/`Audio` + daemon 路由 + `verba-cli tts`，CLI/验收通过）
   - [x] **edge-tts**（微软 Edge 在线神经音色，2026-08-23 实机验证：`verba-tts` Edge provider 接入（WSS + SSML + Sec-MS-GEC 签名），`verba-cli tts` 出真实 MP3，`voice` 可覆盖，默认 zh-CN-XiaoxiaoNeural）
 - [x] **openai 在线 TTS**（OpenAI 兼容 `audio/speech`，复用 LLM base_url+key；config `tts_provider=openai` + `tts_model`/`tts_base_url`/`tts_voice`，2026-08-23）
-- [ ] 系统 TTS（Windows SAPI）/ Piper（本地）/ audio.cpp 子进程（本地，可选）
+- [ ] ~~系统 TTS（Windows SAPI）/ Piper（本地）/ audio.cpp 子进程（本地，可选）~~ **（冻结，不实现）**
 - [x] 候选窗口样式与交互（分页、主题、皮肤）（随 M5 完成，2026-08-23 实机验收）
 - [x] Slint 1.17 设置面板（`apps/settings`：LLM/多模态/引擎/快捷键/隐私，GetConfig/SetConfig/ApiKeySet IPC 热生效；2026-08-23）
-- [ ] 性能与内存预算达标（见 architecture §8）
+- [ ] 性能与内存预算达标（**范围 = LLM 核心输入链路 + OCR**，见 architecture §8；2026-08-29 缩减）
 - [x] AI 模式多轮上下文（2026-08-23：`ai_context_turns` + LlmRequest.history + daemon 会话历史 + `//重置` 清空 + 设置面板可配；端到端验证第2轮携带历史）
 - [x] 诊断与日志（2026-08-23：daemon 写 `data/logs/verba-daemon.log`；`verba-cli diag` 输出健康/关键配置/日志尾/相关进程/rapid 就绪状态）
 - [ ] 日志脱敏与崩溃上报（本地）
@@ -116,9 +116,9 @@
 
 - **平台审核与签名**：macOS 公证、Windows SmartScreen 需要证书与流程，提前规划。
 - **Wayland 碎片化**：不同合成器对 `zwp_input_method_v2` 支持不一（GNOME 需 IBus），需多后端。
-- **本地模型体积 / 性能**：whisper.cpp 模型 75MB+，PaddleOCR 10MB+；首次下载与按需加载策略。
+- **本地模型体积 / 性能**：PaddleOCR 10MB+（whisper 本地模型随 ASR 冻结，不在 M6 范围）；首次下载与按需加载策略。
 - **LLM 成本与延迟**：远程调用不可控，需超时 / 取消 / 失败重试策略。
-- **权限复杂度**：macOS 录屏 / 麦克风 TCC；Linux 不同桌面权限模型。
+- **权限复杂度**：macOS 录屏 TCC（麦克风权限随 ASR 冻结暂不涉及）；Linux 不同桌面权限模型。
 - ~~**macOS 多客户端会话语义**~~：LLM 流/候选队列已改为 per-controller 状态（v0.2.0 落地：全局队列按控制器 seq 消费、会话按 session_id 隔离），多会话并行可用。
 - **同类竞争**：讯飞、百度输入法已有 AI 功能；素言输入法（离线语音 + 截图）是近期最接近的竞品——差异化主打「开源 + 三平台 + 可插拔服务商」。
 
@@ -150,4 +150,5 @@
 | 2026-08-26 | v0.2.0 发布准备：版本号统一 0.2.0（根 workspace + 两前端 Cargo.toml），building.md 版本示例同步 |
 | 2026-08-27 | v0.2.1 发布准备：CI rustfmt 1.98 漂移修复（rust-toolchain.toml pin 1.98.0 + 前端两独立 workspace 重排，#46/#47）；版本号统一 0.2.1（根 workspace + 两前端 Cargo.toml + ISS/Info.plist/building.md 示例同步）；随版内容：PR #43/#45 真机修复与复审批次、biang 词条（9aeac99） |
 | 2026-08-27 | v0.2.2 遗留清扫批次（issue #48 三项 + #44 收口）：菜单栏专属模板 PDF 图标（#50）；设置面板一键安装生僻字扩展——RimeInstallExtra IPC、合并语义与 fetch-rime-vendor 同构（#51）；安装 UX 自动化——DMG「安装.command」双击一步安装 + verba-register TIS 注册/启用输入源（#52）；#44 余项收口（'/' 盲窗裁决、Error 臂对齐、流 token CAS、Windows 真机两步移入 manual-acceptance-windows.md） |
+| 2026-08-29 | 范围决策（Owner）：OCR（截图/看图）保留为正式能力；ASR/TTS 冻结为实验性（代码保留、默认关闭、入口隐藏，不承诺）；#58 性能预算缩减为 LLM 核心输入链路 + OCR |
 | 2026-08-27 | v0.2.2 发布准备：版本号统一 0.2.2（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容即上行清扫批次（#50/#51/#52 + #44） |
