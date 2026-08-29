@@ -173,6 +173,28 @@ pub fn register_provider() {
     }
 }
 
+/// VT_I4 VARIANT（TSF compartment 值 / TfGuidAtom 通用）。
+/// 嵌套 union 经 ptr::write 整体构造（避免 ManuallyDrop 字段的 DerefMut
+/// 写入触发析构语义）。
+pub fn variant_i4(lval: i32) -> VARIANT {
+    let mut var = VARIANT::default();
+    unsafe {
+        core::ptr::write(
+            &mut var.Anonymous,
+            VARIANT_0 {
+                Anonymous: core::mem::ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_I4,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: VARIANT_0_0_0 { lVal: lval },
+                }),
+            },
+        );
+    }
+    var
+}
+
 /// 给组合范围设置显示属性（须在读写编辑会话内调用）。
 /// 值 = 属性 GUID 的 TfGuidAtom（VT_I4）。组合结束时范围销毁，属性自动消失。
 pub fn apply_composition_attribute(
@@ -186,22 +208,7 @@ pub fn apply_composition_attribute(
         let atom = cat.RegisterGUID(&GUID_ATTR_VERBA_COMPOSITION)?;
         let prop: ITfProperty = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
         let range = comp.GetRange()?;
-        let mut var = VARIANT::default();
-        // VT_I4（TfGuidAtom）：嵌套 union 经 ptr::write 整体构造（避免
-        // ManuallyDrop 字段的 DerefMut 写入触发析构语义）。
-        core::ptr::write(
-            &mut var.Anonymous,
-            VARIANT_0 {
-                Anonymous: core::mem::ManuallyDrop::new(VARIANT_0_0 {
-                    vt: VT_I4,
-                    wReserved1: 0,
-                    wReserved2: 0,
-                    wReserved3: 0,
-                    Anonymous: VARIANT_0_0_0 { lVal: atom as i32 },
-                }),
-            },
-        );
-        prop.SetValue(ec, &range, &var)
+        prop.SetValue(ec, &range, &variant_i4(atom as i32))
     }
 }
 

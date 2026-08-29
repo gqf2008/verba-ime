@@ -23,14 +23,16 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_UP,
+    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
 };
 
 use crate::capture::capture_primary_screen;
 use crate::play::play_audio;
 use crate::record::record_seconds;
 use windows::Win32::UI::TextServices::{
-    IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE, IEnumTfDisplayAttributeInfo, ITfComposition,
+    ITfCompositionSink, ITfCompositionSink_Impl, TF_CONVERSIONMODE_ALPHANUMERIC,
+    TF_CONVERSIONMODE_NATIVE,
     ITfContext, ITfContextView, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
     ITfDisplayAttributeProvider_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
@@ -127,6 +129,12 @@ pub struct TextServiceData {
     /// 当前流注册槽：打包 token `(epoch << 32) | 请求id`（见 pack_stream_token）。
     /// 打包携带所属代际是为了让清理可「只认自己的票」——裸 id 会数值撞车
     /// （每连接自增恒为 2），store(0)/store(new) 都可能误伤他流；0 = 空槽。
+    /// 中英模式（Shift 孤立按切换）：true = 中文（拼音），false = 英文直输。
+    ime_chinese: Cell<bool>,
+    /// Shift 按下中（孤立 Shift 抬起时切换中英）。
+    shift_down: Cell<bool>,
+    /// Shift 按下期间是否与其他键组合（组合则不切换）。
+    shift_combined: Cell<bool>,
     pub stream_request_id: Arc<AtomicU64>,
     /// 流代际（epoch）：每次发起新 LLM 流 +1；chunks 队列事件携带 epoch，
     /// 过滤只消费当前代际——请求 id 每连接从 1 自增（恒为 2），不能作跨流依据。
@@ -167,6 +175,9 @@ impl TextServiceData {
             candidate_theme: RefCell::new(verba_candidate::Theme::default()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".into()),
             theme_config_mtime: Cell::new(None),
+            ime_chinese: Cell::new(true),
+            shift_down: Cell::new(false),
+            shift_combined: Cell::new(false),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
@@ -278,6 +289,17 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
+    // 读初始中英状态（系统 compartment 保留上次切换结果）。
+    unsafe {
+        if let Ok(mgr) = ptim.GetGlobalCompartment() {
+            if let Ok(comp) = mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE) {
+                if let Ok(var) = comp.GetValue() {
+                    let mode = var.Anonymous.Anonymous.Anonymous.lVal;
+                    data.ime_chinese.set(mode == TF_CONVERSIONMODE_NATIVE as i32);
+                }
+            }
+        }
+    }
     // 预拉起 daemon（daemon 启动即预热 Rime），避免首次输入等冷启动。
     prewarm_daemon(data);
     // 注册显示属性提供者（组合下划线；幂等，失败仅告警）。
@@ -442,7 +464,13 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
     ) -> Result<windows::core::BOOL> {
         let vk = wparam.0 as u32;
         let state = self.data.machine.borrow().state();
-        let claim = should_claim_key(state, vk, lparam.0 as u32);
+        // 英文模式（Shift 切换后）：除热键外全部交宿主直插（字母/标点不过 IME）；
+        // 中文模式走 should_claim_key 正常路由。
+        let claim = if !self.data.ime_chinese.get() && !is_trigger_hotkey(vk) {
+            false
+        } else {
+            should_claim_key(state, vk, lparam.0 as u32)
+        };
         unsafe {
             log::info!(
                 "OnTestKeyDown vk=0x{vk:02X} scan=0x{:02X} state={state:?} claim={claim} tid={}",
@@ -474,6 +502,18 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
                 GetCurrentThreadId()
             );
         }
+        let vk = wparam.0 as u32;
+        if vk == VK_SHIFT.0 as u32 {
+            // 首次按下（lparam bit30=0）记录：孤立 Shift 抬起时切换中英。
+            if (lparam.0 as u32 >> 30) & 1 == 0 {
+                self.data.shift_down.set(true);
+                self.data.shift_combined.set(false);
+            }
+            return Ok(FALSE); // Shift 不吞（交宿主）
+        }
+        if self.data.shift_down.get() {
+            self.data.shift_combined.set(true);
+        }
         if let Ok(ctx) = pic.ok() {
             *self.data.context.borrow_mut() = Some(ctx.clone());
         }
@@ -482,9 +522,16 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
     fn OnKeyUp(
         &self,
         _pic: Ref<ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        if wparam.0 as u32 == VK_SHIFT.0 as u32 {
+            // 孤立 Shift（按下期间无其他键组合）→ 切换中英。
+            if self.data.shift_down.get() && !self.data.shift_combined.get() {
+                toggle_ime(&self.data);
+            }
+            self.data.shift_down.set(false);
+        }
         Ok(FALSE)
     }
     fn OnPreservedKey(
@@ -527,7 +574,38 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 
 // ---- 按键处理 ----
 
-pub fn handle_key_down(
+/// Shift 孤立按切换中英：翻转模式 + 同步 GUID_COMPARTMENT_KEYBOARD_INPUTMODE
+/// （系统语言栏/输入法指示器显示中/英状态）+ 组合中则取消（干净进入英文）。
+fn toggle_ime(data: &Rc<TextServiceData>) {
+    let chinese = !data.ime_chinese.get();
+    data.ime_chinese.set(chinese);
+    if let Some(tm) = data.threadmgr.borrow().as_ref().cloned() {
+        unsafe {
+            if let Ok(mgr) = tm.GetGlobalCompartment() {
+                if let Ok(comp) = mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE) {
+                    let mode = if chinese {
+                        TF_CONVERSIONMODE_NATIVE as i32
+                    } else {
+                        TF_CONVERSIONMODE_ALPHANUMERIC as i32
+                    };
+                    let _ = comp.SetValue(0, &crate::display_attribute::variant_i4(mode));
+                }
+            }
+        }
+    }
+    // 组合中切换：取消当前组合（干净进入英文，后续字母直插）。
+    if data.machine.borrow().state() != MachineState::Idle {
+        if let Some(context) = data.context.borrow().as_ref().cloned() {
+            if let Some(comp) = data.composition.borrow_mut().take() {
+                let _ = edit_session::end_composition(&context, data.clientid.get(), &comp, "");
+            }
+            *data.machine.borrow_mut() = CompositionMachine::new();
+        }
+    }
+    log::info!("中英模式切换: {}", if chinese { "中文" } else { "英文" });
+}
+
+fn handle_key_down(
     data: &Rc<TextServiceData>,
     wparam: u32,
     lparam: u32,
