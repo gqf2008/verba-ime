@@ -199,3 +199,102 @@ pub fn apply_composition_attribute(
         prop.SetValue(ec, &range, &var)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 组合显示属性描述：文本黑、线黑实线、TARGET_CONVERTED 标记。
+    #[test]
+    fn composition_attribute_shape() {
+        let a = composition_attribute();
+        assert_eq!(a.lsStyle, TF_LS_SOLID);
+        assert_eq!(a.bAttr, TF_ATTR_TARGET_CONVERTED);
+        assert!(!a.fBoldLine.as_bool());
+        assert_eq!(a.crText.r#type, TF_CT_COLORREF);
+        unsafe { assert_eq!(a.crText.Anonymous.cr, COLORREF(0x000000)); }
+    }
+
+    /// provider 枚举/查询：已知 GUID 返回属性对象，未知 GUID 报 E_INVALIDARG。
+    #[test]
+    fn provider_enum_and_get() {
+        let p: ITfDisplayAttributeProvider = DisplayAttributeProvider.into();
+        let mut buf = [None];
+        let mut fetched = 0u32;
+        unsafe {
+            p.EnumDisplayAttributeInfo()
+                .unwrap()
+                .Next(&mut buf, &mut fetched)
+                .unwrap();
+        }
+        assert_eq!(fetched, 1);
+        assert!(buf[0].is_some(), "枚举应产出 1 个属性");
+        let info = buf[0].take().unwrap();
+        unsafe {
+            let guid = info.GetGUID().unwrap();
+            assert_eq!(guid, GUID_ATTR_VERBA_COMPOSITION, "枚举的属性 GUID 应匹配");
+            let mut da = TF_DISPLAYATTRIBUTE::default();
+            info.GetAttributeInfo(&mut da).unwrap();
+            assert_eq!(da.lsStyle, TF_LS_SOLID);
+        }
+        // 未知 GUID → E_INVALIDARG
+        let unknown = GUID::from_u128(0xdeadbeef_dead_beef_dead_beefdeadbeef);
+        let r = unsafe { p.GetDisplayAttributeInfo(&unknown) };
+        assert!(r.is_err(), "未知 GUID 应返回错误");
+        // 已知 GUID → 返回属性对象
+        let ok = unsafe { p.GetDisplayAttributeInfo(&GUID_ATTR_VERBA_COMPOSITION) };
+        assert!(ok.is_ok(), "已知 GUID 应返回属性对象");
+    }
+
+    /// 属性枚举器语义：Next 取尽后返回 0，Reset 后可重取。
+    #[test]
+    fn attribute_enum_semantics() {
+        let e: IEnumTfDisplayAttributeInfo = AttributeEnum { done: Cell::new(false) }.into();
+        let mut buf = [None];
+        let mut fetched = 0u32;
+        unsafe {
+            e.Next(&mut buf, &mut fetched).unwrap();
+            assert_eq!(fetched, 1);
+            assert!(buf[0].is_some(), "第一次 Next 应产出");
+            let mut buf2 = [None];
+            let mut fetched2 = 0u32;
+            e.Next(&mut buf2, &mut fetched2).unwrap();
+            assert_eq!(fetched2, 0, "取尽后返回 0");
+            assert!(buf2[0].is_none());
+            e.Reset().unwrap();
+            let mut buf3 = [None];
+            let mut fetched3 = 0u32;
+            e.Next(&mut buf3, &mut fetched3).unwrap();
+            assert_eq!(fetched3, 1, "Reset 后可重取");
+        }
+    }
+
+    /// VARIANT VT_I4 构造的内存布局：vt=3（VT_I4），lVal 落在偏移 8。
+    #[test]
+    fn variant_i4_layout() {
+        let mut var = VARIANT::default();
+        unsafe {
+            core::ptr::write(
+                &mut var.Anonymous,
+                VARIANT_0 {
+                    Anonymous: core::mem::ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_I4,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: VARIANT_0_0_0 { lVal: 0x12345678 },
+                    }),
+                },
+            );
+        }
+        unsafe {
+            assert_eq!(var.Anonymous.Anonymous.vt, VT_I4);
+            assert_eq!(var.Anonymous.Anonymous.Anonymous.lVal, 0x12345678);
+            // 标准 VARIANT 布局：vt@0(u16)，lVal@8(i32)
+            let raw = &var as *const VARIANT as *const u8;
+            assert_eq!(*raw as u16, VT_I4.0 as u16);
+            let lval_ptr = raw.add(8) as *const i32;
+            assert_eq!(*lval_ptr, 0x12345678);
+        }
+    }
+}
