@@ -101,6 +101,15 @@ fn build_runner() -> Result<RapidOcrRunner, OcrError> {
     Ok(RapidOcrRunner { runner })
 }
 
+/// 统一解码为 RGB：此前把原始字节直接写成 .bmp 临时文件（截图是 PNG 内容），
+/// rapidocr 按扩展名用 BMP 解码器 → failed to decode image（真机复现）。
+/// 现按内容魔数识别（BMP/PNG/JPEG 等，取决于启用 feature）后转 RGB 走 run_image。
+fn decode_rgb(image: &[u8]) -> Result<image::RgbImage, OcrError> {
+    let img = image::load_from_memory(image)
+        .map_err(|e| OcrError::Rapid(format!("图像解码失败: {e}")))?;
+    Ok(img.to_rgb8())
+}
+
 /// 在常驻运行器上执行一次识别。
 fn run_native(image: &[u8]) -> Result<String, OcrError> {
     let mut guard = pool()
@@ -110,12 +119,7 @@ fn run_native(image: &[u8]) -> Result<String, OcrError> {
         *guard = Some(build_runner()?);
     }
     let runner = guard.as_mut().expect("set 后必有运行器");
-    // 统一解码为 RGB 后走 run_image：此前把原始字节直接写成 .bmp 临时文件
-    // （截图是 PNG 内容），rapidocr 按扩展名用 BMP 解码器 → failed to decode
-    // image（真机复现）。
-    let img = image::load_from_memory(image)
-        .map_err(|e| OcrError::Rapid(format!("图像解码失败: {e}")))?
-        .to_rgb8();
+    let img = decode_rgb(image)?;
     let result = runner.runner.run_image(&img);
     let output = result.map_err(|e| OcrError::Rapid(format!("RapidOCR 识别失败: {e}")))?;
     let mut lines = Vec::new();
@@ -154,5 +158,48 @@ mod tests {
         // 兼容旧 API：Python 已被移除，解释器参数不再起作用。
         let o = RapidOcr::with_python("C:\\py\\python.exe");
         assert!(o._python.is_none());
+    }
+
+    /// 回归：run_native 的解码契约——必须吃下 IME 截图的实际格式
+    /// （capture.rs encode_bmp 产出的 32bpp top-down BMP 文件）与 PNG，
+    /// 且对任意字节必须报「图像解码失败」而不是 panic。
+    #[test]
+    fn decode_rgb_accepts_ime_bmp_and_png() {
+        // 与 frontends/windows/ime/src/capture.rs::encode_bmp 同构：BITMAPFILEHEADER(14)
+        // + BITMAPINFOHEADER(40, biHeight 负值 top-down, 32bpp) + 2x2 BGRA 像素。
+        let mut bmp: Vec<u8> = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(14u32 + 40u32 + 16).to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // biWidth
+        bmp.extend_from_slice(&(-2i32).to_le_bytes()); // biHeight（top-down）
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        bmp.extend_from_slice(&16u32.to_le_bytes()); // biSizeImage
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 16]); // BGRA 像素
+
+        let img = decode_rgb(&bmp).expect("IME 截图 BMP 应可解码");
+        assert_eq!((img.width(), img.height()), (2, 2));
+        assert_eq!(img.as_raw().len(), 2 * 2 * 3);
+
+        // PNG（用 image 编码器生成，验证魔数识别路径）
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("PNG 编码");
+        let img = decode_rgb(png.get_ref()).expect("PNG 应可解码");
+        assert_eq!((img.width(), img.height()), (1, 1));
+
+        // 任意字节必须优雅报错（此前写 .bmp 临时文件的路径对任意字节都能走通）
+        let err = decode_rgb(b"not an image at all").unwrap_err();
+        assert!(err.to_string().contains("图像解码失败"));
     }
 }

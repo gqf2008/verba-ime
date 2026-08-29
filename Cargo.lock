@@ -7143,6 +7143,7 @@ name = "verba-ocr"
 version = "0.2.3"
 dependencies = [
  "futures-executor",
+ "image",
  "log",
  "rapidocr-core",
  "thiserror 2.0.20",
