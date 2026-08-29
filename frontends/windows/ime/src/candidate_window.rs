@@ -424,7 +424,11 @@ mod tests {
         // Terminal 真实场景：work 高 1400（任务栏 40px），锚点行在 1981..2009。
         let work_rect = work(0, 0, 2560, 1400);
         let (px, py) = fit_position((29, 1981, 2009), 560, 58, work_rect);
-        assert_eq!((px, py), (29, 1314), "锚点钳到工作区底行上方，窗口位于该行上方");
+        assert_eq!(
+            (px, py),
+            (29, 1314),
+            "锚点钳到工作区底行上方，窗口位于该行上方"
+        );
         assert!(
             py >= work_rect.top && py + 58 <= work_rect.bottom,
             "候选窗必须完整落在工作区内，实际 py={py}"
@@ -446,7 +450,10 @@ mod tests {
     fn anchor_line_taller_than_workarea_still_visible() {
         let work_rect = work(0, 0, 1920, 200);
         let (_, py) = fit_position((100, 500, 2000), 300, 200, work_rect);
-        assert!(py >= 0 && py + 200 <= 200, "超高行也须钳回工作区内，实际 py={py}");
+        assert!(
+            py >= 0 && py + 200 <= 200,
+            "超高行也须钳回工作区内，实际 py={py}"
+        );
     }
 
     #[test]

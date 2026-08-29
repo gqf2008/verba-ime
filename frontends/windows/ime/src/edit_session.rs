@@ -147,11 +147,8 @@ impl ITfEditSession_Impl for StartPreeditSession_Impl {
             let new_comp = comp_ctx.StartComposition(ec, &range, &self.sink)?;
             new_comp.GetRange()?.SetText(ec, 0, &self.text)?;
             // 组合下划线（显示属性）；失败不阻断组合（锦上添花）。
-            let _ = crate::display_attribute::apply_composition_attribute(
-                &self.context,
-                ec,
-                &new_comp,
-            );
+            let _ =
+                crate::display_attribute::apply_composition_attribute(&self.context, ec, &new_comp);
             *self.out.0 = Some(new_comp);
             Ok(())
         }

@@ -709,7 +709,9 @@ impl CompositionMachine {
 
     /// 候选总页数（0 候选 = 0 页）。
     fn total_pages(&self) -> usize {
-        self.pinyin_candidates.len().div_ceil(Self::PINYIN_PAGE_SIZE)
+        self.pinyin_candidates
+            .len()
+            .div_ceil(Self::PINYIN_PAGE_SIZE)
     }
 
     /// 方向键选字：Up 上移选中；页首继续 Up 翻到上一页末项。
@@ -2314,10 +2316,13 @@ mod tests {
             Action::UpdatePinyin { selected: 1, .. }
         ));
         rime(&mut m, "ni", &["你", "尼", "呢"]);
-        assert!(matches!(
-            &m.feed_char(' '),
-            Action::CommitImmediate(t) if t == "你"
-        ), "刷新后选中归 0，空格提交首选");
+        assert!(
+            matches!(
+                &m.feed_char(' '),
+                Action::CommitImmediate(t) if t == "你"
+            ),
+            "刷新后选中归 0，空格提交首选"
+        );
     }
 
     /// 跨页遍历（微软拼音/手心行为）：20 条候选 = 3 页（9+9+2）。
@@ -2339,17 +2344,28 @@ mod tests {
                 Action::UpdatePinyin { selected, .. } if *selected > 0
             ));
         }
-        assert!(matches!(
-            &m.feed_arrow_down(),
-            Action::UpdatePinyin { page: 1, selected: 0, .. }
-        ), "页尾 Down 应翻到第 2 页首项");
+        assert!(
+            matches!(
+                &m.feed_arrow_down(),
+                Action::UpdatePinyin {
+                    page: 1,
+                    selected: 0,
+                    ..
+                }
+            ),
+            "页尾 Down 应翻到第 2 页首项"
+        );
         // 第 2 页 ↓ 到页尾再翻第 3 页
         for _ in 0..8 {
             let _ = m.feed_arrow_down();
         }
         assert!(matches!(
             &m.feed_arrow_down(),
-            Action::UpdatePinyin { page: 2, selected: 0, .. }
+            Action::UpdatePinyin {
+                page: 2,
+                selected: 0,
+                ..
+            }
         ));
         // 第 3 页仅 2 项：↓ 到末项（selected 1）后再 ↓ 不动
         assert!(matches!(
@@ -2360,12 +2376,23 @@ mod tests {
         // ↑ 先回第 3 页首项，再翻回第 2 页末项
         assert!(matches!(
             &m.feed_arrow_up(),
-            Action::UpdatePinyin { page: 2, selected: 0, .. }
+            Action::UpdatePinyin {
+                page: 2,
+                selected: 0,
+                ..
+            }
         ));
-        assert!(matches!(
-            &m.feed_arrow_up(),
-            Action::UpdatePinyin { page: 1, selected: 8, .. }
-        ), "页首 Up 应翻回上一页末项");
+        assert!(
+            matches!(
+                &m.feed_arrow_up(),
+                Action::UpdatePinyin {
+                    page: 1,
+                    selected: 8,
+                    ..
+                }
+            ),
+            "页首 Up 应翻回上一页末项"
+        );
         // 一路 ↑ 回到第 1 页首项：8 次页内 + 1 次翻页 + 8 次页内 = 17 次
         for _ in 0..17 {
             let _ = m.feed_arrow_up();
@@ -2389,13 +2416,20 @@ mod tests {
         }
         assert!(matches!(
             &m.feed_arrow_down(),
-            Action::UpdatePinyin { page: 1, selected: 0, .. }
+            Action::UpdatePinyin {
+                page: 1,
+                selected: 0,
+                ..
+            }
         ));
         // 空格应提交第 2 页首项（全局下标 9 = 词9），而非第一页的词0
-        assert!(matches!(
-            m.feed_char(' '),
-            Action::CommitImmediate(t) if t == "词9"
-        ), "翻页后空格须提交当前页选中项（全局下标），而非第一页首项");
+        assert!(
+            matches!(
+                m.feed_char(' '),
+                Action::CommitImmediate(t) if t == "词9"
+            ),
+            "翻页后空格须提交当前页选中项（全局下标），而非第一页首项"
+        );
         // PageDown 翻页后同样
         let mut m2 = CompositionMachine::new();
         m2.feed_char('y');
@@ -2405,9 +2439,12 @@ mod tests {
             &m2.feed_page_down(),
             Action::UpdatePinyin { page: 1, .. }
         ));
-        assert!(matches!(
-            m2.feed_char(' '),
-            Action::CommitImmediate(t) if t == "词9"
-        ), "PageDown 翻页后空格提交第 2 页首项");
+        assert!(
+            matches!(
+                m2.feed_char(' '),
+                Action::CommitImmediate(t) if t == "词9"
+            ),
+            "PageDown 翻页后空格提交第 2 页首项"
+        );
     }
 }

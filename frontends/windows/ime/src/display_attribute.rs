@@ -9,27 +9,31 @@
 
 use std::cell::Cell;
 
-use windows::core::{implement, Error, GUID, Result};
+use windows::core::{implement, Error, Result, GUID};
 use windows::Win32::Foundation::{COLORREF, E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::TextServices::{
-    IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl, ITfCategoryMgr, ITfComposition,
-    ITfContext, ITfDisplayAttributeInfo, ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider,
-    ITfDisplayAttributeProvider_Impl, ITfProperty, CLSID_TF_CategoryMgr, GUID_PROP_ATTRIBUTE,
-    GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, TF_ATTR_TARGET_CONVERTED, TF_CT_COLORREF, TF_CT_NONE,
-    TF_DA_COLOR, TF_DA_COLOR_0, TF_DISPLAYATTRIBUTE, TF_LS_SOLID,
+    CLSID_TF_CategoryMgr, IEnumTfDisplayAttributeInfo, IEnumTfDisplayAttributeInfo_Impl,
+    ITfCategoryMgr, ITfComposition, ITfContext, ITfDisplayAttributeInfo,
+    ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider, ITfDisplayAttributeProvider_Impl,
+    ITfProperty, GUID_PROP_ATTRIBUTE, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+    TF_ATTR_TARGET_CONVERTED, TF_CT_COLORREF, TF_CT_NONE, TF_DA_COLOR, TF_DA_COLOR_0,
+    TF_DISPLAYATTRIBUTE, TF_LS_SOLID,
 };
 
 /// 组合串显示属性 GUID（自定义；TfGuidAtom 的来源）。
-pub const GUID_ATTR_VERBA_COMPOSITION: GUID = GUID::from_u128(0x3a2f5b8c_1d4e_4f6a_9b7c_2e8d0f1a3b4c);
+pub const GUID_ATTR_VERBA_COMPOSITION: GUID =
+    GUID::from_u128(0x3a2f5b8c_1d4e_4f6a_9b7c_2e8d0f1a3b4c);
 
 /// 组合串显示属性描述：普通文本色 + 实线下划线（微软拼音风格组合标记）。
 pub fn composition_attribute() -> TF_DISPLAYATTRIBUTE {
     TF_DISPLAYATTRIBUTE {
         crText: TF_DA_COLOR {
             r#type: TF_CT_COLORREF,
-            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(0x000000) },
+            Anonymous: TF_DA_COLOR_0 {
+                cr: COLORREF(0x000000),
+            },
         },
         crBk: TF_DA_COLOR {
             r#type: TF_CT_NONE,
@@ -39,7 +43,9 @@ pub fn composition_attribute() -> TF_DISPLAYATTRIBUTE {
         fBoldLine: false.into(),
         crLine: TF_DA_COLOR {
             r#type: TF_CT_COLORREF,
-            Anonymous: TF_DA_COLOR_0 { cr: COLORREF(0x000000) },
+            Anonymous: TF_DA_COLOR_0 {
+                cr: COLORREF(0x000000),
+            },
         },
         bAttr: TF_ATTR_TARGET_CONVERTED,
     }
@@ -212,7 +218,9 @@ mod tests {
         assert_eq!(a.bAttr, TF_ATTR_TARGET_CONVERTED);
         assert!(!a.fBoldLine.as_bool());
         assert_eq!(a.crText.r#type, TF_CT_COLORREF);
-        unsafe { assert_eq!(a.crText.Anonymous.cr, COLORREF(0x000000)); }
+        unsafe {
+            assert_eq!(a.crText.Anonymous.cr, COLORREF(0x000000));
+        }
     }
 
     /// provider 枚举/查询：已知 GUID 返回属性对象，未知 GUID 报 E_INVALIDARG。
@@ -249,7 +257,10 @@ mod tests {
     /// 属性枚举器语义：Next 取尽后返回 0，Reset 后可重取。
     #[test]
     fn attribute_enum_semantics() {
-        let e: IEnumTfDisplayAttributeInfo = AttributeEnum { done: Cell::new(false) }.into();
+        let e: IEnumTfDisplayAttributeInfo = AttributeEnum {
+            done: Cell::new(false),
+        }
+        .into();
         let mut buf = [None];
         let mut fetched = 0u32;
         unsafe {

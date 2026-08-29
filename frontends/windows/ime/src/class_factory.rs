@@ -61,10 +61,9 @@ impl IClassFactory_Impl for VerbaClassFactory_Impl {
                 >(provider);
             } else {
                 let text_service: ITfTextInputProcessor = TextService::new().into();
-                *ppvobject = std::mem::transmute::<
-                    ITfTextInputProcessor,
-                    *mut std::ffi::c_void,
-                >(text_service);
+                *ppvobject = std::mem::transmute::<ITfTextInputProcessor, *mut std::ffi::c_void>(
+                    text_service,
+                );
             }
         }
         Ok(())

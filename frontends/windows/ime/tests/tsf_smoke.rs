@@ -451,13 +451,12 @@ fn tsf_display_attribute_roundtrip() {
 
         // 经 TSF manager 查询组合属性（首次调用会 CoCreateInstance 文本服务
         // 并 QueryInterface ITfDisplayAttributeProvider）
-        let mgr: windows::Win32::UI::TextServices::ITfDisplayAttributeMgr =
-            CoCreateInstance(
-                &windows::Win32::UI::TextServices::CLSID_TF_DisplayAttributeMgr,
-                None,
-                CLSCTX_INPROC_SERVER,
-            )
-            .expect("创建 DisplayAttributeMgr");
+        let mgr: windows::Win32::UI::TextServices::ITfDisplayAttributeMgr = CoCreateInstance(
+            &windows::Win32::UI::TextServices::CLSID_TF_DisplayAttributeMgr,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
+        .expect("创建 DisplayAttributeMgr");
         let mut info: Option<windows::Win32::UI::TextServices::ITfDisplayAttributeInfo> = None;
         let mut owner = windows::core::GUID::zeroed();
         let r = mgr.GetDisplayAttributeInfo(
