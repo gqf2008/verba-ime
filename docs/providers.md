@@ -1,6 +1,7 @@
 # AI 服务商矩阵（OCR / ASR / LLM / TTS）
 
-> 更新：2026-08-22 · 原则：**本地优先（隐私 + 免费 + 离线），云端可插拔**；每个能力一个 trait、多个 provider，运行时按配置选择并支持降级。
+> 更新：2026-08-29 · 原则：**本地优先（隐私 + 免费 + 离线），云端可插拔**；每个能力一个 trait、多个 provider，运行时按配置选择并支持降级。
+> **2026-08-29 Owner 决策：ASR/TTS 冻结为实验性（代码保留、默认关闭、入口隐藏，不承诺，不在 M6 范围）；OCR/LLM 为正式能力。**
 > 关联：[架构设计](architecture.md) §6、[IPC 协议](protocol.md)。
 
 ## OCR（图片 / 截图 → 文字）
@@ -14,15 +15,15 @@
 | Tesseract（`leptess`） | 本地 | 老牌 OCR | `leptess` crate | 中文一般，兜底 |
 | 百度 / 腾讯 / 阿里 / Google Vision | 云端 | 准确率高、按量计费 | HTTP | 可选 |
 
-## ASR（语音 → 文字）
+## ASR（语音 → 文字）—— **❄️ 已冻结为实验性（2026-08-29：代码保留、默认关闭、入口隐藏，不承诺）**
 
 | 方案 | 类型 | 说明 | Rust 接入 | 评价 |
 | --- | --- | --- | --- | --- |
-| whisper.cpp | 本地 | 开源最强本地 ASR，base / small 中英可用，可流式 | `whisper-rs` | ✅ 默认本地方案 |
+| whisper.cpp | 本地 | 开源最强本地 ASR，base / small 中英可用，可流式 | `whisper-rs` | ❄️ 冻结（不实现） |
 | 系统听写（Windows Speech / macOS Dictation） | 系统 | 平台级，受系统语言限制 | 平台 API | 备选 |
 | 讯飞 / 百度 / 腾讯 | 云端 | 中文流式强、低延迟 | HTTP / WS | 可选 |
 | OpenAI Whisper API | 云端 | 质量高、按分钟计费、非流式 | HTTP | 可选 |
-| OpenAI 兼容 `audio/transcriptions` | 云端 | 复用 LLM base_url+key，whisper 系列模型 | HTTP multipart（`verba-asr::openai`，2026-08-23 已实现） | ✅ 在线默认（`asr_provider=openai`） |
+| OpenAI 兼容 `audio/transcriptions` | 云端 | 复用 LLM base_url+key，whisper 系列模型 | HTTP multipart（`verba-asr::openai`，2026-08-23 已实现） | ❄️ 已实现，默认关闭（`asr_provider` 默认禁用） |
 | audio.cpp（STT） | 本地 | ggml 本地 ASR/VAD，模型族丰富 | audio.cpp 预编译包子进程 / audio-cpp-rs | 本地可选（后续） |
 | GLM-ASR / Fun-ASR（candle） | 本地 | 新一代开源 ASR，评估中 | candle | 未来 |
 
@@ -42,15 +43,15 @@
 - 统一抽象：`base_url + api_key + model`，SSE 流式；Rust 用 `reqwest` + `eventsource-stream`（或 `async-openai`，支持自定义 base_url 以适配各服务商）。
 - 功能模板：翻译、润色、续写、扩写、总结、自定义 Prompt、多轮上下文（默认单轮，可配置）。
 
-## TTS（文字 → 语音）
+## TTS（文字 → 语音）—— **❄️ 已冻结为实验性（2026-08-29：代码保留、默认关闭、入口隐藏，不承诺）**
 
 | 方案 | 类型 | 说明 | Rust 接入 | 评价 |
 | --- | --- | --- | --- | --- |
-| 系统 TTS | 系统 | SAPI5 / AVSpeechSynthesizer / espeak-ng | 平台 API | ✅ 零成本离线兜底 |
-| Piper | 本地 | 离线神经 TTS，中文模型可用、延迟低 | `piper-rs` / 子进程 | ✅ 推荐离线神经音色 |
-| edge-tts | 在线 | 微软 Edge 神经音色（非官方接口），免费、音色好 | WS（Rust 已实现，2026-08-23 实机 OK） | ✅ 推荐在线免费音色 |
+| 系统 TTS | 系统 | SAPI5 / AVSpeechSynthesizer / espeak-ng | 平台 API | ❄️ 冻结（不实现） |
+| Piper | 本地 | 离线神经 TTS，中文模型可用、延迟低 | `piper-rs` / 子进程 | ❄️ 冻结（不实现） |
+| edge-tts | 在线 | 微软 Edge 神经音色（非官方接口），免费、音色好 | WS（Rust 已实现，2026-08-23 实机 OK） | ❄️ 已实现，默认关闭（实验性） |
 | OpenAI TTS | 云端 | 音色自然、按字符计费 | HTTP | 可选 |
-| OpenAI 兼容 `audio/speech` | 云端 | 复用 LLM base_url+key，音色自然 | HTTP JSON（`verba-tts::openai`，2026-08-23 已实现） | ✅ 在线可选（`tts_provider=openai`） |
+| OpenAI 兼容 `audio/speech` | 云端 | 复用 LLM base_url+key，音色自然 | HTTP JSON（`verba-tts::openai`，2026-08-23 已实现） | ❄️ 已实现，默认关闭（实验性） |
 | audio.cpp（TTS） | 本地 | ggml 本地神经 TTS，模型族丰富 | audio.cpp 预编译包子进程 | 本地可选（后续） |
 | Azure / 讯飞 | 云端 | 企业级、可定制音色 | HTTP | 可选 |
 
@@ -59,9 +60,9 @@
 | 能力 | 默认 | 备选 | 说明 |
 | --- | --- | --- | --- |
 | OCR | rapid（本地 RapidOCR/PaddleOCR，经 Python `rapidocr_onnxruntime`） | platform 原生（Windows.Media.Ocr）/ vision LLM | 云端仅当用户配置 key |
-| ASR | openai（在线，OpenAI 兼容 `audio/transcriptions`） | mock / whisper.cpp / audio.cpp | 无 key 时回退 mock |
+| ASR | ❄️ 冻结为实验性，默认关闭 | mock | 入口隐藏，不承诺 |
 | LLM | 无默认服务商，首次引导配置 | DeepSeek / OpenAI 兼容 | 纯远程，必须显式配置 |
-| TTS | edge（在线，微软音色）/ openai（OpenAI 兼容） | mock / Piper / audio.cpp | 无网络时本地兜底 |
+| TTS | ❄️ 冻结为实验性，默认关闭 | mock | 入口隐藏，不承诺 |
 
 ## 多模态 vision（`//看图` / 眼睛直读图像）
 
