@@ -12,6 +12,8 @@ export component SettingsWindow inherits Window {
     // ---------- LLM（远程） ----------
     in-out property <string> llm-base-url;
     in-out property <string> llm-model;
+    in-out property <[string]> llm-models: ["deepseek-chat", "deepseek-reasoner"];
+    in-out property <int> llm-model-index: -1;
     in-out property <string> temperature;
     in-out property <string> max-tokens;
     in-out property <string> ai-system-prompt;
@@ -46,9 +48,11 @@ export component SettingsWindow inherits Window {
     callback delete-phrase();
     callback refresh-phrases();
     callback refresh();
+    callback refresh-models();
     callback set-api-key(string);
     callback clear-api-key();
     callback install-rare-chars();
+
 
     VerticalBox {
         padding: 12px;
@@ -74,8 +78,7 @@ export component SettingsWindow inherits Window {
                     VerticalBox {
                         padding: 8px;
                         spacing: 6px;
-                        HorizontalBox { spacing: 8px; Text { text: "Base URL"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-base-url; placeholder-text: "https://api.deepseek.com/v1"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-model; placeholder-text: "deepseek-chat"; } }
+                        HorizontalBox { spacing: 8px; Text { text: "模型"; width: 130px; vertical-alignment: center; } ComboBox { model: root.llm-models; current-index <=> root.llm-model-index; } Button { text: "刷新模型"; clicked => { root.refresh-models(); } } }
                         HorizontalBox { spacing: 8px; Text { text: "温度"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.temperature; placeholder-text: "0.7"; } }
                         HorizontalBox { spacing: 8px; Text { text: "最大 Tokens"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.max-tokens; placeholder-text: "1024"; } }
                         HorizontalBox { spacing: 8px; Text { text: "多轮上下文"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.ai-context-turns; placeholder-text: "0=关闭；>0 记忆最近 N 轮（//重置 清空）"; } }

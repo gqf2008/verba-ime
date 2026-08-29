@@ -13,8 +13,8 @@ use verba_ipc::server::{Outbound, RequestHandler};
 use verba_librime::{RimeConfig, RimeEngine};
 use verba_protos::{
     request, response, stream_event, ApiKeySet, Audio as AudioMsg, Candidates, Chunk,
-    Config as ConfigMsg, Error as ProtoError, Final, LlmCandidates, LlmGenerate, Ok as OkMsg, Pong,
-    Response, StreamEvent,
+    Config as ConfigMsg, Error as ProtoError, Final, LlmCandidates, LlmGenerate, ModelList,
+    Ok as OkMsg, Pong, Response, StreamEvent,
 };
 
 /// 默认 AI 系统提示词（用户未配置时使用）。
@@ -266,6 +266,7 @@ impl RequestHandler for DaemonHandler {
                 self.handle_llm_candidates(conn_id, id, g, out).await
             }
             Some(request::Kind::RimeCandidates(g)) => self.handle_rime_candidates(id, g, out).await,
+            Some(request::Kind::ListModels(_)) => self.handle_list_models(id, out).await,
             Some(request::Kind::RimeInstallExtra(_)) => {
                 self.handle_rime_install_extra(id, out).await
             }
@@ -683,6 +684,49 @@ impl DaemonHandler {
     }
 
     /// Rime 引擎候选（config 引擎=rime）：一次性推送 `Candidates` 事件（done=true）。
+    async fn handle_list_models(
+        &self,
+        id: u64,
+        out: Outbound,
+    ) -> Result<(), verba_ipc::IpcError> {
+        let (cfg, _) = self.llm_snapshot();
+        if cfg.api_key.is_none() || cfg.api_key.as_deref().unwrap_or_default().is_empty() {
+            out.response(&Response {
+                id,
+                kind: Some(response::Kind::Error(ProtoError {
+                    code: 400,
+                    message: "未配置 API Key（设置面板输入）".into(),
+                })),
+            })
+            .await?;
+            return Ok(());
+        }
+        let client = verba_ai::LlmClient::new().map_err(|e| verba_ipc::IpcError::Server {
+            code: 500,
+            message: e.to_string(),
+        })?;
+        match client.list_models(&cfg).await {
+            Ok(models) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::ModelList(ModelList { models })),
+                })
+                .await?;
+            }
+            Err(e) => {
+                out.response(&Response {
+                    id,
+                    kind: Some(response::Kind::Error(ProtoError {
+                        code: 502,
+                        message: e.to_string(),
+                    })),
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_rime_candidates(
         &self,
         id: u64,

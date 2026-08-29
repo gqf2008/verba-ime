@@ -89,6 +89,33 @@ impl LlmClient {
         Ok(Self { http })
     }
 
+    /// 列出模型（GET /models，OpenAI 兼容；当前 provider 仅 DeepSeek）。
+    /// 需 API Key（Bearer 鉴权）——未配置时返回格式错误。
+    pub async fn list_models(&self, cfg: &LlmConfig) -> Result<Vec<String>, LlmError> {
+        let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+        let mut req = self.http.get(&url);
+        if let Some(key) = &cfg.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(LlmError::Http { status: status.as_u16(), body });
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelsResp {
+            data: Vec<ModelItem>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelItem {
+            id: String,
+        }
+        let parsed: ModelsResp = serde_json::from_str(&body)
+            .map_err(|e| LlmError::Format(format!("模型列表解析失败: {e}")))?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
+    }
+
     /// 发起流式生成，返回内容增量流。
     pub async fn stream(
         &self,

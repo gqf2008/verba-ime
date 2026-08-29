@@ -9,8 +9,16 @@ slint::include_modules!();
 
 use std::collections::HashMap;
 
+use slint::Model as _;
 use verba_config::ApiKeyStore;
 use verba_ipc::VerbaClient;
+
+/// 最近一次刷新得到的模型列表（UI 下拉数据源，Rust 侧读取避免 ModelRc 存取）。
+static MODELS_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+fn models_cache() -> &'static std::sync::Mutex<Vec<String>> {
+    MODELS_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 /// provider 显示标签 → 实际配置值（顺序与 settings.slint 的 ComboBox 模型一致）。
 const OCR_PROVIDERS: &[(&str, &str)] = &[
@@ -121,6 +129,46 @@ fn wire_callbacks(ui: &SettingsWindow) {
         });
     });
 
+    // 刷新模型列表（DeepSeek 官方 API，需已配置 API Key）
+    let weak = ui.as_weak();
+    ui.on_refresh_models(move || {
+        let weak2 = weak.clone();
+        std::thread::spawn(move || {
+            let result = with_client(|c| c.llm_list_models());
+            match result {
+                Ok(models) => {
+                    *models_cache().lock().unwrap() = models.clone();
+                    let ui_models: Vec<slint::SharedString> =
+                        models.iter().map(|m| slint::SharedString::from(m.clone())).collect();
+                    let weak3 = weak2.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak3.upgrade() {
+                            ui.set_llm_models(slint::ModelRc::new(std::rc::Rc::new(
+                                slint::VecModel::from(ui_models),
+                            )));
+                            let cur = ui.get_llm_model().to_string();
+                            let cache = models_cache().lock().unwrap();
+                            let idx = cache.iter().position(|m| *m == cur).map(|i| i as i32).unwrap_or(-1);
+                            drop(cache);
+                            ui.set_llm_model_index(idx);
+                            ui.set_status_text(
+                                format!("模型列表已刷新（{} 个）", models.len()).into(),
+                            );
+                        }
+                    });
+                }
+                Err(e) => {
+                    let weak3 = weak2.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak3.upgrade() {
+                            ui.set_status_text(format!("刷新模型失败: {e}").into());
+                        }
+                    });
+                }
+            }
+        });
+    });
+
     let weak = ui.as_weak();
     ui.on_install_rare_chars(move || {
         let weak2 = weak.clone();
@@ -207,7 +255,18 @@ fn phrase_refresh() -> String {
 fn read_fields(ui: &SettingsWindow) -> HashMap<String, String> {
     let mut values = HashMap::new();
     values.insert("llm_base_url".into(), ui.get_llm_base_url().to_string());
-    values.insert("llm_model".into(), ui.get_llm_model().to_string());
+    {
+        // 模型下拉选中优先（未匹配/未刷新时回退 llm-model 原值）
+        let idx = ui.get_llm_model_index();
+        let cache = models_cache().lock().unwrap();
+        let model = if idx >= 0 && (idx as usize) < cache.len() {
+            cache[idx as usize].clone()
+        } else {
+            ui.get_llm_model().to_string()
+        };
+        drop(cache);
+        values.insert("llm_model".into(), model);
+    }
     values.insert("temperature".into(), ui.get_temperature().to_string());
     values.insert("max_tokens".into(), ui.get_max_tokens().to_string());
     values.insert(
@@ -303,6 +362,14 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     let get = |k: &str| cfg.get(k).cloned().unwrap_or_default();
     ui.set_llm_base_url(get("llm_base_url").into());
     ui.set_llm_model(get("llm_model").into());
+    {
+        // 默认列表里匹配当前模型（未刷新时也选中正确项）
+        let cur = ui.get_llm_model().to_string();
+        let cache = models_cache().lock().unwrap();
+        let idx = cache.iter().position(|m| *m == cur).map(|i| i as i32).unwrap_or(-1);
+        drop(cache);
+        ui.set_llm_model_index(idx);
+    }
     ui.set_temperature(get("temperature").into());
     ui.set_max_tokens(get("max_tokens").into());
     ui.set_ai_system_prompt(get("ai_system_prompt").into());

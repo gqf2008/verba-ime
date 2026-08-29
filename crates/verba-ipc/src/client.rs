@@ -230,6 +230,30 @@ impl VerbaClient {
 
     /// 查询 Rime 引擎候选（config 引擎=rime）：同步返回候选列表（一个
     /// `Candidates` 事件，`done=true` 结束）。
+    /// 列出 LLM 模型（OpenAI 兼容 GET /models，provider 当前仅 DeepSeek）。
+    pub fn llm_list_models(&mut self) -> Result<Vec<String>, IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::ListModels(verba_protos::ListModels {})),
+        };
+        self.write_request(&req)?;
+        let frame = self.read_frame_blocking()?;
+        let resp = Response::decode(frame.as_slice())
+            .map_err(IpcError::Decode)?;
+        match resp.kind {
+            Some(response::Kind::ModelList(list)) => Ok(list.models),
+            Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                code: e.code,
+                message: e.message,
+            }),
+            _ => Err(IpcError::Protocol(format!(
+                "llm_list_models 响应类型不匹配: {:?}",
+                resp.kind.map(|k| format!("{k:?}")).unwrap_or_default()
+            ))),
+        }
+    }
+
     pub fn rime_candidates(
         &mut self,
         input: &str,

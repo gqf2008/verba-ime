@@ -25,6 +25,7 @@ message Request {
     AsrTranscribe asr_transcribe = 26;
     ApiKeySet api_key_set = 27;
     RimeInstallExtra rime_install_extra = 28;
+    ListModels list_models = 29;
   }
 }
 
@@ -75,6 +76,13 @@ message RimeCandidates {
 // 编译期内嵌）合入用户 Rime 目录并重建引擎（下一次查询触发重新部署）。
 message RimeInstallExtra {}
 
+// 列出 LLM 模型（OpenAI 兼容 GET /models；provider 当前仅 DeepSeek）。
+message ListModels {}
+
+message ModelList {
+  repeated string models = 1;
+}
+
 // ---------- 响应 ----------
 message Response {
   uint64 id = 1;
@@ -85,6 +93,7 @@ message Response {
     Text text = 5;
     Config config = 6;
     Audio audio = 7;
+    ModelList model_list = 8;
   }
 }
 
