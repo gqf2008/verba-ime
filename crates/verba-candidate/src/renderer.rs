@@ -524,6 +524,8 @@ fn premultiply_channel(v: u8, a: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::premultiply_channel;
+    use crate::renderer::CpuCandidateRenderer;
+    use crate::{CandidateWindowController, Theme};
 
     #[test]
     fn premultiply_boundaries() {
@@ -533,5 +535,37 @@ mod tests {
         assert_eq!(premultiply_channel(128, 255), 128);
         assert_eq!(premultiply_channel(255, 128), 128);
         assert_eq!(premultiply_channel(200, 100), 78); // 200*100/255 = 78.4 → 78
+    }
+
+    /// 回归（真机 NOTEPAD 4K@150% 候选窗全黑）：DPI 缩放（scaled）后的
+    /// 渲染输出必须有不透明像素（卡片背景白底）。若此测试红，说明缩放
+    /// 路径 render 出了全透明缓冲——平台层 blit 后窗口全黑不可见。
+    #[test]
+    fn render_scaled_outputs_opaque_card() {
+        let mut renderer = CpuCandidateRenderer::new();
+        let mut ctrl = CandidateWindowController::new(Theme::default());
+        ctrl.set_candidates(vec!["你".into(), "泥".into(), "拟".into()]);
+        ctrl.set_preedit("nihao");
+        ctrl.show();
+        let scaled = ctrl.scaled(1.5);
+        let out = renderer.render(&scaled);
+        // 默认 vertical 布局：宽 = max_width(360)；逻辑高 = 6*2 + 32 + 3*30 = 134。
+        assert_eq!((out.width, out.height), (540, 201), "150% 缩放尺寸");
+        // 中心像素与四角内侧均须不透明（卡片背景填充覆盖整窗）。
+        // 采样点须在圆角半径内侧（corner_radius=6 逻辑 ×1.5=9 物理），
+        // (2,2) 这类角落点落在圆角抗锯齿带上、alpha 天然 < 255。
+        let samples = [
+            (out.height / 2, out.width / 2),
+            (12, 12),
+            (out.height - 13, out.width - 13),
+        ];
+        for (y, x) in samples {
+            let i = (y * out.width + x) as usize * 4;
+            assert_eq!(out.pixels[i + 3], 255, "({x},{y}) alpha 应为 255，实际全透明");
+        }
+        // 恒等对照：scale=1.0 的输出同样不透明（原路径回归保护）。
+        let out1 = renderer.render(&ctrl);
+        let i = ((out1.height / 2) * out1.width + out1.width / 2) as usize * 4;
+        assert_eq!(out1.pixels[i + 3], 255);
     }
 }

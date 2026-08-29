@@ -61,13 +61,15 @@ fn default_corner_radius() -> u32 {
     6
 }
 fn default_layout() -> String {
-    "horizontal".to_owned()
+    // macOS 风格竖向列表（编号 + 高亮 + 拼音头），与 IMKCandidates 观感对齐；
+    // horizontal（微软拼音/手心风格横向候选行）仍可通过配置 theme.layout 切换。
+    "vertical".to_owned()
 }
 fn default_show_preedit() -> bool {
     true
 }
 fn default_header_height() -> u32 {
-    24
+    32
 }
 fn default_gap() -> u32 {
     10
@@ -98,9 +100,11 @@ impl Default for Theme {
             selected_background: "#D8E6FF".into(),
             selected_text_color: "#1A56DB".into(),
             border_color: "#CCCCCC".into(),
-            font_size: 14,
+            // 对齐主流输入法（微软拼音/手心）视觉字号：14 在高分屏上比
+            // 其他输入法小一圈，提至 18 并同步放大行高/头高保持比例。
+            font_size: 18,
             padding: 6,
-            item_height: 22,
+            item_height: 30,
             page_size: 9,
             max_width: 360,
             corner_radius: default_corner_radius(),
@@ -119,6 +123,28 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// 按 DPI 缩放因子放大所有像素尺寸字段（字体/边距/行高/宽度/圆角）。
+    /// 平台层在物理像素坐标系渲染前调用：高分屏（Windows DPI 缩放 / macOS
+    /// Retina）下逻辑主题 × scale 后输出物理像素，窗口尺寸与文字才与
+    /// 100% 缩放下视觉一致。page_size 是数量不缩放；颜色不变。
+    pub fn scaled(&self, scale: f32) -> Self {
+        let s = |v: u32| (v as f32 * scale).round().max(1.0) as u32;
+        Self {
+            font_size: s(self.font_size),
+            padding: s(self.padding),
+            item_height: s(self.item_height),
+            max_width: s(self.max_width),
+            corner_radius: s(self.corner_radius),
+            header_height: s(self.header_height),
+            gap: s(self.gap),
+            max_width_horizontal: s(self.max_width_horizontal),
+            item_padding: s(self.item_padding),
+            footer_height: s(self.footer_height),
+            // 其余字段（颜色/page_size/layout 等）与像素无关，原样保留。
+            ..self.clone()
+        }
+    }
+
     /// 暗色预设（深灰底 + 亮色文字 + 蓝色选中）。
     pub fn dark() -> Self {
         Self {
@@ -127,9 +153,9 @@ impl Theme {
             selected_background: "#264F78".into(),
             selected_text_color: "#FFFFFF".into(),
             border_color: "#3C3C3C".into(),
-            font_size: 14,
+            font_size: 18,
             padding: 6,
-            item_height: 22,
+            item_height: 30,
             page_size: 9,
             max_width: 360,
             corner_radius: default_corner_radius(),
@@ -181,6 +207,14 @@ impl CandidateWindowController {
             preedit: String::new(),
             status: None,
         }
+    }
+
+    /// 按 DPI 缩放因子克隆（高分屏物理像素渲染前调用）：
+    /// 缩放主题的全部像素尺寸字段，候选/选中/页码等逻辑状态原样保留。
+    pub fn scaled(&self, scale: f32) -> Self {
+        let mut c = self.clone();
+        c.theme = self.theme.scaled(scale);
+        c
     }
 
     // ---- 数据 ----
@@ -436,6 +470,31 @@ mod tests {
         assert_ne!(d.background, Theme::default().background);
         assert_eq!(d.background, "#1E1E1E");
         assert_eq!(d.corner_radius, Theme::default().corner_radius);
+    }
+
+    /// DPI 缩放：150% 屏（scale=1.5）下所有像素尺寸字段 ×1.5 取整，
+    /// 数量字段 page_size 与颜色不变；scale=1.0 恒等。
+    #[test]
+    fn theme_scaled_multiplies_pixel_fields() {
+        let t = Theme::default();
+        let s = t.scaled(1.5);
+        assert_eq!(s.font_size, (t.font_size as f32 * 1.5).round() as u32);
+        assert_eq!(s.padding, (t.padding as f32 * 1.5).round() as u32);
+        assert_eq!(s.item_height, (t.item_height as f32 * 1.5).round() as u32);
+        assert_eq!(s.header_height, (t.header_height as f32 * 1.5).round() as u32);
+        assert_eq!(
+            s.max_width_horizontal,
+            (t.max_width_horizontal as f32 * 1.5).round() as u32
+        );
+        assert_eq!(s.corner_radius, (t.corner_radius as f32 * 1.5).round() as u32);
+        assert_eq!(s.page_size, t.page_size, "候选数量不缩放");
+        assert_eq!(s.background, t.background, "颜色不缩放");
+        assert_eq!(s.layout, t.layout, "布局不缩放");
+        // 恒等：scale=1.0 不改变任何字段
+        assert_eq!(t.scaled(1.0), t);
+        // 下限：scale 极小也不得缩成 0（窗口仍可见）
+        assert!(t.scaled(0.1).font_size >= 1);
+        assert!(t.scaled(0.1).padding >= 1);
     }
 
     #[test]
