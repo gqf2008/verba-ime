@@ -278,7 +278,7 @@ fn ensure_cand_worker() {
                     match client
                         .as_mut()
                         .expect("刚填充")
-                        .rime_candidates(&pinyin, &schema, 9)
+                        .rime_candidates(&pinyin, &schema, 27)
                     {
                         Ok(cands) => Ok(cands),
                         Err(_) => {
@@ -289,7 +289,7 @@ fn ensure_cand_worker() {
                             client = None;
                             match ipc::ensure_daemon() {
                                 Ok(mut c2) => {
-                                    let r = c2.rime_candidates(&pinyin, &schema, 9);
+                                    let r = c2.rime_candidates(&pinyin, &schema, 27);
                                     if r.is_ok() {
                                         client = Some(c2);
                                     }
@@ -965,6 +965,8 @@ impl VerbaIMKController {
                 preedit,
                 candidates,
                 page,
+                // 选中下标由 IMKCandidates 系统组件自行管理，macOS 端暂不消费。
+                selected: _selected,
                 llm_request,
             } => {
                 // 在途空候选不覆盖面板数据源：updateComposition 会按 candidates:

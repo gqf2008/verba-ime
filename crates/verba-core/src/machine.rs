@@ -86,11 +86,13 @@ pub enum Action {
     UpdatePrompt { preedit: String },
     /// 拼音 preedit 更新（preedit 为纯拼音，候选单独给前端渲染候选窗）。
     /// `page` 为当前候选页码（0 起，每页 `PINYIN_PAGE_SIZE` 个）。
+    /// `selected` 为当前选中候选下标（页内，0 起；方向键选字维护）。
     /// `llm_request`：拼音变更后是否需向 LLM 请求融合候选（前端负责防抖与取消）。
     UpdatePinyin {
         preedit: String,
         candidates: Vec<String>,
         page: usize,
+        selected: usize,
         llm_request: Option<LlmCandidateRequest>,
     },
     /// 提示词模式下按下 Enter：发起 LLM 生成。
@@ -155,6 +157,8 @@ pub struct CompositionMachine {
     deferred_intent: Option<DeferredIntent>,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
+    /// 当前选中候选下标（页内，0 起；方向键 Up/Down 移动，候选刷新时归 0）。
+    selected_index: usize,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
@@ -233,6 +237,7 @@ impl CompositionMachine {
             candidates_in_flight: false,
             deferred_intent: None,
             pinyin_page: 0,
+            selected_index: 0,
             prompt: String::new(),
             result: String::new(),
             double_quote_open: false,
@@ -303,10 +308,13 @@ impl CompositionMachine {
         } else {
             self.pinyin_page = (self.pinyin_page + total - 1) % total;
         }
+        // 翻页后选中回到新页首项。
+        self.selected_index = 0;
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
             candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
+            selected: self.selected_index,
             llm_request: None,
         }
     }
@@ -350,6 +358,7 @@ impl CompositionMachine {
                         preedit: self.pinyin_composition_preedit(),
                         candidates: self.display_candidate_texts(),
                         page: self.pinyin_page,
+                        selected: self.selected_index,
                         llm_request: self.request_llm_candidates_if_needed(),
                     }
                 } else {
@@ -427,8 +436,12 @@ impl CompositionMachine {
             return self.pinyin_action();
         }
         if c == ' ' {
-            // 空格：选当前首候选（是否整句提交由 select_candidate 决定）
-            return self.select_candidate(0);
+            // 空格：选当前选中候选（方向键移动后按空格提交选中项）。
+            // selected_index 是页内下标，须换算成全量列表的全局下标——
+            // 翻页后 selected_index 归 0，直接用页内下标会提交到第一页
+            // （真机：翻到第 2 页空格上屏的却是第 1 页首项）。
+            let global = self.pinyin_page * Self::PINYIN_PAGE_SIZE + self.selected_index;
+            return self.select_candidate(global);
         }
         // 其它可打印字符：提交候选 0 + 该字符，避免吞字；标点同时转全角
         if self.blind_window() {
@@ -673,14 +686,73 @@ impl CompositionMachine {
             .collect()
     }
 
-    /// 构建拼音态 UpdatePinyin 动作（preedit/候选/页码/LLM 请求）。
+    /// 构建拼音态 UpdatePinyin 动作（preedit/候选/页码/选中/LLM 请求）。
     fn pinyin_action(&mut self) -> Action {
         Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
             candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
+            selected: self.selected_index,
             llm_request: self.request_llm_candidates_if_needed(),
         }
+    }
+
+    /// 当前页内候选条数（最后一页可能不满页）。
+    fn page_item_count(&self) -> usize {
+        let total = self.pinyin_candidates.len();
+        if total == 0 {
+            return 0;
+        }
+        let start = self.pinyin_page * Self::PINYIN_PAGE_SIZE;
+        (total - start).min(Self::PINYIN_PAGE_SIZE)
+    }
+
+    /// 候选总页数（0 候选 = 0 页）。
+    fn total_pages(&self) -> usize {
+        self.pinyin_candidates.len().div_ceil(Self::PINYIN_PAGE_SIZE)
+    }
+
+    /// 方向键选字：Up 上移选中；页首继续 Up 翻到上一页末项。
+    /// 候选为空时不动（返回原态刷新，前端保持当前显示）。
+    pub fn feed_arrow_up(&mut self) -> Action {
+        if self.state == MachineState::Pinyin {
+            let n = self.page_item_count();
+            if n == 0 {
+                return Action::None;
+            }
+            if self.selected_index > 0 {
+                self.selected_index -= 1;
+            } else if self.pinyin_page > 0 {
+                // 页首继续 Up：翻上一页并选中末项（跨页遍历）。
+                self.pinyin_page -= 1;
+                self.selected_index = self.page_item_count().saturating_sub(1);
+            } else {
+                return Action::None; // 首页首项
+            }
+            return self.pinyin_action();
+        }
+        Action::None
+    }
+
+    /// 方向键选字：Down 下移选中；页尾继续 Down 翻到下一页首项。
+    pub fn feed_arrow_down(&mut self) -> Action {
+        if self.state == MachineState::Pinyin {
+            let n = self.page_item_count();
+            if n == 0 {
+                return Action::None;
+            }
+            if self.selected_index + 1 < n {
+                self.selected_index += 1;
+            } else if self.pinyin_page + 1 < self.total_pages() {
+                // 页尾继续 Down：翻到下一页首项（跨页遍历，微软拼音/手心行为）。
+                self.pinyin_page += 1;
+                self.selected_index = 0;
+            } else {
+                return Action::None; // 末页末项
+            }
+            return self.pinyin_action();
+        }
+        Action::None
     }
 
     /// 取融合候选中的第 `index` 个（含覆盖长度）。
@@ -755,6 +827,7 @@ impl CompositionMachine {
         self.candidates_in_flight = false;
         self.deferred_intent = None;
         self.pinyin_page = 0;
+        self.selected_index = 0;
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
@@ -804,6 +877,7 @@ impl CompositionMachine {
         self.candidates_in_flight = false;
         self.deferred_intent = None;
         self.pinyin_page = 0;
+        self.selected_index = 0;
     }
 
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
@@ -946,6 +1020,8 @@ impl CompositionMachine {
         // （见 fuse_candidates）。
         if done || changed {
             self.fuse_candidates();
+            // 候选列表变化后选中回到首项（方向键选中的位置失效）。
+            self.selected_index = 0;
         }
         // 查询终结（done）时补执行在途暂缓的意图。部分块（done=false，legacy
         // 流式通道保留的入口）只累积候选、不触发重放——提前重放会以「原文+
@@ -975,6 +1051,7 @@ impl CompositionMachine {
                             preedit: self.pinyin_composition_preedit(),
                             candidates: self.display_candidate_texts(),
                             page: self.pinyin_page,
+                            selected: self.selected_index,
                             llm_request: None,
                         };
                     }
@@ -1001,6 +1078,7 @@ impl CompositionMachine {
             preedit: self.pinyin_composition_preedit(),
             candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
+            selected: self.selected_index,
             llm_request: None,
         }
     }
@@ -2185,5 +2263,151 @@ mod tests {
             }
         );
         assert_eq!(m.state(), MachineState::Prompt);
+    }
+
+    /// 方向键选字：Down/Up 移动选中（页内 clamp），空格提交选中项；
+    /// 候选刷新（rime 注入）后选中回到首项。
+    #[test]
+    fn arrow_keys_move_selection_and_space_commits_selected() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        rime(&mut m, "ni", &["你", "泥", "拟"]);
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { selected: 1, .. }
+        ));
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { selected: 2, .. }
+        ));
+        assert_eq!(m.feed_arrow_down(), Action::None, "单页末项再 Down 不动作");
+        assert!(matches!(
+            &m.feed_arrow_up(),
+            Action::UpdatePinyin { selected: 1, .. }
+        ));
+        assert!(matches!(
+            &m.feed_arrow_up(),
+            Action::UpdatePinyin { selected: 0, .. }
+        ));
+        // 空格提交当前选中项（方向键移动后 selected=0 → 你）
+        assert!(matches!(
+            m.feed_char(' '),
+            Action::CommitImmediate(t) if t == "你"
+        ));
+        // 无候选时方向键不动（保持原态）
+        let mut m2 = CompositionMachine::new();
+        m2.feed_char('x');
+        assert_eq!(m2.feed_arrow_down(), Action::None);
+        assert_eq!(m2.feed_arrow_up(), Action::None);
+    }
+
+    /// 方向键选中后候选刷新（新查询结果到达）→ 选中回落到首项。
+    #[test]
+    fn candidate_refresh_resets_selection() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        rime(&mut m, "ni", &["你", "泥", "拟"]);
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { selected: 1, .. }
+        ));
+        rime(&mut m, "ni", &["你", "尼", "呢"]);
+        assert!(matches!(
+            &m.feed_char(' '),
+            Action::CommitImmediate(t) if t == "你"
+        ), "刷新后选中归 0，空格提交首选");
+    }
+
+    /// 跨页遍历（微软拼音/手心行为）：20 条候选 = 3 页（9+9+2）。
+    /// 页尾继续 Down → 下一页首项；末页末项再 Down 不动；
+    /// 页首继续 Up → 上一页末项；首页首项再 Up 不动。
+    #[test]
+    fn arrow_keys_cross_page_at_boundaries() {
+        let texts: Vec<String> = (0..20).map(|i| format!("词{i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let mut m = CompositionMachine::new();
+        m.feed_char('y');
+        m.feed_char('i');
+        rime(&mut m, "yi", &refs);
+
+        // 第 1 页 ↓ 到页尾（selected 8），再 ↓ 翻到第 2 页首项
+        for _ in 0..8 {
+            assert!(matches!(
+                &m.feed_arrow_down(),
+                Action::UpdatePinyin { selected, .. } if *selected > 0
+            ));
+        }
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { page: 1, selected: 0, .. }
+        ), "页尾 Down 应翻到第 2 页首项");
+        // 第 2 页 ↓ 到页尾再翻第 3 页
+        for _ in 0..8 {
+            let _ = m.feed_arrow_down();
+        }
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { page: 2, selected: 0, .. }
+        ));
+        // 第 3 页仅 2 项：↓ 到末项（selected 1）后再 ↓ 不动
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { selected: 1, .. }
+        ));
+        assert_eq!(m.feed_arrow_down(), Action::None, "末页末项 Down 不动");
+        // ↑ 先回第 3 页首项，再翻回第 2 页末项
+        assert!(matches!(
+            &m.feed_arrow_up(),
+            Action::UpdatePinyin { page: 2, selected: 0, .. }
+        ));
+        assert!(matches!(
+            &m.feed_arrow_up(),
+            Action::UpdatePinyin { page: 1, selected: 8, .. }
+        ), "页首 Up 应翻回上一页末项");
+        // 一路 ↑ 回到第 1 页首项：8 次页内 + 1 次翻页 + 8 次页内 = 17 次
+        for _ in 0..17 {
+            let _ = m.feed_arrow_up();
+        }
+        assert_eq!(m.feed_arrow_up(), Action::None, "首页首项 Up 不动");
+    }
+
+    /// 回归（真机：翻到第 2 页后空格上屏的却是第 1 页首项）：
+    /// selected_index 是页内下标，空格提交须换算成全量列表的全局下标。
+    #[test]
+    fn space_after_page_turn_commits_page_global_index() {
+        let texts: Vec<String> = (0..20).map(|i| format!("词{i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let mut m = CompositionMachine::new();
+        m.feed_char('y');
+        m.feed_char('i');
+        rime(&mut m, "yi", &refs);
+        // 翻到第 2 页：8 次页内 + 1 次跨页
+        for _ in 0..8 {
+            let _ = m.feed_arrow_down();
+        }
+        assert!(matches!(
+            &m.feed_arrow_down(),
+            Action::UpdatePinyin { page: 1, selected: 0, .. }
+        ));
+        // 空格应提交第 2 页首项（全局下标 9 = 词9），而非第一页的词0
+        assert!(matches!(
+            m.feed_char(' '),
+            Action::CommitImmediate(t) if t == "词9"
+        ), "翻页后空格须提交当前页选中项（全局下标），而非第一页首项");
+        // PageDown 翻页后同样
+        let mut m2 = CompositionMachine::new();
+        m2.feed_char('y');
+        m2.feed_char('i');
+        rime(&mut m2, "yi", &refs);
+        assert!(matches!(
+            &m2.feed_page_down(),
+            Action::UpdatePinyin { page: 1, .. }
+        ));
+        assert!(matches!(
+            m2.feed_char(' '),
+            Action::CommitImmediate(t) if t == "词9"
+        ), "PageDown 翻页后空格提交第 2 页首项");
     }
 }

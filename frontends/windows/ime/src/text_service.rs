@@ -22,8 +22,8 @@ use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_ESCAPE,
-    VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN,
+    GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_UP,
 };
 
 use crate::capture::capture_primary_screen;
@@ -36,9 +36,9 @@ use windows::Win32::UI::TextServices::{
     ITfThreadMgr,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, PostMessageW,
+    RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
 };
 
 use crate::dll;
@@ -49,7 +49,7 @@ const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
 const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
-const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 4; // 80ms×4≈320ms：输入停顿后发起 LLM 候选融合请求
+const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 1; // 80ms：击键后短暂停顿即查 Rime（本地快）；过早的 320ms 防抖为远程 LLM 融合设计，单引擎 Rime 下导致候选框滞后于输入（不跟手）
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
 
@@ -334,6 +334,7 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     }
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
+    let is_arrow = vk == VK_UP.0 as u32 || vk == VK_DOWN.0 as u32;
     // Ctrl/Alt 按下时不做字符认领：字母键在 Ctrl 下 ToUnicodeEx 返回控制字符
     // 本就不命中认领，但 OEM 标点（. , 等）仍返回普通字符——Idle/Pinyin 新
     // 认领的标点会把应用快捷键吞掉（如 VS Code 的 Ctrl+. 快速修复）。热键与
@@ -349,8 +350,9 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
             None => false,
         },
         MachineState::Pinyin => {
-            if is_control || is_page {
-                // Enter/Backspace/Esc 与 PageUp/PageDown：拼音态由状态机处理
+            if is_control || is_page || is_arrow {
+                // Enter/Backspace/Esc、PageUp/PageDown 与 Up/Down：
+                // 拼音态由状态机处理（翻页/方向键选字）
                 return true;
             }
             match get_char_for_vk(vk, lparam) {
@@ -517,7 +519,8 @@ pub fn handle_key_down(
     let vk = wparam;
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
-    let ch = if is_control || is_page {
+    let is_arrow = vk == VK_UP.0 as u32 || vk == VK_DOWN.0 as u32;
+    let ch = if is_control || is_page || is_arrow {
         None
     } else {
         get_char_for_vk(vk, lparam)
@@ -531,6 +534,16 @@ pub fn handle_key_down(
                 machine.feed_page_up()
             } else {
                 machine.feed_page_down()
+            })
+        } else {
+            None
+        }
+    } else if is_arrow {
+        if state == MachineState::Pinyin {
+            Some(if vk == VK_UP.0 as u32 {
+                machine.feed_arrow_up()
+            } else {
+                machine.feed_arrow_down()
             })
         } else {
             None
@@ -648,10 +661,11 @@ pub fn apply_action(
             preedit,
             candidates,
             page,
+            selected,
             llm_request,
         } => {
             set_preedit(data, context, clientid, &preedit)?;
-            update_candidate_window(data, context, &preedit, &candidates, page);
+            update_candidate_window(data, context, &preedit, &candidates, page, selected);
             schedule_candidate_request(data, llm_request);
             Ok(())
         }
@@ -762,6 +776,7 @@ fn update_candidate_window(
     preedit: &str,
     candidates: &[String],
     page: usize,
+    selected: usize,
 ) {
     let mut borrow = data.candidate_window.borrow_mut();
     let Some(cw) = borrow.as_mut() else {
@@ -778,7 +793,10 @@ fn update_candidate_window(
     let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
     ctrl.set_candidates(candidates.to_vec());
     ctrl.set_preedit(preedit);
+    // 先 set_page（其内部会把选中重置回首项），最后 select_relative 应用
+    // 状态机传来的选中——顺序反了会被 set_page 重置，方向键选字无视觉反馈。
     ctrl.set_page(page);
+    ctrl.select_relative(selected.min(candidates.len().saturating_sub(1)));
     ctrl.show();
     match caret_screen_pos(data, context) {
         Some(anchor) => {
@@ -1164,15 +1182,23 @@ fn cancel_candidate_request(data: &Rc<TextServiceData>) {
     cancel_with_retry(&data.control, id);
 }
 
-/// 调度候选融合请求（防抖由定时器推进；pinyin 变更时重置计时）。
+/// 调度候选融合请求：不在途时**立即**发起（Rime 本地查询经 daemon IPC，
+/// 毫秒级，无需防抖等待——原 320ms 防抖为远程 LLM 融合设计，单引擎下
+/// 造成候选框滞后于输入、不跟手）；在途时保留 pending，由定时器
+/// maybe_fire_candidate_request 在查询结束后补发（防线程堆积）。
 fn schedule_candidate_request(data: &Rc<TextServiceData>, req: Option<LlmCandidateRequest>) {
     if let Some(r) = req {
         // 单引擎（Rime）：打字过程只请求本地 Rime 候选，不请求远程 LLM 候选融合
         // （LLM 仅用于回车触发的 AI 直输）。
-        *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
-            pinyin: r.pinyin,
-            ticks: 0,
-        });
+        if !data.candidate_request_busy.load(Ordering::SeqCst) {
+            let schema = data.candidate_rime_schema.borrow().clone();
+            start_rime_candidates(data, r.pinyin, schema);
+        } else {
+            *data.candidate_req_pending.borrow_mut() = Some(PendingCandidateReq {
+                pinyin: r.pinyin,
+                ticks: 0,
+            });
+        }
     }
 }
 
@@ -1231,6 +1257,9 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
     cancel_candidate_request(data);
     let chunks = Arc::clone(&data.chunks);
     let busy = Arc::clone(&data.candidate_request_busy);
+    // 结果回流后立即唤醒定时器窗口消费（不等下一个 80ms tick，跟手性）。
+    // HWND 不实现 Send，跨线程传递原始指针值再还原。
+    let timer_hwnd = data.timer_hwnd.get().map(|h| h.0 as usize);
     let handle = std::thread::spawn(move || {
         let _busy = BusyGuard::new(&busy);
         let mut client = match ipc::ensure_daemon() {
@@ -1240,7 +1269,9 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
                 return;
             }
         };
-        let cands = match client.rime_candidates(&pinyin, &schema, 9) {
+        // 一次取足量候选（27 = daemon 上限）供前端本地分页（每页 9 条、
+        // 最多 3 页）。此前每查询只取 9 条导致候选窗永远单页、翻页无效。
+        let cands = match client.rime_candidates(&pinyin, &schema, 27) {
             Ok(c) => c,
             Err(e) => {
                 push_rime_fail(&chunks, &pinyin, &format!("Rime 候选查询失败: {e}"));
@@ -1260,6 +1291,14 @@ fn start_rime_candidates(data: &Rc<TextServiceData>, pinyin: String, schema: Str
                     })),
                 },
             ));
+        }
+        // 立即唤醒 on_timer 消费（PostMessage 同 WM_TIMER 投递，定时器
+        // 窗口过程在 TSF 线程处理——线程安全）。
+        if let Some(raw) = timer_hwnd {
+            unsafe {
+                let hwnd = HWND(raw as *mut core::ffi::c_void);
+                let _ = PostMessageW(Some(hwnd), WM_TIMER, WPARAM(TIMER_ID as usize), LPARAM(0));
+            }
         }
     });
     *data.candidate_thread.borrow_mut() = Some(handle);
@@ -1630,6 +1669,7 @@ enum Step {
         preedit: String,
         candidates: Vec<String>,
         page: usize,
+        selected: usize,
     },
     Act(Action),
     EndCompositionQuiet,
@@ -1664,11 +1704,13 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
                             preedit,
                             candidates,
                             page,
+                            selected,
                             ..
                         } => Step::Candidates {
                             preedit,
                             candidates,
                             page,
+                            selected,
                         },
                         // 在途暂缓后的知情回退（重复空格按原文提交）等
                         // 非刷新动作不能丢弃：与 macOS feed_candidates_event
@@ -1742,9 +1784,10 @@ impl TextServiceData {
                     preedit,
                     candidates,
                     page,
+                    selected,
                 } => {
                     let _ = set_preedit(&rc, &context, clientid, &preedit);
-                    update_candidate_window(&rc, &context, &preedit, &candidates, page);
+                    update_candidate_window(&rc, &context, &preedit, &candidates, page, selected);
                 }
                 Step::Act(action) => {
                     let _ = apply_action(&rc, &context, action);
