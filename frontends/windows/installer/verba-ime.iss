@@ -36,7 +36,7 @@ Source: "..\..\..\target\release\verba-settings.exe"; DestDir: "{app}"; Flags: i
 Source: "..\..\..\vendor\rime\*"; DestDir: "{app}\rime"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; OCR 模型（PP-OCRv5，vendor/ocr 产出）：daemon 同目录查找免首次下载；
 ; 本地未拉取时跳过（发布流水线会断言存在）
-Source: "..\..\..\vendor\ocr\*"; DestDir: "{app}\models-rapidocr"; Flags: ignoreversion createallsubdirs skipifsourcedoesntexist
+Source: "..\..\..\vendor\ocr\*"; DestDir: "{app}\models-rapidocr"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Run]
 ; 先注销旧档案（清理早期版本遗留/损坏项），再注册（TSF 档案/类别，需管理员）
