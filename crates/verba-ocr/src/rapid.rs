@@ -8,14 +8,11 @@
 //! - 常驻一个 `RapidOcr` 运行器（ONNX session 有状态），串行执行识别。
 //! - `spawn_blocking` 包裹阻塞推理，不占 daemon async 运行时。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use verba_ai::OcrProvider;
 
 use crate::OcrError;
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 常驻的快速 OCR 运行器（ONNX sessions 有状态，需串行访问）。
 struct RapidOcrRunner {
@@ -113,12 +110,13 @@ fn run_native(image: &[u8]) -> Result<String, OcrError> {
         *guard = Some(build_runner()?);
     }
     let runner = guard.as_mut().expect("set 后必有运行器");
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let img_path =
-        std::env::temp_dir().join(format!("verba-ocr-{}-{}.bmp", std::process::id(), id));
-    std::fs::write(&img_path, image).map_err(|e| OcrError::Rapid(format!("写图像失败: {e}")))?;
-    let result = runner.runner.run_path(&img_path);
-    let _ = std::fs::remove_file(&img_path);
+    // 统一解码为 RGB 后走 run_image：此前把原始字节直接写成 .bmp 临时文件
+    // （截图是 PNG 内容），rapidocr 按扩展名用 BMP 解码器 → failed to decode
+    // image（真机复现）。
+    let img = image::load_from_memory(image)
+        .map_err(|e| OcrError::Rapid(format!("图像解码失败: {e}")))?
+        .to_rgb8();
+    let result = runner.runner.run_image(&img);
     let output = result.map_err(|e| OcrError::Rapid(format!("RapidOCR 识别失败: {e}")))?;
     let mut lines = Vec::new();
     for line in output.lines {

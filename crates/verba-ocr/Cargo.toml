@@ -14,6 +14,7 @@ unsafe_code = "allow"
 verba-ai = { path = "../verba-ai" }
 verba-config = { path = "../verba-config" }
 rapidocr-core = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 thiserror.workspace = true
 log.workspace = true
 tokio.workspace = true
