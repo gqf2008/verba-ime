@@ -138,6 +138,7 @@ impl ITfDisplayAttributeProvider_Impl for DisplayAttributeProvider_Impl {
         .into())
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn GetDisplayAttributeInfo(&self, guid: *const GUID) -> Result<ITfDisplayAttributeInfo> {
         unsafe {
             if *guid == GUID_ATTR_VERBA_COMPOSITION {
@@ -188,20 +189,18 @@ pub fn apply_composition_attribute(
         let mut var = VARIANT::default();
         // VT_I4（TfGuidAtom）：嵌套 union 经 ptr::write 整体构造（避免
         // ManuallyDrop 字段的 DerefMut 写入触发析构语义）。
-        unsafe {
-            core::ptr::write(
-                &mut var.Anonymous,
-                VARIANT_0 {
-                    Anonymous: core::mem::ManuallyDrop::new(VARIANT_0_0 {
-                        vt: VT_I4,
-                        wReserved1: 0,
-                        wReserved2: 0,
-                        wReserved3: 0,
-                        Anonymous: VARIANT_0_0_0 { lVal: atom as i32 },
-                    }),
-                },
-            );
-        }
+        core::ptr::write(
+            &mut var.Anonymous,
+            VARIANT_0 {
+                Anonymous: core::mem::ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_I4,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: VARIANT_0_0_0 { lVal: atom as i32 },
+                }),
+            },
+        );
         prop.SetValue(ec, &range, &var)
     }
 }
@@ -303,7 +302,7 @@ mod tests {
             assert_eq!(var.Anonymous.Anonymous.Anonymous.lVal, 0x12345678);
             // 标准 VARIANT 布局：vt@0(u16)，lVal@8(i32)
             let raw = &var as *const VARIANT as *const u8;
-            assert_eq!(*raw as u16, VT_I4.0 as u16);
+            assert_eq!(*raw as u16, VT_I4.0);
             let lval_ptr = raw.add(8) as *const i32;
             assert_eq!(*lval_ptr, 0x12345678);
         }
