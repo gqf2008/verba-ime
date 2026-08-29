@@ -19,7 +19,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
-    ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIP_KEYBOARD,
+    ITfInputProcessorProfiles, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIP_KEYBOARD,
 };
 
 use crate::dll::module_handle;
@@ -264,7 +265,7 @@ fn language_tag_to_langid(tag: &str) -> Option<u16> {
     }
 }
 
-/// 注册 TSF 类别（键盘输入法 + 沉浸式支持）。
+/// 注册 TSF 类别（键盘输入法 + 沉浸式支持 + 显示属性提供者）。
 pub fn register_categories() -> Result<()> {
     unsafe {
         let catmgr: ITfCategoryMgr =
@@ -285,6 +286,15 @@ pub fn register_categories() -> Result<()> {
         catmgr.RegisterCategory(
             &CLSID_VERBA_TEXT_SERVICE,
             &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+            &CLSID_VERBA_TEXT_SERVICE,
+        )?;
+        // 显示属性提供者（组合下划线）：RegisterCategory 写 HKLM 需要管理员，
+        // 激活时（普通权限）调用会 E_FAIL（真机实测 0x80004005）——必须在
+        // 安装器/regsvr32（管理员）路径注册。应用经 ITfDisplayAttributeMgr
+        // 按 GUID 查询下划线属性时靠此类别找到 provider。
+        catmgr.RegisterCategory(
+            &CLSID_VERBA_TEXT_SERVICE,
+            &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
             &CLSID_VERBA_TEXT_SERVICE,
         )?;
         Ok(())

@@ -431,3 +431,73 @@ fn should_claim_key_composition_claims_all() {
         );
     }
 }
+
+/// 显示属性链路冒烟（真实 TSF 环境）：TextService::Activate 注册 provider 后，
+/// ITfDisplayAttributeMgr 能按属性 GUID 查到属性对象（owner = 文本服务 CLSID）
+/// 且属性描述为实线下划线——组合下划线的完整注册/查询链路。
+#[test]
+fn tsf_display_attribute_roundtrip() {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        assert_eq!(hr.0, 0, "CoInitializeEx 失败: {hr}");
+
+        // 激活 TextService（触发 register_provider）
+        let tm: ITfThreadMgr = CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
+            .expect("创建 TSF ThreadMgr");
+        let tid = tm.Activate().expect("ThreadMgr.Activate");
+        let svc: ITfTextInputProcessor = TextService::new().into();
+        svc.Activate(&tm, tid)
+            .expect("TextService.Activate（含显示属性 provider 注册）");
+
+        // 经 TSF manager 查询组合属性（首次调用会 CoCreateInstance 文本服务
+        // 并 QueryInterface ITfDisplayAttributeProvider）
+        let mgr: windows::Win32::UI::TextServices::ITfDisplayAttributeMgr =
+            CoCreateInstance(
+                &windows::Win32::UI::TextServices::CLSID_TF_DisplayAttributeMgr,
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+            .expect("创建 DisplayAttributeMgr");
+        let mut info: Option<windows::Win32::UI::TextServices::ITfDisplayAttributeInfo> = None;
+        let mut owner = windows::core::GUID::zeroed();
+        let r = mgr.GetDisplayAttributeInfo(
+            &verba_ime_windows::display_attribute::GUID_ATTR_VERBA_COMPOSITION,
+            &mut info,
+            &mut owner,
+        );
+        if let Err(e) = r {
+            // provider 类别注册（GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER）写
+            // HKLM\SOFTWARE\Microsoft\CTF\TIP\{CLSID}\Category，普通权限
+            // 下 RegisterCategory 返回 E_FAIL（真机实测 0x80004005）——类别
+            // 由安装器 verba-reg（管理员）注册；未注册环境跳过（权限限制，
+            // 非代码缺陷），已注册环境（安装版）继续验证完整链路。
+            eprintln!("provider 类别未注册（需 verba-reg register 管理员注册）: {e}");
+            svc.Deactivate().expect("TextService.Deactivate");
+            let _ = tm.Deactivate();
+            CoUninitialize();
+            return;
+        }
+        let info = info.expect("属性对象");
+        assert_eq!(
+            owner,
+            verba_ime_windows::guids::CLSID_VERBA_TEXT_SERVICE,
+            "属性 owner 应为文本服务 CLSID"
+        );
+        let mut da = windows::Win32::UI::TextServices::TF_DISPLAYATTRIBUTE::default();
+        info.GetAttributeInfo(&mut da).expect("GetAttributeInfo");
+        assert_eq!(
+            da.lsStyle,
+            windows::Win32::UI::TextServices::TF_LS_SOLID,
+            "组合属性应为实线下划线"
+        );
+        assert_eq!(
+            da.bAttr,
+            windows::Win32::UI::TextServices::TF_ATTR_TARGET_CONVERTED,
+            "组合属性应为 TARGET_CONVERTED 标记"
+        );
+
+        svc.Deactivate().expect("TextService.Deactivate");
+        let _ = tm.Deactivate();
+        CoUninitialize();
+    }
+}
