@@ -228,7 +228,8 @@ fn cmd_rime(args: &[String]) -> i32 {
         .cloned()
         .unwrap_or_else(|| "luna_pinyin_simp".into());
     with_client(|c| {
-        let cands = c.rime_candidates(&input, &schema, 9)?;
+        // 27 = daemon 上限（与输入法前端一致）：调试时看全量候选，分页由面板处理。
+        let cands = c.rime_candidates(&input, &schema, 27)?;
         if cands.is_empty() {
             println!("（无候选）");
         } else {

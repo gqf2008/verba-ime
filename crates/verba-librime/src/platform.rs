@@ -412,21 +412,27 @@ fn to_rust(ptr: *const c_char) -> String {
 }
 
 /// 候选页大小补丁内容（default.custom.yaml patch 形式，librime 部署时合并）。
-const PAGE_SIZE_PATCH_CONTENT: &str =
+/// 注意：librime 的 patch 仅递归合并映射字段，**序列字段（如 key_bindings）
+/// 不生效**——翻页键绑定不写在这里，逐页收集直接模拟方案内置的 equal 键。
+const PATCH_CONTENT: &str =
     "# Verba 自动生成：候选菜单每页条数（与输入法面板一次展示的 9 条对齐）\npatch:\n  menu/page_size: 9\n";
 
 /// 部署前写入候选页大小补丁（幂等：已存在不覆盖用户自定义）。
+/// 返回 true = 本次实际写入了补丁内容（调用方应触发全量部署——
+/// librime 增量部署只盯源文件 mtime，custom 补丁变更检测不到）。
 ///
 /// 写失败只降级告警、不中断引擎初始化：`candidates()` 的分页收集循环本身
 /// 就是页大小 5 时的兜底，故障面不应大于一项展示优化。
-fn ensure_page_size_patch(user_data_dir: &Path) {
+fn ensure_page_patches(user_data_dir: &Path) -> bool {
     let patch = user_data_dir.join("default.custom.yaml");
-    if patch.exists() {
-        return;
+    if !patch.exists() {
+        if let Err(e) = std::fs::write(&patch, PATCH_CONTENT) {
+            log::warn!("[verba-librime] 写入候选页大小补丁失败（按每页 5 条分页收集兜底）: {e}");
+            return false;
+        }
+        return true;
     }
-    if let Err(e) = std::fs::write(&patch, PAGE_SIZE_PATCH_CONTENT) {
-        log::warn!("[verba-librime] 写入候选页大小补丁失败（按每页 5 条分页收集兜底）: {e}");
-    }
+    false
 }
 
 impl RimeEngine {
@@ -438,11 +444,12 @@ impl RimeEngine {
         std::fs::create_dir_all(&cfg.user_data_dir)
             .map_err(|e| RimeError::Init(format!("用户目录不可用: {e}")))?;
 
-        // 候选页大小补丁：菜单每页默认 5 条，面板一次展示 9 条——首页只给
-        // 5 条即「候选不全」（真机）；运行时 Page_Down 翻页不被方案保证接受，
-        // 直接经 default.custom.yaml 把页大小提到 9 最稳。仅缺失时写入，
-        // 不覆盖用户自定义（变更后 start_maintenance 的部署会检测并重编译）。
-        ensure_page_size_patch(&cfg.user_data_dir);
+        // 候选页大小/翻页键补丁：菜单每页默认 5 条，面板一次展示 9 条——
+        // 首页只给 5 条即「候选不全」（真机）；运行时 Page_Down 翻页不被
+        // 方案保证接受（默认翻页键为 ,/./-/=），经 default.custom.yaml 把
+        // 页大小提到 9 并绑定 Page_Down/Page_Up 翻页最稳。仅缺失时写入/
+        // 缺绑定时追加，不覆盖用户自定义（写入点在 start_maintenance 前，
+        // 返回 true 时触发全量部署，见下）。
 
         let shared_c = CString::new(cfg.shared_data_dir.to_str().unwrap_or_default())
             .map_err(|e| RimeError::Init(e.to_string()))?;
@@ -474,7 +481,11 @@ impl RimeEngine {
             ((*api).setup)(&mut traits);
             ((*api).initialize)(&mut traits);
             // 首次运行需部署（编译 schema/词典）；同步等待完成。
-            ((*api).start_maintenance)(0);
+            // 补丁刚写入（新增/追加）时强制全量部署——librime 增量检测
+            // 只盯源文件 mtime，custom 补丁变更不会触发重编译（真机：
+            // 翻页键绑定写入后 build 产物未合并，逐页收集仍只有首页）。
+            let patch_changed = ensure_page_patches(&cfg.user_data_dir);
+            ((*api).start_maintenance)(if patch_changed { 1 } else { 0 });
             ((*api).join_maintenance_thread)();
         }
 
@@ -568,6 +579,10 @@ impl RimeEngine {
                     }
                     let n = ctx.menu.num_candidates.max(0) as usize;
                     let cur_page_no = ctx.menu.page_no;
+                    eprintln!(
+                        "[librime-diag] page_no={cur_page_no} n={n} prev={prev_page_no} is_last={}",
+                        ctx.menu.is_last_page
+                    );
                     if cur_page_no == prev_page_no {
                         // 页码未前进：翻页未生效，放弃续翻（宁缺勿重复）。
                         ((*api).free_context)(&mut ctx);
@@ -587,9 +602,13 @@ impl RimeEngine {
                         break;
                     }
                     // SAFETY: 静态 NUL 结尾字节串；simulate_key_sequence 接受按键名。
-                    let page_down = b"Page_Down\0";
-                    if ((*api).simulate_key_sequence)(session, page_down.as_ptr() as *const i8) == 0
-                    {
+                    // 用 process_key 直接发 `=`（equal）键事件（keycode 61，X11
+                    // keysym）：方案默认翻页键是 ,/./-/=（default.yaml 内置
+                    // `{accept: equal, send: Page_Down, when: has_menu}`）。
+                    // simulate_key_sequence 对功能键实测无效（页码不推进），
+                    // process_key 走正式按键处理链。
+                    let keycode_equal: i32 = 0x3d; // '=' keysym
+                    if ((*api).process_key)(session, keycode_equal, 0) == 0 {
                         break;
                     }
                     prev_page_no = cur_page_no;
@@ -687,22 +706,59 @@ mod tests {
         let patch = dir.join("default.custom.yaml");
 
         // 缺失 → 写入预期内容
-        ensure_page_size_patch(&dir);
+        ensure_page_patches(&dir);
         assert_eq!(
             std::fs::read_to_string(&patch).unwrap(),
-            PAGE_SIZE_PATCH_CONTENT,
+            PATCH_CONTENT,
             "首次写入应为内置补丁内容"
         );
 
         // 已存在（用户改过）→ 保持原样不覆盖
         let custom = "patch:\n  menu/page_size: 7\n";
         std::fs::write(&patch, custom).unwrap();
-        ensure_page_size_patch(&dir);
+        ensure_page_patches(&dir);
         assert_eq!(
             std::fs::read_to_string(&patch).unwrap(),
             custom,
             "已存在的 default.custom.yaml 不得被覆盖"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 集成自测（需真实 rime 运行时，环境变量传路径；未设置则跳过）：
+    /// 验证逐页收集能凑满 `max` 条候选——真机回归：模拟 Page_Down 不被
+    /// 方案接受时只剩首页，改用方案内置的 equal（`=`）翻页键后应凑满 27 条。
+    ///
+    /// 运行示例（PowerShell）：
+    /// ```powershell
+    /// $env:VERBA_RIME_DLL="E:\...\target_dev22\x86_64-pc-windows-msvc\release\rime\rime.dll"
+    /// $env:VERBA_RIME_SHARED="E:\...\target_dev22\x86_64-pc-windows-msvc\release\rime\data"
+    /// $env:VERBA_RIME_USER="$env:APPDATA\Verba\Verba\data\rime"
+    /// cargo test -p verba-librime --lib integration_ -- --nocapture
+    /// ```
+    #[test]
+    fn integration_candidates_collects_full_pages() {
+        let Ok(dll) = std::env::var("VERBA_RIME_DLL") else {
+            eprintln!("跳过：未设置 VERBA_RIME_DLL");
+            return;
+        };
+        let shared = std::env::var("VERBA_RIME_SHARED").unwrap_or_default();
+        let user = std::env::var("VERBA_RIME_USER").unwrap_or_default();
+        let engine = RimeEngine::new(&RimeConfig::load(
+            std::path::Path::new(&dll),
+            std::path::Path::new(&shared),
+            std::path::Path::new(&user),
+        ))
+        .expect("引擎初始化");
+        let cands = engine
+            .candidates("yi", "luna_pinyin_simp", 27)
+            .expect("候选查询");
+        let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        println!("集成自测: yi 候选 {} 条: {texts:?}", cands.len());
+        assert!(
+            cands.len() > 9,
+            "逐页收集应超过首页 9 条（equal 翻页键），实际 {}",
+            cands.len()
+        );
     }
 }
