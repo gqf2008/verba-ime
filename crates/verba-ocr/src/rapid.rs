@@ -75,7 +75,18 @@ fn ensure_runner() -> Result<(), OcrError> {
 fn build_runner() -> Result<RapidOcrRunner, OcrError> {
     let dirs = verba_config::VerbaDirs::locate()
         .map_err(|e| OcrError::Rapid(format!("定位数据目录失败: {e}")))?;
-    let model_dir = dirs.data_dir().join("models-rapidocr");
+    let user_model_dir = dirs.data_dir().join("models-rapidocr");
+    // 模型目录查找：用户数据目录优先（可自更新）；否则用安装包自带
+    // （daemon 同目录 models-rapidocr，安装器打包，免首次下载离线可用）。
+    let model_dir = if user_model_dir.join("ch_PP-OCRv5_det_mobile.onnx").exists() {
+        user_model_dir
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("models-rapidocr")))
+            .filter(|d| d.join("ch_PP-OCRv5_det_mobile.onnx").exists())
+            .unwrap_or(user_model_dir)
+    };
     let cache = rapidocr_core::model::ModelCache::new(&model_dir);
     cache
         .ensure_model_set(
