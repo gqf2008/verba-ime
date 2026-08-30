@@ -467,9 +467,14 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
     ) -> Result<windows::core::BOOL> {
         let vk = wparam.0 as u32;
         let state = self.data.machine.borrow().state();
-        // 英文模式（Shift 切换后）：除热键外全部交宿主直插（字母/标点不过 IME）；
-        // 中文模式走 should_claim_key 正常路由。
-        let claim = if !self.data.ime_chinese.get() && !is_trigger_hotkey(vk) {
+        // Shift 始终认领（仅用于接收 OnKeyUp 检测孤立按；OnKeyDown 返回 FALSE
+        // 不吞键，Shift 照常交宿主）——TSF 对不认领的键不回调 OnKeyUp，切换
+        // 检测会永远不触发（真机复现）。
+        // 英文模式（Shift 切换后）：除 Shift/热键外全部交宿主直插（字母/标点
+        // 不过 IME）；中文模式走 should_claim_key 正常路由。
+        let claim = if vk == VK_SHIFT.0 as u32 {
+            true
+        } else if !self.data.ime_chinese.get() && !is_trigger_hotkey(vk) {
             false
         } else {
             should_claim_key(state, vk, lparam.0 as u32)
