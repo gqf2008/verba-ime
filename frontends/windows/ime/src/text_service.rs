@@ -604,6 +604,24 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 
 // ---- 按键处理 ----
 
+/// OCR 预览候选窗：状态行提示操作 + 首条候选=识别文本。
+fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
+    let theme = data.candidate_theme.borrow().clone();
+    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
+    ctrl.set_candidates(vec![text.to_owned()]);
+    ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
+    ctrl.show();
+    if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
+        let fallback = data
+            .context
+            .borrow()
+            .as_ref()
+            .and_then(|ctx| view_screen_pos(ctx))
+            .unwrap_or((0, 0, 0));
+        cw.update(&ctrl, fallback);
+    }
+}
+
 /// Shift 孤立按切换中英：翻转模式 + 同步 GUID_COMPARTMENT_KEYBOARD_INPUTMODE
 /// （系统语言栏/输入法指示器显示中/英状态）+ 组合中则取消（干净进入英文）。
 fn toggle_ime(data: &Rc<TextServiceData>) {
@@ -677,6 +695,42 @@ fn handle_key_down(
 
     let mut machine = data.machine.borrow_mut();
     let state = machine.state();
+    // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
+    // 后照常走下方路由（不打断打字流）。
+    if machine.ocr_previewing() {
+        use verba_core::machine::PreviewKey;
+        let key = if vk == VK_RETURN.0 as u32 {
+            Some(PreviewKey::Enter)
+        } else if ch == Some(' ') {
+            Some(PreviewKey::Space)
+        } else if ch == Some('1') {
+            Some(PreviewKey::Digit1)
+        } else if vk == VK_ESCAPE.0 as u32 {
+            Some(PreviewKey::Escape)
+        } else {
+            None
+        };
+        match key {
+            Some(k) => {
+                let action = machine.feed_ocr_preview(k).unwrap_or(Action::None);
+                log::info!("OCR 预览: {action:?}");
+                drop(machine);
+                hide_candidate_window(data);
+                if matches!(action, Action::CommitImmediate(_) | Action::Cancel) {
+                    let Some(context) = data.context.borrow().as_ref().cloned() else {
+                        return Ok(FALSE);
+                    };
+                    let _ = apply_action(data, &context, action);
+                }
+                return Ok(TRUE);
+            }
+            None => {
+                // 未命中预览键：退出预览，隐藏候选窗，落回下方正常路由。
+                machine.end_ocr_preview();
+                hide_candidate_window(data);
+            }
+        }
+    }
     let action = if is_page {
         if state == MachineState::Pinyin {
             Some(if vk == VK_PRIOR.0 as u32 {
@@ -898,6 +952,12 @@ pub fn apply_action(
             // 写进会话历史（原实现仅 store(0)，既不取消也不 bump，复审发现）。
             cancel_stream(data);
             Ok(())
+        }
+        Action::OcrPreview { text } => {
+            // 预览动作不经 apply_action（handle_key_down 的预览分支直处理）；
+            // 走到这里属异常路径，回退直接上屏保不丢文本。
+            log::warn!("OcrPreview 走到 apply_action（异常路径），直接上屏");
+            edit_session::commit_text(context, clientid, &text)
         }
         Action::TriggerOcr => {
             // `///`：结束当前组合，触发选区截图 OCR（Ctrl+Alt+O 的键盘化替代）。
@@ -2022,16 +2082,29 @@ impl TextServiceData {
         if results.is_empty() {
             return;
         }
-        let Some(context) = self.context.borrow().as_ref().cloned() else {
+        let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
             return;
         };
-        let clientid = self.clientid.get();
         for text in results {
-            match edit_session::commit_text(&context, clientid, &text) {
-                Ok(()) => log::info!("触发结果上屏: chars={}", text.chars().count()),
-                Err(e) => log::warn!("触发结果上屏失败: {e}"),
-            }
+            // 剪贴板照常（识别文本随手可粘贴）；上屏改为候选窗预览——
+            // 用户看到再决定（Enter/空格/数字 1 上屏，Esc 取消）。
             crate::clipboard::set_text_quiet(&text);
+            match self.machine.borrow_mut().begin_ocr_preview(text.clone()) {
+                Some(Action::OcrPreview { text: t }) => {
+                    show_ocr_preview(&rc, &t);
+                    log::info!("OCR 结果进预览: chars={}", t.chars().count());
+                }
+                _ => {
+                    // 非 Idle（组合中触发等罕见场景）回退直接上屏。
+                    if let Some(context) = self.context.borrow().as_ref().cloned() {
+                        let _ = edit_session::commit_text(
+                            &context,
+                            self.clientid.get(),
+                            &text,
+                        );
+                    }
+                }
+            }
         }
     }
 }

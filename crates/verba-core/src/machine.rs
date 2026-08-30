@@ -73,6 +73,16 @@ pub enum MachineState {
     ResultReady,
 }
 
+/// OCR 预览态的按键分类（feed_ocr_preview 的输入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKey {
+    Enter,
+    Space,
+    Digit1,
+    Escape,
+    Other,
+}
+
 /// 前端应执行的动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -109,6 +119,9 @@ pub enum Action {
     /// `///`：Prompt 态空提示词按第三个斜杠 → 触发选区截图 OCR
     /// （Ctrl+Alt+O 的键盘化替代）。
     TriggerOcr,
+    /// OCR 结果到达 → 进候选窗预览（首条=识别文本，Enter/空格/数字上屏；
+    /// Esc 取消）。不直接插光标——用户看到了再决定。
+    OcrPreview { text: String },
     /// 取消当前组合（Esc / 清空）。
     Cancel,
     /// LLM 出错，已回到 Idle。
@@ -162,6 +175,8 @@ pub struct CompositionMachine {
     pinyin_page: usize,
     /// 当前选中候选下标（页内，0 起；方向键 Up/Down 移动，候选刷新时归 0）。
     selected_index: usize,
+    /// OCR 预览文本（preview 状态期间候选窗首条显示它；None=非预览态）。
+    ocr_preview: Option<String>,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
@@ -241,6 +256,7 @@ impl CompositionMachine {
             deferred_intent: None,
             pinyin_page: 0,
             selected_index: 0,
+            ocr_preview: None,
             prompt: String::new(),
             result: String::new(),
             double_quote_open: false,
@@ -837,6 +853,7 @@ impl CompositionMachine {
         self.deferred_intent = None;
         self.pinyin_page = 0;
         self.selected_index = 0;
+        self.ocr_preview = None;
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
@@ -887,6 +904,7 @@ impl CompositionMachine {
         self.deferred_intent = None;
         self.pinyin_page = 0;
         self.selected_index = 0;
+        self.ocr_preview = None;
     }
 
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
@@ -953,6 +971,47 @@ impl CompositionMachine {
                 .map(|c| c.text.clone())
                 .collect(),
         })
+    }
+
+    /// OCR 结果进入预览：候选窗首条 = 识别文本（选中态），非流式通道。
+    /// 不覆盖已有组合（OCR 触发时组合已结束，状态应 Idle）。
+    pub fn begin_ocr_preview(&mut self, text: String) -> Option<Action> {
+        if self.state != MachineState::Idle || text.is_empty() {
+            return None;
+        }
+        self.ocr_preview = Some(text.clone());
+        Some(Action::OcrPreview { text })
+    }
+
+    /// OCR 预览态的按键处理：Enter/空格/数字 1 上屏识别文本；
+    /// Esc 取消；其余键退出预览并照常处理（不打断打字流）。
+    pub fn feed_ocr_preview(&mut self, key: PreviewKey) -> Option<Action> {
+        debug_assert!(self.ocr_preview.is_some(), "preview 状态须有文本");
+        let text = self.ocr_preview.clone().unwrap_or_default();
+        match key {
+            PreviewKey::Enter | PreviewKey::Space | PreviewKey::Digit1 => {
+                self.ocr_preview = None;
+                Some(Action::CommitImmediate(text))
+            }
+            PreviewKey::Escape => {
+                self.ocr_preview = None;
+                Some(Action::Cancel)
+            }
+            PreviewKey::Other => {
+                // 其他键：退出预览（丢弃），该键交回调用方重走正常路径。
+                self.ocr_preview = None;
+                None
+            }
+        }
+    }
+
+    pub fn ocr_previewing(&self) -> bool {
+        self.ocr_preview.is_some()
+    }
+
+    /// 退出预览（丢弃识别文本；其他键照常处理时调用）。
+    pub fn end_ocr_preview(&mut self) {
+        self.ocr_preview = None;
     }
 
     /// LLM 流式增量。
@@ -2330,6 +2389,47 @@ mod tests {
             ),
             "刷新后选中归 0，空格提交首选"
         );
+    }
+
+    /// OCR 预览：Enter/空格/数字 1 上屏，Esc 取消，其他键退出预览。
+    #[test]
+    fn ocr_preview_keys() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(
+            m.begin_ocr_preview("识别文本".to_owned()),
+            Some(Action::OcrPreview { text: "识别文本".to_owned() })
+        );
+        assert!(m.ocr_previewing());
+        // Enter 上屏
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Enter),
+            Some(Action::CommitImmediate("识别文本".to_owned()))
+        );
+        assert!(!m.ocr_previewing());
+        // 空格上屏
+        let _ = m.begin_ocr_preview("文本2".to_owned());
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Space),
+            Some(Action::CommitImmediate("文本2".to_owned()))
+        );
+        // 数字 1 上屏
+        let _ = m.begin_ocr_preview("文本3".to_owned());
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Digit1),
+            Some(Action::CommitImmediate("文本3".to_owned()))
+        );
+        // Esc 取消
+        let _ = m.begin_ocr_preview("文本4".to_owned());
+        assert_eq!(m.feed_ocr_preview(PreviewKey::Escape), Some(Action::Cancel));
+        assert!(!m.ocr_previewing());
+        // 其他键退出预览（None = 交回正常路由）
+        let _ = m.begin_ocr_preview("文本5".to_owned());
+        assert_eq!(m.feed_ocr_preview(PreviewKey::Other), None);
+        assert!(!m.ocr_previewing());
+        // 非 Idle 时不进预览
+        m.feed_char('n');
+        assert_eq!(m.begin_ocr_preview("x".to_owned()), None);
+        assert!(!m.ocr_previewing());
     }
 
     /// `///`：Prompt 态空提示词按第三个斜杠 → TriggerOcr（选区截图）。
