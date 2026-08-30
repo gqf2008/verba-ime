@@ -135,6 +135,8 @@ pub struct TextServiceData {
     shift_down: Cell<bool>,
     /// Shift 按下期间是否与其他键组合（组合则不切换）。
     shift_combined: Cell<bool>,
+    /// 中英切换状态提示的到期时刻（候选窗闪「中/英」后自动隐藏）。
+    ime_status_until: Cell<Option<std::time::Instant>>,
     pub stream_request_id: Arc<AtomicU64>,
     /// 流代际（epoch）：每次发起新 LLM 流 +1；chunks 队列事件携带 epoch，
     /// 过滤只消费当前代际——请求 id 每连接从 1 自增（恒为 2），不能作跨流依据。
@@ -178,6 +180,7 @@ impl TextServiceData {
             ime_chinese: Cell::new(true),
             shift_down: Cell::new(false),
             shift_combined: Cell::new(false),
+            ime_status_until: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
@@ -602,6 +605,22 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
             *data.machine.borrow_mut() = CompositionMachine::new();
         }
     }
+    // 视觉反馈：候选窗位置闪「中/英」状态卡（2 秒后由 on_timer 隐藏）。
+    let theme = data.candidate_theme.borrow().clone();
+    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
+    ctrl.set_status(Some(if chinese { "中文模式" } else { "英文模式" }.to_owned()));
+    ctrl.show();
+    if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
+        let fallback = data
+            .context
+            .borrow()
+            .as_ref()
+            .and_then(|ctx| view_screen_pos(ctx))
+            .unwrap_or((0, 0, 0));
+        cw.update(&ctrl, fallback);
+    }
+    data.ime_status_until
+        .set(Some(std::time::Instant::now() + std::time::Duration::from_secs(2)));
     log::info!("中英模式切换: {}", if chinese { "中文" } else { "英文" });
 }
 
@@ -1892,6 +1911,15 @@ impl TextServiceData {
         let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
             return;
         };
+        // 中英切换状态提示超时：Idle（无候选）时隐藏候选窗。
+        if let Some(until) = self.ime_status_until.get() {
+            if std::time::Instant::now() >= until {
+                self.ime_status_until.set(None);
+                if self.machine.borrow().state() == MachineState::Idle {
+                    hide_candidate_window(&rc);
+                }
+            }
+        }
         // 持续重试挂载键盘 sink（Activate 时可能失败）
         try_advise_keysink(&rc);
         // 候选窗主题/引擎：配置文件变更时热更新
