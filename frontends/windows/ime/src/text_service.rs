@@ -23,7 +23,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_M, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
+    VK_ESCAPE, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
 };
 
 use crate::capture::capture_primary_screen;
@@ -872,6 +872,20 @@ pub fn apply_action(
             schedule_candidate_request(data, llm_request);
             Ok(())
         }
+        Action::StartRewrite { content } => {
+            // `//<内容>` + Tab：改写管道。系统提示词固定为「忠实改写」——
+            // 纠错补全 + 结构化成文，不自由发挥；流式结果沿用
+            // Streaming/ResultReady 通道（Enter 上屏 / 继续打字编辑）。
+            log::info!("改写管道: content_len={}", content.chars().count());
+            let system = Some(
+                "你是文字润色助手。忠实改写用户给出的内容：纠正错别字与语病，补全残句使其通顺，按内容自动判断是否需要结构化（如请假条/邮件/通知则给出合适格式）。不要回答问题、不要扩展内容、不要添加评论；只输出改写后的文本本身，不用 Markdown。"
+                    .to_owned(),
+            );
+            // 保持组合（首个流式块由 on_timer 的 UpdateResult 替换文本），
+            // 与 StartLlm 的自由生成同通道。
+            start_llm_with_system(data, &content, system, None, false);
+            Ok(())
+        }
         Action::StartLlm { prompt, system: _ } => {
             // 多模态命令路由：
             // - `//朗读 <文本>` → TTS 合成并播放（不落盘文本）
@@ -1188,6 +1202,18 @@ fn start_llm(
     eye_rect: Option<(i32, i32, i32, i32)>,
     use_vision: bool,
 ) {
+    start_llm_with_system(data, &prompt, None, eye_rect, use_vision)
+}
+
+/// start_llm 的系统提示词可注入变体（改写管道用）。
+fn start_llm_with_system(
+    data: &Rc<TextServiceData>,
+    prompt: &str,
+    system: Option<String>,
+    eye_rect: Option<(i32, i32, i32, i32)>,
+    use_vision: bool,
+) {
+    let prompt = prompt.to_owned();
     let chunks = Arc::clone(&data.chunks);
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
@@ -1210,7 +1236,8 @@ fn start_llm(
         };
         // 眼睛：指令前捕捉光标上方屏幕。use_vision=true 时（`//看图` / eye_mode=vision）
         // 在工作线程内截图→PNG 直接交给 LLM；否则 OCR 转文字注入 system。
-        let mut system: Option<String> = None;
+        // 改写管道等调用方注入的系统提示词；None 时按用例（眼睛等）再定。
+        let mut system: Option<String> = system;
         let mut image: Option<(String, Vec<u8>)> = None;
         if use_vision {
             if let Some(img) = eye_vision_image(eye_rect) {
@@ -2127,7 +2154,7 @@ mod tests {
         // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
         assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
         // Ctrl+Alt+M（听写）随 ASR 冻结移除（#78）；S = 打开设置。
-        assert_eq!(trigger_kind_for_vk(VK_M.0 as u32), None);
+        assert_eq!(trigger_kind_for_vk(0x4D), None);
         assert_eq!(trigger_kind_for_vk(VK_S.0 as u32), None);
     }
 
@@ -2142,7 +2169,7 @@ mod tests {
             trigger_kind_for_hotkey_vk(VK_S.0 as u32),
             Some(TriggerKind::OpenSettings)
         );
-        assert_eq!(trigger_kind_for_hotkey_vk(VK_M.0 as u32), None, "M 热键已移除");
+        assert_eq!(trigger_kind_for_hotkey_vk(0x4D), None, "M 热键已移除");
         // 其他键不在热键集合
         assert_eq!(trigger_kind_for_hotkey_vk(VK_UP.0 as u32), None);
     }

@@ -122,6 +122,9 @@ pub enum Action {
     /// OCR 结果到达 → 进候选窗预览（首条=识别文本，Enter/空格/数字上屏；
     /// Esc 取消）。不直接插光标——用户看到了再决定。
     OcrPreview { text: String },
+    /// `//<内容>` + Tab：提示词内容走改写管道（润色/纠错/成文），
+    /// 前端发起 LLM 请求；流式结果沿用 Streaming/ResultReady 通道。
+    StartRewrite { content: String },
     /// 取消当前组合（Esc / 清空）。
     Cancel,
     /// LLM 出错，已回到 Idle。
@@ -544,7 +547,16 @@ impl CompositionMachine {
                 preedit: self.preedit(),
             };
         }
-        // 未组合：字母开始拼音；其它字符直接入提示词
+        // 未组合：Tab = 改写管道（提示词内容非空）；字母开始拼音；其它字符直接入提示词
+        if c == '\t' {
+            if self.prompt.is_empty() {
+                return Action::None; // 空内容无改写对象
+            }
+            let content = std::mem::take(&mut self.prompt);
+            self.state = MachineState::Streaming;
+            self.result.clear();
+            return Action::StartRewrite { content };
+        }
         if c == '/' && self.prompt.is_empty() {
             // `///`：第三个斜杠（提示词空）→ 选区截图 OCR
             return Action::TriggerOcr;
@@ -2389,6 +2401,31 @@ mod tests {
             ),
             "刷新后选中归 0，空格提交首选"
         );
+    }
+
+    /// `//<内容>` + Tab：提示词内容走改写管道（StartRewrite）；
+    /// 空内容 Tab 无动作；Tab 字符不入提示词。
+    #[test]
+    fn tab_in_prompt_starts_rewrite() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for ch in "明天发烧请假条".chars() {
+            let _ = m.feed_char(ch);
+        }
+        assert!(matches!(m.state(), MachineState::Prompt));
+        // Tab → 改写（内容清空，进 Streaming）
+        assert!(matches!(
+            m.feed_char('\t'),
+            Action::StartRewrite { content } if content == "明天发烧请假条"
+        ));
+        assert!(matches!(m.state(), MachineState::Streaming));
+        // 空内容 Tab → None（无改写对象）
+        let mut m2 = CompositionMachine::new();
+        m2.feed_char('/');
+        m2.feed_char('/');
+        assert_eq!(m2.feed_char('\t'), Action::None);
+        assert!(matches!(m2.state(), MachineState::Prompt));
     }
 
     /// OCR 预览：Enter/空格/数字 1 上屏，Esc 取消，其他键退出预览。
