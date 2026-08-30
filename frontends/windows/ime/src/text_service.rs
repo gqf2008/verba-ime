@@ -491,9 +491,13 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
     fn OnTestKeyUp(
         &self,
         _pic: Ref<ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        // Shift Up 也须认领（与 Down 对称——TSF 对未认领的键不回调 OnKeyUp）。
+        if wparam.0 as u32 == VK_SHIFT.0 as u32 {
+            return Ok(TRUE);
+        }
         Ok(FALSE)
     }
     fn OnKeyDown(
@@ -531,8 +535,16 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         &self,
         _pic: Ref<ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
+        unsafe {
+            log::info!(
+                "OnKeyUp vk=0x{:02X} scan=0x{:02X} tid={}",
+                wparam.0 as u32,
+                (lparam.0 as u32 >> 16) & 0xff,
+                GetCurrentThreadId()
+            );
+        }
         if wparam.0 as u32 == VK_SHIFT.0 as u32 {
             // 孤立 Shift（按下期间无其他键组合）→ 切换中英。
             if self.data.shift_down.get() && !self.data.shift_combined.get() {
