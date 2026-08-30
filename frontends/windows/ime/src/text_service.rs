@@ -622,6 +622,24 @@ fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
     }
 }
 
+/// 改写对照预览候选窗：1=改写结果（选中态）2=原文，状态行提示操作。
+fn show_rewrite_preview(data: &Rc<TextServiceData>, rewritten: &str, source: &str) {
+    let theme = data.candidate_theme.borrow().clone();
+    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
+    ctrl.set_candidates(vec![rewritten.to_owned(), source.to_owned()]);
+    ctrl.set_status(Some("1/Enter 改写 · 2 原文 · Esc 取消".to_owned()));
+    ctrl.show();
+    if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
+        let fallback = data
+            .context
+            .borrow()
+            .as_ref()
+            .and_then(|ctx| view_screen_pos(ctx))
+            .unwrap_or((0, 0, 0));
+        cw.update(&ctrl, fallback);
+    }
+}
+
 /// Shift 孤立按切换中英：翻转模式 + 同步 GUID_COMPARTMENT_KEYBOARD_INPUTMODE
 /// （系统语言栏/输入法指示器显示中/英状态）+ 组合中则取消（干净进入英文）。
 fn toggle_ime(data: &Rc<TextServiceData>) {
@@ -695,6 +713,39 @@ fn handle_key_down(
 
     let mut machine = data.machine.borrow_mut();
     let state = machine.state();
+    // 改写对照预览态按键拦截（优先于 OCR 预览——两态互斥）：1/Enter/空格=
+    // 改写上屏，2=原文上屏，Esc 取消；其他键不动预览（交回路由但被
+    // Streaming/ResultReady 忽略——预览期间保护结果）。
+    if machine.rewrite_previewing() {
+        use verba_core::machine::PreviewKey;
+        let key = if vk == VK_RETURN.0 as u32 {
+            Some(PreviewKey::Enter)
+        } else if ch == Some(' ') {
+            Some(PreviewKey::Space)
+        } else if ch == Some('1') {
+            Some(PreviewKey::Digit1)
+        } else if ch == Some('2') {
+            Some(PreviewKey::Digit2)
+        } else if vk == VK_ESCAPE.0 as u32 {
+            Some(PreviewKey::Escape)
+        } else {
+            None
+        };
+        if let Some(k) = key {
+            if let Some(action) = machine.feed_rewrite_preview(k) {
+                log::info!("改写预览: {action:?}");
+                drop(machine);
+                hide_candidate_window(data);
+                let Some(context) = data.context.borrow().as_ref().cloned() else {
+                    return Ok(FALSE);
+                };
+                let _ = apply_action(data, &context, action);
+            }
+            return Ok(TRUE);
+        }
+        // 其他键不属于预览：不吞、不退出（保护预览），交宿主。
+        return Ok(FALSE);
+    }
     // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
     // 后照常走下方路由（不打断打字流）。
     if machine.ocr_previewing() {
@@ -955,6 +1006,16 @@ pub fn apply_action(
             Ok(())
         }
         Action::ResultReady => Ok(()),
+        Action::RewriteReady { rewritten, source } => {
+            // 改写完成 → 对照预览候选窗（1=改写结果 2=原文）。
+            // 组合串此时显示着流式结果（rewritten），保持不隐藏——预览
+            // 候选窗叠加显示双候选；用户选定后组合由 CommitImmediate/
+            // Cancel 清理。
+            show_rewrite_preview(data, &rewritten, &source);
+            log::info!("改写对照预览: rewritten_len={} source_len={}",
+                rewritten.chars().count(), source.chars().count());
+            Ok(())
+        }
         Action::CommitResult { text } => {
             hide_candidate_window(data);
             cancel_candidate_request(data);
@@ -1976,7 +2037,11 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
                 }
             }
             Some(stream_event::Kind::Final(_)) => {
-                machine.on_llm_done();
+                // 改写流完成 → RewriteReady（对照预览）须走 Act 派发；
+                // 自由生成 → ResultReady（无动作）。
+                if let Action::RewriteReady { rewritten, source } = machine.on_llm_done() {
+                    steps.push(Step::Act(Action::RewriteReady { rewritten, source }));
+                }
                 pending_preedit = Some(machine.result().to_owned());
             }
             Some(stream_event::Kind::Candidates(c)) => {

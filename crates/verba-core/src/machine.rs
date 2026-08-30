@@ -79,6 +79,7 @@ pub enum PreviewKey {
     Enter,
     Space,
     Digit1,
+    Digit2,
     Escape,
     Other,
 }
@@ -125,6 +126,9 @@ pub enum Action {
     /// `//<内容>` + Tab：提示词内容走改写管道（润色/纠错/成文），
     /// 前端发起 LLM 请求；流式结果沿用 Streaming/ResultReady 通道。
     StartRewrite { content: String },
+    /// 改写流完成 → 对照预览（候选窗：1=改写结果 2=原文；
+    /// Enter/空格 选改写结果，2 选原文，Esc 全部取消）。
+    RewriteReady { rewritten: String, source: String },
     /// 取消当前组合（Esc / 清空）。
     Cancel,
     /// LLM 出错，已回到 Idle。
@@ -180,6 +184,10 @@ pub struct CompositionMachine {
     selected_index: usize,
     /// OCR 预览文本（preview 状态期间候选窗首条显示它；None=非预览态）。
     ocr_preview: Option<String>,
+    /// 改写流的原内容（StartRewrite 时保留；流完成时进入对照预览）。
+    rewrite_source: Option<String>,
+    /// 改写对照预览（Some((改写结果, 原文)) = 预览中；期间候选窗显示双候选）。
+    rewrite_preview: Option<(String, String)>,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
     /// LLM 流式结果。
@@ -260,6 +268,8 @@ impl CompositionMachine {
             pinyin_page: 0,
             selected_index: 0,
             ocr_preview: None,
+            rewrite_source: None,
+            rewrite_preview: None,
             prompt: String::new(),
             result: String::new(),
             double_quote_open: false,
@@ -555,6 +565,7 @@ impl CompositionMachine {
             let content = std::mem::take(&mut self.prompt);
             self.state = MachineState::Streaming;
             self.result.clear();
+            self.rewrite_source = Some(content.clone());
             return Action::StartRewrite { content };
         }
         if c == '/' && self.prompt.is_empty() {
@@ -866,6 +877,8 @@ impl CompositionMachine {
         self.pinyin_page = 0;
         self.selected_index = 0;
         self.ocr_preview = None;
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
@@ -917,6 +930,8 @@ impl CompositionMachine {
         self.pinyin_page = 0;
         self.selected_index = 0;
         self.ocr_preview = None;
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
     }
 
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
@@ -1009,7 +1024,7 @@ impl CompositionMachine {
                 self.ocr_preview = None;
                 Some(Action::Cancel)
             }
-            PreviewKey::Other => {
+            PreviewKey::Digit2 | PreviewKey::Other => {
                 // 其他键：退出预览（丢弃），该键交回调用方重走正常路径。
                 self.ocr_preview = None;
                 None
@@ -1024,6 +1039,45 @@ impl CompositionMachine {
     /// 退出预览（丢弃识别文本；其他键照常处理时调用）。
     pub fn end_ocr_preview(&mut self) {
         self.ocr_preview = None;
+    }
+
+    /// 改写对照预览：进入（流完成时前端调用）。
+    /// 期间 Esc/Enter/空格/数字路由由 feed_rewrite_preview 处理。
+    pub fn begin_rewrite_preview(&mut self, rewritten: String, source: String) {
+        self.rewrite_preview = Some((rewritten, source));
+    }
+
+    pub fn rewrite_previewing(&self) -> bool {
+        self.rewrite_preview.is_some()
+    }
+
+    /// 对照预览按键：1/Enter/空格=改写结果上屏；2=原文上屏；Esc 全取消；
+    /// None 返回表示键不属于预览（交回正常路由，预览保持）。
+    pub fn feed_rewrite_preview(&mut self, key: PreviewKey) -> Option<Action> {
+        let Some((rewritten, source)) = self.rewrite_preview.clone() else {
+            return None;
+        };
+        match key {
+            PreviewKey::Enter | PreviewKey::Space | PreviewKey::Digit1 => {
+                self.rewrite_preview = None;
+                self.state = MachineState::Idle;
+                self.result.clear();
+                Some(Action::CommitImmediate(rewritten))
+            }
+            PreviewKey::Digit2 => {
+                self.rewrite_preview = None;
+                self.state = MachineState::Idle;
+                self.result.clear();
+                Some(Action::CommitImmediate(source))
+            }
+            PreviewKey::Escape => {
+                self.rewrite_preview = None;
+                self.state = MachineState::Idle;
+                self.result.clear();
+                Some(Action::Cancel)
+            }
+            PreviewKey::Other => None,
+        }
     }
 
     /// LLM 流式增量。
@@ -1044,7 +1098,15 @@ impl CompositionMachine {
         match self.state {
             MachineState::Streaming => {
                 self.state = MachineState::ResultReady;
-                Action::ResultReady
+                // 改写流：附带原文（前端据此弹对照预览候选窗）。
+                if let Some(source) = self.rewrite_source.take() {
+                    Action::RewriteReady {
+                        rewritten: self.result.clone(),
+                        source,
+                    }
+                } else {
+                    Action::ResultReady
+                }
             }
             _ => Action::None,
         }
@@ -2401,6 +2463,52 @@ mod tests {
             ),
             "刷新后选中归 0，空格提交首选"
         );
+    }
+
+    /// 改写对照预览：on_llm_done 返回 RewriteReady（带原文）；
+    /// 1/Enter/空格=改写上屏，2=原文上屏，Esc 取消，其他键不动预览。
+    #[test]
+    fn rewrite_ready_preview_keys() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for ch in "明天发烧请假条".chars() {
+            let _ = m.feed_char(ch);
+        }
+        assert!(matches!(
+            m.feed_char('\t'),
+            Action::StartRewrite { content } if content == "明天发烧请假条"
+        ));
+        // 模拟流完成
+        let _ = m.on_llm_chunk("尊敬的经理：");
+        match m.on_llm_done() {
+            Action::RewriteReady { rewritten, source } => {
+                assert_eq!(rewritten, "尊敬的经理：");
+                assert_eq!(source, "明天发烧请假条");
+            }
+            other => panic!("应返回 RewriteReady，实际 {other:?}"),
+        }
+        m.begin_rewrite_preview("尊敬的经理：".into(), "明天发烧请假条".into());
+        assert!(m.rewrite_previewing());
+        // 2 = 原文上屏
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Digit2),
+            Some(Action::CommitImmediate("明天发烧请假条".to_owned()))
+        );
+        assert!(!m.rewrite_previewing());
+        // 再走一遍：Enter = 改写上屏
+        m.begin_rewrite_preview("改写结果".into(), "原文".into());
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Enter),
+            Some(Action::CommitImmediate("改写结果".to_owned()))
+        );
+        // Esc 取消
+        m.begin_rewrite_preview("a".into(), "b".into());
+        assert_eq!(m.feed_rewrite_preview(PreviewKey::Escape), Some(Action::Cancel));
+        // 其他键：None（预览保持）
+        m.begin_rewrite_preview("a".into(), "b".into());
+        assert_eq!(m.feed_rewrite_preview(PreviewKey::Other), None);
+        assert!(m.rewrite_previewing());
     }
 
     /// `//<内容>` + Tab：提示词内容走改写管道（StartRewrite）；
