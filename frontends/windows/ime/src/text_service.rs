@@ -293,12 +293,22 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
 
     create_timer_window(data)?;
     // 读初始中英状态（系统 compartment 保留上次切换结果）。
+    // 默认中文：compartment 空值/未设置（VT_EMPTY 或 0）时按中文模式起——
+    // 拼音输入法的自然默认（真机：首次激活 GetValue 成功但值为 0 → 误判英文）。
     unsafe {
         if let Ok(mgr) = ptim.GetGlobalCompartment() {
             if let Ok(comp) = mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE) {
-                if let Ok(var) = comp.GetValue() {
-                    let mode = var.Anonymous.Anonymous.Anonymous.lVal;
-                    data.ime_chinese.set(mode == TF_CONVERSIONMODE_NATIVE as i32);
+                match comp.GetValue() {
+                    Ok(var) => {
+                        let vt = var.Anonymous.Anonymous.vt;
+                        let mode = var.Anonymous.Anonymous.Anonymous.lVal;
+                        // VT_I4 且显式 ALPHANUMERIC 才判英文；其余（NATIVE/
+                        // VT_EMPTY/0）默认中文。
+                        data.ime_chinese.set(
+                            vt.0 == 3 && mode == TF_CONVERSIONMODE_ALPHANUMERIC as i32,
+                        );
+                    }
+                    Err(_) => data.ime_chinese.set(true),
                 }
             }
         }
