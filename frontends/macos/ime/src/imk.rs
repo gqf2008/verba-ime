@@ -1005,6 +1005,11 @@ impl VerbaIMKController {
                 self.refresh_candidate_window();
                 true
             }
+            Action::TriggerOcr => {
+                // `///` 触发选区截图 OCR：macOS 侧实现留待（先结束组合）。
+                self.set_marked("");
+                true
+            }
             Action::StartLlm { prompt, system } => {
                 self.start_llm(prompt, system);
                 true

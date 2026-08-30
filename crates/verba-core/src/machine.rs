@@ -106,6 +106,9 @@ pub enum Action {
     ResultReady,
     /// 确认上屏最终结果。
     CommitResult { text: String },
+    /// `///`：Prompt 态空提示词按第三个斜杠 → 触发选区截图 OCR
+    /// （Ctrl+Alt+O 的键盘化替代）。
+    TriggerOcr,
     /// 取消当前组合（Esc / 清空）。
     Cancel,
     /// LLM 出错，已回到 Idle。
@@ -526,6 +529,10 @@ impl CompositionMachine {
             };
         }
         // 未组合：字母开始拼音；其它字符直接入提示词
+        if c == '/' && self.prompt.is_empty() {
+            // `///`：第三个斜杠（提示词空）→ 选区截图 OCR
+            return Action::TriggerOcr;
+        }
         if c.is_ascii_uppercase() {
             // 大写 ASCII 直接入提示词（保 `//translate Hello` 这类英文提示词）
             self.prompt.push(c);
@@ -2323,6 +2330,25 @@ mod tests {
             ),
             "刷新后选中归 0，空格提交首选"
         );
+    }
+
+    /// `///`：Prompt 态空提示词按第三个斜杠 → TriggerOcr（选区截图）。
+    #[test]
+    fn triple_slash_triggers_ocr() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        assert_eq!(m.state(), MachineState::Prompt);
+        // 提示词空时第三个斜杠 → 截图
+        assert_eq!(m.feed_char('/'), Action::TriggerOcr);
+        // 提示词非空时斜杠按字面入提示词（不触发）
+        let mut m2 = CompositionMachine::new();
+        m2.feed_char('/');
+        m2.feed_char('/');
+        for ch in "你好".chars() {
+            let _ = m2.feed_char(ch);
+        }
+        assert!(matches!(m2.feed_char('/'), Action::UpdatePrompt { .. }), "提示词非空时 / 字面入提示词");
     }
 
     /// 跨页遍历（微软拼音/手心行为）：20 条候选 = 3 页（9+9+2）。

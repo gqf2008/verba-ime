@@ -853,6 +853,16 @@ pub fn apply_action(
             cancel_stream(data);
             Ok(())
         }
+        Action::TriggerOcr => {
+            // `///`：结束当前组合，触发选区截图 OCR（Ctrl+Alt+O 的键盘化替代）。
+            hide_candidate_window(data);
+            if let Some(comp) = data.composition.borrow_mut().take() {
+                let _ = edit_session::end_composition(context, clientid, &comp, "");
+            }
+            *data.machine.borrow_mut() = CompositionMachine::new();
+            trigger_async(data, TriggerKind::Ocr);
+            Ok(())
+        }
         Action::Cancel => {
             hide_candidate_window(data);
             if let Some(comp) = data.composition.borrow_mut().take() {
