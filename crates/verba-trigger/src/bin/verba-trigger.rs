@@ -1,13 +1,22 @@
-//! Verba 触发工具（Windows）：截图→OCR、录音→ASR、TTS→合成/播放。
+//! Verba 触发工具（跨平台，issue #82）：选区截图→OCR、录音→ASR、TTS→合成/播放。
 //!
-//! 能力模块（capture / record / play）供后续 TSF 热键接线复用；
-//! 本工具用于手动验证与脚本化冒烟。
+//! 自 v0.2.4 的 Windows 专版（frontends/windows/ime/src/bin/verba-trigger.rs）
+//! 迁为共享 crate bin：Windows/macOS/Linux 同名同参，前端各自 spawn 本进程
+//! （TSF DLL / IMK 进程内不承载选区 UI 与事件循环）。
+//!
+//! daemon 连接：验活握手失败时拉起**同目录**的 verba-daemon（安装布局两端
+//! 一致：{app} 目录 / Verba.app/Contents/MacOS），Windows 加 CREATE_NO_WINDOW
+//! 防控制台闪窗，随后退避重连。
 
-use verba_ime_windows::capture::{capture_primary_screen, capture_region};
-use verba_ime_windows::play::play_audio;
-use verba_ime_windows::record::record_seconds;
-use verba_ime_windows::selection::select_region;
-use verba_ime_windows::TriggerError;
+use std::process::Command;
+use std::time::Duration;
+
+use verba_ipc::VerbaClient;
+use verba_trigger::capture::{capture_primary_screen, capture_region};
+use verba_trigger::play::play_audio;
+use verba_trigger::record::record_seconds;
+use verba_trigger::selection::select_region;
+use verba_trigger::TriggerError;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,7 +47,7 @@ fn main() {
 
 fn print_help() {
     println!(
-        "Verba 触发工具（Windows）\n\
+        "Verba 触发工具（跨平台）\n\
          用法:\n  \
          verba-trigger shot [输出.bmp]        截取主屏全屏为 BMP\n  \
          verba-trigger region-shot [--rect x,y,w,h] [输出.bmp]  选区截图（交互拖选；--rect 脚本化）\n  \
@@ -52,9 +61,49 @@ fn print_help() {
     );
 }
 
-fn connect_daemon() -> Result<verba_ipc::VerbaClient, verba_ime_windows::TriggerError> {
-    verba_ime_windows::ipc::ensure_daemon()
-        .map_err(|e| verba_ime_windows::TriggerError::Daemon(e.to_string()))
+/// 连接 daemon；不在运行则拉起同目录 verba-daemon 并退避重连。
+/// （替代原 verba_ime_windows::ipc::ensure_daemon 的跨平台版。）
+fn connect_daemon() -> Result<VerbaClient, TriggerError> {
+    if let Ok(c) = VerbaClient::connect_verified() {
+        return Ok(c);
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_owned()))
+        .ok_or_else(|| TriggerError::Daemon("无法定位自身目录".into()))?;
+    let daemon = exe_dir.join(if cfg!(windows) {
+        "verba-daemon.exe"
+    } else {
+        "verba-daemon"
+    });
+    if !daemon.is_file() {
+        return Err(TriggerError::Daemon(format!(
+            "未找到 daemon（{}），无法自动拉起",
+            daemon.display()
+        )));
+    }
+    let mut cmd = Command::new(&daemon);
+    // stdio 全部落 null：daemon 常驻不退出，若继承本进程 stdout 管道写端，
+    // 调用方的 .output() 将永不 EOF（独立审查 NOTE——结果静默丢失根因）。
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：daemon 为控制台子系统构建（debug），防闪窗
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.spawn()
+        .map_err(|e| TriggerError::Daemon(format!("拉起 daemon 失败: {e}")))?;
+    // 退避重连：daemon 启动 + 首次部署预热期间 socket 就绪需要时间
+    for attempt in 0..20 {
+        std::thread::sleep(Duration::from_millis(if attempt < 10 { 150 } else { 400 }));
+        if let Ok(c) = VerbaClient::connect_verified() {
+            return Ok(c);
+        }
+    }
+    Err(TriggerError::Daemon("daemon 拉起后连接失败".into()))
 }
 
 fn cmd_shot(args: &[String]) -> i32 {
@@ -225,7 +274,7 @@ fn cmd_speak(args: &[String]) -> i32 {
     }
 }
 
-/// 解析 --rect x,y,w,h（虚拟屏幕坐标），未提供返回 None。
+/// 解析 --rect x,y,w,h（全局坐标），未提供返回 None。
 fn parse_rect(args: &[String]) -> Option<(i32, i32, i32, i32)> {
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -255,11 +304,14 @@ fn region_output_path(args: &[String]) -> Option<String> {
 }
 
 /// 选区截图：--rect 脚本化，否则交互拖选（Esc/右键取消 → Ok(None)）。
-fn region_capture(
-    args: &[String],
-) -> Result<Option<verba_ime_windows::capture::ScreenShot>, TriggerError> {
+/// 显式传了 --rect 但解析失败 → 报错退出（脚本化场景静默落交互会挂死管道）。
+fn region_capture(args: &[String]) -> Result<Option<verba_trigger::bmp::ScreenShot>, TriggerError> {
+    let rect_given = args.iter().any(|a| a == "--rect");
     match parse_rect(args) {
         Some((x, y, w, h)) => capture_region(x, y, w, h).map(Some),
+        None if rect_given => Err(TriggerError::Capture(
+            "--rect 参数非法（应为 x,y,w,h 四个整数）".into(),
+        )),
         None => match select_region()? {
             Some(r) => capture_region(r.x, r.y, r.width, r.height).map(Some),
             None => Ok(None),

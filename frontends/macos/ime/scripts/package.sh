@@ -15,6 +15,7 @@ cd "$IME_ROOT"
 cargo build --release --manifest-path "$IME_ROOT/Cargo.toml"
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p verba-daemon
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p verba-settings
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" -p verba-trigger
 
 APP="$IME_ROOT/dist/Verba.app"
 rm -rf "$APP"
@@ -23,6 +24,10 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
 cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
+# 触发工具（issue #82 跨平台统一）：选区截图/录音/TTS 播放的共享 CLI，
+# `///` 选区 OCR 由 verba-mac spawn 本进程完成；随 bundle 分发、
+# 由 release.yml 的逐二进制签名循环覆盖。
+cp "$REPO_ROOT/target/release/verba-trigger" "$APP/Contents/MacOS/verba-trigger"
 # 安装注册助手（issue #48 项 3）：DMG 内「安装.command」双击后由它注册/启用
 # 输入源（TIS C API），随 bundle 分发、由 release.yml 的逐二进制签名循环覆盖。
 cp "$IME_ROOT/target/release/verba-register" "$APP/Contents/MacOS/verba-register"

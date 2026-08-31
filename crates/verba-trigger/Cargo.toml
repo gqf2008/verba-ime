@@ -1,0 +1,27 @@
+[package]
+name = "verba-trigger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Verba 跨平台触发工具：选区截图/截屏、录音、播放（Windows/macOS/Linux 同源实现）"
+
+[lints]
+workspace = true
+
+[dependencies]
+verba-core = { path = "../verba-core" }
+verba-ipc = { path = "../verba-ipc" }
+log.workspace = true
+# 录音/播放：cpal + rodio（跨平台，自 frontends/windows/ime 原样迁入）
+cpal = "0.15"
+rodio = "0.20"
+# 选区 UI：winit 单代码库窗口 + softbuffer CPU 光栅（半透明遮罩 + 选区框）
+winit = "0.30"
+softbuffer = "0.4"
+# 截屏：xcap（内部封装 Win32 GDI / macOS CoreGraphics / Linux X11）
+xcap = "0.9"
+
+[[bin]]
+name = "verba-trigger"
+path = "src/bin/verba-trigger.rs"

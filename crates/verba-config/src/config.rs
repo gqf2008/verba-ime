@@ -872,6 +872,13 @@ mod tests {
 
     #[test]
     fn api_key_falls_back_to_env() {
+        // 环境无关性：真机密钥库可能已存用户真实密钥（settings 面板/CLI 设置），
+        // keychain 优先于 env 回退——非空库时无法隔离验证 fallback，跳过
+        // （CI/无密机器上仍覆盖该路径）。
+        std::env::remove_var(ENV_API_KEY);
+        if ApiKeyStore::get().unwrap().is_some() {
+            return;
+        }
         std::env::set_var(ENV_API_KEY, "sk-test-env");
         assert_eq!(ApiKeyStore::get().unwrap(), Some("sk-test-env".into()));
         std::env::remove_var(ENV_API_KEY);

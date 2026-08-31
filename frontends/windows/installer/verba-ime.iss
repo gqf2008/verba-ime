@@ -29,7 +29,7 @@ SetupIconFile=..\..\..\assets\branding\verba.ico
 ; 先构建（见 docs/building.md），产物路径依 release 构建调整
 Source: "..\ime\target\release\verba_ime_windows.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\ime\target\release\verba-reg.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\ime\target\release\verba-trigger.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\..\target\release\verba-trigger.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\..\target\release\verba-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\..\target\release\verba-settings.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Rime 引擎（scripts/fetch-rime-vendor.ps1 产出）；本地未拉取时跳过（发布流水线会断言存在）

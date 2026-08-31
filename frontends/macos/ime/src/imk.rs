@@ -236,6 +236,72 @@ fn push_llm(seq: u64, event: StreamEvent) {
     }
 }
 
+/// 选区 OCR 结果单槽位（issue #82）：verba-trigger 子进程的后台线程写入，
+/// 主线程 drain 定时器取走并进预览。与 LLM 流共用「后台产、主线程消」管线。
+fn ocr_result_slot() -> &'static Mutex<Option<String>> {
+    static S: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// 定位 verba-trigger（同目录 sibling，安装布局与 daemon 一致；env 可覆盖）。
+fn trigger_exe_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("VERBA_TRIGGER_PATH") {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            let candidate = d.join("verba-trigger");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// `///` 触发选区截图 OCR：spawn 同目录 verba-trigger region-ocr（选区 UI 的
+/// winit 事件循环在子进程，不阻塞 IMK 主线程与宿主应用），文本经 stdout
+/// 回传后落入结果槽位，由 drain 定时器在主线程消费。取消 → stdout 空。
+fn trigger_region_ocr_async() {
+    std::thread::spawn(|| {
+        let Some(exe) = trigger_exe_path() else {
+            dbg_log("OCR: 未找到 verba-trigger");
+            return;
+        };
+        match std::process::Command::new(exe).arg("region-ocr").output() {
+            Ok(out) => {
+                if !out.status.success() {
+                    dbg_log(&format!("OCR: region-ocr 退出码 {:?}", out.status.code()));
+                    return;
+                }
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if text.is_empty() {
+                    return; // 用户取消或无文字
+                }
+                if let Ok(mut slot) = ocr_result_slot().lock() {
+                    *slot = Some(text);
+                }
+            }
+            Err(e) => dbg_log(&format!("OCR: 启动 verba-trigger 失败: {e}")),
+        }
+    });
+}
+
+/// OCR 识别文本写剪贴板（静默失败）。与 Windows 行为对齐：识别文本随手可粘贴。
+fn set_clipboard_text_quiet(text: &str) {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let s = NSString::from_str(text);
+        let _ = pb.setString_forType(&s, NSPasteboardTypeString);
+    }
+}
+
 /// 最新候选查询请求（单槽位：新请求覆盖旧请求）。
 struct CandRequest {
     seq: u64,
@@ -862,6 +928,25 @@ define_class!(
                 dbg_log("replay pending key");
                 self.replay_pending(pk);
             }
+            // 选区 OCR 结果槽位（issue #82）：与 LLM 事件同管线消费。
+            // 与 Windows 对齐：剪贴板照常；上屏走 OCR 预览（候选窗单候选，
+            // Enter/空格/1 上屏，Esc 取消）；非 Idle（组合中触发等罕见场景）
+            // 回退直接上屏。
+            if let Some(text) = ocr_result_slot().lock().ok().and_then(|mut s| s.take()) {
+                set_clipboard_text_quiet(&text);
+                match self
+                    .ivars()
+                    .machine
+                    .borrow_mut()
+                    .begin_ocr_preview(text.clone())
+                {
+                    Some(Action::OcrPreview { text: t }) => {
+                        self.apply_action(Action::OcrPreview { text: t });
+                    }
+                    _ => self.commit(&text),
+                }
+                return;
+            }
             static DRAIN_LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             let stream_seq = self.ivars().active_stream.get();
@@ -1075,8 +1160,10 @@ impl VerbaIMKController {
                 true
             }
             Action::TriggerOcr => {
-                // `///` 触发选区截图 OCR：macOS 侧实现留待（先结束组合）。
+                // `///` 触发选区截图 OCR（issue #82 跨平台统一）：结束组合 +
+                // 后台 spawn verba-trigger region-ocr，结果经槽位回主线程进预览。
                 self.set_marked("");
+                trigger_region_ocr_async();
                 true
             }
             Action::StartLlm { prompt, system } => {
