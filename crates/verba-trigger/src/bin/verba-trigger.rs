@@ -19,6 +19,11 @@ use verba_trigger::selection::select_region;
 use verba_trigger::TriggerError;
 
 fn main() {
+    // 诊断日志（stderr）：选区 UI 的 winit 全屏/装饰问题排查（issue #83）。
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[verba-trigger] PANIC: {info}");
+    }));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") | Some("help") => {

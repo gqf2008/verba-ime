@@ -7692,6 +7692,7 @@ name = "verba-trigger"
 version = "0.2.4"
 dependencies = [
  "cpal",
+ "env_logger",
  "log",
  "rodio",
  "softbuffer",
