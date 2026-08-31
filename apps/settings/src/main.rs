@@ -138,8 +138,10 @@ fn wire_callbacks(ui: &SettingsWindow) {
             match result {
                 Ok(models) => {
                     *models_cache().lock().unwrap() = models.clone();
-                    let ui_models: Vec<slint::SharedString> =
-                        models.iter().map(|m| slint::SharedString::from(m.clone())).collect();
+                    let ui_models: Vec<slint::SharedString> = models
+                        .iter()
+                        .map(|m| slint::SharedString::from(m.clone()))
+                        .collect();
                     let weak3 = weak2.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak3.upgrade() {
@@ -148,7 +150,11 @@ fn wire_callbacks(ui: &SettingsWindow) {
                             )));
                             let cur = ui.get_llm_model().to_string();
                             let cache = models_cache().lock().unwrap();
-                            let idx = cache.iter().position(|m| *m == cur).map(|i| i as i32).unwrap_or(-1);
+                            let idx = cache
+                                .iter()
+                                .position(|m| *m == cur)
+                                .map(|i| i as i32)
+                                .unwrap_or(-1);
                             drop(cache);
                             ui.set_llm_model_index(idx);
                             ui.set_status_text(
@@ -366,7 +372,11 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
         // 默认列表里匹配当前模型（未刷新时也选中正确项）
         let cur = ui.get_llm_model().to_string();
         let cache = models_cache().lock().unwrap();
-        let idx = cache.iter().position(|m| *m == cur).map(|i| i as i32).unwrap_or(-1);
+        let idx = cache
+            .iter()
+            .position(|m| *m == cur)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
         drop(cache);
         ui.set_llm_model_index(idx);
     }

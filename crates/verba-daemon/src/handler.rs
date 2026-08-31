@@ -684,11 +684,7 @@ impl DaemonHandler {
     }
 
     /// Rime 引擎候选（config 引擎=rime）：一次性推送 `Candidates` 事件（done=true）。
-    async fn handle_list_models(
-        &self,
-        id: u64,
-        out: Outbound,
-    ) -> Result<(), verba_ipc::IpcError> {
+    async fn handle_list_models(&self, id: u64, out: Outbound) -> Result<(), verba_ipc::IpcError> {
         let (cfg, _) = self.llm_snapshot();
         if cfg.api_key.is_none() || cfg.api_key.as_deref().unwrap_or_default().is_empty() {
             out.response(&Response {

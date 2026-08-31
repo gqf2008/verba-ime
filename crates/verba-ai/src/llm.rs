@@ -101,7 +101,10 @@ impl LlmClient {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            return Err(LlmError::Http { status: status.as_u16(), body });
+            return Err(LlmError::Http {
+                status: status.as_u16(),
+                body,
+            });
         }
         #[derive(serde::Deserialize)]
         struct ModelsResp {

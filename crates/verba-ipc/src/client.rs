@@ -239,8 +239,7 @@ impl VerbaClient {
         };
         self.write_request(&req)?;
         let frame = self.read_frame_blocking()?;
-        let resp = Response::decode(frame.as_slice())
-            .map_err(IpcError::Decode)?;
+        let resp = Response::decode(frame.as_slice()).map_err(IpcError::Decode)?;
         match resp.kind {
             Some(response::Kind::ModelList(list)) => Ok(list.models),
             Some(response::Kind::Error(e)) => Err(IpcError::Server {
