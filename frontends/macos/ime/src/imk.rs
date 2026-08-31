@@ -346,6 +346,13 @@ struct Ivars {
     machine: RefCell<CompositionMachine>,
     /// 融合后的展示候选（当前页索引由 `page` 给出）。
     candidates: RefCell<Vec<String>>,
+    /// 中英模式（macOS 无 TSF compartment：CapsLock 切换，内存态）。
+    /// true = 中文（拼音），false = 英文直输。
+    ime_chinese: Cell<bool>,
+    /// 改写对照预览（Some((改写, 原文))：期间数字 1/2/Enter/Esc 由预览拦截）。
+    rewrite_preview: RefCell<Option<(String, String)>>,
+    /// OCR 预览文本（Some = 预览中）。
+    ocr_preview: RefCell<Option<String>>,
     page: Cell<usize>,
     /// 输入会话客户端（保留引用以跨回调上屏/标记）。
     client: RefCell<Option<Retained<AnyObject>>>,
@@ -387,6 +394,9 @@ impl Default for Ivars {
         Self {
             machine: RefCell::new(CompositionMachine::new()),
             candidates: RefCell::new(Vec::new()),
+            ime_chinese: Cell::new(true),
+            rewrite_preview: RefCell::new(None),
+            ocr_preview: RefCell::new(None),
             page: Cell::new(0),
             client: RefCell::new(None),
             timer: RefCell::new(None),
@@ -499,6 +509,63 @@ define_class!(
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
             self.drain_stream(sel!(drainVerbaStream));
+            // CapsLock（keyCode 57）切换中英——macOS 惯例（系统拼音同款；
+            // IMK 无 keyUp 回调，Windows 的孤立 Shift 方案在此平台不可行）。
+            if key_code == 57 {
+                let chinese = !self.ivars().ime_chinese.get();
+                self.ivars().ime_chinese.set(chinese);
+                dbg_log(&format!("CapsLock 切换中英: {}", if chinese { "中文" } else { "英文" }));
+                // 非中文态：清预览/组合，进入直输。
+                if !chinese {
+                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    let _ = self.ivars().machine.borrow_mut().feed_escape();
+                }
+                return Bool::new(true);
+            }
+            // 英文模式（CapsLock 切换后）：全部交宿主直插（字母/标点不过 IME）。
+            if !self.ivars().ime_chinese.get() {
+                return Bool::new(false);
+            }
+            // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
+            // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
+            if self.ivars().ocr_preview.borrow().is_some()
+                || self.ivars().rewrite_preview.borrow().is_some()
+            {
+                let key = classify_key(string, key_code);
+                let pick: Option<usize> = match key {
+                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
+                    Some(ImkKey::Char('2')) => Some(1),
+                    _ => None,
+                };
+                let esc = matches!(key, Some(ImkKey::Escape));
+                if esc {
+                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.refresh_candidate_window();
+                    return Bool::new(true);
+                }
+                if let Some(idx) = pick {
+                    let text = if let Some((rw, src)) =
+                        self.ivars().rewrite_preview.borrow().as_ref()
+                    {
+                        [rw.clone(), src.clone()].get(idx).cloned()
+                    } else {
+                        self.ivars().ocr_preview.borrow().clone()
+                    };
+                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.refresh_candidate_window();
+                    if let Some(t) = text {
+                        self.commit(&t);
+                    }
+                    return Bool::new(true);
+                }
+                // 预览期间其他键：不吞（交宿主），预览保持。
+                return Bool::new(false);
+            }
             let panel_visible = self
                 .ivars()
                 .candidates_ui
@@ -1024,20 +1091,32 @@ impl VerbaIMKController {
                 true
             }
             Action::OcrPreview { text } => {
-                // OCR 预览候选窗 macOS 侧留待：异常路径回退直接上屏（与
-                // Windows apply_action 的 OcrPreview 回退一致），保不丢文本。
-                log::warn!("[VerbaIMK] OcrPreview 走到 apply_action，直接上屏");
-                self.commit(&text);
+                // OCR 预览候选窗：复用 IMKCandidates 数据源（单候选=识别文本），
+                // 数字 1/Enter/Esc 由 input_text 的 ocr_preview 拦截路由。
+                *self.ivars().ocr_preview.borrow_mut() = Some(text.clone());
+                *self.ivars().candidates.borrow_mut() = vec![text.clone()];
+                self.ivars().page.set(0);
+                self.set_marked("");
+                self.refresh_candidate_window();
                 true
             }
-            Action::RewriteReady { .. } => {
-                // 改写对照预览候选窗 macOS 侧留待：沿用 ResultReady 语义
-                // （Enter 上屏改写结果）；「2=原文」暂不支持。
+            Action::RewriteReady { rewritten, source } => {
+                // 改写对照预览：候选窗双候选（1=改写 2=原文），数字选字由
+                // input_text 的 rewrite_preview 拦截路由处理。组合标记清空
+                // （预览期间不显示流式文本，候选窗即预览）。
+                *self.ivars().rewrite_preview.borrow_mut() =
+                    Some((rewritten.clone(), source.clone()));
+                *self.ivars().candidates.borrow_mut() = vec![rewritten, source];
+                self.ivars().page.set(0);
+                self.set_marked("");
+                self.refresh_candidate_window();
+                true
+            }
+            Action::ResultReady => {
                 self.set_marked(self.ivars().machine.borrow().result());
                 self.invalidate_timer();
                 true
             }
-            Action::ResultReady => true,
             Action::Cancel => {
                 self.cancel_stream();
                 self.invalidate_timer();
