@@ -61,7 +61,7 @@ jobs:
       - name: 打包 IMK .app
         run: bash frontends/macos/ime/scripts/package.sh
       - name: 校验 .app
-        run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-settings && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register && test -f frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf && frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register --list && ls -la frontends/macos/ime/dist/Verba.app/Contents
+        run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-settings && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-trigger && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register && test -f frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf && frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register --list && ls -la frontends/macos/ime/dist/Verba.app/Contents
 
   frontend-windows:
     runs-on: windows-latest

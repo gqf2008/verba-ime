@@ -27,9 +27,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
 };
 
-use crate::capture::capture_primary_screen;
-use crate::play::play_audio;
-use crate::record::record_seconds;
+use verba_trigger::capture::capture_primary_screen;
+use verba_trigger::play::play_audio;
+use verba_trigger::record::record_seconds;
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
     ITfContext, ITfContextView, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
@@ -1886,8 +1886,8 @@ fn bmp_to_png(bmp: &[u8]) -> std::result::Result<Vec<u8>, String> {
 /// `eye_rect` 为 None 时回退到主屏全屏。
 fn eye_vision_image(eye_rect: Option<(i32, i32, i32, i32)>) -> Option<(String, Vec<u8>)> {
     let shot = match eye_rect {
-        Some((rx, ry, rw, rh)) => crate::capture::capture_region(rx, ry, rw, rh).ok()?,
-        None => crate::capture::capture_primary_screen().ok()?,
+        Some((rx, ry, rw, rh)) => verba_trigger::capture::capture_region(rx, ry, rw, rh).ok()?,
+        None => verba_trigger::capture::capture_primary_screen().ok()?,
     };
     let png = bmp_to_png(&shot.bmp).ok()?;
     Some(("image/png".to_owned(), png))

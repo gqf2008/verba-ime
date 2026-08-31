@@ -12,6 +12,7 @@ members = [
     "crates/verba-tts",
     "crates/verba-ocr",
     "crates/verba-asr",
+    "crates/verba-trigger",
     "crates/verba-cli",
     "apps/settings",
 ]

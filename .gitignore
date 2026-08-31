@@ -38,3 +38,6 @@ node_modules/
 *.AppImage
 # pinyin 缓存数据：引擎已于 2026-08-24 单引擎化移除，无消费者；如重新启用需重新生成并补授权/来源说明
 crates/verba-pinyin/tools/cache/
+
+# Claude Code 会话目录（settings/worktrees）不入库
+.claude/

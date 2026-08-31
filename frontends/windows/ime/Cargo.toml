@@ -17,16 +17,14 @@ embed-resource = "2"
 name = "verba-reg"
 path = "src/bin/verba-reg.rs"
 
-[[bin]]
-name = "verba-trigger"
-path = "src/bin/verba-trigger.rs"
-
 [dependencies]
 verba-core = { path = "../../../crates/verba-core" }
 verba-candidate = { path = "../../../crates/verba-candidate" }
 verba-config = { path = "../../../crates/verba-config" }
 verba-ipc = { path = "../../../crates/verba-ipc" }
 verba-protos = { path = "../../../crates/verba-protos" }
+# 触发能力（选区截图/截屏/录音/播放）已迁至共享 crate（issue #82 跨平台统一）
+verba-trigger = { path = "../../../crates/verba-trigger" }
 log = { version = "0.4", features = ["std"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -48,8 +46,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.62"
-cpal = "0.15"
-rodio = "0.20"
 
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
