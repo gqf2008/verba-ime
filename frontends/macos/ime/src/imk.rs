@@ -616,6 +616,31 @@ define_class!(
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
             self.drain_stream(sel!(drainVerbaStream));
+            // CapsLock 跟随（系统拼音同款）：会话级锁存位 ON = 英文直输，OFF =
+            // 中文。非 toggle——revert AI v1 的裸 toggle 教训（issue #83 真机：
+            // 系统「CapsLock 切 ABC」开启时切源动作把 keyCode 57 投给刚激活
+            // 的控制器，toggle 与系统状态打架致静默失灵）；系统管理状态、
+            // LED 即中英指示，输入法每次按键只读会话级修饰锁存态。
+            let caps_on: bool = unsafe {
+                let flags: NSEventModifierFlags = msg_send![NSEvent::class(), modifierFlags];
+                flags.contains(NSEventModifierFlags::CapsLock)
+            };
+            if key_code == 57 {
+                // CapsLock 键本身：透传交系统翻转锁定态（下一次按键即新态）。
+                return Bool::new(false);
+            }
+            if caps_on {
+                // 英文态：清挂着的预览（防跨态粘滞吞键）后全部透传宿主直插。
+                let had = self.ivars().ocr_preview.borrow().is_some()
+                    || self.ivars().rewrite_preview.borrow().is_some();
+                let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                let _ = self.ivars().ocr_preview.borrow_mut().take();
+                if had {
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.hide_candidate_window();
+                }
+                return Bool::new(false);
+            }
             // 中英切换不在此处理（revert AI v1 的 CapsLock toggle，issue #83
             // 后续修复）：系统「CapsLock 切换 ABC」开启时，切源动作本身会把
             // keyCode 57 投给刚激活的控制器，裸 toggle 与系统状态打架且无
