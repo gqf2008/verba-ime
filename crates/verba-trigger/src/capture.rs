@@ -30,6 +30,13 @@ pub struct VirtualScreen {
     pub height: i32,
 }
 
+impl VirtualScreen {
+    /// 覆盖区域的全局原点（xcap 点单位）。
+    pub fn origin(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+}
+
 /// 全部显示器的 RGBA 快照（复合虚拟屏幕）。选区遮罩底图与复合截取共用。
 pub(crate) struct RgbaSnapshot {
     pub vs: VirtualScreen,
@@ -191,9 +198,61 @@ pub fn capture_primary_screen() -> Result<ScreenShot, TriggerError> {
     })
 }
 
-/// 选区遮罩底图：虚拟屏幕 RGBA 快照（供 selection.rs 合成底图，不转 BGRA）。
+/// 选区遮罩底图：**主显示器** RGBA 快照（供 selection.rs 合成底图）。
+///
+/// 覆盖窗由 winit 全屏 Borderless 到主屏（跨库坐标拼接在 Retina 上不可靠，
+/// 真机实测覆盖层缩在左上角——issue #83 调试），因此快照取主屏边界；
+/// 拷贝同 snapshot_virtual：边界(点) × 图像(物理像素) 最近邻采样。
 pub(crate) fn snapshot_for_overlay() -> Result<RgbaSnapshot, TriggerError> {
-    snapshot_virtual()
+    let list = monitors()?;
+    let m = list
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| list.first())
+        .ok_or_else(|| TriggerError::Capture("无可用显示器".into()))?;
+    let mx = m.x().map_err(|e| TriggerError::Capture(e.to_string()))?;
+    let my = m.y().map_err(|e| TriggerError::Capture(e.to_string()))?;
+    let mw = m
+        .width()
+        .map_err(|e| TriggerError::Capture(e.to_string()))?;
+    let mh = m
+        .height()
+        .map_err(|e| TriggerError::Capture(e.to_string()))?;
+    if mw == 0 || mh == 0 {
+        return Err(TriggerError::Capture("主屏尺寸为 0".into()));
+    }
+    let img = m
+        .capture_image()
+        .map_err(|e| TriggerError::Capture(format!("截取主屏失败: {e}")))?;
+    let (iw, ih) = img.dimensions();
+    let (iw, ih) = (iw as i32, ih as i32);
+    if iw <= 0 || ih <= 0 {
+        return Err(TriggerError::Capture("主屏图像为空".into()));
+    }
+    let sx = iw as f64 / mw as f64;
+    let sy = ih as f64 / mh as f64;
+    let raw = img.as_raw();
+    let mut rgba = vec![0u8; (mw as usize) * (mh as usize) * 4];
+    for row in 0..mh {
+        let srow = ((row as f64 * sy) as i32).clamp(0, ih - 1);
+        let src_row = (srow as usize) * iw as usize;
+        let dst_row = (row as usize) * mw as usize;
+        for col in 0..mw {
+            let scol = ((col as f64 * sx) as i32).clamp(0, iw - 1);
+            let src = (src_row + scol as usize) * 4;
+            let dst = (dst_row + col as usize) * 4;
+            rgba[dst..dst + 4].copy_from_slice(&raw[src..src + 4]);
+        }
+    }
+    Ok(RgbaSnapshot {
+        vs: VirtualScreen {
+            x: mx,
+            y: my,
+            width: mw as i32,
+            height: mh as i32,
+        },
+        rgba,
+    })
 }
 
 #[cfg(test)]

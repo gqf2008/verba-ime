@@ -26,6 +26,9 @@ use core_foundation::url::CFURL;
 
 /// Verba 输入法本体的 TIS 输入源 ID（与 Info.plist 的 TISInputSourceID 一致）。
 const VERBA_SOURCE_ID: &str = "dev.verba.inputmethod.Verba";
+/// 可选中的输入模式 ID（TISEnable/Select 须作用于 mode 而非父源——对父源
+/// select 返回 paramErr(-50)，macOS 26 实测）。
+const VERBA_MODE_ID: &str = "dev.verba.inputmethod.Verba.Pinyin";
 /// kTISPropertyInputSourceID（TextInputSources.h 公开常量）。
 const TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
 
@@ -40,6 +43,7 @@ unsafe extern "C" {
     ) -> *const c_void;
     fn TISGetInputSourceProperty(source: *const c_void, key: *const c_void) -> *const c_void;
     fn TISEnableInputSource(source: *const c_void) -> i32;
+    fn TISSelectInputSource(source: *const c_void) -> i32;
     fn TISRegisterInputSource(location: *const c_void) -> i32;
 }
 
@@ -66,7 +70,7 @@ fn app_root_from_exe(exe: &Path) -> PathBuf {
 /// CFArray 的元素（get-rule），数组 CFRelease 后引用即失效——因此
 /// TISEnableInputSource 必须在数组存活期内调用。本函数内完成「查找→启用」，
 /// 不把源引用带出作用域，杜绝 use-after-free。
-fn find_and_enable_source() -> (bool, i32) {
+fn find_and_enable_source(select: bool) -> (bool, i32) {
     let raw = unsafe { TISCreateInputSourceList(std::ptr::null(), true) };
     if raw.is_null() {
         return (false, 0);
@@ -75,7 +79,11 @@ fn find_and_enable_source() -> (bool, i32) {
     let _owned = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(raw as CFArrayRef) };
     let id_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_ID);
     let id_key_ref = id_key.as_concrete_TypeRef() as *const c_void;
-    let want = CFString::new(VERBA_SOURCE_ID);
+    let want = CFString::new(if select {
+        VERBA_MODE_ID
+    } else {
+        VERBA_SOURCE_ID
+    });
     for i in 0..unsafe { CFArrayGetCount(raw) } {
         let src = unsafe { CFArrayGetValueAtIndex(raw, i) };
         let prop = unsafe { TISGetInputSourceProperty(src, id_key_ref) };
@@ -86,7 +94,16 @@ fn find_and_enable_source() -> (bool, i32) {
         // CFRetain + create-rule，drop 即释放，净零引用计数）。
         let id = unsafe { CFString::wrap_under_get_rule(prop as CFStringRef) };
         if id == want {
-            return (true, unsafe { TISEnableInputSource(src) });
+            let rc = unsafe { TISEnableInputSource(src) };
+            if select {
+                // TISSelectInputSource：把系统当前输入源切到 Verba Pinyin
+                // （菜单刷新失效时的程序化兜底，修复「启用未选中」状态）。
+                let sel = unsafe { TISSelectInputSource(src) };
+                if sel != 0 {
+                    eprintln!("警告: TISSelectInputSource 返回 {sel}");
+                }
+            }
+            return (true, rc);
         }
     }
     (false, 0)
@@ -94,7 +111,7 @@ fn find_and_enable_source() -> (bool, i32) {
 
 /// 注册（app 路径 → TISRegisterInputSource）并启用（源列表匹配 → TISEnableInputSource）。
 /// 返回 (注册成功, 找到并尝试启用, 启用返回码)。
-fn register_and_enable(app: &Path) -> (bool, bool, i32) {
+fn register_and_enable(app: &Path, select: bool) -> (bool, bool, i32) {
     let url = CFURL::from_path(app, true).expect("app 路径应可构造 CFURL");
     let url_ref = url.as_concrete_TypeRef() as *const c_void;
     let status = unsafe { TISRegisterInputSource(url_ref) };
@@ -106,7 +123,7 @@ fn register_and_enable(app: &Path) -> (bool, bool, i32) {
     }
     // 注册后源列表刷新可能有延迟：最多重试 3 次 × 1s，找到即启用。
     for attempt in 1..=3 {
-        let (found, rc) = find_and_enable_source();
+        let (found, rc) = find_and_enable_source(select);
         if found {
             return (registered, true, rc);
         }
@@ -148,13 +165,16 @@ fn list_sources() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "用法: verba-register [--app <Verba.app 路径>] | --list | --help\n\
+        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --help\n\
+         \x20 --select：注册启用后把系统当前输入源切到 Verba\n\
          \x20 无参数：注册并启用自身所在 bundle 的 Verba 输入源"
     );
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let select = args.contains(&"--select".to_owned());
+    args.retain(|a| a != "--select");
     if args.first().map(|s| s.as_str()) == Some("--help") {
         usage();
         return ExitCode::SUCCESS;
@@ -194,7 +214,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let (registered, found, enable_rc) = register_and_enable(&app);
+    let (registered, found, enable_rc) = register_and_enable(&app, select);
     if registered {
         println!("已注册输入源（TISRegisterInputSource）");
     }

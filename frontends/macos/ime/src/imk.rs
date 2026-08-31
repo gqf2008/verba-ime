@@ -266,15 +266,36 @@ fn trigger_exe_path() -> Option<std::path::PathBuf> {
 /// winit 事件循环在子进程，不阻塞 IMK 主线程与宿主应用），文本经 stdout
 /// 回传后落入结果槽位，由 drain 定时器在主线程消费。取消 → stdout 空。
 fn trigger_region_ocr_async() {
-    std::thread::spawn(|| {
+    // 单实例守卫：选区框在途时忽略再次 ///（否则叠加多个遮罩窗，
+    // 真机踩坑：连按三次出现三个覆盖层）。
+    static OCR_SPAWN_IN_FLIGHT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if OCR_SPAWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        dbg_log("OCR: 选区已在途，忽略本次 ///");
+        return;
+    }
+    std::thread::spawn(move || {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                OCR_SPAWN_IN_FLIGHT.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = Guard;
         let Some(exe) = trigger_exe_path() else {
             dbg_log("OCR: 未找到 verba-trigger");
             return;
         };
+        dbg_log("OCR: spawn verba-trigger region-ocr");
         match std::process::Command::new(exe).arg("region-ocr").output() {
             Ok(out) => {
+                dbg_log(&format!(
+                    "OCR: region-ocr 退出 {:?} stdout_len={} stderr={:?}",
+                    out.status.code(),
+                    out.stdout.len(),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
                 if !out.status.success() {
-                    dbg_log(&format!("OCR: region-ocr 退出码 {:?}", out.status.code()));
                     return;
                 }
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -414,7 +435,6 @@ struct Ivars {
     candidates: RefCell<Vec<String>>,
     /// 中英模式（macOS 无 TSF compartment：CapsLock 切换，内存态）。
     /// true = 中文（拼音），false = 英文直输。
-    ime_chinese: Cell<bool>,
     /// 改写对照预览（Some((改写, 原文))：期间数字 1/2/Enter/Esc 由预览拦截）。
     rewrite_preview: RefCell<Option<(String, String)>>,
     /// OCR 预览文本（Some = 预览中）。
@@ -460,7 +480,6 @@ impl Default for Ivars {
         Self {
             machine: RefCell::new(CompositionMachine::new()),
             candidates: RefCell::new(Vec::new()),
-            ime_chinese: Cell::new(true),
             rewrite_preview: RefCell::new(None),
             ocr_preview: RefCell::new(None),
             page: Cell::new(0),
@@ -519,6 +538,12 @@ define_class!(
             // 上一会话的拼音——若先 updateComposition 会把残留拼音标记进
             // 新会话（随后被宿主当作普通文本上屏）。
             self.reset();
+            // 清粘滞预览（issue #83 调试发现）：OCR/改写预览槽只靠 1/2/Esc
+            // 清除，会话切换不清理时新会话继承旧预览 → 拦截分支吞掉全部
+            // 按键、输入法整体静默失灵（真机踩坑）。会话边界强制清理。
+            let _ = self.ivars().rewrite_preview.borrow_mut().take();
+            let _ = self.ivars().ocr_preview.borrow_mut().take();
+            *self.ivars().candidates.borrow_mut() = Vec::new();
             // 预置空标记文本：首个按键前建立 marked 状态，防首字母在标记状态
             // 建立前被宿主当普通文本直插（快打/刚启动漏字，真机排查）。
             self.host_call("activate_server.prime", || unsafe {
@@ -537,6 +562,11 @@ define_class!(
             // 重入窗内积压的键属于本会话：换会话（应用/输入位置）后语义已失效
             // （原目标文本域可能已滚动/失焦），丢弃而非带入新会话。
             self.ivars().pending_keys.borrow_mut().clear();
+            // 预览槽与会话绑定：换应用/换输入位置后旧预览无效，清掉
+            // （同 pending_keys 的会话失效语义；否则拦截分支吞键）。
+            let _ = self.ivars().rewrite_preview.borrow_mut().take();
+            let _ = self.ivars().ocr_preview.borrow_mut().take();
+            *self.ivars().candidates.borrow_mut() = Vec::new();
             // 清宿主的标记文本再重置状态机：会话切换（换应用/换输入位置）时
             // 宿主会把残留 marked text 当普通文本上屏——组合中的拼音字母漏进
             // 文档（真机排查：「你 s会」中的 s）。丢弃组合，不提交原文。
@@ -570,34 +600,33 @@ define_class!(
             flags: NSUInteger,
             sender: Option<&AnyObject>,
         ) -> Bool {
+            // 进门口志（先于一切门/路由）：区分「键未投递」vs「被中英门吞」。
+            dbg_log(&format!(
+                "inputText enter s={:?} key={}",
+                string.map(|x| x.to_string()),
+                key_code
+            ));
             self.set_client(sender);
             // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
             self.drain_stream(sel!(drainVerbaStream));
-            // CapsLock（keyCode 57）切换中英——macOS 惯例（系统拼音同款；
-            // IMK 无 keyUp 回调，Windows 的孤立 Shift 方案在此平台不可行）。
-            if key_code == 57 {
-                let chinese = !self.ivars().ime_chinese.get();
-                self.ivars().ime_chinese.set(chinese);
-                dbg_log(&format!("CapsLock 切换中英: {}", if chinese { "中文" } else { "英文" }));
-                // 非中文态：清预览/组合，进入直输。
-                if !chinese {
-                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    let _ = self.ivars().machine.borrow_mut().feed_escape();
-                }
-                return Bool::new(true);
-            }
-            // 英文模式（CapsLock 切换后）：全部交宿主直插（字母/标点不过 IME）。
-            if !self.ivars().ime_chinese.get() {
-                return Bool::new(false);
-            }
+            // 中英切换不在此处理（revert AI v1 的 CapsLock toggle，issue #83
+            // 后续修复）：系统「CapsLock 切换 ABC」开启时，切源动作本身会把
+            // keyCode 57 投给刚激活的控制器，裸 toggle 与系统状态打架且无
+            // 视觉提示——实测表现为整个输入法静默失灵（全部键透传宿主）。
+            // CapsLock 落到 classify_key None → 空闲透传，交系统处理。
             // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
             // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
             if self.ivars().ocr_preview.borrow().is_some()
                 || self.ivars().rewrite_preview.borrow().is_some()
             {
+                dbg_log(&format!(
+                    "预览拦截命中: ocr={} rewrite={} key={:?}",
+                    self.ivars().ocr_preview.borrow().is_some(),
+                    self.ivars().rewrite_preview.borrow().is_some(),
+                    string.map(|x| x.to_string())
+                ));
                 let key = classify_key(string, key_code);
                 let pick: Option<usize> = match key {
                     Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
@@ -972,6 +1001,7 @@ define_class!(
             // Enter/空格/1 上屏，Esc 取消）；非 Idle（组合中触发等罕见场景）
             // 回退直接上屏。
             if let Some(text) = ocr_result_slot().lock().ok().and_then(|mut s| s.take()) {
+                dbg_log(&format!("OCR: 槽位消费 len={}", text.chars().count()));
                 set_clipboard_text_quiet(&text);
                 match self
                     .ivars()
@@ -980,9 +1010,13 @@ define_class!(
                     .begin_ocr_preview(text.clone())
                 {
                     Some(Action::OcrPreview { text: t }) => {
+                        dbg_log("OCR: 进入候选窗预览");
                         self.apply_action(Action::OcrPreview { text: t });
                     }
-                    _ => self.commit(&text),
+                    _ => {
+                        dbg_log("OCR: 非 Idle 回退直接上屏");
+                        self.commit(&text);
+                    }
                 }
                 return;
             }
@@ -1201,6 +1235,7 @@ impl VerbaIMKController {
             Action::TriggerOcr => {
                 // `///` 触发选区截图 OCR（issue #82 跨平台统一）：结束组合 +
                 // 后台 spawn verba-trigger region-ocr，结果经槽位回主线程进预览。
+                dbg_log("TriggerOcr fired");
                 self.set_marked("");
                 trigger_region_ocr_async();
                 true
@@ -1219,8 +1254,15 @@ impl VerbaIMKController {
             Action::OcrPreview { text } => {
                 // OCR 预览候选窗：复用 IMKCandidates 数据源（单候选=识别文本），
                 // 数字 1/Enter/Esc 由 input_text 的 ocr_preview 拦截路由。
+                // 候选显示截断（真机踩坑：大段识别文本 1059 字符塞单行候选，
+                // 渲染不可读、用户以为没出字）；提交/剪贴板仍是全文——
+                // 全文在 ocr_preview 槽位，pick 路径从槽位取。
                 *self.ivars().ocr_preview.borrow_mut() = Some(text.clone());
-                *self.ivars().candidates.borrow_mut() = vec![text.clone()];
+                let mut disp: String = text.chars().take(40).collect();
+                if text.chars().count() > 40 {
+                    disp.push('…');
+                }
+                *self.ivars().candidates.borrow_mut() = vec![disp];
                 self.ivars().page.set(0);
                 self.set_marked("");
                 self.refresh_candidate_window();

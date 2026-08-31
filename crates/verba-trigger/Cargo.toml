@@ -13,6 +13,7 @@ workspace = true
 verba-core = { path = "../verba-core" }
 verba-ipc = { path = "../verba-ipc" }
 log.workspace = true
+env_logger.workspace = true
 # 录音/播放：cpal + rodio（跨平台，自 frontends/windows/ime 原样迁入）
 cpal = "0.15"
 rodio = "0.20"
