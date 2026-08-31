@@ -11,7 +11,8 @@
 //!   逻辑单位
 //! - Windows/Linux：xcap=物理像素 = winit physical → 直传，scale 恒按 1
 //!
-//! softbuffer 像素无 alpha，遮罩用亮度衰减实现；缓冲取 vs 尺寸（单位网格）。
+//! softbuffer 像素无 alpha，遮罩用亮度衰减实现；缓冲取窗口**物理**尺寸，
+//! 快照（点网格）按 scale 查表采样（Retina 实测点尺寸缓冲被裁右下 3/4）。
 
 use std::num::NonZeroU32;
 
@@ -68,8 +69,7 @@ struct SelectionState {
     surface: Option<softbuffer::Surface<std::rc::Rc<Window>, std::rc::Rc<Window>>>,
     /// 物理像素 → 快照点 采样表缓存（窗口变化时重建）。
     map_cache: Option<SampleMap>,
-    /// 全屏/无装饰是否已应用（winit macOS：事件循环启动前的设置会被丢弃，
-    /// 须在首个 RedrawRequested——循环内、窗口已就绪——时应用）。
+    /// 首帧日志闸（全屏/无装饰已在 resumed 应用；此处仅核验 outer/inner）。
     chrome_applied: bool,
 }
 

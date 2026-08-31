@@ -670,7 +670,9 @@ define_class!(
                 if self.ivars().ocr_preview.borrow().is_some() {
                     let _ = self.ivars().ocr_preview.borrow_mut().take();
                     *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.refresh_candidate_window();
+                    // 空候选时 refresh 直接 return 不隐藏面板——显式 hide，
+                    // 防截断预览面板粘滞（对齐 Windows 同路径的显式 hide）。
+                    self.hide_candidate_window();
                     // 不 return：落到下方正常路由处理本键
                 } else {
                     return Bool::new(false);
