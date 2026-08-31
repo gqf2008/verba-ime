@@ -2,7 +2,7 @@
 
 [package]
 name = "verba-ime-macos"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 publish = false
 description = "Verba macOS IMK 前端（全 Rust）：objc2 + InputMethodKit 绑定 + 连接 daemon"

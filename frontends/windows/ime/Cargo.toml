@@ -2,7 +2,7 @@
 
 [package]
 name = "verba-ime-windows"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 publish = false
 description = "Verba Windows TSF 文本服务前端（输入法 DLL）"
