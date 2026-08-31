@@ -18,7 +18,7 @@ use objc2::{
     MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSApplication, NSEventModifierFlags, NSFont, NSFontAttributeName, NSMenu, NSMenuItem,
+    NSApplication, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSMenu, NSMenuItem,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSDictionary, NSInteger,
