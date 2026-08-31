@@ -9,7 +9,6 @@ slint::include_modules!();
 
 use std::collections::HashMap;
 
-use slint::Model as _;
 use verba_config::ApiKeyStore;
 use verba_ipc::VerbaClient;
 
