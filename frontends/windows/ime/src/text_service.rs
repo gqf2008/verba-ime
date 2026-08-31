@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 
 use verba_core::machine::{
     is_fullwidth_mapped_punct, Action, CompositionMachine, LlmCandidateRequest, MachineState,
+    PreviewKey, REWRITE_SYSTEM_PROMPT,
 };
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
@@ -30,13 +31,12 @@ use crate::capture::capture_primary_screen;
 use crate::play::play_audio;
 use crate::record::record_seconds;
 use windows::Win32::UI::TextServices::{
-    GUID_COMPARTMENT_KEYBOARD_INPUTMODE, IEnumTfDisplayAttributeInfo, ITfComposition,
-    ITfCompositionSink, ITfCompositionSink_Impl, TF_CONVERSIONMODE_ALPHANUMERIC,
-    TF_CONVERSIONMODE_NATIVE,
+    IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
     ITfContext, ITfContextView, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
     ITfDisplayAttributeProvider_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfTextInputProcessor_Impl, ITfThreadMgr,
+    ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE,
+    TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, PostMessageW,
@@ -304,9 +304,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
                         let mode = var.Anonymous.Anonymous.Anonymous.lVal;
                         // VT_I4 且显式 ALPHANUMERIC 才判英文；其余（NATIVE/
                         // VT_EMPTY/0）默认中文。
-                        data.ime_chinese.set(
-                            vt.0 == 3 && mode == TF_CONVERSIONMODE_ALPHANUMERIC as i32,
-                        );
+                        data.ime_chinese
+                            .set(vt.0 == 3 && mode == TF_CONVERSIONMODE_ALPHANUMERIC as i32);
                     }
                     Err(_) => data.ime_chinese.set(true),
                 }
@@ -604,40 +603,56 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 
 // ---- 按键处理 ----
 
-/// OCR 预览候选窗：状态行提示操作 + 首条候选=识别文本。
-fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
+/// 构建覆盖层候选窗并按给定锚点显示。OCR 预览 / 改写对照预览 / 中英状态卡
+/// 共用这套「主题克隆 → 控制器 → 显示 → 锚点」管线——三处各抄一份时兜底
+/// 定位与借锁顺序已经开始漂移，收口到这里后改一处即三处生效。
+fn show_overlay_window(
+    data: &Rc<TextServiceData>,
+    anchor: (i32, i32, i32),
+    populate: impl FnOnce(&mut verba_candidate::CandidateWindowController),
+) {
     let theme = data.candidate_theme.borrow().clone();
     let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
-    ctrl.set_candidates(vec![text.to_owned()]);
-    ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
+    populate(&mut ctrl);
     ctrl.show();
     if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
-        let fallback = data
-            .context
-            .borrow()
-            .as_ref()
-            .and_then(|ctx| view_screen_pos(ctx))
-            .unwrap_or((0, 0, 0));
-        cw.update(&ctrl, fallback);
+        cw.update(&ctrl, anchor);
     }
 }
 
+/// 视图粗定位兜底锚点（无组合 / 布局未就绪时的最佳 effort）。
+fn view_fallback_anchor(data: &Rc<TextServiceData>) -> (i32, i32, i32) {
+    data.context
+        .borrow()
+        .as_ref()
+        .and_then(view_screen_pos)
+        .unwrap_or((0, 0, 0))
+}
+
+/// OCR 预览候选窗：状态行提示操作 + 首条候选=识别文本。
+fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
+    show_overlay_window(data, view_fallback_anchor(data), |ctrl| {
+        ctrl.set_candidates(vec![text.to_owned()]);
+        ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
+    });
+}
+
 /// 改写对照预览候选窗：1=改写结果（选中态）2=原文，状态行提示操作。
-fn show_rewrite_preview(data: &Rc<TextServiceData>, rewritten: &str, source: &str) {
-    let theme = data.candidate_theme.borrow().clone();
-    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
-    ctrl.set_candidates(vec![rewritten.to_owned(), source.to_owned()]);
-    ctrl.set_status(Some("1/Enter 改写 · 2 原文 · Esc 取消".to_owned()));
-    ctrl.show();
-    if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
-        let fallback = data
-            .context
-            .borrow()
-            .as_ref()
-            .and_then(|ctx| view_screen_pos(ctx))
-            .unwrap_or((0, 0, 0));
-        cw.update(&ctrl, fallback);
-    }
+/// 此刻组合仍活跃（preedit=改写结果），优先光标锚点——只按视图粗定位会把
+/// 窗口甩到文本区左上角，离正在改写的那一行可能相距数屏。
+fn show_rewrite_preview(
+    data: &Rc<TextServiceData>,
+    context: &ITfContext,
+    rewritten: &str,
+    source: &str,
+) {
+    let anchor = caret_screen_pos(data, context)
+        .or_else(|| view_screen_pos(context))
+        .unwrap_or((0, 0, 0));
+    show_overlay_window(data, anchor, |ctrl| {
+        ctrl.set_candidates(vec![rewritten.to_owned(), source.to_owned()]);
+        ctrl.set_status(Some("1/Enter 改写 · 2 原文 · Esc 取消".to_owned()));
+    });
 }
 
 /// Shift 孤立按切换中英：翻转模式 + 同步 GUID_COMPARTMENT_KEYBOARD_INPUTMODE
@@ -669,25 +684,54 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
         }
     }
     // 视觉反馈：候选窗位置闪「中/英」状态卡（2 秒后由 on_timer 隐藏）。
-    let theme = data.candidate_theme.borrow().clone();
-    let mut ctrl = verba_candidate::CandidateWindowController::new(theme);
-    ctrl.set_status(Some(if chinese { "中文模式" } else { "英文模式" }.to_owned()));
-    ctrl.show();
-    if let Some(cw) = data.candidate_window.borrow_mut().as_mut() {
-        let fallback = data
-            .context
-            .borrow()
-            .as_ref()
-            .and_then(|ctx| view_screen_pos(ctx))
-            .unwrap_or((0, 0, 0));
-        cw.update(&ctrl, fallback);
-    }
-    data.ime_status_until
-        .set(Some(std::time::Instant::now() + std::time::Duration::from_secs(2)));
+    show_overlay_window(data, view_fallback_anchor(data), |ctrl| {
+        ctrl.set_status(Some(
+            if chinese {
+                "中文模式"
+            } else {
+                "英文模式"
+            }
+            .to_owned(),
+        ));
+    });
+    data.ime_status_until.set(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    ));
     log::info!("中英模式切换: {}", if chinese { "中文" } else { "英文" });
 }
 
-fn handle_key_down(
+/// 预览态按键分类（OCR 预览与改写对照预览共用一份清单，防止两条路由
+/// 各自漂移）。Return/Esc 按虚拟键；数字/空格按成字符。
+fn classify_preview_key(vk: u32, ch: Option<char>) -> Option<PreviewKey> {
+    if vk == VK_RETURN.0 as u32 {
+        Some(PreviewKey::Enter)
+    } else if ch == Some(' ') {
+        Some(PreviewKey::Space)
+    } else if ch == Some('1') {
+        Some(PreviewKey::Digit1)
+    } else if ch == Some('2') {
+        Some(PreviewKey::Digit2)
+    } else if vk == VK_ESCAPE.0 as u32 {
+        Some(PreviewKey::Escape)
+    } else {
+        None
+    }
+}
+
+/// 数字列的 VK 回退：AZERTY 等布局数字键不经 Shift 不产生数字字符（法语
+/// 布局原样产出 é 等），只看成字符会让「1/2 选定」在这些布局永远触发不了。
+/// 仅改写对照预览使用——OCR 预览发生在 Idle 态，数字键本就不会被认领送达。
+fn preview_digit_by_vk(vk: u32) -> Option<PreviewKey> {
+    match vk {
+        0x31 => Some(PreviewKey::Digit1), // VK_1
+        0x32 => Some(PreviewKey::Digit2), // VK_2
+        _ => None,
+    }
+}
+
+/// 处理一次 key down。pub 供 tsf_smoke 集成测试直驱按键路由（曾在
+/// 重构中被收回私有，测试目标随之编译失败）。
+pub fn handle_key_down(
     data: &Rc<TextServiceData>,
     wparam: u32,
     lparam: u32,
@@ -714,23 +758,11 @@ fn handle_key_down(
     let mut machine = data.machine.borrow_mut();
     let state = machine.state();
     // 改写对照预览态按键拦截（优先于 OCR 预览——两态互斥）：1/Enter/空格=
-    // 改写上屏，2=原文上屏，Esc 取消；其他键不动预览（交回路由但被
-    // Streaming/ResultReady 忽略——预览期间保护结果）。
+    // 改写上屏，2=原文上屏，Esc 取消；其他键不动预览，落回下方正常路由
+    // （此刻仍 ResultReady：可打印键已被认领送达，feed_char 返回 None 后
+    // 照常吞掉，不会漏进宿主文档——预览期间保护结果）。
     if machine.rewrite_previewing() {
-        use verba_core::machine::PreviewKey;
-        let key = if vk == VK_RETURN.0 as u32 {
-            Some(PreviewKey::Enter)
-        } else if ch == Some(' ') {
-            Some(PreviewKey::Space)
-        } else if ch == Some('1') {
-            Some(PreviewKey::Digit1)
-        } else if ch == Some('2') {
-            Some(PreviewKey::Digit2)
-        } else if vk == VK_ESCAPE.0 as u32 {
-            Some(PreviewKey::Escape)
-        } else {
-            None
-        };
+        let key = classify_preview_key(vk, ch).or(preview_digit_by_vk(vk));
         if let Some(k) = key {
             if let Some(action) = machine.feed_rewrite_preview(k) {
                 log::info!("改写预览: {action:?}");
@@ -743,25 +775,18 @@ fn handle_key_down(
             }
             return Ok(TRUE);
         }
-        // 其他键不属于预览：不吞、不退出（保护预览），交宿主。
-        return Ok(FALSE);
     }
     // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
     // 后照常走下方路由（不打断打字流）。
     if machine.ocr_previewing() {
-        use verba_core::machine::PreviewKey;
-        let key = if vk == VK_RETURN.0 as u32 {
-            Some(PreviewKey::Enter)
-        } else if ch == Some(' ') {
-            Some(PreviewKey::Space)
-        } else if ch == Some('1') {
-            Some(PreviewKey::Digit1)
-        } else if vk == VK_ESCAPE.0 as u32 {
-            Some(PreviewKey::Escape)
-        } else {
-            None
-        };
-        match key {
+        match classify_preview_key(vk, ch) {
+            // 2 在 OCR 预览无语义（仅识别文本一项）：按未命中处理——退出
+            // 预览，该键落回下方正常路由。
+            Some(PreviewKey::Digit2) | None => {
+                // 未命中预览键：退出预览，隐藏候选窗，落回下方正常路由。
+                machine.end_ocr_preview();
+                hide_candidate_window(data);
+            }
             Some(k) => {
                 let action = machine.feed_ocr_preview(k).unwrap_or(Action::None);
                 log::info!("OCR 预览: {action:?}");
@@ -774,11 +799,6 @@ fn handle_key_down(
                     let _ = apply_action(data, &context, action);
                 }
                 return Ok(TRUE);
-            }
-            None => {
-                // 未命中预览键：退出预览，隐藏候选窗，落回下方正常路由。
-                machine.end_ocr_preview();
-                hide_candidate_window(data);
             }
         }
     }
@@ -927,11 +947,9 @@ pub fn apply_action(
             // `//<内容>` + Tab：改写管道。系统提示词固定为「忠实改写」——
             // 纠错补全 + 结构化成文，不自由发挥；流式结果沿用
             // Streaming/ResultReady 通道（Enter 上屏 / 继续打字编辑）。
+            // 提示词与 macOS 前端共用 verba-core 的常量，杜绝两端措辞漂移。
             log::info!("改写管道: content_len={}", content.chars().count());
-            let system = Some(
-                "你是文字润色助手。忠实改写用户给出的内容：纠正错别字与语病，补全残句使其通顺，按内容自动判断是否需要结构化（如请假条/邮件/通知则给出合适格式）。不要回答问题、不要扩展内容、不要添加评论；只输出改写后的文本本身，不用 Markdown。"
-                    .to_owned(),
-            );
+            let system = Some(REWRITE_SYSTEM_PROMPT.to_owned());
             // 保持组合（首个流式块由 on_timer 的 UpdateResult 替换文本），
             // 与 StartLlm 的自由生成同通道。
             start_llm_with_system(data, &content, system, None, false);
@@ -1007,13 +1025,22 @@ pub fn apply_action(
         }
         Action::ResultReady => Ok(()),
         Action::RewriteReady { rewritten, source } => {
-            // 改写完成 → 对照预览候选窗（1=改写结果 2=原文）。
-            // 组合串此时显示着流式结果（rewritten），保持不隐藏——预览
-            // 候选窗叠加显示双候选；用户选定后组合由 CommitImmediate/
-            // Cancel 清理。
-            show_rewrite_preview(data, &rewritten, &source);
-            log::info!("改写对照预览: rewritten_len={} source_len={}",
-                rewritten.chars().count(), source.chars().count());
+            // 改写完成 → 进入对照预览态 + 弹对照预览候选窗（1=改写结果
+            // 2=原文）。机器必须同步 begin_rewrite_preview——此后 1/Enter/
+            // 空格=改写、2=原文、Esc=取消才由 handle_key_down 的改写预览
+            // 分支路由；漏调时拦截分支成死代码，窗口文案承诺的按键全部
+            // 失效（审查发现）。组合串此时显示着流式结果（rewritten），
+            // 保持不隐藏——预览候选窗叠加显示双候选；用户选定后组合由
+            // CommitImmediate/Cancel 清理。
+            data.machine
+                .borrow_mut()
+                .begin_rewrite_preview(rewritten.clone(), source.clone());
+            show_rewrite_preview(data, context, &rewritten, &source);
+            log::info!(
+                "改写对照预览: rewritten_len={} source_len={}",
+                rewritten.chars().count(),
+                source.chars().count()
+            );
             Ok(())
         }
         Action::CommitResult { text } => {
@@ -1699,7 +1726,12 @@ fn open_settings() {
     }
     candidates.push(PathBuf::from(r"C:\Program Files\Verba\verba-settings.exe"));
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(appdata).join("Verba").join("ime").join("verba-settings.exe"));
+        candidates.push(
+            PathBuf::from(appdata)
+                .join("Verba")
+                .join("ime")
+                .join("verba-settings.exe"),
+        );
     }
     for p in &candidates {
         if p.exists() {
@@ -2039,8 +2071,8 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
             Some(stream_event::Kind::Final(_)) => {
                 // 改写流完成 → RewriteReady（对照预览）须走 Act 派发；
                 // 自由生成 → ResultReady（无动作）。
-                if let Action::RewriteReady { rewritten, source } = machine.on_llm_done() {
-                    steps.push(Step::Act(Action::RewriteReady { rewritten, source }));
+                if let action @ Action::RewriteReady { .. } = machine.on_llm_done() {
+                    steps.push(Step::Act(action));
                 }
                 pending_preedit = Some(machine.result().to_owned());
             }
@@ -2189,11 +2221,7 @@ impl TextServiceData {
                 _ => {
                     // 非 Idle（组合中触发等罕见场景）回退直接上屏。
                     if let Some(context) = self.context.borrow().as_ref().cloned() {
-                        let _ = edit_session::commit_text(
-                            &context,
-                            self.clientid.get(),
-                            &text,
-                        );
+                        let _ = edit_session::commit_text(&context, self.clientid.get(), &text);
                     }
                 }
             }
@@ -2354,6 +2382,49 @@ mod tests {
     }
 
     /// 流 token 打包/安装属性（issue #44 真机项的可自动化部分）：
+    /// 改写流完成布线钉住：Final 事件 → Step::Act(RewriteReady) 派发（不得
+    /// 静默丢弃），自由生成 Final 则无 Act。apply_action 侧须接住该动作调
+    /// begin_rewrite_preview——两跳缺一，对照预览按键路由整条失效（审查
+    /// 发现：后一跳曾漏接，拦截分支成死代码而单测全绿）。
+    #[test]
+    fn collect_steps_rewrite_final_emits_rewrite_ready_act() {
+        let mut m = CompositionMachine::new();
+        for c in "//请假条".chars() {
+            let _ = m.feed_char(c);
+        }
+        assert!(matches!(m.feed_char('\t'), Action::StartRewrite { .. }));
+        let steps = collect_steps(
+            &mut m,
+            vec![
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                        text: "尊敬的经理：".into(),
+                    })),
+                },
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Final(verba_protos::Final {
+                        text: "尊敬的经理：".into(),
+                    })),
+                },
+            ],
+        );
+        assert!(
+            matches!(
+                &steps[..],
+                [Step::Act(Action::RewriteReady { rewritten, source }), Step::Preedit(p)]
+                    if rewritten == "尊敬的经理：" && source == "请假条" && p == "尊敬的经理："
+            ),
+            "改写 Final 应派发 RewriteReady 并保留组合 preedit，实际 {steps:?}"
+        );
+        assert_eq!(m.state(), MachineState::ResultReady);
+        assert!(
+            !m.rewrite_previewing(),
+            "预览态由 apply_action 接住 RewriteReady 后才进入（前端职责）"
+        );
+    }
+
     /// 代际嵌入高位、id 嵌入低位；「同代保留先到者、旧代绝不覆盖新代、
     /// 空槽正常安装」在交错序列下成立——真机验收仅剩 TSF 路由副作用。
     #[test]

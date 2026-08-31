@@ -234,6 +234,11 @@ pub fn is_fullwidth_mapped_punct(c: char) -> bool {
     c == '"' || c == '\'' || fullwidth_punct(c).is_some()
 }
 
+/// 改写管道（`//<内容>` + Tab）的固定系统提示词。前端各自发起 LLM 请求时
+/// 共用同一份——此前内联在 Windows 前端，macOS 接入改写流时需复制粘贴，
+/// 两端措辞一旦漂移，同一内容在两个平台改出不同文风。
+pub const REWRITE_SYSTEM_PROMPT: &str = "你是文字润色助手。忠实改写用户给出的内容：纠正错别字与语病，补全残句使其通顺，按内容自动判断是否需要结构化（如请假条/邮件/通知则给出合适格式）。不要回答问题、不要扩展内容、不要添加评论；只输出改写后的文本本身，不用 Markdown。";
+
 /// 盲按窗口内暂缓的提交意图（见 `deferred_intent` 字段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredIntent {
@@ -687,6 +692,11 @@ impl CompositionMachine {
             MachineState::Streaming | MachineState::ResultReady => {
                 let text = std::mem::take(&mut self.result);
                 self.state = MachineState::Idle;
+                // 流中提前 Enter：本条流已终结（前端 cancel_stream），改写标记
+                // 一并清掉——否则残留的 rewrite_source 会让下一条普通生成的
+                // on_llm_done 误判为改写流（对照窗误弹、原文错配）。
+                self.rewrite_source = None;
+                self.rewrite_preview = None;
                 Action::CommitResult { text }
             }
         }
@@ -698,15 +708,7 @@ impl CompositionMachine {
             MachineState::Idle => Action::None,
             _ => {
                 self.state = MachineState::Idle;
-                self.pinyin_buffer.clear();
-                self.dictionary_candidates.clear();
-                self.llm_candidates.clear();
-                self.pinyin_candidates.clear();
-                self.committed.clear();
-                self.commit_offset = 0;
-                self.last_candidates_request = None;
-                self.candidates_in_flight = false;
-                self.deferred_intent = None;
+                self.clear_composition_state();
                 self.prompt.clear();
                 self.result.clear();
                 Action::Cancel
@@ -863,8 +865,11 @@ impl CompositionMachine {
         !self.pinyin_buffer.is_empty()
     }
 
-    /// 清空拼音缓冲与候选（保留提示词）。
-    fn clear_pinyin(&mut self) {
+    /// 清空拼音缓冲、候选与预览态（保留 state 与提示词）。所有「归零组合
+    /// 现场」的出口（clear_pinyin / reset_pinyin / feed_escape）共用——新增
+    /// 组合/预览字段只改这一处；rewrite_source 此前就因各出口各自手写清理
+    /// 而漏掉，泄漏进下一条普通生成流（对照窗误弹）。
+    fn clear_composition_state(&mut self) {
         self.pinyin_buffer.clear();
         self.dictionary_candidates.clear();
         self.llm_candidates.clear();
@@ -879,6 +884,11 @@ impl CompositionMachine {
         self.ocr_preview = None;
         self.rewrite_source = None;
         self.rewrite_preview = None;
+    }
+
+    /// 清空拼音缓冲与候选（保留提示词）。
+    fn clear_pinyin(&mut self) {
+        self.clear_composition_state();
     }
 
     /// 拼音组合区的 preedit（`buffer 1.候选 2.候选…`），无候选时仅缓冲。
@@ -918,20 +928,7 @@ impl CompositionMachine {
     /// 重置拼音状态回 Idle。
     fn reset_pinyin(&mut self) {
         self.state = MachineState::Idle;
-        self.pinyin_buffer.clear();
-        self.dictionary_candidates.clear();
-        self.llm_candidates.clear();
-        self.pinyin_candidates.clear();
-        self.committed.clear();
-        self.commit_offset = 0;
-        self.last_candidates_request = None;
-        self.candidates_in_flight = false;
-        self.deferred_intent = None;
-        self.pinyin_page = 0;
-        self.selected_index = 0;
-        self.ocr_preview = None;
-        self.rewrite_source = None;
-        self.rewrite_preview = None;
+        self.clear_composition_state();
     }
 
     /// 用当前缓冲刷新候选（缓冲变化时回到第 1 页，并丢弃旧远程候选）。
@@ -1054,30 +1051,21 @@ impl CompositionMachine {
     /// 对照预览按键：1/Enter/空格=改写结果上屏；2=原文上屏；Esc 全取消；
     /// None 返回表示键不属于预览（交回正常路由，预览保持）。
     pub fn feed_rewrite_preview(&mut self, key: PreviewKey) -> Option<Action> {
-        let Some((rewritten, source)) = self.rewrite_preview.clone() else {
-            return None;
-        };
-        match key {
+        let (rewritten, source) = self.rewrite_preview.as_ref()?;
+        let action = match key {
             PreviewKey::Enter | PreviewKey::Space | PreviewKey::Digit1 => {
-                self.rewrite_preview = None;
-                self.state = MachineState::Idle;
-                self.result.clear();
-                Some(Action::CommitImmediate(rewritten))
+                Some(Action::CommitImmediate(rewritten.clone()))
             }
-            PreviewKey::Digit2 => {
-                self.rewrite_preview = None;
-                self.state = MachineState::Idle;
-                self.result.clear();
-                Some(Action::CommitImmediate(source))
-            }
-            PreviewKey::Escape => {
-                self.rewrite_preview = None;
-                self.state = MachineState::Idle;
-                self.result.clear();
-                Some(Action::Cancel)
-            }
+            PreviewKey::Digit2 => Some(Action::CommitImmediate(source.clone())),
+            PreviewKey::Escape => Some(Action::Cancel),
             PreviewKey::Other => None,
+        };
+        if action.is_some() {
+            self.rewrite_preview = None;
+            self.state = MachineState::Idle;
+            self.result.clear();
         }
+        action
     }
 
     /// LLM 流式增量。
@@ -1118,6 +1106,10 @@ impl CompositionMachine {
         self.state = MachineState::Idle;
         self.prompt.clear();
         self.result.clear();
+        // 失败的改写流不得残留改写标记：否则下一条普通生成完成时
+        // on_llm_done 会 take 到陈旧原文，误弹对照预览窗（原文错配）。
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
         if was_active {
             Action::LlmFailed {
                 message: message.to_owned(),
@@ -2504,7 +2496,10 @@ mod tests {
         );
         // Esc 取消
         m.begin_rewrite_preview("a".into(), "b".into());
-        assert_eq!(m.feed_rewrite_preview(PreviewKey::Escape), Some(Action::Cancel));
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Escape),
+            Some(Action::Cancel)
+        );
         // 其他键：None（预览保持）
         m.begin_rewrite_preview("a".into(), "b".into());
         assert_eq!(m.feed_rewrite_preview(PreviewKey::Other), None);
@@ -2542,7 +2537,9 @@ mod tests {
         let mut m = CompositionMachine::new();
         assert_eq!(
             m.begin_ocr_preview("识别文本".to_owned()),
-            Some(Action::OcrPreview { text: "识别文本".to_owned() })
+            Some(Action::OcrPreview {
+                text: "识别文本".to_owned()
+            })
         );
         assert!(m.ocr_previewing());
         // Enter 上屏
@@ -2593,7 +2590,10 @@ mod tests {
         for ch in "你好".chars() {
             let _ = m2.feed_char(ch);
         }
-        assert!(matches!(m2.feed_char('/'), Action::UpdatePrompt { .. }), "提示词非空时 / 字面入提示词");
+        assert!(
+            matches!(m2.feed_char('/'), Action::UpdatePrompt { .. }),
+            "提示词非空时 / 字面入提示词"
+        );
     }
 
     /// 跨页遍历（微软拼音/手心行为）：20 条候选 = 3 页（9+9+2）。

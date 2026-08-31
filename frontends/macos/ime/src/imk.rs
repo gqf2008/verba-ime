@@ -30,7 +30,9 @@ use objc2_input_method_kit::{
     IMKCandidatesSendServerKeyEventFirst, IMKInputController, IMKServer, IMKStateSetting,
 };
 
-use verba_core::machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState};
+use verba_core::machine::{
+    Action, CompositionMachine, LlmCandidateRequest, MachineState, REWRITE_SYSTEM_PROMPT,
+};
 use verba_ipc::name::local_entropy_u64;
 use verba_protos::{stream_event, StreamEvent};
 
@@ -1014,6 +1016,27 @@ impl VerbaIMKController {
                 self.start_llm(prompt, system);
                 true
             }
+            Action::StartRewrite { content } => {
+                // `//<内容>` + Tab：改写管道（与 Windows 同一套固定系统提示词，
+                // 常量收口在 verba-core）。流式结果沿用 Streaming/ResultReady
+                // 通道（Enter 上屏）。
+                self.start_llm(content, Some(REWRITE_SYSTEM_PROMPT.to_owned()));
+                true
+            }
+            Action::OcrPreview { text } => {
+                // OCR 预览候选窗 macOS 侧留待：异常路径回退直接上屏（与
+                // Windows apply_action 的 OcrPreview 回退一致），保不丢文本。
+                log::warn!("[VerbaIMK] OcrPreview 走到 apply_action，直接上屏");
+                self.commit(&text);
+                true
+            }
+            Action::RewriteReady { .. } => {
+                // 改写对照预览候选窗 macOS 侧留待：沿用 ResultReady 语义
+                // （Enter 上屏改写结果）；「2=原文」暂不支持。
+                self.set_marked(self.ivars().machine.borrow().result());
+                self.invalidate_timer();
+                true
+            }
             Action::ResultReady => true,
             Action::Cancel => {
                 self.cancel_stream();
@@ -1426,7 +1449,9 @@ impl VerbaIMKController {
             Action::UpdateResult { preedit } | Action::UpdatePrompt { preedit } => {
                 self.set_marked(&preedit);
             }
-            Action::ResultReady => {
+            // 改写流完成同样要刷新标记文本并停表——RewriteReady 不接住会落进
+            // 兜底 debug 日志，组合文本停留上一个 chunk、drain 定时器空转。
+            Action::ResultReady | Action::RewriteReady { .. } => {
                 self.set_marked(self.ivars().machine.borrow().result());
                 self.invalidate_timer();
             }
