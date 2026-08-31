@@ -71,6 +71,11 @@ pub fn virtual_screen() -> Result<VirtualScreen, TriggerError> {
 }
 
 /// 复合虚拟屏幕的 RGBA 快照：逐显示器截取，把交集区域拷入统一画布。
+///
+/// 单位换算（独立审查 Retina 实测）：xcap `Monitor::x/y/width/height` 为
+/// **点**（CGDisplayBounds），`capture_image()` 为**物理像素**（Retina 2×，
+/// 真机 1470×956 点 → 2940×1912 像素）。画布与选区坐标统一在点网格，
+/// 拷贝时按每显示器 `图像/边界` 比例做最近邻采样（一次性成本，正确优先）。
 fn snapshot_virtual() -> Result<RgbaSnapshot, TriggerError> {
     let vs = virtual_screen()?;
     let mut rgba = vec![0u8; (vs.width as usize) * (vs.height as usize) * 4];
@@ -83,6 +88,9 @@ fn snapshot_virtual() -> Result<RgbaSnapshot, TriggerError> {
         let mh = m
             .height()
             .map_err(|e| TriggerError::Capture(e.to_string()))?;
+        if mw == 0 || mh == 0 {
+            continue;
+        }
         let (x1, y1) = (mx.max(vs.x), my.max(vs.y));
         let (x2, y2) = (
             (mx + mw as i32).min(vs.x + vs.width),
@@ -96,17 +104,23 @@ fn snapshot_virtual() -> Result<RgbaSnapshot, TriggerError> {
             .map_err(|e| TriggerError::Capture(format!("截取显示器失败: {e}")))?;
         let (iw, ih) = img.dimensions();
         let (iw, ih) = (iw as i32, ih as i32);
-        // 显示器图像尺寸可能与其报告边界略有出入（DPI 取整）：交集裁到两者最小
-        let (cx2, cy2) = (x2.min(mx + iw), y2.min(my + ih));
-        if cx2 <= x1 || cy2 <= y1 {
+        if iw <= 0 || ih <= 0 {
             continue;
         }
+        // 点 → 像素的采样比例（scale=1 时恒等于 1，走同一采样路径）
+        let sx = iw as f64 / mw as f64;
+        let sy = ih as f64 / mh as f64;
         let raw = img.as_raw();
-        for row in y1..cy2 {
-            let src = (((row - my) as usize) * iw as usize + (x1 - mx) as usize) * 4;
-            let dst = (((row - vs.y) as usize) * vs.width as usize + (x1 - vs.x) as usize) * 4;
-            let len = (cx2 - x1) as usize * 4;
-            rgba[dst..dst + len].copy_from_slice(&raw[src..src + len]);
+        for row in y1..y2 {
+            let srow = (((row - my) as f64 * sy) as i32).clamp(0, ih - 1);
+            let src_row = (srow as usize) * iw as usize;
+            let dst_row = ((row - vs.y) as usize) * vs.width as usize;
+            for col in x1..x2 {
+                let scol = (((col - mx) as f64 * sx) as i32).clamp(0, iw - 1);
+                let src = (src_row + scol as usize) * 4;
+                let dst = (dst_row + (col - vs.x) as usize) * 4;
+                rgba[dst..dst + 4].copy_from_slice(&raw[src..src + 4]);
+            }
         }
     }
     Ok(RgbaSnapshot { vs, rgba })

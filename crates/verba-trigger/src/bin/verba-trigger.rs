@@ -83,6 +83,11 @@ fn connect_daemon() -> Result<VerbaClient, TriggerError> {
         )));
     }
     let mut cmd = Command::new(&daemon);
+    // stdio 全部落 null：daemon 常驻不退出，若继承本进程 stdout 管道写端，
+    // 调用方的 .output() 将永不 EOF（独立审查 NOTE——结果静默丢失根因）。
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -299,9 +304,14 @@ fn region_output_path(args: &[String]) -> Option<String> {
 }
 
 /// 选区截图：--rect 脚本化，否则交互拖选（Esc/右键取消 → Ok(None)）。
+/// 显式传了 --rect 但解析失败 → 报错退出（脚本化场景静默落交互会挂死管道）。
 fn region_capture(args: &[String]) -> Result<Option<verba_trigger::bmp::ScreenShot>, TriggerError> {
+    let rect_given = args.iter().any(|a| a == "--rect");
     match parse_rect(args) {
         Some((x, y, w, h)) => capture_region(x, y, w, h).map(Some),
+        None if rect_given => Err(TriggerError::Capture(
+            "--rect 参数非法（应为 x,y,w,h 四个整数）".into(),
+        )),
         None => match select_region()? {
             Some(r) => capture_region(r.x, r.y, r.width, r.height).map(Some),
             None => Ok(None),
