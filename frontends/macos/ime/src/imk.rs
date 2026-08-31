@@ -541,9 +541,14 @@ define_class!(
             // 清粘滞预览（issue #83 调试发现）：OCR/改写预览槽只靠 1/2/Esc
             // 清除，会话切换不清理时新会话继承旧预览 → 拦截分支吞掉全部
             // 按键、输入法整体静默失灵（真机踩坑）。会话边界强制清理。
+            let had_preview = self.ivars().ocr_preview.borrow().is_some()
+                || self.ivars().rewrite_preview.borrow().is_some();
             let _ = self.ivars().rewrite_preview.borrow_mut().take();
             let _ = self.ivars().ocr_preview.borrow_mut().take();
             *self.ivars().candidates.borrow_mut() = Vec::new();
+            if had_preview {
+                dbg_log("activate: 清理粘滞预览");
+            }
             // 预置空标记文本：首个按键前建立 marked 状态，防首字母在标记状态
             // 建立前被宿主当普通文本直插（快打/刚启动漏字，真机排查）。
             self.host_call("activate_server.prime", || unsafe {
@@ -658,8 +663,18 @@ define_class!(
                     }
                     return Bool::new(true);
                 }
-                // 预览期间其他键：不吞（交宿主），预览保持。
-                return Bool::new(false);
+                // 预览期间其他键：OCR 预览 → 清预览并**继续正常路由**（对齐
+                // Windows feed_ocr_preview 的 Other 语义：退出预览、该键重走
+                // 拼音路径——透传会字母泄漏，真机踩坑）；改写预览保持原样
+                // （Windows 同款：Other 不清、键透传、预览保持）。
+                if self.ivars().ocr_preview.borrow().is_some() {
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.refresh_candidate_window();
+                    // 不 return：落到下方正常路由处理本键
+                } else {
+                    return Bool::new(false);
+                }
             }
             // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
             // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
@@ -1245,6 +1260,10 @@ impl VerbaIMKController {
                 true
             }
             Action::StartRewrite { content } => {
+                dbg_log(&format!(
+                    "apply StartRewrite len={}",
+                    content.chars().count()
+                ));
                 // `//<内容>` + Tab：改写管道（与 Windows 同一套固定系统提示词，
                 // 常量收口在 verba-core）。流式结果沿用 Streaming/ResultReady
                 // 通道（Enter 上屏）。
@@ -1252,6 +1271,7 @@ impl VerbaIMKController {
                 true
             }
             Action::OcrPreview { text } => {
+                dbg_log(&format!("apply OcrPreview len={}", text.chars().count()));
                 // OCR 预览候选窗：复用 IMKCandidates 数据源（单候选=识别文本），
                 // 数字 1/Enter/Esc 由 input_text 的 ocr_preview 拦截路由。
                 // 候选显示截断（真机踩坑：大段识别文本 1059 字符塞单行候选，
@@ -1269,6 +1289,11 @@ impl VerbaIMKController {
                 true
             }
             Action::RewriteReady { rewritten, source } => {
+                dbg_log(&format!(
+                    "apply RewriteReady rewritten_len={} source_len={}",
+                    rewritten.chars().count(),
+                    source.chars().count()
+                ));
                 // 改写对照预览：候选窗双候选（1=改写 2=原文），数字选字由
                 // input_text 的 rewrite_preview 拦截路由处理。组合标记清空
                 // （预览期间不显示流式文本，候选窗即预览）。
