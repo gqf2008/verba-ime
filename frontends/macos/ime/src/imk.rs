@@ -632,6 +632,45 @@ define_class!(
                 // 预览期间其他键：不吞（交宿主），预览保持。
                 return Bool::new(false);
             }
+            // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
+            // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
+            if self.ivars().ocr_preview.borrow().is_some()
+                || self.ivars().rewrite_preview.borrow().is_some()
+            {
+                let key = classify_key(string, key_code);
+                let pick: Option<usize> = match key {
+                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
+                    Some(ImkKey::Char('2')) => Some(1),
+                    _ => None,
+                };
+                let esc = matches!(key, Some(ImkKey::Escape));
+                if esc {
+                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.refresh_candidate_window();
+                    return Bool::new(true);
+                }
+                if let Some(idx) = pick {
+                    let text = if let Some((rw, src)) =
+                        self.ivars().rewrite_preview.borrow().as_ref()
+                    {
+                        [rw.clone(), src.clone()].get(idx).cloned()
+                    } else {
+                        self.ivars().ocr_preview.borrow().clone()
+                    };
+                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
+                    let _ = self.ivars().ocr_preview.borrow_mut().take();
+                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    self.refresh_candidate_window();
+                    if let Some(t) = text {
+                        self.commit(&t);
+                    }
+                    return Bool::new(true);
+                }
+                // 预览期间其他键：不吞（交宿主），预览保持。
+                return Bool::new(false);
+            }
             let panel_visible = self
                 .ivars()
                 .candidates_ui
