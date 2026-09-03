@@ -72,6 +72,80 @@ pub enum MachineState {
     Streaming,
     /// LLM 已输出完毕，等待 Enter 上屏 / Esc 取消。
     ResultReady,
+    /// LLM 出错（独立态而非 ResultReady+标志：feed_escape 的 `_` 兜底自动
+    /// 覆盖它，按键路由按状态分派无需旁路标志）。失败态保留 last_request
+    /// 与已生成的部分结果，Enter/`r` 重试、`e` 回提示词编辑。
+    Failed,
+}
+
+/// AI 结果浮层的阶段（状态行文案与按键语义由阶段决定，见 `result_hint`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultPhase {
+    /// 流式生成中。
+    Streaming,
+    /// 已完成，等待确认（Enter/空格/1 上屏）。
+    Ready,
+    /// 生成失败（Enter/r 重试）。
+    Failed,
+}
+
+/// 结果浮层状态行提示（两端共用文案——收口在 core，与
+/// REWRITE_SYSTEM_PROMPT 同一理由：两端措辞漂移会让同一状态在两个平台
+/// 给出不同的按键承诺）。
+pub fn result_hint(phase: ResultPhase) -> &'static str {
+    match phase {
+        ResultPhase::Streaming => "生成中… Enter 提交已生成部分 · Esc 取消",
+        ResultPhase::Ready => "Enter/空格/1 上屏 · r 重试 · e 改提示词 · Esc 关闭",
+        ResultPhase::Failed => "Enter 或 r 重试 · e 改提示词 · Esc 关闭",
+    }
+}
+
+/// AI 结果浮层态的按键分类（`feed_ai_preview` 的输入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiKey {
+    Enter,
+    Space,
+    Digit1,
+    /// `r`：按上一条请求原样重试（改写流重走改写、命令流重走命令路由）。
+    Retry,
+    /// `e`：回到提示词编辑（带出上一条提示词原文）。
+    Edit,
+    Escape,
+}
+
+impl AiKey {
+    /// 字符 → 浮层按键（仅结果浮层态消费的字符；其它 None 不吞——防误伤
+    /// 正常字母输入）。
+    fn from_char(c: char) -> Option<Self> {
+        match c {
+            ' ' => Some(Self::Space),
+            '1' => Some(Self::Digit1),
+            'r' | 'R' => Some(Self::Retry),
+            'e' | 'E' => Some(Self::Edit),
+            _ => None,
+        }
+    }
+}
+
+/// 最近一次 AI 请求参数（重试 / 改提示词的基础）。
+///
+/// **清理边界**：不在 `clear_composition_state` 的清理清单——Esc 后仍保留
+/// （Esc 关掉浮层后想重试/再编辑是合理诉求）。极易被后续重构顺手加进
+/// 清理清单，`last_request_survives_escape` 钉住。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastLlmRequest {
+    prompt: String,
+    system: Option<String>,
+    /// 改写流的原内容（普通生成为 None）。重试据此重走 StartRewrite。
+    rewrite_source: Option<String>,
+}
+
+/// AI 结果浮层预览态。**由 core 在进入流时自行置位**，不依赖前端回调
+/// begin_*——改写预览曾因「动作发出与前端注册两跳缺一，拦截分支成死
+/// 代码而单测全绿」付过学费；注册责任收归 core 是该教训的结构性修复。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiPreview {
+    phase: ResultPhase,
 }
 
 /// OCR 预览态的按键分类（feed_ocr_preview 的输入）。
@@ -112,10 +186,13 @@ pub enum Action {
         prompt: String,
         system: Option<String>,
     },
-    /// LLM 流式增量更新，preedit 显示结果。
-    UpdateResult { preedit: String },
-    /// LLM 输出完毕，等待用户确认。
-    ResultReady,
+    /// LLM 流式增量更新。`preedit` 是**短状态串**（如「✨ 生成中…」，绝
+    /// 不可为空——组合文本置空会触发应用终止组合，真机 Notepad-- 吞掉整
+    /// 条流的教训）；`body` 是流式全文，供结果浮层渲染（不再挤 preedit）。
+    UpdateResult { preedit: String, body: String },
+    /// LLM 输出完毕，等待用户确认。`text` 携带结果全文（前端浮层显示/上屏
+    /// 一份来源，杜绝「截断显示串当全文提交」一类两份数据漂移）。
+    ResultReady { text: String },
     /// 确认上屏最终结果。
     CommitResult { text: String },
     /// `///`：Prompt 态空提示词按第三个斜杠 → 触发选区截图 OCR
@@ -132,7 +209,9 @@ pub enum Action {
     RewriteReady { rewritten: String, source: String },
     /// 取消当前组合（Esc / 清空）。
     Cancel,
-    /// LLM 出错，已回到 Idle。
+    /// LLM 出错，已入 Failed 态（浮层仍在，Enter/r 重试）。前端收到后
+    /// **不得清理组合**——那是旧「回 Idle」语义的残留，会把刚弹的失败
+    /// 浮层立刻清掉（表现为「错误一闪而过、按 r 无反应」）。
     LlmFailed { message: String },
 }
 
@@ -192,6 +271,10 @@ pub struct CompositionMachine {
     rewrite_preview: Option<(String, String)>,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
+    /// 最近一次 AI 请求参数（重试/改提示词基础；Esc 后保留，见类型注）。
+    last_request: Option<LastLlmRequest>,
+    /// AI 结果浮层预览态（core 自行置位，见类型注）。
+    ai_preview: Option<AiPreview>,
     /// LLM 流式结果。
     result: String,
     /// 成对引号交替开闭状态，**双引号与单引号各自独立交替**（false=下一个是
@@ -278,6 +361,8 @@ impl CompositionMachine {
             rewrite_source: None,
             rewrite_preview: None,
             prompt: String::new(),
+            last_request: None,
+            ai_preview: None,
             result: String::new(),
             double_quote_open: false,
             single_quote_open: false,
@@ -297,6 +382,11 @@ impl CompositionMachine {
     }
 
     /// 当前应显示的 preedit 文本（无组合时为空）。
+    ///
+    /// 流式/结果/失败态返回**短状态串**（非全文）：长结果挤窄 preedit 是
+    /// AI 交互三痛点之一，全文由结果浮层（`ai_preview` + `result`）渲染。
+    /// 状态串绝不可为空——组合文本置空会触发应用终止组合 →
+    /// OnCompositionTerminated → 流式输出全丢（真机 Notepad-- 教训）。
     pub fn preedit(&self) -> String {
         match self.state {
             MachineState::PendingSlash => "/".to_owned(),
@@ -308,7 +398,9 @@ impl CompositionMachine {
                     format!("//{}", self.prompt)
                 }
             }
-            MachineState::Streaming | MachineState::ResultReady => self.result.clone(),
+            MachineState::Streaming => "✨ 生成中…".to_owned(),
+            MachineState::ResultReady => "✨ 已就绪".to_owned(),
+            MachineState::Failed => "✨ 生成失败".to_owned(),
             MachineState::Idle => String::new(),
         }
     }
@@ -426,7 +518,19 @@ impl CompositionMachine {
             }
             MachineState::Pinyin => self.feed_pinyin_char(c),
             MachineState::Prompt => self.feed_prompt_char(c),
-            MachineState::Streaming | MachineState::ResultReady => Action::None,
+            MachineState::Streaming => {
+                // 流中空格/1：停流并提交已生成部分（Enter 走 feed_enter 同一
+                // 通道；此前返回 None 被前端吞掉无反馈——AI 交互「死感」来源）。
+                if c == ' ' || c == '1' {
+                    self.feed_enter()
+                } else {
+                    Action::None
+                }
+            }
+            MachineState::ResultReady | MachineState::Failed => match AiKey::from_char(c) {
+                Some(key) => self.feed_ai_preview(key).unwrap_or(Action::None),
+                None => Action::None,
+            },
         }
     }
 
@@ -630,6 +734,15 @@ impl CompositionMachine {
             self.state = MachineState::Streaming;
             self.result.clear();
             self.rewrite_source = Some(content.clone());
+            // 重试基础与结果浮层由 core 自行置位（见字段注）。
+            self.last_request = Some(LastLlmRequest {
+                prompt: content.clone(),
+                system: None,
+                rewrite_source: Some(content.clone()),
+            });
+            self.ai_preview = Some(AiPreview {
+                phase: ResultPhase::Streaming,
+            });
             return Action::StartRewrite { content };
         }
         if c == '/' && self.prompt.is_empty() {
@@ -712,7 +825,11 @@ impl CompositionMachine {
                     Action::Cancel
                 }
             }
-            MachineState::Streaming | MachineState::ResultReady => Action::None,
+            MachineState::Streaming => Action::None,
+            MachineState::ResultReady | MachineState::Failed => {
+                // 退格 = 改提示词（与 `e` 同义：浮层态退格的意图是回去改）。
+                self.feed_ai_preview(AiKey::Edit).unwrap_or(Action::None)
+            }
         }
     }
 
@@ -742,6 +859,16 @@ impl CompositionMachine {
                     let prompt = std::mem::take(&mut self.prompt);
                     self.state = MachineState::Streaming;
                     self.result.clear();
+                    // 重试基础：按原样存一份（克隆先于 take 消耗）。
+                    self.last_request = Some(LastLlmRequest {
+                        prompt: prompt.clone(),
+                        system: None,
+                        rewrite_source: None,
+                    });
+                    // 结果浮层由 core 置位（不依赖前端回调，见字段注）。
+                    self.ai_preview = Some(AiPreview {
+                        phase: ResultPhase::Streaming,
+                    });
                     Action::StartLlm {
                         prompt,
                         system: None,
@@ -756,7 +883,12 @@ impl CompositionMachine {
                 // on_llm_done 误判为改写流（对照窗误弹、原文错配）。
                 self.rewrite_source = None;
                 self.rewrite_preview = None;
+                self.ai_preview = None;
                 Action::CommitResult { text }
+            }
+            MachineState::Failed => {
+                // 失败态无结果可提交：Enter = 重试（见 retry_last_llm 注）。
+                self.retry_last_llm()
             }
         }
     }
@@ -949,6 +1081,9 @@ impl CompositionMachine {
         self.ocr_preview = None;
         self.rewrite_source = None;
         self.rewrite_preview = None;
+        // last_request 刻意不在清单（Esc 后保留，见其类型注）；ai_preview
+        // 与组合现场同生共死，归零组合即收起浮层。
+        self.ai_preview = None;
     }
 
     /// 清空拼音缓冲与候选（保留提示词）。
@@ -1107,6 +1242,8 @@ impl CompositionMachine {
     /// 期间 Esc/Enter/空格/数字路由由 feed_rewrite_preview 处理。
     pub fn begin_rewrite_preview(&mut self, rewritten: String, source: String) {
         self.rewrite_preview = Some((rewritten, source));
+        // 结果浮层与对照预览互斥：对照预览接管按键路由，浮层态撤销。
+        self.ai_preview = None;
     }
 
     pub fn rewrite_previewing(&self) -> bool {
@@ -1133,13 +1270,88 @@ impl CompositionMachine {
         action
     }
 
-    /// LLM 流式增量。
+    /// 结果浮层是否活跃（前端按键拦截以 `ai_previewing` 为门——由 core
+    /// 自行置位，与前端 begin_* 回调解耦）。
+    pub fn ai_previewing(&self) -> bool {
+        self.ai_preview.is_some()
+    }
+
+    /// 结果浮层当前阶段（非浮层态为 None）。
+    pub fn result_phase(&self) -> Option<ResultPhase> {
+        self.ai_preview.as_ref().map(|p| p.phase)
+    }
+
+    /// 结果浮层按键：Enter/空格/1 = 上屏（失败态转重试）、`r` = 重试、
+    /// `e`/退格 = 回提示词编辑、Esc = 取消。返回 `Some(action)` = 键被浮层
+    /// 消费；`None` = 不属于浮层，交回正常路由（非结果态恒 None——防吞
+    /// 字母，`ai_preview_none_outside_result_states` 钉住）。
+    pub fn feed_ai_preview(&mut self, key: AiKey) -> Option<Action> {
+        if !self.ai_previewing()
+            || !matches!(self.state, MachineState::ResultReady | MachineState::Failed)
+        {
+            return None;
+        }
+        match key {
+            // 上屏走 feed_enter 的 Streaming/ResultReady 通道；失败态由
+            // feed_enter 的 Failed 臂转重试（一份语义一处实现）。
+            AiKey::Enter | AiKey::Space | AiKey::Digit1 => Some(self.feed_enter()),
+            AiKey::Retry => Some(self.retry_last_llm()),
+            AiKey::Edit => Some(self.edit_last_prompt()),
+            AiKey::Escape => Some(self.feed_escape()),
+        }
+    }
+
+    /// 按上一条请求原样重发（结果态 `r`、失败态 Enter/`r`）。改写流重走
+    /// StartRewrite（原文恢复——重试成功仍进对照预览）；普通/命令流重发
+    /// StartLlm，前端在该分支重做多模态命令路由（`//看图` 重试即重走
+    /// vision 截屏，commands.rs 单一判定）。
+    fn retry_last_llm(&mut self) -> Action {
+        let Some(last) = self.last_request.clone() else {
+            return Action::None;
+        };
+        self.state = MachineState::Streaming;
+        self.result.clear();
+        self.rewrite_preview = None;
+        self.ai_preview = Some(AiPreview {
+            phase: ResultPhase::Streaming,
+        });
+        match last.rewrite_source {
+            Some(src) => {
+                self.rewrite_source = Some(src);
+                Action::StartRewrite {
+                    content: last.prompt,
+                }
+            }
+            None => Action::StartLlm {
+                prompt: last.prompt,
+                system: last.system,
+            },
+        }
+    }
+
+    /// 回提示词编辑：带出上一条提示词原文（改写流带出改写内容）。
+    fn edit_last_prompt(&mut self) -> Action {
+        if let Some(last) = self.last_request.take() {
+            self.prompt = last.prompt;
+        }
+        self.state = MachineState::Prompt;
+        self.result.clear();
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
+        self.ai_preview = None;
+        Action::UpdatePrompt {
+            preedit: self.preedit(),
+        }
+    }
+
+    /// LLM 流式增量。`preedit` 为短状态串、`body` 为全文（见 Action 注）。
     pub fn on_llm_chunk(&mut self, chunk: &str) -> Action {
         match self.state {
             MachineState::Streaming => {
                 self.result.push_str(chunk);
                 Action::UpdateResult {
-                    preedit: self.result.clone(),
+                    preedit: self.preedit(),
+                    body: self.result.clone(),
                 }
             }
             _ => Action::None,
@@ -1151,6 +1363,9 @@ impl CompositionMachine {
         match self.state {
             MachineState::Streaming => {
                 self.state = MachineState::ResultReady;
+                if let Some(preview) = self.ai_preview.as_mut() {
+                    preview.phase = ResultPhase::Ready;
+                }
                 // 改写流：附带原文（前端据此弹对照预览候选窗）。
                 if let Some(source) = self.rewrite_source.take() {
                     Action::RewriteReady {
@@ -1158,21 +1373,28 @@ impl CompositionMachine {
                         source,
                     }
                 } else {
-                    Action::ResultReady
+                    Action::ResultReady {
+                        text: self.result.clone(),
+                    }
                 }
             }
             _ => Action::None,
         }
     }
 
-    /// LLM 出错。
+    /// LLM 出错：入 Failed 态（**不回 Idle**——失败浮层保留，Enter/`r` 可
+    /// 重试；两端前端处理器也不得清组合，见 Action::LlmFailed 注）。
+    /// last_request 与已生成的部分结果保留（重试基础）；prompt 在发起时
+    /// 已被 take，此处无需也不得再清。
     pub fn on_llm_error(&mut self, message: &str) -> Action {
-        let was_active = matches!(self.state, MachineState::Streaming);
-        self.state = MachineState::Idle;
-        self.prompt.clear();
-        self.result.clear();
+        let was_active = matches!(self.state, MachineState::Streaming | MachineState::Failed);
+        self.state = MachineState::Failed;
+        if let Some(preview) = self.ai_preview.as_mut() {
+            preview.phase = ResultPhase::Failed;
+        }
         // 失败的改写流不得残留改写标记：否则下一条普通生成完成时
         // on_llm_done 会 take 到陈旧原文，误弹对照预览窗（原文错配）。
+        // 重试需要时由 last_request.rewrite_source 恢复。
         self.rewrite_source = None;
         self.rewrite_preview = None;
         if was_active {
@@ -1361,6 +1583,7 @@ impl fmt::Display for MachineState {
             Self::Prompt => "prompt",
             Self::Streaming => "streaming",
             Self::ResultReady => "result-ready",
+            Self::Failed => "failed",
         })
     }
 }
@@ -1855,16 +2078,23 @@ mod tests {
         assert_eq!(
             m.on_llm_chunk("你"),
             Action::UpdateResult {
-                preedit: "你".into()
+                preedit: "✨ 生成中…".into(),
+                body: "你".into()
             }
         );
         assert_eq!(
             m.on_llm_chunk("好"),
             Action::UpdateResult {
-                preedit: "你好".into()
+                preedit: "✨ 生成中…".into(),
+                body: "你好".into()
             }
         );
-        assert_eq!(m.on_llm_done(), Action::ResultReady);
+        assert_eq!(
+            m.on_llm_done(),
+            Action::ResultReady {
+                text: "你好".into()
+            }
+        );
         assert_eq!(
             m.feed_enter(),
             Action::CommitResult {
@@ -1891,18 +2121,35 @@ mod tests {
     }
 
     #[test]
-    fn llm_error_returns_to_idle() {
+    fn llm_error_enters_failed_state() {
+        // 语义变更（AI 交互重做）：错误不再回 Idle，入 Failed——失败浮层
+        // 保留、Enter/`r` 可重试；last_request 与部分结果一并保留。
         let mut m = CompositionMachine::new();
         m.feed_char('/');
         m.feed_char('/');
+        m.feed_char('翻');
+        m.feed_char('译');
         m.feed_enter();
+        m.on_llm_chunk("部分");
         assert_eq!(
             m.on_llm_error("网络错误"),
             Action::LlmFailed {
                 message: "网络错误".into()
             }
         );
-        assert_eq!(m.state(), MachineState::Idle);
+        assert_eq!(m.state(), MachineState::Failed);
+        assert!(m.ai_previewing(), "失败浮层应由 core 自行置位");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Failed));
+        assert_eq!(m.result(), "部分", "已生成的部分结果保留（重试前可见）");
+        // 重试基础保留：失败态 Enter 重发同一条请求
+        assert_eq!(
+            m.feed_enter(),
+            Action::StartLlm {
+                prompt: "翻译".into(),
+                system: None
+            }
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
     }
 
     #[test]
@@ -1913,9 +2160,222 @@ mod tests {
         m.feed_char('翻');
         assert_eq!(m.preedit(), "//翻");
         m.feed_enter();
-        assert_eq!(m.preedit(), "");
+        // 流式/结果/失败态的 preedit 是**短状态串**（短且非空——空串会触发
+        // 应用终止组合吞掉整条流，真机 Notepad-- 教训）；全文走结果浮层。
+        assert_eq!(m.preedit(), "✨ 生成中…");
         m.on_llm_chunk("Hello");
-        assert_eq!(m.preedit(), "Hello");
+        assert_eq!(m.preedit(), "✨ 生成中…");
+        assert_eq!(m.result(), "Hello", "全文在 result，不挤 preedit");
+        m.on_llm_done();
+        assert_eq!(m.preedit(), "✨ 已就绪");
+        m.on_llm_error("boom");
+        assert_eq!(m.preedit(), "✨ 生成失败");
+    }
+
+    /// AI 交互重做（issue #89）：结果浮层由 core 在进入流时**自行置位**——
+    /// 不依赖前端 begin_* 回调（改写预览曾因两跳缺一使拦截成死代码而单测
+    /// 全绿）。发起即浮层活跃，流完成 → Ready。
+    #[test]
+    fn ai_preview_registered_by_core_not_frontend() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('翻');
+        m.feed_enter();
+        assert!(m.ai_previewing(), "发起 LLM 即注册浮层，无需前端回调");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+        m.on_llm_done();
+        assert_eq!(m.result_phase(), Some(ResultPhase::Ready));
+    }
+
+    /// ResultReady 态 Enter/空格/1 都上屏全文（此前空格/1 返回 None 被
+    /// 前端吞掉无反馈——「死感」来源）；浮层随提交撤销。
+    #[test]
+    fn result_ready_enter_space_digit_commit() {
+        #[derive(Clone, Copy, Debug)]
+        enum Fire {
+            Enter,
+            Space,
+            Digit1,
+        }
+        for fire in [Fire::Enter, Fire::Space, Fire::Digit1] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_enter();
+            m.on_llm_chunk("你好");
+            m.on_llm_done();
+            let a = match fire {
+                Fire::Enter => m.feed_enter(),
+                Fire::Space => m.feed_char(' '),
+                Fire::Digit1 => m.feed_char('1'),
+            };
+            assert!(
+                matches!(a, Action::CommitResult { ref text } if text == "你好"),
+                "{fire:?} 应上屏全文，实际 {a:?}"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+            assert!(!m.ai_previewing());
+        }
+    }
+
+    /// Streaming 态空格/1 = 停流提交已生成部分（与 Enter 同通道）。
+    #[test]
+    fn streaming_space_or_digit_commits_partial() {
+        for key in [' ', '1'] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_enter();
+            m.on_llm_chunk("部分结果");
+            assert!(
+                matches!(m.feed_char(key), Action::CommitResult { ref text } if text == "部分结果"),
+                "流中 {key:?} 应提交已生成部分"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+        }
+    }
+
+    /// 结果态 `r` 重试：回 Streaming、重发同一条 StartLlm（原文带命令前缀，
+    /// 前端/重试共用 commands.rs 路由）；旧结果清空、浮层回 Streaming 相位。
+    #[test]
+    fn result_ready_r_retries_same_request() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('看');
+        m.feed_char('图');
+        m.feed_enter();
+        m.on_llm_chunk("旧");
+        m.on_llm_done();
+        assert_eq!(
+            m.feed_char('r'),
+            Action::StartLlm {
+                prompt: "看图".into(),
+                system: None
+            },
+            "重试应原样重发请求（含命令文本）"
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
+        assert_eq!(m.result(), "", "旧结果清空");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+    }
+
+    /// 失败态 `r` 同样重试；改写流的重试重走 StartRewrite 并恢复原文
+    /// （重试成功仍进对照预览，不退化成普通生成）。
+    #[test]
+    fn failed_retry_and_rewrite_retry_paths() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "请假条".chars() {
+            m.feed_char(c);
+        }
+        m.feed_char('\t');
+        assert!(matches!(
+            m.feed_char('x'), /* Streaming：不消费 */
+            Action::None
+        ));
+        m.on_llm_error("超时");
+        assert_eq!(m.state(), MachineState::Failed);
+        assert_eq!(
+            m.feed_char('r'),
+            Action::StartRewrite {
+                content: "请假条".into()
+            },
+            "改写流重试应重走 StartRewrite"
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
+        // 原文已恢复：完成后仍产对照预览
+        assert!(matches!(
+            m.on_llm_done(),
+            Action::RewriteReady { rewritten: _, source } if source == "请假条"
+        ));
+    }
+
+    /// `e` 回提示词编辑：带出上一条提示词原文，浮层撤销。
+    #[test]
+    fn result_ready_e_edits_last_prompt() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "翻译一下".chars() {
+            m.feed_char(c);
+        }
+        m.feed_enter();
+        m.on_llm_chunk("x");
+        m.on_llm_done();
+        assert_eq!(
+            m.feed_char('e'),
+            Action::UpdatePrompt {
+                preedit: "//翻译一下".into()
+            }
+        );
+        assert_eq!(m.state(), MachineState::Prompt);
+        assert_eq!(m.prompt(), "翻译一下");
+        assert!(!m.ai_previewing());
+    }
+
+    /// 浮层态退格 = `e`（改提示词同义）。
+    #[test]
+    fn result_ready_backspace_edits_prompt() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_enter();
+        m.on_llm_done();
+        assert!(matches!(m.feed_backspace(), Action::UpdatePrompt { .. }));
+        assert_eq!(m.state(), MachineState::Prompt);
+    }
+
+    /// 非结果态 feed_ai_preview 恒 None（防吞字母）；浮层态内不属于浮层的
+    /// 字符经 feed_char 也不消费。
+    #[test]
+    fn ai_preview_none_outside_result_states() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(m.feed_ai_preview(AiKey::Enter), None, "Idle 不消费");
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_enter();
+        assert_eq!(
+            m.feed_ai_preview(AiKey::Retry),
+            None,
+            "Streaming 态重试键不消费（防误触）"
+        );
+        assert!(matches!(m.feed_char('x'), Action::None), "流中字母不消费");
+        m.on_llm_done();
+        // ResultReady 态：非浮层字符（如 'z'）仍不吞——只有 r/e/空格/1 消费
+        assert!(matches!(m.feed_char('z'), Action::None));
+        // Esc 关闭浮层后回 Idle，再按 r 是普通字母（起拼音组合）
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert!(
+            matches!(m.feed_char('r'), Action::UpdatePinyin { .. }),
+            "Idle 下 r 是普通拼音字母"
+        );
+    }
+
+    /// last_request 清理边界：Esc 不清（Esc 后想重试是合理诉求）。极易被
+    /// 后续重构加进 clear_composition_state——钉住。
+    #[test]
+    fn last_request_survives_escape() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "写诗".chars() {
+            m.feed_char(c);
+        }
+        m.feed_enter();
+        m.on_llm_error("网络错误");
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(m.last_request.is_some(), "Esc 只关浮层，重试基础保留");
+        // 编辑路径可用它带出原文（Esc 后无 UI 入口，仅保字段语义）
+        m.state = MachineState::Failed;
+        m.ai_preview = Some(AiPreview {
+            phase: ResultPhase::Failed,
+        });
+        assert!(matches!(m.feed_char('e'), Action::UpdatePrompt { .. }));
+        assert_eq!(m.prompt(), "写诗");
     }
 
     #[test]

@@ -5,9 +5,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod commands;
 pub mod machine;
 
-pub use machine::{Action, CompositionMachine, LlmCandidateRequest, MachineState, Mode};
+pub use commands::{parse_ai_command, AiCommand};
+pub use machine::{
+    result_hint, Action, AiKey, CompositionMachine, LlmCandidateRequest, MachineState, Mode,
+    ResultPhase,
+};
 
 /// 当前核心版本。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

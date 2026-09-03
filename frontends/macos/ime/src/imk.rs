@@ -830,6 +830,7 @@ define_class!(
                         | MachineState::Prompt
                         | MachineState::Streaming
                         | MachineState::ResultReady
+                        | MachineState::Failed
                 ) && matches!(
                     key,
                     Some(ImkKey::Backspace | ImkKey::Enter | ImkKey::Escape)
@@ -985,7 +986,11 @@ define_class!(
                 let mut m = self.ivars().machine.borrow_mut();
                 let text = match m.state() {
                     MachineState::Pinyin | MachineState::Prompt => m.preedit(),
-                    MachineState::Streaming | MachineState::ResultReady => m.result().to_owned(),
+                    // Failed 保留已生成的部分结果：宿主强制结束组合时按流同款
+                    // 提交部分文本（空部分提交空）。
+                    MachineState::Streaming | MachineState::ResultReady | MachineState::Failed => {
+                        m.result().to_owned()
+                    }
                     _ => String::new(),
                 };
                 m.feed_escape();
@@ -1267,7 +1272,7 @@ impl VerbaIMKController {
             }
             Action::EnterPrompt { preedit }
             | Action::UpdatePrompt { preedit }
-            | Action::UpdateResult { preedit } => {
+            | Action::UpdateResult { preedit, .. } => {
                 self.set_marked(&preedit);
                 true
             }
@@ -1352,8 +1357,8 @@ impl VerbaIMKController {
                 self.refresh_candidate_window();
                 true
             }
-            Action::ResultReady => {
-                self.set_marked(self.ivars().machine.borrow().result());
+            Action::ResultReady { text } => {
+                self.set_marked(&text);
                 self.invalidate_timer();
                 true
             }
@@ -1779,12 +1784,12 @@ impl VerbaIMKController {
             _ => Action::None,
         };
         match action {
-            Action::UpdateResult { preedit } | Action::UpdatePrompt { preedit } => {
+            Action::UpdateResult { preedit, .. } | Action::UpdatePrompt { preedit } => {
                 self.set_marked(&preedit);
             }
             // 改写流完成同样要刷新标记文本并停表——RewriteReady 不接住会落进
             // 兜底 debug 日志，组合文本停留上一个 chunk、drain 定时器空转。
-            Action::ResultReady | Action::RewriteReady { .. } => {
+            Action::ResultReady { .. } | Action::RewriteReady { .. } => {
                 self.set_marked(self.ivars().machine.borrow().result());
                 self.invalidate_timer();
             }

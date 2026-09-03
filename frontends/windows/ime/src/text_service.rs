@@ -383,8 +383,9 @@ impl KeyEventSink {
 /// - `Idle`：认领 `/` 触发键、字母（进入拼音组合）与状态机标点（全角输出，
 ///   与 macOS 契约对齐——此前不认领时宿主直插半角，跨平台审查发现的不一致），
 ///   其余按键直通应用（不吞键、不进 IME）。
-/// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady`：认领全部可打印字符
-///   与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被吞/丢字符。
+/// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady` / `Failed`：认领
+///   全部可打印字符与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被
+///   吞/丢字符。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
@@ -424,7 +425,8 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
         MachineState::PendingSlash
         | MachineState::Prompt
         | MachineState::Streaming
-        | MachineState::ResultReady => {
+        | MachineState::ResultReady
+        | MachineState::Failed => {
             if is_control {
                 return true;
             }
@@ -930,7 +932,7 @@ pub fn apply_action(
         }
         Action::EnterPrompt { preedit }
         | Action::UpdatePrompt { preedit }
-        | Action::UpdateResult { preedit } => set_preedit(data, context, clientid, &preedit),
+        | Action::UpdateResult { preedit, .. } => set_preedit(data, context, clientid, &preedit),
         Action::UpdatePinyin {
             preedit,
             candidates,
@@ -1023,7 +1025,7 @@ pub fn apply_action(
             start_llm(data, prompt, eye_rect, use_vision);
             Ok(())
         }
-        Action::ResultReady => Ok(()),
+        Action::ResultReady { .. } => Ok(()),
         Action::RewriteReady { rewritten, source } => {
             // 改写完成 → 进入对照预览态 + 弹对照预览候选窗（1=改写结果
             // 2=原文）。机器必须同步 begin_rewrite_preview——此后 1/Enter/
@@ -2065,7 +2067,7 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
     for evt in events {
         match evt.kind {
             Some(stream_event::Kind::Chunk(ch)) => {
-                if let Action::UpdateResult { preedit } = machine.on_llm_chunk(&ch.text) {
+                if let Action::UpdateResult { preedit, .. } = machine.on_llm_chunk(&ch.text) {
                     pending_preedit = Some(preedit);
                 }
             }
