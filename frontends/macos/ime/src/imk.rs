@@ -1818,27 +1818,31 @@ impl VerbaIMKController {
                 // 不得影响正在展示的新候选）。
                 let is_current =
                     self.ivars().candidate_pinyin.borrow().as_deref() == Some(pinyin.as_str());
-                let action = self.ivars().machine.borrow_mut().on_llm_candidates(
+                let actions = self.ivars().machine.borrow_mut().on_llm_candidates(
                     &pinyin,
                     &c.candidates,
                     c.done,
                 );
-                match action {
-                    Action::UpdatePinyin {
-                        preedit,
-                        candidates,
-                        page,
-                        ..
-                    } => {
-                        self.ivars().candidates.borrow_mut().clone_from(&candidates);
-                        self.ivars().page.set(page);
-                        self.set_marked(&preedit);
-                        self.refresh_candidate_window();
+                // settle 可能按序重放整队暂缓意图，产出动作序列（盲窗队列化，
+                // issue #87）——逐个按序执行。
+                for action in actions {
+                    match action {
+                        Action::UpdatePinyin {
+                            preedit,
+                            candidates,
+                            page,
+                            ..
+                        } => {
+                            self.ivars().candidates.borrow_mut().clone_from(&candidates);
+                            self.ivars().page.set(page);
+                            self.set_marked(&preedit);
+                            self.refresh_candidate_window();
+                        }
+                        // 在途期间暂缓的意图补执行：候选（或原文回退）提交上屏。
+                        Action::CommitImmediate(text) => self.commit(&text),
+                        Action::None => {}
+                        other => log::debug!("[VerbaIMK] 候选事件产生其它动作: {other:?}"),
                     }
-                    // 在途期间暂缓的空格补执行：候选（或原文回退）提交上屏。
-                    Action::CommitImmediate(text) => self.commit(&text),
-                    Action::None => {}
-                    other => log::debug!("[VerbaIMK] 候选事件产生其它动作: {other:?}"),
                 }
                 if c.done {
                     self.ivars().candidate_pinyin.borrow_mut().take();
@@ -1859,14 +1863,17 @@ impl VerbaIMKController {
                 let pinyin = self.ivars().candidate_pinyin.borrow_mut().take();
                 self.ivars().active_candidates.set(0);
                 // 错误也是查询终结：以空结果通知状态机，释放在途标记并补执行
-                // 暂缓的空格（无候选按原文回退），避免按键被吞。
+                // 暂缓队列（无候选按原文回退），避免按键被吞（前端兜底是队列
+                // 的唯一解药，静默 return 会让队列永不 settle）。
                 if let Some(py) = pinyin {
-                    let action =
+                    let actions =
                         self.ivars()
                             .machine
                             .borrow_mut()
                             .on_llm_candidates(&py, &[], true);
-                    let _ = self.apply_action(action);
+                    for action in actions {
+                        let _ = self.apply_action(action);
+                    }
                 }
             }
             _ => {}

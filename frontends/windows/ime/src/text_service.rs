@@ -1564,9 +1564,10 @@ fn maybe_fire_candidate_request(data: &Rc<TextServiceData>) {
 }
 
 /// Rime 候选查询失败也必须回一个 done=true 空结果事件：状态机靠
-/// Candidates(done=true) 释放 candidates_in_flight 并结算 deferred_intent
-/// （与 macOS imk.rs 的错误即空结果 done 结算对齐，issue #44），静默
-/// return 会把组合永远卡在「在途」——空格/选字全被暂缓（复审发现）。
+/// Candidates(done=true) 释放 candidates_in_flight 并结算盲窗暂缓队列
+/// deferred_intents（与 macOS imk.rs 的错误即空结果 done 结算对齐，
+/// issue #44/#87），静默 return 会把组合永远卡在「在途」——空格/选字
+/// 全被暂缓（复审发现；前端兜底是队列的唯一解药）。
 fn push_rime_fail(chunks: &Arc<Mutex<VecDeque<(u64, StreamEvent)>>>, pinyin: &str, msg: &str) {
     log::warn!("{msg}");
     if let Ok(mut q) = chunks.lock() {
@@ -2081,27 +2082,29 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
                 if let Some(p) = pending_preedit.take() {
                     steps.push(Step::Preedit(p));
                 }
-                steps.push(
-                    match machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done) {
+                // settle 可能按序重放整队暂缓意图，产出动作序列（盲窗队列化，
+                // issue #87）——逐个映射为步骤，两段式派发顺序不变。
+                for action in machine.on_llm_candidates(&c.pinyin, &c.candidates, c.done) {
+                    match action {
                         Action::UpdatePinyin {
                             preedit,
                             candidates,
                             page,
                             selected,
                             ..
-                        } => Step::Candidates {
+                        } => steps.push(Step::Candidates {
                             preedit,
                             candidates,
                             page,
                             selected,
-                        },
-                        // 在途暂缓后的知情回退（重复空格按原文提交）等
-                        // 非刷新动作不能丢弃：与 macOS feed_candidates_event
-                        // 的 CommitImmediate 处理对齐，走通用派发上屏
-                        // （复审发现：此前被静默吞掉，空格无效）。
-                        other => Step::Act(other),
-                    },
-                );
+                        }),
+                        // 在途暂缓后的知情回退（重复空格按原文提交）、settle
+                        // 整队重放的提交等非刷新动作不能丢弃：与 macOS
+                        // feed_candidates_event 的 CommitImmediate 处理对齐，
+                        // 走通用派发上屏（复审发现：此前被静默吞掉，空格无效）。
+                        other => steps.push(Step::Act(other)),
+                    }
+                }
             }
             Some(stream_event::Kind::Error(e)) => {
                 if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
@@ -2379,6 +2382,35 @@ mod tests {
             matches!(&steps[..], [Step::Act(Action::CommitImmediate(t))] if t == "你"),
             "真实候选结算应产出首候选提交步骤（不被丢弃），实际 {steps:?}"
         );
+    }
+
+    /// 布线语义钉住（issue #87 盲窗队列化）：暂缓队列 [空格, 标点] 在 settle
+    /// 时按序重放为**一次合并提交**（首候选+全角标点），经 collect_steps 走
+    /// Step::Act 派发——既不许只重放队首（旧单槽语义），也不许把序列拆成多
+    /// 次上屏。
+    #[test]
+    fn collect_steps_queue_settle_replays_merged_commit_act() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None, "空格先暂缓");
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        let steps = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Candidates(verba_protos::Candidates {
+                    pinyin: "ni".into(),
+                    candidates: vec!["你".into()],
+                    done: true,
+                })),
+            }],
+        );
+        assert!(
+            matches!(&steps[..], [Step::Act(Action::CommitImmediate(t))] if t == "你，"),
+            "队列 settle 应合并为一次提交步骤，实际 {steps:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
     }
 
     /// 流 token 打包/安装属性（issue #44 真机项的可自动化部分）：
