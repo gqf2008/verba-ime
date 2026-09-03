@@ -2,8 +2,10 @@
 //! 把候选窗状态画成 RGBA（预乘）缓冲。跨平台：平台层只负责把缓冲 blit 到窗口。
 //!
 //! 布局：
-//! - horizontal（默认，微软拼音/手心风格）：顶部拼音组合头 + 横向候选行 + 页码脚。
+//! - horizontal（微软拼音/手心风格）：顶部拼音组合头 + 横向候选行 + 页码脚。
 //! - vertical：顶部拼音组合头 + 竖向候选列表 + 页码脚（经典回退）。
+//! - result（AI 结果浮层）：多行结果文本 + 状态行，无候选/页码脚；
+//!   优先于上述两种候选布局（两态互斥）。
 //!
 //! 字体：cosmic-text 的 FontSystem 自动发现系统字体（Windows 微软雅黑 /
 //! macOS PingFang / Linux Noto CJK），无需打包字体。
@@ -40,8 +42,12 @@ impl CpuCandidateRenderer {
         }
     }
 
-    /// 渲染当前候选窗状态。窗口尺寸由主题与候选数决定。
+    /// 渲染当前候选窗状态。窗口尺寸由主题、候选数与结果块行数决定。
     pub fn render(&mut self, ctrl: &CandidateWindowController) -> RenderedCandidateWindow {
+        // 结果浮层形态优先于候选布局（两态互斥，结果态优先）。
+        if ctrl.result_block().is_some() {
+            return self.render_result(ctrl);
+        }
         if ctrl.theme().layout == "horizontal" {
             self.render_horizontal(ctrl)
         } else {
@@ -360,6 +366,42 @@ impl CpuCandidateRenderer {
         }
     }
 
+    /// AI 结果浮层：卡片背景 + 多行结果文本 + 状态行（无候选/页码脚/拼音头
+    /// ——阶段提示走状态行，与应用内 preedit 短串各司其职）。
+    /// 高度与 `window_size` 的结果分支共用 `result_height`/`result_window_width`
+    /// 这一份公式——两处独立计算必致「建窗尺寸 ≠ 位图尺寸」的错位/裁切。
+    fn render_result(&mut self, ctrl: &CandidateWindowController) -> RenderedCandidateWindow {
+        let theme = ctrl.theme();
+        let pad = theme.padding;
+        let status = Self::status_height(ctrl);
+        let width = result_window_width(theme);
+        let height = pad * 2 + result_height(theme, ctrl.result_lines()) + status;
+        let mut pixmap = Pixmap::new(width, height).expect("候选窗 pixmap");
+        self.draw_card(&mut pixmap, theme, width, height);
+        let text = ctrl.result_block().unwrap_or("");
+        let text_fg =
+            parse_color(&theme.text_color).unwrap_or(Color::from_rgba8(0x33, 0x33, 0x33, 0xFF));
+        // draw_text 已支持多行：按 pixmap 宽度自动换行并逐行下移
+        // （layout_runs 的 line_y 差值即行高）。换行宽度与 measure_lines
+        // 传入的 result_window_width 是同一个值，测量与渲染天然一致。
+        self.draw_text(
+            &mut pixmap,
+            text,
+            pad as f32,
+            pad as f32,
+            text_fg,
+            theme.font_size as f32,
+        );
+        if status > 0 {
+            self.draw_status(&mut pixmap, ctrl, width, (height - status) as f32, status);
+        }
+        RenderedCandidateWindow {
+            width,
+            height,
+            pixels: pixmap.take(),
+        }
+    }
+
     /// 文本排版宽度（用于右对齐 / 横向布局）。
     fn text_width(&mut self, text: &str, size: f32) -> f32 {
         let metrics = Metrics::new(size, size * 1.3);
@@ -372,6 +414,25 @@ impl CpuCandidateRenderer {
             .last()
             .map(|run| run.line_w)
             .unwrap_or(0.0)
+    }
+
+    /// 测量文本按给定宽度换行后的行数（供平台层在 show 前预测量，
+    /// 结果回填 `set_result_lines`，浮层高度才与实际换行一致）。
+    ///
+    /// Buffer 参数与 `draw_text` 完全一致（同 Metrics / 同 set_size 宽度 /
+    /// 同 Shaping），单一 attrs 下 `layout_runs` 每条 run 恰是一行，故 run
+    /// 计数即行数——测量与渲染必须出自同一套参数，否则行数漂移 → 高度
+    /// 与实际换行不符（末行被裁或底部留白）。
+    ///
+    /// 注意：DPI 缩放场景须传入**缩放后**的 font_size 与窗口宽度再测
+    /// （wrap_width 取 `result_window_width(scaled_theme)`）。
+    pub fn measure_lines(&mut self, text: &str, font_size: f32, wrap_width: f32) -> usize {
+        let metrics = Metrics::new(font_size, font_size * 1.3);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(&mut self.font_system, Some(wrap_width), None);
+        buffer.set_text(&mut self.font_system, text, Attrs::new(), Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer.layout_runs().count().max(1)
     }
 
     /// 在 (x, y) 画一行文字（cosmic-text 排版 + swash 字形栅格化，
@@ -484,24 +545,43 @@ fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
+/// AI 结果浮层的窗口宽度：结果形态两种布局共用这一份公式——
+/// `window_size`、`render_result` 与平台层的 `measure_lines` 调用都取此值，
+/// 三者的换行宽度才能一致。
+pub fn result_window_width(theme: &Theme) -> u32 {
+    if theme.layout == "horizontal" {
+        theme.max_width_horizontal
+    } else {
+        theme.max_width
+    }
+}
+
+/// 结果块总高度——`window_size` 与 `render_result` **共用此唯一公式**。
+/// 两处独立计算必致「建窗尺寸 ≠ 位图尺寸」的错位/裁切（本仓库已为
+/// 双公式漂移交过学费）。行高与 `draw_text` 的 `Metrics::new(size, size*1.3)`
+/// 对齐；ceil 取整保证高度预算 ≥ 实际排版（宁可底部多 1px，不可裁末行）。
+pub fn result_height(theme: &Theme, lines: usize) -> u32 {
+    (lines as f32 * theme.font_size as f32 * 1.3).ceil() as u32
+}
+
 /// 主题尺寸辅助：窗口期望尺寸（多页时含页码脚，供平台层创建窗口）。
+/// header/footer/status 高度与 render_* 共用 `CpuCandidateRenderer` 的
+/// 同名辅助（同模块直呼，杜绝「两处本该一致的公式分开维护」）；
+/// 结果浮层分支共用 `result_height`/`result_window_width`。
 pub fn window_size(ctrl: &CandidateWindowController) -> (u32, u32) {
     let theme = ctrl.theme();
-    let header = if theme.show_preedit && !ctrl.preedit().is_empty() {
-        theme.header_height
-    } else {
-        0
-    };
-    let footer = if ctrl.total_pages() > 1 {
-        ctrl.theme().footer_height
-    } else {
-        0
-    };
-    let status = if ctrl.status().is_some() {
-        (ctrl.theme().font_size + 4).max(16)
-    } else {
-        0
-    };
+    if ctrl.result_block().is_some() {
+        // 结果浮层：不画拼音头/页码脚（阶段提示走状态行）。
+        return (
+            result_window_width(theme),
+            theme.padding * 2
+                + result_height(theme, ctrl.result_lines())
+                + CpuCandidateRenderer::status_height(ctrl),
+        );
+    }
+    let header = CpuCandidateRenderer::header_height(ctrl);
+    let footer = CpuCandidateRenderer::footer_height(ctrl);
+    let status = CpuCandidateRenderer::status_height(ctrl);
     if theme.layout == "horizontal" {
         (
             theme.max_width_horizontal,
@@ -524,8 +604,24 @@ fn premultiply_channel(v: u8, a: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::premultiply_channel;
-    use crate::renderer::CpuCandidateRenderer;
+    use crate::renderer::{result_height, result_window_width, window_size, CpuCandidateRenderer};
     use crate::{CandidateWindowController, Theme};
+
+    /// 组装一个已实测行数的结果浮层控制器（测量 → 回填的标准流程）。
+    /// 注意测量对象必须是 set_result_block **截断后**的显示文本，
+    /// 不是原始输入——浮层高度对应的是实际会画出来的内容。
+    fn result_ctrl(renderer: &mut CpuCandidateRenderer, text: &str) -> CandidateWindowController {
+        let mut ctrl = CandidateWindowController::new(Theme::default());
+        ctrl.set_result_block(text);
+        let width = result_window_width(ctrl.theme()) as f32;
+        let lines = renderer.measure_lines(
+            ctrl.result_block().unwrap(),
+            ctrl.theme().font_size as f32,
+            width,
+        );
+        ctrl.set_result_lines(lines);
+        ctrl
+    }
 
     #[test]
     fn premultiply_boundaries() {
@@ -571,5 +667,75 @@ mod tests {
         let out1 = renderer.render(&ctrl);
         let i = ((out1.height / 2) * out1.width + out1.width / 2) as usize * 4;
         assert_eq!(out1.pixels[i + 3], 255);
+    }
+
+    /// 锁住「两处本该一致」：结果浮层形态下 `window_size`（建窗/定位依据）
+    /// 与 `render`（实际位图）必须给出同一尺寸——结果块高度依赖换行行数，
+    /// 任何一边的公式漂移都会让 StretchDIBits 按 mismatched 尺寸拉伸/裁切。
+    #[test]
+    fn window_size_matches_render_output_for_result_block() {
+        let mut renderer = CpuCandidateRenderer::new();
+        let mut ctrl = result_ctrl(&mut renderer, &"多行结果文本。".repeat(40));
+        assert!(
+            ctrl.result_lines() > 1,
+            "280 个全角字符在 {}px 宽度下必然折行",
+            result_window_width(ctrl.theme())
+        );
+        ctrl.set_status(Some("生成中…".into()));
+        ctrl.show();
+        let (w, h) = window_size(&ctrl);
+        let out = renderer.render(&ctrl);
+        assert_eq!((out.width, out.height), (w, h));
+    }
+
+    /// 结果浮层确实画上了文本：结果区应有可观的深色字形像素。
+    /// 用 ASCII 文本——任何字体配置下必有字形，不依赖 CJK 字体存在。
+    #[test]
+    fn result_mode_renders_text_pixels() {
+        let mut renderer = CpuCandidateRenderer::new();
+        let mut ctrl = result_ctrl(&mut renderer, &"AI result line of text. ".repeat(12));
+        ctrl.show();
+        let out = renderer.render(&ctrl);
+        // 白底 (#FFFFFF) 上统计字形像素（text_color #333333 → R < 128）
+        let dark = out
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] < 128 && p[3] == 255)
+            .count();
+        assert!(dark > 100, "结果区应有可观数量的文字像素，实际 {dark}");
+        let (w, h) = window_size(&ctrl);
+        assert_eq!((out.width, out.height), (w, h));
+    }
+
+    /// 显示截断使高度有界：超长文本（10 倍于 MAX_RESULT_CHARS）行数收敛
+    /// 在截断上限内，窗口高度不再随输入无限增长。断言上界而非精确值
+    /// （字体度量跨平台有差异）。
+    #[test]
+    fn truncated_result_height_bounded() {
+        let mut renderer = CpuCandidateRenderer::new();
+        let ctrl = result_ctrl(&mut renderer, &"字".repeat(10_000));
+        let (w, h) = window_size(&ctrl);
+        assert_eq!(w, Theme::default().max_width);
+        // 601 字（600+省略号）在 360px 宽、18px 字号下约 30 行，
+        // 留足字体度量余量断言上界。
+        assert!(h < 1500, "截断后高度应有界，实际 {h}");
+    }
+
+    /// 结果浮层形态优先于候选布局：即便候选仍在（前端未清理的中间态），
+    /// 尺寸公式也必须走结果分支，与 render 的分派次序一致。
+    #[test]
+    fn result_mode_takes_priority_over_candidates() {
+        let mut ctrl = CandidateWindowController::new(Theme::default());
+        ctrl.set_candidates(vec!["你".into(), "泥".into(), "拟".into()]);
+        let candidate_size = window_size(&ctrl);
+        ctrl.set_result_block("结果");
+        ctrl.set_result_lines(2);
+        let result_size = window_size(&ctrl);
+        assert_ne!(candidate_size, result_size, "两形态尺寸公式应不同");
+        assert_eq!(
+            result_size.1,
+            Theme::default().padding * 2 + result_height(ctrl.theme(), 2),
+            "结果分支高度只由 pad*2 + result_height 构成（无状态行）"
+        );
     }
 }

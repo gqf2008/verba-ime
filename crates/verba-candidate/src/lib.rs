@@ -1,7 +1,7 @@
 //! 候选窗口共享逻辑（纯 Rust、跨平台、无 UI 依赖）。
 //!
 //! 平台适配层（Windows 自绘窗 / macOS IMK / Linux fcitx5-IBus）只负责渲染，
-//! 候选列表、分页、选择、主题等全部在此控制器内完成，可离线单测。
+//! 候选列表、分页、选择、AI 结果浮层、主题等全部在此控制器内完成，可离线单测。
 
 #![forbid(unsafe_code)]
 
@@ -173,6 +173,22 @@ impl Theme {
     }
 }
 
+/// AI 结果浮层的显示截断上限（字符数）：显示层截到该长度使浮层高度有界。
+/// **提交永远取全文**——全文由 core（`ai_preview`/`last_request`）与前端持有，
+/// 本控制器只管显示（真机 1059 字符教训：显示截断、提交取全文）。
+pub const MAX_RESULT_CHARS: usize = 600;
+
+/// 按字符数截断结果文本（超限时截到上限并补省略号）。
+/// 只影响显示，不影响提交全文。
+fn truncate_result_display(text: &str) -> String {
+    if text.chars().count() <= MAX_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let mut s: String = text.chars().take(MAX_RESULT_CHARS).collect();
+    s.push('…');
+    s
+}
+
 /// 候选窗口控制器（纯逻辑）。
 #[derive(Debug, Clone)]
 pub struct CandidateWindowController {
@@ -187,6 +203,15 @@ pub struct CandidateWindowController {
     preedit: String,
     /// 状态行（如 “眼睛已捕捉”）；非空时在候选窗底部显示。
     status: Option<String>,
+    /// AI 结果块（显示用，已按 MAX_RESULT_CHARS 截断）：Some 时窗口进入
+    /// 「结果浮层」形态——只渲染结果文本 + 状态行，不渲染候选/页码脚，
+    /// 且优先于候选布局（两态互斥，切换由前端负责清理）。与 candidates
+    /// 正交：本槽只决定渲染形态，不触碰候选数据。
+    result_block: Option<String>,
+    /// 结果块换行后的行数。纯逻辑的 `renderer::window_size` 无字体度量，
+    /// 行数必须由平台层用 `renderer::measure_lines` 实测后 `set_result_lines`
+    /// 回填；未回填时按 1 行占位（避免高度塌 0）。
+    result_lines: usize,
 }
 
 impl Default for CandidateWindowController {
@@ -206,6 +231,8 @@ impl CandidateWindowController {
             position: None,
             preedit: String::new(),
             status: None,
+            result_block: None,
+            result_lines: 0,
         }
     }
 
@@ -325,7 +352,9 @@ impl CandidateWindowController {
     // ---- 显隐 / 位置 ----
 
     pub fn show(&mut self) {
-        if !self.candidates.is_empty() {
+        // 纯结果浮层（无候选）也须可显示：AI 结果态候选恒空，
+        // 门槛只看候选会把结果浮层永久挡在门外。
+        if !self.candidates.is_empty() || self.result_block.is_some() {
             self.visible = true;
         }
     }
@@ -358,6 +387,39 @@ impl CandidateWindowController {
         self.status.as_deref()
     }
 
+    // ---- AI 结果浮层 ----
+
+    /// 设置 AI 结果块文本（超长自动按 MAX_RESULT_CHARS 截断显示）。
+    /// 行数重置为 1 行占位，随后须由平台层用 `renderer::measure_lines`
+    /// 实测并 `set_result_lines` 回填，浮层高度才与实际换行一致。
+    pub fn set_result_block(&mut self, text: &str) {
+        self.result_block = Some(truncate_result_display(text));
+        self.result_lines = 1;
+    }
+
+    /// 当前结果块显示文本（None = 非结果浮层形态）。
+    pub fn result_block(&self) -> Option<&str> {
+        self.result_block.as_deref()
+    }
+
+    /// 回填结果块换行行数（0 钳为 1，防高度塌 0）。
+    /// 注意 DPI 缩放场景须在**缩放后**的控制器上实测回填（scaled 的
+    /// 逐字段取整会微调宽度/字号比，换行点可能漂一行）。
+    pub fn set_result_lines(&mut self, lines: usize) {
+        self.result_lines = lines.max(1);
+    }
+
+    /// 结果块行数（未实测时为占位 1）。
+    pub fn result_lines(&self) -> usize {
+        self.result_lines
+    }
+
+    /// 清除结果块（回到候选形态；可见性不变，是否隐藏由前端决定）。
+    pub fn clear_result_block(&mut self) {
+        self.result_block = None;
+        self.result_lines = 0;
+    }
+
     pub fn set_position(&mut self, x: i32, y: i32) {
         self.position = Some((x, y));
     }
@@ -366,9 +428,9 @@ impl CandidateWindowController {
         self.position
     }
 
-    /// 是否需要显示（有候选且可见）。
+    /// 是否需要显示（有候选或有结果块，且可见）。
     pub fn should_render(&self) -> bool {
-        self.visible && !self.candidates.is_empty()
+        self.visible && (!self.candidates.is_empty() || self.result_block.is_some())
     }
 
     pub fn theme(&self) -> &Theme {
@@ -525,5 +587,49 @@ mod tests {
         let s = r##"{"background":"#FFFFFF","text_color":"#333333","selected_background":"#D8E6FF","selected_text_color":"#1A56DB","border_color":"#CCCCCC","font_size":14,"padding":6,"item_height":22,"page_size":9,"max_width":360}"##;
         let t: Theme = serde_json::from_str(s).unwrap();
         assert_eq!(t.corner_radius, Theme::default().corner_radius);
+    }
+
+    /// AI 结果浮层：纯结果（无候选）也应能通过 show 门槛——
+    /// 此前门槛只看候选，结果浮层将永久不可见。
+    #[test]
+    fn show_gate_allows_result_only_window() {
+        let mut c = ctrl();
+        c.show();
+        assert!(!c.visible(), "无候选且无结果块 → 不可见");
+        c.set_result_block("生成结果文本");
+        c.show();
+        assert!(c.visible(), "纯结果浮层应可显示");
+        assert!(c.should_render());
+        c.clear_result_block();
+        assert!(!c.should_render(), "清除结果块且无候选 → 不渲染");
+        // 回到候选形态后原有行为不变
+        c.set_candidates(vec!["你".into()]);
+        c.show();
+        assert!(c.should_render());
+    }
+
+    /// 显示截断：超长文本按 MAX_RESULT_CHARS 截断并补省略号；
+    /// 短文本原样保留；按字符计数天然不劈开多字节字符。
+    #[test]
+    fn result_block_truncated_to_max_chars() {
+        let mut c = ctrl();
+        c.set_result_block(&"你".repeat(MAX_RESULT_CHARS + 100));
+        let n = c.result_block().unwrap().chars().count();
+        assert_eq!(n, MAX_RESULT_CHARS + 1, "截断到上限并补省略号");
+        assert!(c.result_block().unwrap().ends_with('…'));
+        assert_eq!(c.result_lines(), 1, "set_result_block 后行数为占位 1");
+        c.set_result_block("短文本");
+        assert_eq!(c.result_block(), Some("短文本"));
+    }
+
+    /// 行数回填下限：0 行钳为 1，防止浮层高度塌成纯边距。
+    #[test]
+    fn set_result_lines_floors_at_one() {
+        let mut c = ctrl();
+        c.set_result_block("x");
+        c.set_result_lines(0);
+        assert_eq!(c.result_lines(), 1);
+        c.set_result_lines(7);
+        assert_eq!(c.result_lines(), 7);
     }
 }
