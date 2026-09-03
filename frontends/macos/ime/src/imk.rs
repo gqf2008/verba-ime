@@ -429,12 +429,18 @@ fn record_dead(ivars: &Ivars, seq: u64) {
 }
 
 /// 控制器实例变量（主线程独占；define_class 只暴露 `&Ivars`，故用内部可变性）。
+/// `caps_host_cleanup` 的清理位：bit0 = 收起候选面板、bit1 = 推空组合清宿
+/// 主 marked 残留。补做时 CLEAR 位走 clear_composition（内部已含面板收
+/// 起），仅 HIDE 位时才单走 hide_candidate_window。欠什么必须记位、不能
+/// 在补做时重查现场反推——caps 分支的 reset() 已清空 composed ivar，宿
+/// 主侧 marked 文本却仍残留（两份状态不同步正是挂起清理的原因）。
+const CAPS_OWE_HIDE: u8 = 1 << 0;
+const CAPS_OWE_CLEAR_MARKED: u8 = 1 << 1;
+
 struct Ivars {
     machine: RefCell<CompositionMachine>,
     /// 融合后的展示候选（当前页索引由 `page` 给出）。
     candidates: RefCell<Vec<String>>,
-    /// 中英模式（macOS 无 TSF compartment：CapsLock 切换，内存态）。
-    /// true = 中文（拼音），false = 英文直输。
     /// 改写对照预览（Some((改写, 原文))：期间数字 1/2/Enter/Esc 由预览拦截）。
     rewrite_preview: RefCell<Option<(String, String)>>,
     /// OCR 预览文本（Some = 预览中）。
@@ -473,6 +479,10 @@ struct Ivars {
     host_call_depth: Cell<usize>,
     /// 重入窗内积压的待补放按键（见 `PendingKey` 与 drain 顶部的补放循环）。
     pending_keys: RefCell<VecDeque<PendingKey>>,
+    /// CapsLock 切英文时因重入窗（host_call_depth>0）无法即时执行的宿主侧
+    /// 清理欠账（CAPS_OWE_* 组合），挂起待下一键补做（见 input_text 顶部
+    /// 的补做块与 caps 分支）。
+    caps_host_cleanup: Cell<u8>,
 }
 
 impl Default for Ivars {
@@ -497,6 +507,7 @@ impl Default for Ivars {
             panel_probe_done: Cell::new(false),
             host_call_depth: Cell::new(0),
             pending_keys: RefCell::new(VecDeque::new()),
+            caps_host_cleanup: Cell::new(0),
         }
     }
 }
@@ -541,12 +552,7 @@ define_class!(
             // 清粘滞预览（issue #83 调试发现）：OCR/改写预览槽只靠 1/2/Esc
             // 清除，会话切换不清理时新会话继承旧预览 → 拦截分支吞掉全部
             // 按键、输入法整体静默失灵（真机踩坑）。会话边界强制清理。
-            let had_preview = self.ivars().ocr_preview.borrow().is_some()
-                || self.ivars().rewrite_preview.borrow().is_some();
-            let _ = self.ivars().rewrite_preview.borrow_mut().take();
-            let _ = self.ivars().ocr_preview.borrow_mut().take();
-            *self.ivars().candidates.borrow_mut() = Vec::new();
-            if had_preview {
+            if self.clear_previews() {
                 dbg_log("activate: 清理粘滞预览");
             }
             // 预置空标记文本：首个按键前建立 marked 状态，防首字母在标记状态
@@ -569,14 +575,16 @@ define_class!(
             self.ivars().pending_keys.borrow_mut().clear();
             // 预览槽与会话绑定：换应用/换输入位置后旧预览无效，清掉
             // （同 pending_keys 的会话失效语义；否则拦截分支吞键）。
-            let _ = self.ivars().rewrite_preview.borrow_mut().take();
-            let _ = self.ivars().ocr_preview.borrow_mut().take();
-            *self.ivars().candidates.borrow_mut() = Vec::new();
+            let _ = self.clear_previews();
             // 清宿主的标记文本再重置状态机：会话切换（换应用/换输入位置）时
             // 宿主会把残留 marked text 当普通文本上屏——组合中的拼音字母漏进
             // 文档（真机排查：「你 s会」中的 s）。丢弃组合，不提交原文。
             self.clear_composition();
             self.reset();
+            // 上面的 clear_composition 已替 caps 挂起的宿主侧清理还账——撤欠
+            // 账位，防新会话首键补做一次多余的推空组合（空叠空无实害，但混
+            // 淆补做日志语义）。
+            self.ivars().caps_host_cleanup.set(0);
             log::info!("[VerbaIMK] deactivateServer");
         }
     }
@@ -612,10 +620,18 @@ define_class!(
                 key_code
             ));
             self.set_client(sender);
-            // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
-            // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
-            // 免去 16ms 定时器延迟被感知为「输入卡」。
-            self.drain_stream(sel!(drainVerbaStream));
+            // 补做 caps 切英文时因重入窗推迟的宿主侧清理（此刻须已出窗；
+            // 仍在窗内则继续挂起，下一键再试）。
+            if self.ivars().caps_host_cleanup.get() != 0
+                && self.ivars().host_call_depth.get() == 0
+            {
+                let owed = self.ivars().caps_host_cleanup.replace(0);
+                if owed & CAPS_OWE_CLEAR_MARKED != 0 {
+                    self.clear_composition();
+                } else if owed & CAPS_OWE_HIDE != 0 {
+                    self.hide_candidate_window();
+                }
+            }
             // CapsLock 跟随（系统拼音同款）：会话级锁存位 ON = 英文直输，OFF =
             // 中文。非 toggle——revert AI v1 的裸 toggle 教训（issue #83 真机：
             // 系统「CapsLock 切 ABC」开启时切源动作把 keyCode 57 投给刚激活
@@ -630,24 +646,64 @@ define_class!(
                 return Bool::new(false);
             }
             if caps_on {
-                // 英文态：清挂着的预览（防跨态粘滞吞键）后全部透传宿主直插。
-                let had = self.ivars().ocr_preview.borrow().is_some()
+                // 英文态门：**先于 drain**（审查 F1）——切英文即刻作废中文侧
+                // 现场（组合/流/预览/积压键）再透传宿主直插。若 drain 在前：
+                // OCR 预览刚 show 就被同帧消费销毁、在途流式 chunk 与迟到候选
+                // 继续写回宿主、caps OFF 期间积压的拼音键被重放进英文现场。
+                // 此前本分支只清预览（had=false 时零清理），宿主 marked 残留、
+                // 16ms 定时器继续回流、关 caps 后空格提交陈旧候选（审查 #1）。
+                let had_marked = !self.ivars().composed.borrow().is_empty();
+                let had_previews = self.ivars().ocr_preview.borrow().is_some()
                     || self.ivars().rewrite_preview.borrow().is_some();
-                let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                let _ = self.ivars().ocr_preview.borrow_mut().take();
-                if had {
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.hide_candidate_window();
+                let has_state = !matches!(
+                    self.ivars().machine.borrow().state(),
+                    MachineState::Idle
+                );
+                let has_pending = !self.ivars().pending_keys.borrow().is_empty();
+                if had_marked || had_previews || has_state || has_pending {
+                    // 核心侧/队列侧清理不触宿主 XPC，重入窗内也安全：
+                    // cancel_stream 另起线程走 daemon IPC；feed_escape 纯核心。
+                    // had_marked 须在 reset() 清空 composed 前捕获。
+                    if had_previews {
+                        let _ = self.clear_previews();
+                    }
+                    // 积压键属 caps OFF 时的中文会话，切英文后语义失效——
+                    // 丢弃而非重放（同 deactivateServer 的会话失效语义）。
+                    self.ivars().pending_keys.borrow_mut().clear();
+                    self.reset();
+                    // 宿主侧（面板 hide + 推空组合）走 host_call XPC：重入窗内
+                    // 执行会与外层客户端调用交错（NSInvalidArgumentException
+                    // 真机崩溃，见 host_call 注释）——按欠账记位，挂起待下一
+                    // 键补做。
+                    if self.ivars().host_call_depth.get() == 0 {
+                        if had_previews {
+                            self.hide_candidate_window();
+                        }
+                        if had_marked {
+                            self.clear_composition();
+                        }
+                    } else {
+                        let mut owed = 0u8;
+                        if had_previews {
+                            owed |= CAPS_OWE_HIDE;
+                        }
+                        if had_marked {
+                            owed |= CAPS_OWE_CLEAR_MARKED;
+                        }
+                        self.ivars().caps_host_cleanup.set(owed);
+                    }
                 }
                 return Bool::new(false);
             }
-            // 中英切换不在此处理（revert AI v1 的 CapsLock toggle，issue #83
-            // 后续修复）：系统「CapsLock 切换 ABC」开启时，切源动作本身会把
-            // keyCode 57 投给刚激活的控制器，裸 toggle 与系统状态打架且无
-            // 视觉提示——实测表现为整个输入法静默失灵（全部键透传宿主）。
-            // CapsLock 落到 classify_key None → 空闲透传，交系统处理。
+            // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
+            // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
+            // 免去 16ms 定时器延迟被感知为「输入卡」。
+            self.drain_stream(sel!(drainVerbaStream));
             // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
-            // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
+            // 数字 2 选改写原文、Esc 取消；其他键不动预览交宿主。
+            // '2' 仅在改写对照预览算选中（审查 F10，对齐 Windows Digit2 语义）：
+            // OCR 预览无次条，'2' 落「其他键」清预览并重走路由，此前会把
+            // 识别文本当次条上屏（idx=1 越界回退取 ocr 文本提交）。
             if self.ivars().ocr_preview.borrow().is_some()
                 || self.ivars().rewrite_preview.borrow().is_some()
             {
@@ -660,15 +716,19 @@ define_class!(
                 let key = classify_key(string, key_code);
                 let pick: Option<usize> = match key {
                     Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
-                    Some(ImkKey::Char('2')) => Some(1),
+                    Some(ImkKey::Char('2'))
+                        if self.ivars().rewrite_preview.borrow().is_some() =>
+                    {
+                        Some(1)
+                    }
                     _ => None,
                 };
                 let esc = matches!(key, Some(ImkKey::Escape));
                 if esc {
-                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.refresh_candidate_window();
+                    self.clear_previews();
+                    // 空候选下 refresh 直接 return 不隐藏面板——显式 hide
+                    // （姊妹路径同款修复，审查 F11）。
+                    self.hide_candidate_window();
                     return Bool::new(true);
                 }
                 if let Some(idx) = pick {
@@ -679,10 +739,10 @@ define_class!(
                     } else {
                         self.ivars().ocr_preview.borrow().clone()
                     };
-                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.refresh_candidate_window();
+                    self.clear_previews();
+                    // 同 F11：清空候选后 refresh 是空操作，面板会挂着旧预览
+                    // 条目直到下一次刷新——选中即显式收起（对齐 Windows）。
+                    self.hide_candidate_window();
                     if let Some(t) = text {
                         self.commit(&t);
                     }
@@ -693,8 +753,7 @@ define_class!(
                 // 拼音路径——透传会字母泄漏，真机踩坑）；改写预览保持原样
                 // （Windows 同款：Other 不清、键透传、预览保持）。
                 if self.ivars().ocr_preview.borrow().is_some() {
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
+                    let _ = self.clear_previews();
                     // 空候选时 refresh 直接 return 不隐藏面板——显式 hide，
                     // 防截断预览面板粘滞（对齐 Windows 同路径的显式 hide）。
                     self.hide_candidate_window();
@@ -702,45 +761,6 @@ define_class!(
                 } else {
                     return Bool::new(false);
                 }
-            }
-            // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
-            // 数字 2 选次条（改写原文）、Esc 取消；其他键不动预览交宿主。
-            if self.ivars().ocr_preview.borrow().is_some()
-                || self.ivars().rewrite_preview.borrow().is_some()
-            {
-                let key = classify_key(string, key_code);
-                let pick: Option<usize> = match key {
-                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
-                    Some(ImkKey::Char('2')) => Some(1),
-                    _ => None,
-                };
-                let esc = matches!(key, Some(ImkKey::Escape));
-                if esc {
-                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.refresh_candidate_window();
-                    return Bool::new(true);
-                }
-                if let Some(idx) = pick {
-                    let text = if let Some((rw, src)) =
-                        self.ivars().rewrite_preview.borrow().as_ref()
-                    {
-                        [rw.clone(), src.clone()].get(idx).cloned()
-                    } else {
-                        self.ivars().ocr_preview.borrow().clone()
-                    };
-                    let _ = self.ivars().rewrite_preview.borrow_mut().take();
-                    let _ = self.ivars().ocr_preview.borrow_mut().take();
-                    *self.ivars().candidates.borrow_mut() = Vec::new();
-                    self.refresh_candidate_window();
-                    if let Some(t) = text {
-                        self.commit(&t);
-                    }
-                    return Bool::new(true);
-                }
-                // 预览期间其他键：不吞（交宿主），预览保持。
-                return Bool::new(false);
             }
             let panel_visible = self
                 .ivars()
@@ -1479,6 +1499,20 @@ impl VerbaIMKController {
         self.host_call("set_marked.updateComposition", || unsafe {
             let _: () = msg_send![self, updateComposition];
         });
+    }
+
+    /// 清空 OCR/改写双预览槽并清空候选数据源；返回是否确有预览被清。
+    ///
+    /// 面板动作（hide/refresh）语义各调用点不同，由调用方在清槽后自行决定，
+    /// 不并入本函数。此前双槽同清点散落在 input_text 的 caps/esc/选中/其他键
+    /// 四个臂与 activate/deactivate，拷贝多份易漂移（审查 F6 收敛）。
+    fn clear_previews(&self) -> bool {
+        let had = self.ivars().ocr_preview.borrow().is_some()
+            || self.ivars().rewrite_preview.borrow().is_some();
+        let _ = self.ivars().rewrite_preview.borrow_mut().take();
+        let _ = self.ivars().ocr_preview.borrow_mut().take();
+        *self.ivars().candidates.borrow_mut() = Vec::new();
+        had
     }
 
     fn clear_composition(&self) {
