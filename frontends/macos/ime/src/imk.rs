@@ -31,8 +31,10 @@ use objc2_input_method_kit::{
 };
 
 use verba_core::machine::{
-    Action, CompositionMachine, LlmCandidateRequest, MachineState, REWRITE_SYSTEM_PROMPT,
+    result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, ResultPhase,
+    REWRITE_SYSTEM_PROMPT,
 };
+use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
 use verba_protos::{stream_event, StreamEvent};
 
@@ -311,6 +313,68 @@ fn trigger_region_ocr_async() {
     });
 }
 
+/// spawn verba-trigger 采集子命令（`ocr` 全屏截图 OCR / `asr` 录音转写）：
+/// stdout 文本经 ocr_result_slot 进 OCR 预览——与 `///`（region-ocr）同一
+/// 「后台产、主线程 drain 消费」管线，无新通道。
+fn spawn_trigger_capture(sub: &str) {
+    let sub = sub.to_owned();
+    std::thread::spawn(move || {
+        let Some(exe) = trigger_exe_path() else {
+            dbg_log(&format!("trigger {sub}: 未找到 verba-trigger"));
+            return;
+        };
+        match std::process::Command::new(exe).arg(&sub).output() {
+            Ok(out) => {
+                dbg_log(&format!(
+                    "trigger {sub}: 退出 {:?} stdout_len={}",
+                    out.status.code(),
+                    out.stdout.len()
+                ));
+                if !out.status.success() {
+                    return;
+                }
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if text.is_empty() {
+                    return; // 无识别文本
+                }
+                if let Ok(mut slot) = ocr_result_slot().lock() {
+                    *slot = Some(text);
+                }
+            }
+            Err(e) => dbg_log(&format!("trigger {sub}: 启动 verba-trigger 失败: {e}")),
+        }
+    });
+}
+
+/// spawn verba-trigger speak（daemon TTS 合成 + rodio 播放，不落盘文本）。
+fn spawn_trigger_speak(text: String) {
+    std::thread::spawn(move || {
+        let Some(exe) = trigger_exe_path() else {
+            dbg_log("speak: 未找到 verba-trigger");
+            return;
+        };
+        match std::process::Command::new(exe)
+            .arg("speak")
+            .arg(&text)
+            .output()
+        {
+            Ok(out) => dbg_log(&format!(
+                "speak: 退出 {:?} stderr={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )),
+            Err(e) => dbg_log(&format!("speak: 启动 verba-trigger 失败: {e}")),
+        }
+    });
+}
+
+/// 查用户定义短语（`//短语 名称`）；无配置/无此名称返回 None（调用方按
+/// 普通生成兜底，与 Windows 前端一致——config 依赖留在前端）。
+fn lookup_phrase(name: &str) -> Option<String> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    verba_config::phrases::get(&dirs, name).ok().flatten()
+}
+
 /// OCR 识别文本写剪贴板（静默失败）。与 Windows 行为对齐：识别文本随手可粘贴。
 fn set_clipboard_text_quiet(text: &str) {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
@@ -436,6 +500,25 @@ fn record_dead(ivars: &Ivars, seq: u64) {
 /// 主侧 marked 文本却仍残留（两份状态不同步正是挂起清理的原因）。
 const CAPS_OWE_HIDE: u8 = 1 << 0;
 const CAPS_OWE_CLEAR_MARKED: u8 = 1 << 1;
+
+/// AI 结果浮层的面板显示截断（字符数，与 OCR 预览同款）。仅影响显示，
+/// 提交永远取 core 的全文（显示截断、提交取全文）。
+const AI_RESULT_DISPLAY_CHARS: usize = 40;
+
+/// AI 结果面板条目（纯函数，供单测）：截断结果 + 阶段提示两条；空结果
+/// （失败于首块前）只剩提示一条。
+fn ai_result_display_items(text: &str, phase: ResultPhase) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    if !text.is_empty() {
+        let mut disp: String = text.chars().take(AI_RESULT_DISPLAY_CHARS).collect();
+        if text.chars().count() > AI_RESULT_DISPLAY_CHARS {
+            disp.push('…');
+        }
+        items.push(disp);
+    }
+    items.push(result_hint(phase).to_owned());
+    items
+}
 
 struct Ivars {
     machine: RefCell<CompositionMachine>,
@@ -726,6 +809,13 @@ define_class!(
                 let esc = matches!(key, Some(ImkKey::Escape));
                 if esc {
                     self.clear_previews();
+                    // 机器同步回 Idle（Windows 经 feed_rewrite_preview 的
+                    // Cancel 同款）：改写预览取消后机器仍停在 ResultReady——
+                    // 后续字母会被结果浮层键语义吞掉、`r` 误触发重试。
+                    // ResultReady 下 feed_escape 产 Cancel（含组合清理），
+                    // 走统一派发点；OCR 预览态机器本就在 Idle → None 无副作用。
+                    let action = self.ivars().machine.borrow_mut().feed_escape();
+                    let _ = self.apply_action(action);
                     // 空候选下 refresh 直接 return 不隐藏面板——显式 hide
                     // （姊妹路径同款修复，审查 F11）。
                     self.hide_candidate_window();
@@ -740,6 +830,12 @@ define_class!(
                         self.ivars().ocr_preview.borrow().clone()
                     };
                     self.clear_previews();
+                    // 同上：选取路径也要把机器从 ResultReady 拉回 Idle，
+                    // 否则改写上屏后的第一串字母被吞（预存失同步，#89 顺修）。
+                    // Cancel 的组合清理后紧跟 commit 上屏（commit 自带空
+                    // setMarkedText + insertText，语义恰为「先清后插」）。
+                    let action = self.ivars().machine.borrow_mut().feed_escape();
+                    let _ = self.apply_action(action);
                     // 同 F11：清空候选后 refresh 是空操作，面板会挂着旧预览
                     // 条目直到下一次刷新——选中即显式收起（对齐 Windows）。
                     self.hide_candidate_window();
@@ -1270,10 +1366,30 @@ impl VerbaIMKController {
                 self.commit(&text);
                 true
             }
-            Action::EnterPrompt { preedit }
-            | Action::UpdatePrompt { preedit }
-            | Action::UpdateResult { preedit, .. } => {
+            Action::EnterPrompt { preedit } | Action::UpdatePrompt { preedit } => {
+                // `e`/退格离开结果浮层回提示词编辑：残留的 AI 结果面板若不
+                // 收起，其条目被点击（candidateSelected → feed_char('1')）
+                // 会把数字字面量插进提示词。
+                if !self.ivars().machine.borrow().ai_previewing() && self.ai_result_panel_showing()
+                {
+                    self.ivars().candidates.borrow_mut().clear();
+                    self.hide_candidate_window();
+                }
                 self.set_marked(&preedit);
+                true
+            }
+            Action::UpdateResult { preedit, body } => {
+                // 流式增量：组合只持**短状态串**（set_marked 去重——此前每
+                // chunk 整串 setMarkedText 长 preedit，既挤爆窄组合又每 chunk
+                // 一次宿主往返）；全文经 show_ai_result 截断进候选面板。
+                self.set_marked(&preedit);
+                let phase = self
+                    .ivars()
+                    .machine
+                    .borrow()
+                    .result_phase()
+                    .unwrap_or(ResultPhase::Streaming);
+                self.show_ai_result(&body, phase);
                 true
             }
             Action::UpdatePinyin {
@@ -1308,8 +1424,65 @@ impl VerbaIMKController {
                 true
             }
             Action::StartLlm { prompt, system } => {
-                self.start_llm(prompt, system);
-                true
+                // 多模态命令路由统一走 core commands::parse_ai_command
+                // （与 Windows 同一份判定；此前 macOS 完全没有命令路由，
+                // 同一 `//截图` 在两端行为分叉，且结果浮层的重试也依赖此
+                // 收口还原命令语义）。
+                let cmd = parse_ai_command(prompt.trim());
+                match cmd {
+                    // `//朗读 <文本>`：spawn verba-trigger speak（daemon TTS
+                    // 合成 + 播放，不落盘文本）。
+                    AiCommand::Tts { text } => {
+                        dbg_log(&format!("朗读命令: text={text}"));
+                        self.set_marked("");
+                        self.reset();
+                        spawn_trigger_speak(text);
+                        true
+                    }
+                    // `//短语 名称`：查配置直插 + 剪贴板；未命中（无配置/
+                    // 无此名称）按普通生成兜底（与 Windows 一致）。
+                    AiCommand::Phrase { name } => match lookup_phrase(&name) {
+                        Some(text) => {
+                            dbg_log(&format!("插入快捷短语: {name}"));
+                            set_clipboard_text_quiet(&text);
+                            self.set_marked("");
+                            self.reset();
+                            self.commit(&text);
+                            true
+                        }
+                        None => {
+                            self.start_llm(prompt, system);
+                            true
+                        }
+                    },
+                    // `//截图` / `//听写`：spawn verba-trigger（stdout 文本经
+                    // ocr_result_slot 进 OCR 预览，与 `///` 同管线）。
+                    AiCommand::FullScreenOcr | AiCommand::Asr => {
+                        let sub = if matches!(cmd, AiCommand::Asr) {
+                            "asr"
+                        } else {
+                            "ocr"
+                        };
+                        dbg_log(&format!("触发命令: {sub}"));
+                        self.set_marked("");
+                        self.reset();
+                        spawn_trigger_capture(sub);
+                        true
+                    }
+                    // `//看图` 一期回退普通生成（macOS 前端尚无 vision 捕捉
+                    // 基础设施；列为 #89 后续，见 PR 注）。
+                    AiCommand::Vision => {
+                        log::warn!("[VerbaIMK] //看图 vision 一期未接入，回退普通生成");
+                        self.start_llm(prompt, system);
+                        true
+                    }
+                    // 普通生成与 daemon 命令（`//重置`/`//会话`——前端不得
+                    // 拦截，原样送 daemon）。
+                    AiCommand::Llm => {
+                        self.start_llm(prompt, system);
+                        true
+                    }
+                }
             }
             Action::StartRewrite { content } => {
                 dbg_log(&format!(
@@ -1349,16 +1522,23 @@ impl VerbaIMKController {
                 // 改写对照预览：候选窗双候选（1=改写 2=原文），数字选字由
                 // input_text 的 rewrite_preview 拦截路由处理。组合标记清空
                 // （预览期间不显示流式文本，候选窗即预览）。
+                // 停表：流已终结（本臂此前只被 feed_stream_event 内联处理、
+                // 从未真正走到；统一派发后成为活路径，保留原路径停表行为）。
                 *self.ivars().rewrite_preview.borrow_mut() =
                     Some((rewritten.clone(), source.clone()));
                 *self.ivars().candidates.borrow_mut() = vec![rewritten, source];
                 self.ivars().page.set(0);
                 self.set_marked("");
                 self.refresh_candidate_window();
+                self.invalidate_timer();
                 true
             }
             Action::ResultReady { text } => {
-                self.set_marked(&text);
+                // 就绪：组合换短状态串（不再塞全文），面板换就绪提示
+                // （Enter/空格/1 上屏、r 重试、e 改提示词）。
+                let preedit = self.ivars().machine.borrow().preedit();
+                self.set_marked(&preedit);
+                self.show_ai_result(&text, ResultPhase::Ready);
                 self.invalidate_timer();
                 true
             }
@@ -1369,8 +1549,19 @@ impl VerbaIMKController {
                 true
             }
             Action::LlmFailed { message } => {
+                // 失败浮层保留（core 已入 Failed 态并保留 last_request：
+                // Enter/`r` 重试、`e` 改提示词）——**不清组合、不收面板**，
+                // 清掉即「错误一闪而过、按 r 无反应」（与 Windows 前端同款
+                // 修复，计划风险 5；body 为已生成的部分结果，失败于首块前
+                // 为空——面板只剩重试提示条）。
                 log::warn!("[VerbaIMK] LLM 失败: {message}");
-                self.clear_composition();
+                let (body, preedit) = {
+                    let m = self.ivars().machine.borrow();
+                    (m.result().to_owned(), m.preedit())
+                };
+                self.set_marked(&preedit);
+                self.show_ai_result(&body, ResultPhase::Failed);
+                self.invalidate_timer();
                 true
             }
         }
@@ -1518,6 +1709,37 @@ impl VerbaIMKController {
         let _ = self.ivars().ocr_preview.borrow_mut().take();
         *self.ivars().candidates.borrow_mut() = Vec::new();
         had
+    }
+
+    /// AI 结果浮层（macOS 一期形态）：IMKCandidates 单列面板显示
+    /// 「截断结果 + 阶段提示」两条候选。**提交语义全在 core**——
+    /// Enter/空格/1/`r`/`e` 走 input_text 的 feed_* 正常路由（机器
+    /// ResultReady/Failed 态按键由 core 分派），上屏取 machine.result()
+    /// **全文**；显示截断仅限面板（显示截断、提交取全文——OCR 预览真机
+    /// 1059 字符教训）。提示条目点击无语义（对应数字键在流态被 core 吞
+    /// 掉），仅供阅读。多行 NSPanel 自绘浮层列二期（issue #89）。
+    fn show_ai_result(&self, text: &str, phase: ResultPhase) {
+        let items = ai_result_display_items(text, phase);
+        // 去重：同一 drain 批内多条 chunk 连续刷新时显示串未变则跳过
+        // updateCandidates 宿主往返（与 set_marked 去重同一动机）。
+        if *self.ivars().candidates.borrow() == items {
+            return;
+        }
+        *self.ivars().candidates.borrow_mut() = items;
+        self.ivars().page.set(0);
+        self.refresh_candidate_window();
+    }
+
+    /// 当前候选面板是否为 AI 结果浮层形态（末条为 result_hint 的阶段
+    /// 提示文案；面板条目由 ai_result_display_items 构造）。仅在「离开
+    /// 结果态回提示词编辑」时用于收起残留面板，不承担状态机职责。
+    fn ai_result_panel_showing(&self) -> bool {
+        let last = self.ivars().candidates.borrow().last().cloned();
+        last.is_some_and(|s| {
+            s == result_hint(ResultPhase::Streaming)
+                || s == result_hint(ResultPhase::Ready)
+                || s == result_hint(ResultPhase::Failed)
+        })
     }
 
     fn clear_composition(&self) {
@@ -1783,24 +2005,12 @@ impl VerbaIMKController {
             }
             _ => Action::None,
         };
-        match action {
-            Action::UpdateResult { preedit, .. } | Action::UpdatePrompt { preedit } => {
-                self.set_marked(&preedit);
-            }
-            // 改写流完成同样要刷新标记文本并停表——RewriteReady 不接住会落进
-            // 兜底 debug 日志，组合文本停留上一个 chunk、drain 定时器空转。
-            Action::ResultReady { .. } | Action::RewriteReady { .. } => {
-                self.set_marked(self.ivars().machine.borrow().result());
-                self.invalidate_timer();
-            }
-            Action::LlmFailed { message } => {
-                log::warn!("[VerbaIMK] LLM 失败: {message}");
-                self.clear_composition();
-                self.invalidate_timer();
-            }
-            Action::None => {}
-            other => log::debug!("[VerbaIMK] 流事件产生其它动作: {other:?}"),
-        }
+        // 统一走 apply_action（单一派发点）：此前本函数自持一份
+        // set_marked/clear_composition 处理，与 apply_action 的同名臂两处
+        // 维护——「两处本该一致」的漂移温床（RewriteReady 曾因此漏接）。
+        // ResultReady（结果浮层）/LlmFailed（失败保留，不清组合）的新语义
+        // 只改 apply_action 一处。
+        let _ = self.apply_action(action);
     }
 
     fn feed_candidates_event(&self, evt: StreamEvent) {
@@ -2114,5 +2324,31 @@ mod tests {
         assert_eq!(a >> 32, b >> 32, "同进程盐应一致");
         assert_eq!((a >> 32) as u32, process_salt());
         assert!((b as u32) > (a as u32), "低 32 位应递增");
+    }
+
+    /// #89 结果浮层面板条目：显示截断（上限+省略号）、空结果只剩提示、
+    /// 短文本原样。「提交取全文」的一半由 core 的 feed_enter →
+    /// CommitResult(全文) 测试钉住——显示截断只属于面板。
+    #[test]
+    fn ai_result_display_items_truncate_and_hint() {
+        let items = ai_result_display_items(&"字".repeat(60), ResultPhase::Ready);
+        assert_eq!(items.len(), 2, "截断结果 + 阶段提示两条");
+        assert_eq!(
+            items[0].chars().count(),
+            AI_RESULT_DISPLAY_CHARS + 1,
+            "截断到上限并补省略号"
+        );
+        assert!(items[0].ends_with('…'));
+        assert_eq!(items[1], result_hint(ResultPhase::Ready));
+        // 失败于首块前（空结果）：只剩提示条目
+        assert_eq!(
+            ai_result_display_items("", ResultPhase::Failed),
+            vec![result_hint(ResultPhase::Failed).to_owned()]
+        );
+        // 短文本不截断
+        assert_eq!(
+            ai_result_display_items("你好", ResultPhase::Streaming)[0],
+            "你好"
+        );
     }
 }
