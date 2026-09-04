@@ -9,6 +9,7 @@
 //!   +--- Esc/Backspace 取消 <---------+-----------------------------------------------+
 //! ```
 
+use std::collections::VecDeque;
 use std::fmt;
 
 /// 候选：文本 + 覆盖的输入拼音字符数（用于分段承诺/整句提交）。
@@ -71,6 +72,80 @@ pub enum MachineState {
     Streaming,
     /// LLM 已输出完毕，等待 Enter 上屏 / Esc 取消。
     ResultReady,
+    /// LLM 出错（独立态而非 ResultReady+标志：feed_escape 的 `_` 兜底自动
+    /// 覆盖它，按键路由按状态分派无需旁路标志）。失败态保留 last_request
+    /// 与已生成的部分结果，Enter/`r` 重试、`e` 回提示词编辑。
+    Failed,
+}
+
+/// AI 结果浮层的阶段（状态行文案与按键语义由阶段决定，见 `result_hint`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultPhase {
+    /// 流式生成中。
+    Streaming,
+    /// 已完成，等待确认（Enter/空格/1 上屏）。
+    Ready,
+    /// 生成失败（Enter/r 重试）。
+    Failed,
+}
+
+/// 结果浮层状态行提示（两端共用文案——收口在 core，与
+/// REWRITE_SYSTEM_PROMPT 同一理由：两端措辞漂移会让同一状态在两个平台
+/// 给出不同的按键承诺）。
+pub fn result_hint(phase: ResultPhase) -> &'static str {
+    match phase {
+        ResultPhase::Streaming => "生成中… Enter 提交已生成部分 · Esc 取消",
+        ResultPhase::Ready => "Enter/空格/1 上屏 · r 重试 · e 改提示词 · Esc 关闭",
+        ResultPhase::Failed => "Enter 或 r 重试 · e 改提示词 · Esc 关闭",
+    }
+}
+
+/// AI 结果浮层态的按键分类（`feed_ai_preview` 的输入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiKey {
+    Enter,
+    Space,
+    Digit1,
+    /// `r`：按上一条请求原样重试（改写流重走改写、命令流重走命令路由）。
+    Retry,
+    /// `e`：回到提示词编辑（带出上一条提示词原文）。
+    Edit,
+    Escape,
+}
+
+impl AiKey {
+    /// 字符 → 浮层按键（仅结果浮层态消费的字符；其它 None 不吞——防误伤
+    /// 正常字母输入）。
+    fn from_char(c: char) -> Option<Self> {
+        match c {
+            ' ' => Some(Self::Space),
+            '1' => Some(Self::Digit1),
+            'r' | 'R' => Some(Self::Retry),
+            'e' | 'E' => Some(Self::Edit),
+            _ => None,
+        }
+    }
+}
+
+/// 最近一次 AI 请求参数（重试 / 改提示词的基础）。
+///
+/// **清理边界**：不在 `clear_composition_state` 的清理清单——Esc 后仍保留
+/// （Esc 关掉浮层后想重试/再编辑是合理诉求）。极易被后续重构顺手加进
+/// 清理清单，`last_request_survives_escape` 钉住。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastLlmRequest {
+    prompt: String,
+    system: Option<String>,
+    /// 改写流的原内容（普通生成为 None）。重试据此重走 StartRewrite。
+    rewrite_source: Option<String>,
+}
+
+/// AI 结果浮层预览态。**由 core 在进入流时自行置位**，不依赖前端回调
+/// begin_*——改写预览曾因「动作发出与前端注册两跳缺一，拦截分支成死
+/// 代码而单测全绿」付过学费；注册责任收归 core 是该教训的结构性修复。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiPreview {
+    phase: ResultPhase,
 }
 
 /// OCR 预览态的按键分类（feed_ocr_preview 的输入）。
@@ -111,10 +186,13 @@ pub enum Action {
         prompt: String,
         system: Option<String>,
     },
-    /// LLM 流式增量更新，preedit 显示结果。
-    UpdateResult { preedit: String },
-    /// LLM 输出完毕，等待用户确认。
-    ResultReady,
+    /// LLM 流式增量更新。`preedit` 是**短状态串**（如「✨ 生成中…」，绝
+    /// 不可为空——组合文本置空会触发应用终止组合，真机 Notepad-- 吞掉整
+    /// 条流的教训）；`body` 是流式全文，供结果浮层渲染（不再挤 preedit）。
+    UpdateResult { preedit: String, body: String },
+    /// LLM 输出完毕，等待用户确认。`text` 携带结果全文（前端浮层显示/上屏
+    /// 一份来源，杜绝「截断显示串当全文提交」一类两份数据漂移）。
+    ResultReady { text: String },
     /// 确认上屏最终结果。
     CommitResult { text: String },
     /// `///`：Prompt 态空提示词按第三个斜杠 → 触发选区截图 OCR
@@ -131,7 +209,9 @@ pub enum Action {
     RewriteReady { rewritten: String, source: String },
     /// 取消当前组合（Esc / 清空）。
     Cancel,
-    /// LLM 出错，已回到 Idle。
+    /// LLM 出错，已入 Failed 态（浮层仍在，Enter/r 重试）。前端收到后
+    /// **不得清理组合**——那是旧「回 Idle」语义的残留，会把刚弹的失败
+    /// 浮层立刻清掉（表现为「错误一闪而过、按 r 无反应」）。
     LlmFailed { message: String },
 }
 
@@ -174,10 +254,11 @@ pub struct CompositionMachine {
     /// 候选请求是否在途（已发出、Rime 结果未回）。
     /// 快速输入时若此刻按空格选首候选，会把拼音原文上屏——须暂缓到结果到达。
     candidates_in_flight: bool,
-    /// 盲按窗口内暂缓的意图：候选在途且零已知真实结果时，空格/大写/标点
-    /// 的提交通道都不立即按原文提交——记下最新一次按键，结果 settle 后重放。
-    /// 最新击键覆盖旧暂缓（被替换的键已被吞，属盲按保护的可接受损失）。
-    deferred_intent: Option<DeferredIntent>,
+    /// 盲按窗口内暂缓的意图队列：候选在途且零已知真实结果时，空格/大写/
+    /// 标点的提交通道都不立即按原文提交——按下顺序入队，结果 settle 后按
+    /// FIFO 重放。此前为单槽「最新覆盖旧」（被替换的键已被吞）——快打连
+    /// 按两个收尾键必丢前一个（真机漏字，issue #87）。
+    deferred_intents: VecDeque<DeferredIntent>,
     /// 当前候选页码（0 起）。
     pinyin_page: usize,
     /// 当前选中候选下标（页内，0 起；方向键 Up/Down 移动，候选刷新时归 0）。
@@ -190,6 +271,10 @@ pub struct CompositionMachine {
     rewrite_preview: Option<(String, String)>,
     /// AI 提示词（不含 `//` 前缀）。
     prompt: String,
+    /// 最近一次 AI 请求参数（重试/改提示词基础；Esc 后保留，见类型注）。
+    last_request: Option<LastLlmRequest>,
+    /// AI 结果浮层预览态（core 自行置位，见类型注）。
+    ai_preview: Option<AiPreview>,
     /// LLM 流式结果。
     result: String,
     /// 成对引号交替开闭状态，**双引号与单引号各自独立交替**（false=下一个是
@@ -239,7 +324,7 @@ pub fn is_fullwidth_mapped_punct(c: char) -> bool {
 /// 两端措辞一旦漂移，同一内容在两个平台改出不同文风。
 pub const REWRITE_SYSTEM_PROMPT: &str = "你是文字润色助手。忠实改写用户给出的内容：纠正错别字与语病，补全残句使其通顺，按内容自动判断是否需要结构化（如请假条/邮件/通知则给出合适格式）。不要回答问题、不要扩展内容、不要添加评论；只输出改写后的文本本身，不用 Markdown。";
 
-/// 盲按窗口内暂缓的提交意图（见 `deferred_intent` 字段）。
+/// 盲按窗口内暂缓的提交意图（见 `deferred_intents` 队列）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredIntent {
     /// 空格：settle 后有真实结果则选首候选；零结果不提交（展示合成项，
@@ -269,13 +354,15 @@ impl CompositionMachine {
             commit_offset: 0,
             last_candidates_request: None,
             candidates_in_flight: false,
-            deferred_intent: None,
+            deferred_intents: VecDeque::new(),
             pinyin_page: 0,
             selected_index: 0,
             ocr_preview: None,
             rewrite_source: None,
             rewrite_preview: None,
             prompt: String::new(),
+            last_request: None,
+            ai_preview: None,
             result: String::new(),
             double_quote_open: false,
             single_quote_open: false,
@@ -295,6 +382,11 @@ impl CompositionMachine {
     }
 
     /// 当前应显示的 preedit 文本（无组合时为空）。
+    ///
+    /// 流式/结果/失败态返回**短状态串**（非全文）：长结果挤窄 preedit 是
+    /// AI 交互三痛点之一，全文由结果浮层（`ai_preview` + `result`）渲染。
+    /// 状态串绝不可为空——组合文本置空会触发应用终止组合 →
+    /// OnCompositionTerminated → 流式输出全丢（真机 Notepad-- 教训）。
     pub fn preedit(&self) -> String {
         match self.state {
             MachineState::PendingSlash => "/".to_owned(),
@@ -306,7 +398,9 @@ impl CompositionMachine {
                     format!("//{}", self.prompt)
                 }
             }
-            MachineState::Streaming | MachineState::ResultReady => self.result.clone(),
+            MachineState::Streaming => "✨ 生成中…".to_owned(),
+            MachineState::ResultReady => "✨ 已就绪".to_owned(),
+            MachineState::Failed => "✨ 生成失败".to_owned(),
             MachineState::Idle => String::new(),
         }
     }
@@ -318,6 +412,13 @@ impl CompositionMachine {
     /// 入缓冲（退格仍可删），同时约束 preedit/查询/候选面板规模——长句候选
     /// 慢与不全的源头之一。
     pub const MAX_PINYIN_BUFFER: usize = 48;
+
+    /// 盲窗暂缓队列上限（意图数）。正常永不满（settle 一到即整队重放；前端
+    /// 兜底在守护出错时也会推 done 空结果结算整队）。到顶 = 守护崩溃**且**
+    /// 前端兜底同时失效的双重故障：此刻整队按「原文 + 全部后缀」一次结算
+    /// （同重复空格的知情回退哲学，防无限吞键）。绝不可改为「丢弃最旧」
+    /// ——丢键正是本队列要修的漏字（issue #87）。
+    pub const MAX_DEFERRED: usize = 16;
 
     /// 翻到上一页（仅拼音态；无候选或单页时无动作）。
     pub fn feed_page_up(&mut self) -> Action {
@@ -417,7 +518,19 @@ impl CompositionMachine {
             }
             MachineState::Pinyin => self.feed_pinyin_char(c),
             MachineState::Prompt => self.feed_prompt_char(c),
-            MachineState::Streaming | MachineState::ResultReady => Action::None,
+            MachineState::Streaming => {
+                // 流中空格/1：停流并提交已生成部分（Enter 走 feed_enter 同一
+                // 通道；此前返回 None 被前端吞掉无反馈——AI 交互「死感」来源）。
+                if c == ' ' || c == '1' {
+                    self.feed_enter()
+                } else {
+                    Action::None
+                }
+            }
+            MachineState::ResultReady | MachineState::Failed => match AiKey::from_char(c) {
+                Some(key) => self.feed_ai_preview(key).unwrap_or(Action::None),
+                None => Action::None,
+            },
         }
     }
 
@@ -431,9 +544,14 @@ impl CompositionMachine {
             // 重放会把已解决的候选插进用户正在输入的提示词组合里（Prompt 态
             // 活跃时插入文本），引入新的竞态与错序风险，收益远小于风险。
             // 行为由 slash_in_blind_window_commits_raw_enters_pending 钉住。
+            // '/' 前已暂缓的意图（若有）一并折进本次提交：'/' 直出即放弃候选
+            // 等待，settle 重放不会再来（组合已清），留在队里即丢键（issue #87
+            // 的队列化收尾；drain 须在 reset_pinyin 之前——它会清空队列）。
+            let intents: Vec<DeferredIntent> = self.deferred_intents.drain(..).collect();
             // 提交当前拼音，再进入 AI 触发
-            let text = self.commit_pinyin_text();
+            let mut text = self.commit_pinyin_text();
             self.reset_pinyin();
+            text.push_str(&self.fold_deferred(intents));
             self.state = MachineState::PendingSlash;
             return Action::CommitImmediate(text);
         }
@@ -456,9 +574,10 @@ impl CompositionMachine {
                 // 大写：提交当前候选（或原文）+ 该字符，避免吞字（与其它可打印字符一致）
                 if self.blind_window() {
                     // 盲窗（查询在途且零已知结果）：按原文提交会带上拼音字母——
-                    // 与空格同走暂缓，settle 后重放本通道。
-                    self.deferred_intent = Some(DeferredIntent::Uppercase(c));
-                    return self.pinyin_action();
+                    // 与空格同走暂缓，settle 后按入队顺序重放本通道。
+                    self.deferred_intents
+                        .push_back(DeferredIntent::Uppercase(c));
+                    return self.overflow_or_pinyin_action();
                 }
                 let text = format!("{}{c}", self.commit_pinyin_text());
                 self.reset_pinyin();
@@ -482,10 +601,10 @@ impl CompositionMachine {
         }
         // 其它可打印字符：提交候选 0 + 该字符，避免吞字；标点同时转全角
         if self.blind_window() {
-            // 盲窗同上：暂缓到 settle 重放（在 punct_commit_text 之前登记，
-            // 引号交替等映射状态留待重放时恰好翻转一次）。
-            self.deferred_intent = Some(DeferredIntent::Punct(c));
-            return self.pinyin_action();
+            // 盲窗同上：暂缓到 settle 按序重放（在 punct_commit_text 之前
+            // 登记，引号交替等映射状态留待重放时恰好翻转一次）。
+            self.deferred_intents.push_back(DeferredIntent::Punct(c));
+            return self.overflow_or_pinyin_action();
         }
         let punct = self.punct_commit_text(c);
         let text = format!("{}{punct}", self.commit_pinyin_text());
@@ -499,6 +618,50 @@ impl CompositionMachine {
         self.candidates_in_flight
             && self.dictionary_candidates.is_empty()
             && self.llm_candidates.is_empty()
+    }
+
+    /// 暂缓入队后的收口：到顶（双故障）则整队按原文结算，否则走常规
+    /// pinyin_action（刷新 preedit/候选展示，不改提交通道）。
+    fn overflow_or_pinyin_action(&mut self) -> Action {
+        if self.deferred_intents.len() > Self::MAX_DEFERRED {
+            return self.flush_deferred_as_raw(false);
+        }
+        self.pinyin_action()
+    }
+
+    /// 把暂缓意图折叠成后缀文本：大写原样、标点走全角映射（成对引号恰好
+    /// 翻转一次）、历史空格落半角（fullwidth_punct(' ') 本就无映射）。
+    /// 供放弃候选等待的两条出口共用（见 `flush_deferred_as_raw` 与拼音 '/'
+    /// 直出分支）。
+    fn fold_deferred(&mut self, intents: Vec<DeferredIntent>) -> String {
+        let mut suffix = String::new();
+        for intent in intents {
+            match intent {
+                DeferredIntent::Uppercase(ch) => suffix.push(ch),
+                DeferredIntent::Punct(ch) => suffix.push_str(&self.punct_commit_text(ch)),
+                DeferredIntent::SelectSpace => suffix.push(' '),
+            }
+        }
+        suffix
+    }
+
+    /// 放弃等待候选：把当前组合按「原文 + 队列全部意图的后缀」一次结算。
+    /// 两个入口：①知情回退（队尾重复空格，`pop_tail_space=true` 只消费该
+    /// 空格）；②暂缓队列到顶（守护崩溃且前端兜底失效的双重故障，
+    /// `pop_tail_space=false` 整队连同本键结算）。语义同旧的「重复空格按
+    /// 原文提交」，只是把队列里已按下的收尾字符一并接上，不再丢键。
+    ///
+    /// 结算必须在 `reset_pinyin()` **之前**先把队列 drain 成快照——reset
+    /// 经 clear_composition_state 会清空队列，边遍历边取会丢队尾意图。
+    fn flush_deferred_as_raw(&mut self, pop_tail_space: bool) -> Action {
+        if pop_tail_space {
+            self.deferred_intents.pop_back();
+        }
+        let intents: Vec<DeferredIntent> = self.deferred_intents.drain(..).collect();
+        let mut text = format!("{}{}", self.committed_text(), self.active_pinyin());
+        self.reset_pinyin();
+        text.push_str(&self.fold_deferred(intents));
+        Action::CommitImmediate(text)
     }
 
     /// 提示词态的字符输入：支持拼音组合（字母→候选→选中上屏到提示词）。
@@ -571,6 +734,15 @@ impl CompositionMachine {
             self.state = MachineState::Streaming;
             self.result.clear();
             self.rewrite_source = Some(content.clone());
+            // 重试基础与结果浮层由 core 自行置位（见字段注）。
+            self.last_request = Some(LastLlmRequest {
+                prompt: content.clone(),
+                system: None,
+                rewrite_source: Some(content.clone()),
+            });
+            self.ai_preview = Some(AiPreview {
+                phase: ResultPhase::Streaming,
+            });
             return Action::StartRewrite { content };
         }
         if c == '/' && self.prompt.is_empty() {
@@ -653,7 +825,11 @@ impl CompositionMachine {
                     Action::Cancel
                 }
             }
-            MachineState::Streaming | MachineState::ResultReady => Action::None,
+            MachineState::Streaming => Action::None,
+            MachineState::ResultReady | MachineState::Failed => {
+                // 退格 = 改提示词（与 `e` 同义：浮层态退格的意图是回去改）。
+                self.feed_ai_preview(AiKey::Edit).unwrap_or(Action::None)
+            }
         }
     }
 
@@ -683,6 +859,16 @@ impl CompositionMachine {
                     let prompt = std::mem::take(&mut self.prompt);
                     self.state = MachineState::Streaming;
                     self.result.clear();
+                    // 重试基础：按原样存一份（克隆先于 take 消耗）。
+                    self.last_request = Some(LastLlmRequest {
+                        prompt: prompt.clone(),
+                        system: None,
+                        rewrite_source: None,
+                    });
+                    // 结果浮层由 core 置位（不依赖前端回调，见字段注）。
+                    self.ai_preview = Some(AiPreview {
+                        phase: ResultPhase::Streaming,
+                    });
                     Action::StartLlm {
                         prompt,
                         system: None,
@@ -697,7 +883,12 @@ impl CompositionMachine {
                 // on_llm_done 误判为改写流（对照窗误弹、原文错配）。
                 self.rewrite_source = None;
                 self.rewrite_preview = None;
+                self.ai_preview = None;
                 Action::CommitResult { text }
+            }
+            MachineState::Failed => {
+                // 失败态无结果可提交：Enter = 重试（见 retry_last_llm 注）。
+                self.retry_last_llm()
             }
         }
     }
@@ -826,16 +1017,22 @@ impl CompositionMachine {
                 //
                 // 暂缓后的**重复**空格 = 知情回退：结果迟迟未达（守护重启、查询
                 // 被更新的请求取代、连接失效等极端场景下可能永不回达），再按一次
-                // 空格说明用户明确要上屏——按原文提交并清掉暂缓，避免无限吞键。
-                // 与「终结空结果展示原文条目后，再按空格是知情选择」同一语义通道。
-                if self.deferred_intent != Some(DeferredIntent::SelectSpace) {
-                    self.deferred_intent = Some(DeferredIntent::SelectSpace);
-                    return Action::None;
+                // 空格说明用户明确要上屏——按原文提交，避免无限吞键。判「重复」
+                // 只看**队尾**（back）而非 contains：队列里已有更早的空格时，尾
+                // 上是别的意图，本次空格是对该意图之后的新按键、须入队而非回退
+                // （真机序：␣ → ， → ␣ 的第三键是新意图）。
+                if self.deferred_intents.back() == Some(&DeferredIntent::SelectSpace) {
+                    // 回退只消费队尾这一个空格；队列其余意图此刻一并结算——用户
+                    // 已放弃等待候选，而 reset 后 settle 不再触发重放（组合已清，
+                    // on_llm_candidates 早退），留着必丢（issue #87 的队列化收尾）。
+                    return self.flush_deferred_as_raw(true);
                 }
-                self.deferred_intent = None;
-                let text = format!("{}{}", self.committed_text(), self.active_pinyin());
-                self.reset_pinyin();
-                return Action::CommitImmediate(text);
+                self.deferred_intents.push_back(DeferredIntent::SelectSpace);
+                if self.deferred_intents.len() > Self::MAX_DEFERRED {
+                    // 双故障到顶：整队按原文一次结算（见 MAX_DEFERRED 注）。
+                    return self.flush_deferred_as_raw(false);
+                }
+                return Action::None;
             }
             None => (self.active_pinyin().to_owned(), active_len),
         };
@@ -878,12 +1075,15 @@ impl CompositionMachine {
         self.commit_offset = 0;
         self.last_candidates_request = None;
         self.candidates_in_flight = false;
-        self.deferred_intent = None;
+        self.deferred_intents.clear();
         self.pinyin_page = 0;
         self.selected_index = 0;
         self.ocr_preview = None;
         self.rewrite_source = None;
         self.rewrite_preview = None;
+        // last_request 刻意不在清单（Esc 后保留，见其类型注）；ai_preview
+        // 与组合现场同生共死，归零组合即收起浮层。
+        self.ai_preview = None;
     }
 
     /// 清空拼音缓冲与候选（保留提示词）。
@@ -1042,6 +1242,8 @@ impl CompositionMachine {
     /// 期间 Esc/Enter/空格/数字路由由 feed_rewrite_preview 处理。
     pub fn begin_rewrite_preview(&mut self, rewritten: String, source: String) {
         self.rewrite_preview = Some((rewritten, source));
+        // 结果浮层与对照预览互斥：对照预览接管按键路由，浮层态撤销。
+        self.ai_preview = None;
     }
 
     pub fn rewrite_previewing(&self) -> bool {
@@ -1068,13 +1270,88 @@ impl CompositionMachine {
         action
     }
 
-    /// LLM 流式增量。
+    /// 结果浮层是否活跃（前端按键拦截以 `ai_previewing` 为门——由 core
+    /// 自行置位，与前端 begin_* 回调解耦）。
+    pub fn ai_previewing(&self) -> bool {
+        self.ai_preview.is_some()
+    }
+
+    /// 结果浮层当前阶段（非浮层态为 None）。
+    pub fn result_phase(&self) -> Option<ResultPhase> {
+        self.ai_preview.as_ref().map(|p| p.phase)
+    }
+
+    /// 结果浮层按键：Enter/空格/1 = 上屏（失败态转重试）、`r` = 重试、
+    /// `e`/退格 = 回提示词编辑、Esc = 取消。返回 `Some(action)` = 键被浮层
+    /// 消费；`None` = 不属于浮层，交回正常路由（非结果态恒 None——防吞
+    /// 字母，`ai_preview_none_outside_result_states` 钉住）。
+    pub fn feed_ai_preview(&mut self, key: AiKey) -> Option<Action> {
+        if !self.ai_previewing()
+            || !matches!(self.state, MachineState::ResultReady | MachineState::Failed)
+        {
+            return None;
+        }
+        match key {
+            // 上屏走 feed_enter 的 Streaming/ResultReady 通道；失败态由
+            // feed_enter 的 Failed 臂转重试（一份语义一处实现）。
+            AiKey::Enter | AiKey::Space | AiKey::Digit1 => Some(self.feed_enter()),
+            AiKey::Retry => Some(self.retry_last_llm()),
+            AiKey::Edit => Some(self.edit_last_prompt()),
+            AiKey::Escape => Some(self.feed_escape()),
+        }
+    }
+
+    /// 按上一条请求原样重发（结果态 `r`、失败态 Enter/`r`）。改写流重走
+    /// StartRewrite（原文恢复——重试成功仍进对照预览）；普通/命令流重发
+    /// StartLlm，前端在该分支重做多模态命令路由（`//看图` 重试即重走
+    /// vision 截屏，commands.rs 单一判定）。
+    fn retry_last_llm(&mut self) -> Action {
+        let Some(last) = self.last_request.clone() else {
+            return Action::None;
+        };
+        self.state = MachineState::Streaming;
+        self.result.clear();
+        self.rewrite_preview = None;
+        self.ai_preview = Some(AiPreview {
+            phase: ResultPhase::Streaming,
+        });
+        match last.rewrite_source {
+            Some(src) => {
+                self.rewrite_source = Some(src);
+                Action::StartRewrite {
+                    content: last.prompt,
+                }
+            }
+            None => Action::StartLlm {
+                prompt: last.prompt,
+                system: last.system,
+            },
+        }
+    }
+
+    /// 回提示词编辑：带出上一条提示词原文（改写流带出改写内容）。
+    fn edit_last_prompt(&mut self) -> Action {
+        if let Some(last) = self.last_request.take() {
+            self.prompt = last.prompt;
+        }
+        self.state = MachineState::Prompt;
+        self.result.clear();
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
+        self.ai_preview = None;
+        Action::UpdatePrompt {
+            preedit: self.preedit(),
+        }
+    }
+
+    /// LLM 流式增量。`preedit` 为短状态串、`body` 为全文（见 Action 注）。
     pub fn on_llm_chunk(&mut self, chunk: &str) -> Action {
         match self.state {
             MachineState::Streaming => {
                 self.result.push_str(chunk);
                 Action::UpdateResult {
-                    preedit: self.result.clone(),
+                    preedit: self.preedit(),
+                    body: self.result.clone(),
                 }
             }
             _ => Action::None,
@@ -1086,6 +1363,9 @@ impl CompositionMachine {
         match self.state {
             MachineState::Streaming => {
                 self.state = MachineState::ResultReady;
+                if let Some(preview) = self.ai_preview.as_mut() {
+                    preview.phase = ResultPhase::Ready;
+                }
                 // 改写流：附带原文（前端据此弹对照预览候选窗）。
                 if let Some(source) = self.rewrite_source.take() {
                     Action::RewriteReady {
@@ -1093,21 +1373,28 @@ impl CompositionMachine {
                         source,
                     }
                 } else {
-                    Action::ResultReady
+                    Action::ResultReady {
+                        text: self.result.clone(),
+                    }
                 }
             }
             _ => Action::None,
         }
     }
 
-    /// LLM 出错。
+    /// LLM 出错：入 Failed 态（**不回 Idle**——失败浮层保留，Enter/`r` 可
+    /// 重试；两端前端处理器也不得清组合，见 Action::LlmFailed 注）。
+    /// last_request 与已生成的部分结果保留（重试基础）；prompt 在发起时
+    /// 已被 take，此处无需也不得再清。
     pub fn on_llm_error(&mut self, message: &str) -> Action {
-        let was_active = matches!(self.state, MachineState::Streaming);
-        self.state = MachineState::Idle;
-        self.prompt.clear();
-        self.result.clear();
+        let was_active = matches!(self.state, MachineState::Streaming | MachineState::Failed);
+        self.state = MachineState::Failed;
+        if let Some(preview) = self.ai_preview.as_mut() {
+            preview.phase = ResultPhase::Failed;
+        }
         // 失败的改写流不得残留改写标记：否则下一条普通生成完成时
         // on_llm_done 会 take 到陈旧原文，误弹对照预览窗（原文错配）。
+        // 重试需要时由 last_request.rewrite_source 恢复。
         self.rewrite_source = None;
         self.rewrite_preview = None;
         if was_active {
@@ -1119,12 +1406,115 @@ impl CompositionMachine {
         }
     }
 
+    /// settle（查询终结）时按 FIFO 重放盲窗暂缓队列。**队首保语义、后续
+    /// 重喂键**——看似重复，实为两个不同契约，合并成一条无论往哪边合都会
+    /// 重新引入一类漏字：
+    ///
+    /// - **队首**沿用「有真实结果选首候选、零结果不盲提」的 has_real 分流。
+    ///   不能统一改 feed_char(' ')：SelectSpace 零结果时它会落
+    ///   select_candidate 的原文兜底分支直接提交原文，击穿「零结果不盲提」
+    ///   保护，退化回本修复针对的漏字。空格零结果分支不自动提交——按空格
+    ///   那一刻用户还没见过面板（快打场景），盲提原文即漏字（真机：
+    ///   「kjf是埃迪卡拉纪」的前半段）；吞掉该键、组合保留，原文条目此刻
+    ///   已在面板上，再按一次空格才是知情选择。大写/标点不同：按下的是明确
+    ///   的「收尾字符」，意图是「文本＋后缀」完整单元，settle 时刻无论有无
+    ///   真实候选都执行提交（有则选中首候选再接后缀，无则原文接后缀；全角
+    ///   映射/引号交替照常，且恰好只翻转一次）。
+    /// - **第 2 个及以后**统一重喂键（feed_char 按当前 state 分派）。不能硬
+    ///   编码「按 Idle 提交」：队首提交后回 Idle，后续须按 Idle 直出；队首
+    ///   零结果后组合仍存活在 Pinyin，后续须按 Pinyin 组合通道
+    ///   （commit_pinyin_text 取当前全长）——按任一态硬编码都会错一半。
+    fn replay_deferred_intents(&mut self) -> Vec<Action> {
+        // 先整体 drain 成局部快照再重放：重放路径会经 reset_pinyin →
+        // clear_composition_state 清空队列，边重放边取会丢队尾意图
+        // （deferred_queue_drain_snapshot_prevents_self_clear 钉住）。
+        let intents: Vec<DeferredIntent> = self.deferred_intents.drain(..).collect();
+        let mut iter = intents.into_iter();
+        let Some(first) = iter.next() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        let has_real = !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
+        match first {
+            DeferredIntent::SelectSpace => {
+                if has_real {
+                    actions.push(self.select_candidate(0));
+                } else {
+                    self.refresh_candidates();
+                    actions.push(Action::UpdatePinyin {
+                        preedit: self.pinyin_composition_preedit(),
+                        candidates: self.display_candidate_texts(),
+                        page: self.pinyin_page,
+                        selected: self.selected_index,
+                        llm_request: None,
+                    });
+                }
+            }
+            DeferredIntent::Uppercase(ch) => {
+                let text = format!("{}{ch}", self.commit_pinyin_text());
+                self.reset_pinyin();
+                actions.push(Action::CommitImmediate(text));
+            }
+            DeferredIntent::Punct(ch) => {
+                let punct = self.punct_commit_text(ch);
+                let text = format!("{}{punct}", self.commit_pinyin_text());
+                self.reset_pinyin();
+                actions.push(Action::CommitImmediate(text));
+            }
+        }
+        for intent in iter {
+            let ch = match intent {
+                DeferredIntent::SelectSpace => ' ',
+                DeferredIntent::Uppercase(ch) | DeferredIntent::Punct(ch) => ch,
+            };
+            let action = self.feed_char(ch);
+            if matches!(action, Action::None) {
+                continue;
+            }
+            // 相邻 CommitImmediate 合并：两次提交的文本在文档中连续，合成一次
+            // 提交减一半宿主往返（macOS 每次 commit 是一次 host_call XPC）。
+            if let Action::CommitImmediate(next) = &action {
+                if let Some(Action::CommitImmediate(prev)) = actions.last_mut() {
+                    prev.push_str(next);
+                    continue;
+                }
+            }
+            actions.push(action);
+        }
+        Self::collapse_superseded(actions)
+    }
+
+    /// 收尾折叠：首个 CommitImmediate 之前的 UpdatePinyin（零结果上板的
+    /// 合成项展示）只会在提交的 end_composition 清空 preedit 前同帧闪现、
+    /// 随即被覆盖——移除防闪。无提交动作（纯上板知情展示）则原样保留。
+    fn collapse_superseded(actions: Vec<Action>) -> Vec<Action> {
+        let Some(first_commit) = actions
+            .iter()
+            .position(|a| matches!(a, Action::CommitImmediate(_)))
+        else {
+            return actions;
+        };
+        actions
+            .into_iter()
+            .enumerate()
+            .filter(|(i, a)| *i >= first_commit || !matches!(a, Action::UpdatePinyin { .. }))
+            .map(|(_, a)| a)
+            .collect()
+    }
+
     /// LLM 候选融合增量：追加候选（去重），返回更新后的候选列表。
     /// `pinyin` 与当前组合不符时视为过期结果直接忽略。
-    pub fn on_llm_candidates(&mut self, pinyin: &str, candidates: &[String], done: bool) -> Action {
+    /// settle 时若队列非空，返回按序重放产生的**动作序列**（存在「上板
+    /// 展示 + 后续提交」这种异种序列，单个 Action 表达不了）。
+    pub fn on_llm_candidates(
+        &mut self,
+        pinyin: &str,
+        candidates: &[String],
+        done: bool,
+    ) -> Vec<Action> {
         // 单引擎（Rime）：在主组合（Pinyin）与提示词内拼音（Prompt 组合中）都接受 Rime 候选。
         if !self.pinyin_composing() || self.active_pinyin() != pinyin {
-            return Action::None;
+            return Vec::new();
         }
         if done {
             // 本拼音查询终结（即使空结果）：释放在途标记，避免后续选择被无限暂缓。
@@ -1157,64 +1547,30 @@ impl CompositionMachine {
             // 候选列表变化后选中回到首项（方向键选中的位置失效）。
             self.selected_index = 0;
         }
-        // 查询终结（done）时补执行在途暂缓的意图。部分块（done=false，legacy
-        // 流式通道保留的入口）只累积候选、不触发重放——提前重放会以「原文+
-        // 后缀」直出，击穿防漏暂缓；当前唯一在用通道 rime_candidates 单事件
-        // 即终结（daemon handler），此处门控是对未来接入方的语义护栏。
-        //
-        // 空格的零结果分支不自动提交——按空格那一刻用户还没见过面板（快打
-        // 场景），盲提原文即漏字（真机：「kjf是埃迪卡拉纪」的前半段）。吞掉
-        // 该键、组合保留；原文条目此刻已在面板上，再按一次空格才是知情选择。
-        //
-        // 大写/标点不同：按下的是明确的「收尾字符」，意图是「文本＋后缀」
-        // 完整单元。settle 时刻合成项已可见，无论有无真实候选都执行提交：
-        // 有则选中首候选再接后缀，无则原文接后缀（全角映射/引号交替照常，
-        // 且恰好只翻转一次）。若查询永不回达则无 settle、无重放——该路径由
-        // 「重复按键 = 最新意图覆盖」或 Esc 复位解除，不会无限挂起。
+        // 查询终结（done）时按 FIFO 重放整队暂缓意图。部分块（done=false，
+        // legacy 流式通道保留的入口）只累积候选、不触发重放——提前重放会以
+        // 「原文+后缀」直出，击穿防漏暂缓；当前唯一在用通道 rime_candidates
+        // 单事件即终结（daemon handler），此处门控是对未来接入方的语义护栏。
+        // 重放语义与队首/后续的分流理由见 `replay_deferred_intents`；队列
+        // 空则回落常规刷新。
         if done {
-            if let Some(intent) = self.deferred_intent.take() {
-                let has_real =
-                    !self.dictionary_candidates.is_empty() || !self.llm_candidates.is_empty();
-                match intent {
-                    DeferredIntent::SelectSpace => {
-                        if has_real {
-                            return self.select_candidate(0);
-                        }
-                        self.refresh_candidates();
-                        return Action::UpdatePinyin {
-                            preedit: self.pinyin_composition_preedit(),
-                            candidates: self.display_candidate_texts(),
-                            page: self.pinyin_page,
-                            selected: self.selected_index,
-                            llm_request: None,
-                        };
-                    }
-                    DeferredIntent::Uppercase(ch) => {
-                        let text = format!("{}{ch}", self.commit_pinyin_text());
-                        self.reset_pinyin();
-                        return Action::CommitImmediate(text);
-                    }
-                    DeferredIntent::Punct(ch) => {
-                        let punct = self.punct_commit_text(ch);
-                        let text = format!("{}{punct}", self.commit_pinyin_text());
-                        self.reset_pinyin();
-                        return Action::CommitImmediate(text);
-                    }
-                }
+            let actions = self.replay_deferred_intents();
+            if !actions.is_empty() {
+                return actions;
             }
         }
         // 仅当公开候选列表实际变化时发刷新（done 但列表未变的重复注入
         // 不重复推送），合成项的首次出现也走此通道到前端。
         if !changed && self.display_candidate_texts() == llm_before_texts {
-            return Action::None;
+            return Vec::new();
         }
-        Action::UpdatePinyin {
+        vec![Action::UpdatePinyin {
             preedit: self.pinyin_composition_preedit(),
             candidates: self.display_candidate_texts(),
             page: self.pinyin_page,
             selected: self.selected_index,
             llm_request: None,
-        }
+        }]
     }
 }
 
@@ -1227,6 +1583,7 @@ impl fmt::Display for MachineState {
             Self::Prompt => "prompt",
             Self::Streaming => "streaming",
             Self::ResultReady => "result-ready",
+            Self::Failed => "failed",
         })
     }
 }
@@ -1649,7 +2006,7 @@ mod tests {
         // settle 空结果：原文 + 全角后缀（此刻合成项已可见，知情提交）
         let a = m.on_llm_candidates("ni", &[], true);
         assert!(
-            matches!(a, Action::CommitImmediate(ref t) if t == "ni，"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "ni，"),
             "settle 应重放为原文+全角，实际 {a:?}"
         );
         assert_eq!(m.state(), MachineState::Idle);
@@ -1721,16 +2078,23 @@ mod tests {
         assert_eq!(
             m.on_llm_chunk("你"),
             Action::UpdateResult {
-                preedit: "你".into()
+                preedit: "✨ 生成中…".into(),
+                body: "你".into()
             }
         );
         assert_eq!(
             m.on_llm_chunk("好"),
             Action::UpdateResult {
-                preedit: "你好".into()
+                preedit: "✨ 生成中…".into(),
+                body: "你好".into()
             }
         );
-        assert_eq!(m.on_llm_done(), Action::ResultReady);
+        assert_eq!(
+            m.on_llm_done(),
+            Action::ResultReady {
+                text: "你好".into()
+            }
+        );
         assert_eq!(
             m.feed_enter(),
             Action::CommitResult {
@@ -1757,18 +2121,35 @@ mod tests {
     }
 
     #[test]
-    fn llm_error_returns_to_idle() {
+    fn llm_error_enters_failed_state() {
+        // 语义变更（AI 交互重做）：错误不再回 Idle，入 Failed——失败浮层
+        // 保留、Enter/`r` 可重试；last_request 与部分结果一并保留。
         let mut m = CompositionMachine::new();
         m.feed_char('/');
         m.feed_char('/');
+        m.feed_char('翻');
+        m.feed_char('译');
         m.feed_enter();
+        m.on_llm_chunk("部分");
         assert_eq!(
             m.on_llm_error("网络错误"),
             Action::LlmFailed {
                 message: "网络错误".into()
             }
         );
-        assert_eq!(m.state(), MachineState::Idle);
+        assert_eq!(m.state(), MachineState::Failed);
+        assert!(m.ai_previewing(), "失败浮层应由 core 自行置位");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Failed));
+        assert_eq!(m.result(), "部分", "已生成的部分结果保留（重试前可见）");
+        // 重试基础保留：失败态 Enter 重发同一条请求
+        assert_eq!(
+            m.feed_enter(),
+            Action::StartLlm {
+                prompt: "翻译".into(),
+                system: None
+            }
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
     }
 
     #[test]
@@ -1779,9 +2160,222 @@ mod tests {
         m.feed_char('翻');
         assert_eq!(m.preedit(), "//翻");
         m.feed_enter();
-        assert_eq!(m.preedit(), "");
+        // 流式/结果/失败态的 preedit 是**短状态串**（短且非空——空串会触发
+        // 应用终止组合吞掉整条流，真机 Notepad-- 教训）；全文走结果浮层。
+        assert_eq!(m.preedit(), "✨ 生成中…");
         m.on_llm_chunk("Hello");
-        assert_eq!(m.preedit(), "Hello");
+        assert_eq!(m.preedit(), "✨ 生成中…");
+        assert_eq!(m.result(), "Hello", "全文在 result，不挤 preedit");
+        m.on_llm_done();
+        assert_eq!(m.preedit(), "✨ 已就绪");
+        m.on_llm_error("boom");
+        assert_eq!(m.preedit(), "✨ 生成失败");
+    }
+
+    /// AI 交互重做（issue #89）：结果浮层由 core 在进入流时**自行置位**——
+    /// 不依赖前端 begin_* 回调（改写预览曾因两跳缺一使拦截成死代码而单测
+    /// 全绿）。发起即浮层活跃，流完成 → Ready。
+    #[test]
+    fn ai_preview_registered_by_core_not_frontend() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('翻');
+        m.feed_enter();
+        assert!(m.ai_previewing(), "发起 LLM 即注册浮层，无需前端回调");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+        m.on_llm_done();
+        assert_eq!(m.result_phase(), Some(ResultPhase::Ready));
+    }
+
+    /// ResultReady 态 Enter/空格/1 都上屏全文（此前空格/1 返回 None 被
+    /// 前端吞掉无反馈——「死感」来源）；浮层随提交撤销。
+    #[test]
+    fn result_ready_enter_space_digit_commit() {
+        #[derive(Clone, Copy, Debug)]
+        enum Fire {
+            Enter,
+            Space,
+            Digit1,
+        }
+        for fire in [Fire::Enter, Fire::Space, Fire::Digit1] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_enter();
+            m.on_llm_chunk("你好");
+            m.on_llm_done();
+            let a = match fire {
+                Fire::Enter => m.feed_enter(),
+                Fire::Space => m.feed_char(' '),
+                Fire::Digit1 => m.feed_char('1'),
+            };
+            assert!(
+                matches!(a, Action::CommitResult { ref text } if text == "你好"),
+                "{fire:?} 应上屏全文，实际 {a:?}"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+            assert!(!m.ai_previewing());
+        }
+    }
+
+    /// Streaming 态空格/1 = 停流提交已生成部分（与 Enter 同通道）。
+    #[test]
+    fn streaming_space_or_digit_commits_partial() {
+        for key in [' ', '1'] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_enter();
+            m.on_llm_chunk("部分结果");
+            assert!(
+                matches!(m.feed_char(key), Action::CommitResult { ref text } if text == "部分结果"),
+                "流中 {key:?} 应提交已生成部分"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+        }
+    }
+
+    /// 结果态 `r` 重试：回 Streaming、重发同一条 StartLlm（原文带命令前缀，
+    /// 前端/重试共用 commands.rs 路由）；旧结果清空、浮层回 Streaming 相位。
+    #[test]
+    fn result_ready_r_retries_same_request() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('看');
+        m.feed_char('图');
+        m.feed_enter();
+        m.on_llm_chunk("旧");
+        m.on_llm_done();
+        assert_eq!(
+            m.feed_char('r'),
+            Action::StartLlm {
+                prompt: "看图".into(),
+                system: None
+            },
+            "重试应原样重发请求（含命令文本）"
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
+        assert_eq!(m.result(), "", "旧结果清空");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+    }
+
+    /// 失败态 `r` 同样重试；改写流的重试重走 StartRewrite 并恢复原文
+    /// （重试成功仍进对照预览，不退化成普通生成）。
+    #[test]
+    fn failed_retry_and_rewrite_retry_paths() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "请假条".chars() {
+            m.feed_char(c);
+        }
+        m.feed_char('\t');
+        assert!(matches!(
+            m.feed_char('x'), /* Streaming：不消费 */
+            Action::None
+        ));
+        m.on_llm_error("超时");
+        assert_eq!(m.state(), MachineState::Failed);
+        assert_eq!(
+            m.feed_char('r'),
+            Action::StartRewrite {
+                content: "请假条".into()
+            },
+            "改写流重试应重走 StartRewrite"
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
+        // 原文已恢复：完成后仍产对照预览
+        assert!(matches!(
+            m.on_llm_done(),
+            Action::RewriteReady { rewritten: _, source } if source == "请假条"
+        ));
+    }
+
+    /// `e` 回提示词编辑：带出上一条提示词原文，浮层撤销。
+    #[test]
+    fn result_ready_e_edits_last_prompt() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "翻译一下".chars() {
+            m.feed_char(c);
+        }
+        m.feed_enter();
+        m.on_llm_chunk("x");
+        m.on_llm_done();
+        assert_eq!(
+            m.feed_char('e'),
+            Action::UpdatePrompt {
+                preedit: "//翻译一下".into()
+            }
+        );
+        assert_eq!(m.state(), MachineState::Prompt);
+        assert_eq!(m.prompt(), "翻译一下");
+        assert!(!m.ai_previewing());
+    }
+
+    /// 浮层态退格 = `e`（改提示词同义）。
+    #[test]
+    fn result_ready_backspace_edits_prompt() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_enter();
+        m.on_llm_done();
+        assert!(matches!(m.feed_backspace(), Action::UpdatePrompt { .. }));
+        assert_eq!(m.state(), MachineState::Prompt);
+    }
+
+    /// 非结果态 feed_ai_preview 恒 None（防吞字母）；浮层态内不属于浮层的
+    /// 字符经 feed_char 也不消费。
+    #[test]
+    fn ai_preview_none_outside_result_states() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(m.feed_ai_preview(AiKey::Enter), None, "Idle 不消费");
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_enter();
+        assert_eq!(
+            m.feed_ai_preview(AiKey::Retry),
+            None,
+            "Streaming 态重试键不消费（防误触）"
+        );
+        assert!(matches!(m.feed_char('x'), Action::None), "流中字母不消费");
+        m.on_llm_done();
+        // ResultReady 态：非浮层字符（如 'z'）仍不吞——只有 r/e/空格/1 消费
+        assert!(matches!(m.feed_char('z'), Action::None));
+        // Esc 关闭浮层后回 Idle，再按 r 是普通字母（起拼音组合）
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert!(
+            matches!(m.feed_char('r'), Action::UpdatePinyin { .. }),
+            "Idle 下 r 是普通拼音字母"
+        );
+    }
+
+    /// last_request 清理边界：Esc 不清（Esc 后想重试是合理诉求）。极易被
+    /// 后续重构加进 clear_composition_state——钉住。
+    #[test]
+    fn last_request_survives_escape() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "写诗".chars() {
+            m.feed_char(c);
+        }
+        m.feed_enter();
+        m.on_llm_error("网络错误");
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(m.last_request.is_some(), "Esc 只关浮层，重试基础保留");
+        // 编辑路径可用它带出原文（Esc 后无 UI 入口，仅保字段语义）
+        m.state = MachineState::Failed;
+        m.ai_preview = Some(AiPreview {
+            phase: ResultPhase::Failed,
+        });
+        assert!(matches!(m.feed_char('e'), Action::UpdatePrompt { .. }));
+        assert_eq!(m.prompt(), "写诗");
     }
 
     #[test]
@@ -1919,31 +2513,28 @@ mod tests {
         let _ = m.feed_char('n');
         // 首次 Rime 候选：全部追加
         let a = m.on_llm_candidates("n", &["你".into(), "你是".into()], false);
-        match a {
-            Action::UpdatePinyin {
+        match a.as_slice() {
+            [Action::UpdatePinyin {
                 candidates, page, ..
-            } => {
-                assert_eq!(page, 0);
-                assert_eq!(candidates, vec!["你".to_string(), "你是".to_string()]);
+            }] => {
+                assert_eq!(*page, 0);
+                assert_eq!(candidates, &vec!["你".to_string(), "你是".to_string()]);
             }
             other => panic!("融合应返回更新，实际 {other:?}"),
         }
         // 已存在的候选不重复，新候选追加到尾部
         let a = m.on_llm_candidates("n", &["你是".into(), "你好".into()], false);
-        match a {
-            Action::UpdatePinyin { candidates, .. } => {
+        match a.as_slice() {
+            [Action::UpdatePinyin { candidates, .. }] => {
                 assert_eq!(
                     candidates,
-                    vec!["你".to_string(), "你是".to_string(), "你好".to_string()]
+                    &vec!["你".to_string(), "你是".to_string(), "你好".to_string()]
                 );
             }
             other => panic!("融合应返回更新，实际 {other:?}"),
         }
         // 无新增 → 无动作
-        assert_eq!(
-            m.on_llm_candidates("n", &["你是".into()], true),
-            Action::None
-        );
+        assert!(m.on_llm_candidates("n", &["你是".into()], true).is_empty());
     }
 
     #[test]
@@ -1956,9 +2547,12 @@ mod tests {
         };
         // 单引擎无内置词库候选；在途也不合成（防抖动），结果到达后填充
         assert!(dict.is_empty(), "实际 {dict:?}");
-        match m.on_llm_candidates("n", &["你".into(), "你是".into()], true) {
-            Action::UpdatePinyin { candidates, .. } => {
-                assert_eq!(candidates, vec!["你".to_string(), "你是".to_string()]);
+        match m
+            .on_llm_candidates("n", &["你".into(), "你是".into()], true)
+            .as_slice()
+        {
+            [Action::UpdatePinyin { candidates, .. }] => {
+                assert_eq!(candidates, &vec!["你".to_string(), "你是".to_string()]);
             }
             other => panic!("Rime 融合应填充候选，实际 {other:?}"),
         }
@@ -1973,16 +2567,12 @@ mod tests {
         m.feed_char('n');
         // 拼音已变成 "ni" 后才到达的 "n" 结果 → 忽略
         m.feed_char('i');
-        assert_eq!(
-            m.on_llm_candidates("n", &["你是".into()], false),
-            Action::None
-        );
+        assert!(m.on_llm_candidates("n", &["你是".into()], false).is_empty());
         // 非拼音态忽略
         m.feed_escape();
-        assert_eq!(
-            m.on_llm_candidates("ni", &["你是".into()], false),
-            Action::None
-        );
+        assert!(m
+            .on_llm_candidates("ni", &["你是".into()], false)
+            .is_empty());
     }
 
     #[test]
@@ -2023,9 +2613,9 @@ mod tests {
         }
         // Rime 候选融合后去重、可数字选择上屏
         let _ = m.on_llm_candidates("n", &["你好".into(), "你是".into()], false);
-        match m.on_llm_candidates("n", &["你".into()], true) {
-            Action::UpdatePinyin { candidates, .. } => {
-                assert_eq!(candidates, ["你好", "你是", "你"]);
+        match m.on_llm_candidates("n", &["你".into()], true).as_slice() {
+            [Action::UpdatePinyin { candidates, .. }] => {
+                assert_eq!(candidates, &["你好", "你是", "你"]);
             }
             other => panic!("应融合 Rime 候选，实际 {other:?}"),
         }
@@ -2157,7 +2747,7 @@ mod tests {
         assert_eq!(m.state(), MachineState::Pinyin, "暂缓期间保持组合态");
         assert_eq!(
             m.on_llm_candidates("ni", &["你".into(), "拟".into()], true),
-            Action::CommitImmediate("你".into()),
+            vec![Action::CommitImmediate("你".into())],
             "候选到达后应补执行首候选提交"
         );
         assert_eq!(m.state(), MachineState::Idle);
@@ -2173,11 +2763,12 @@ mod tests {
         m.feed_char('q');
         assert_eq!(m.feed_char(' '), Action::None);
         let a = m.on_llm_candidates("qq", &[], true);
-        assert!(
-            matches!(&a, Action::UpdatePinyin { candidates, .. }
-                if candidates == &vec!["qq".to_string()]),
-            "应上板原文条目，实际 {a:?}"
-        );
+        match a.as_slice() {
+            [Action::UpdatePinyin { candidates, .. }] => {
+                assert_eq!(candidates, &vec!["qq".to_string()], "应上板原文条目");
+            }
+            other => panic!("应上板原文条目，实际 {other:?}"),
+        }
         assert_eq!(m.state(), MachineState::Pinyin);
         // 用户此刻看得见了：再按空格 = 知情选择原文
         assert_eq!(m.feed_char(' '), Action::CommitImmediate("qq".into()));
@@ -2189,8 +2780,8 @@ mod tests {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         assert!(matches!(
-            m.on_llm_candidates("n", &["你".into()], true),
-            Action::UpdatePinyin { .. }
+            m.on_llm_candidates("n", &["你".into()], true).as_slice(),
+            [Action::UpdatePinyin { .. }]
         ));
         assert_eq!(m.feed_char(' '), Action::CommitImmediate("你".into()));
     }
@@ -2202,9 +2793,8 @@ mod tests {
         m.feed_char('n');
         assert_eq!(m.feed_char(' '), Action::None);
         assert!(matches!(m.feed_escape(), Action::Cancel));
-        assert_eq!(
-            m.on_llm_candidates("n", &["你".into()], true),
-            Action::None,
+        assert!(
+            m.on_llm_candidates("n", &["你".into()], true).is_empty(),
             "组合已取消，迟到候选与暂缓空格都不应产生动作"
         );
     }
@@ -2238,7 +2828,7 @@ mod tests {
         );
         let a = m.on_llm_candidates("ni", &["你".into()], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "你A"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你A"),
             "settle 应重放为候选+大写，实际 {a:?}"
         );
         assert_eq!(m.state(), MachineState::Idle);
@@ -2254,7 +2844,7 @@ mod tests {
         assert!(matches!(m.feed_char('A'), Action::UpdatePinyin { .. }));
         let a = m.on_llm_candidates("ni", &[], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "niA"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "niA"),
             "settle 空结果应原文+大写，实际 {a:?}"
         );
     }
@@ -2268,15 +2858,18 @@ mod tests {
         assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
         let a = m.on_llm_candidates("ni", &["你".into()], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你，"),
             "settle 应重放为候选+全角，实际 {a:?}"
         );
     }
 
-    /// 最新意图覆盖旧暂缓：在途按了空格又按标点，settle 只重放标点
-    /// （被替换的键已被吞，属盲按保护的可接受损失），且只产生一次提交。
+    /// 盲窗暂缓队列化（issue #87）：在途按了空格又按标点，**两键都保序
+    /// 重放**——空格选首候选、标点接全角。旧版为单槽「最新覆盖旧」，空格
+    /// 被标点顶掉即吞键（快打连按收尾键必丢前一个，真机漏字）；本测试的
+    /// 旧版本 `latest_intent_replaces_pending` 把吞键固化为「可接受损失」，
+    /// 队列化后废除——这是语义变更，非回归。
     #[test]
-    fn latest_intent_replaces_pending() {
+    fn deferred_intents_queue_in_order() {
         let mut m = CompositionMachine::new();
         m.feed_char('n');
         m.feed_char('i');
@@ -2284,8 +2877,8 @@ mod tests {
         assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
         let a = m.on_llm_candidates("ni", &["你".into()], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "你，"),
-            "应只重放最新的标点意图，实际 {a:?}"
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你，"),
+            "空格与标点都应重放（首候选 + 全角标点），实际 {a:?}"
         );
         assert_eq!(m.state(), MachineState::Idle);
     }
@@ -2299,7 +2892,7 @@ mod tests {
         assert!(matches!(m.feed_char('"'), Action::UpdatePinyin { .. }));
         let a = m.on_llm_candidates("ni", &["你".into()], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "你“"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你“"),
             "重放应为候选+开引号，实际 {a:?}"
         );
         // 组合已复回 Idle：下一个双引号是闭引号（交替延续）
@@ -2322,9 +2915,235 @@ mod tests {
         // 结果针对增长后的 "nik" 到达：整段提交
         let a = m.on_llm_candidates("nik", &["你好".into()], true);
         assert!(
-            matches!(&a, Action::CommitImmediate(t) if t == "你好"),
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你好"),
             "增长后的 settle 应选全长首候选，实际 {a:?}"
         );
+    }
+
+    /// 三意图保序重放（A → ， → ␣）：队首走「候选+大写」通道、后续重喂键
+    /// 按落地时状态分派，相邻提交合并为一次（"你A， "）。同时钉住重放
+    /// 快照语义：若重放边遍历队列边取，队首提交的 reset_pinyin 会经
+    /// clear_composition_state 清空队列，只会产出 "你A"（陷阱由此钉住）。
+    #[test]
+    fn three_intents_replay_in_order_single_commit() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char('A'), Action::UpdatePinyin { .. }));
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert!(matches!(m.feed_char(' '), Action::None));
+        assert_eq!(m.deferred_intents.len(), 3, "三意图都应入队");
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你A， "),
+            "应按序重放为候选+大写+全角+空格，实际 {a:?}"
+        );
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 队首零结果 + 后续收尾字符：走 Pinyin 存活通道按「原文+全角后缀」
+    /// 结算；队首的上板展示被 collapse_superseded 移除（提交会立刻清
+    /// preedit，展示只闪一帧）。两种队形各自恰好结算一次。
+    #[test]
+    fn zero_result_head_punct_replays_via_pinyin_channel() {
+        for keys in [vec![','], vec![',', '.']] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('n');
+            m.feed_char('i');
+            m.feed_char(' ');
+            for k in keys.clone() {
+                assert!(matches!(m.feed_char(k), Action::UpdatePinyin { .. }));
+            }
+            let a = m.on_llm_candidates("ni", &[], true);
+            let expect = match keys.len() {
+                1 => "ni，",
+                _ => "ni，。",
+            };
+            assert!(
+                matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == expect),
+                "零结果应原文+全角后缀一次提交（{keys:?}），实际 {a:?}"
+            );
+            assert_eq!(m.state(), MachineState::Idle);
+        }
+    }
+
+    /// 尾部空格（标点后的空格）：重放经 Idle 直出落半角空格（"你， "）。
+    #[test]
+    fn trailing_space_after_punct_replays_halfwidth() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert_eq!(m.feed_char(' '), Action::None, "标点后的空格是新意图");
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你， "),
+            "尾部空格应按 Idle 直出落半角，实际 {a:?}"
+        );
+    }
+
+    /// 配对引号跨多次重放：队列里两个 '"' 意图各自恰好翻转一次（先开后
+    /// 闭），重放外再按引号延续交替（再开）。硬编码「按 Idle 提交」的
+    /// 重放实现会跳过 punct_commit_text 的翻转、在此露馅。
+    #[test]
+    fn paired_quotes_alternate_across_multiple_replays() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert!(matches!(m.feed_char('"'), Action::UpdatePinyin { .. }));
+        assert!(matches!(m.feed_char('"'), Action::UpdatePinyin { .. }));
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你“”"),
+            "两个引号意图应各自翻转一次（开+闭），实际 {a:?}"
+        );
+        assert_eq!(m.feed_char('"'), Action::CommitImmediate("“".into()));
+    }
+
+    /// 重放不二次入队：settle 重放后队列必须为空。重放期间 blind_window
+    /// 基本恒假（settle 已置 candidates_in_flight=false），唯一理论例外是
+    /// 队首 SelectSpace 命中**分段承诺**候选时 `pinyin_action` 会重新置
+    /// in_flight——单引擎 Rime 下候选 consumed==active_len 恒整句提交，
+    /// 该路径实际不可达；即便将来出现，意图也只会顺延到下一轮 settle
+    /// 重放，不丢键（独立复审 P4 注明）。且此后新的在途键正常重新暂缓
+    /// （队列功能未被重放破坏）。
+    #[test]
+    fn replay_does_not_reenqueue() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        m.feed_char(' ');
+        m.feed_char(',');
+        let _ = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(m.deferred_intents.is_empty(), "重放后队列应清空");
+        // 新一轮组合的在途键正常入队
+        m.feed_char('h');
+        m.feed_char('a');
+        m.feed_char('o');
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert!(!m.deferred_intents.is_empty(), "新组合在途键应重新入队");
+        let _ = m.feed_escape();
+    }
+
+    /// 队列到顶（守护崩溃且前端兜底同时失效的双重故障）：第 17 个意图触
+    /// 发整队按「原文+全部后缀」一次结算，一个键都不丢（绝不可丢最旧——
+    /// 丢键正是队列要修的漏字）。
+    #[test]
+    fn deferred_queue_overflow_flushes_raw_once() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        for _ in 0..CompositionMachine::MAX_DEFERRED {
+            assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        }
+        assert_eq!(
+            m.deferred_intents.len(),
+            CompositionMachine::MAX_DEFERRED,
+            "到顶前逐个入队"
+        );
+        let n = CompositionMachine::MAX_DEFERRED + 1;
+        let expect = format!("ni{}", "，".repeat(n));
+        assert_eq!(
+            m.feed_char(','),
+            Action::CommitImmediate(expect),
+            "到顶应整队原文一次结算（含本键，共 {n} 个后缀）"
+        );
+        assert!(m.deferred_intents.is_empty());
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 知情回退保残留队列：␣ → ， → ␣␣ 的末键回退只消费队尾空格，队列
+    /// 其余意图折进本次提交接在原文后（"ni ，"），不留滞销键。
+    #[test]
+    fn rollback_folds_residual_queue_into_raw_commit() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert_eq!(
+            m.feed_char(' '),
+            Action::CommitImmediate("ni ，".into()),
+            "回退应提交原文并接上残留队列（空格+全角逗号）"
+        );
+        assert!(m.deferred_intents.is_empty());
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// 队尾判定（back 而非 contains）：␣ → ， 后的空格是**新意图**（队尾
+    /// 是标点），应入队而非当作对旧空格的回退确认；settle 时三意图保序。
+    #[test]
+    fn space_after_punct_defers_not_rolls_back() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert_eq!(
+            m.feed_char(' '),
+            Action::None,
+            "队尾是标点，本次空格是新意图应入队，而非回退"
+        );
+        assert_eq!(m.deferred_intents.len(), 3);
+        let a = m.on_llm_candidates("ni", &["你".into()], true);
+        assert!(
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你， "),
+            "三意图按序重放，实际 {a:?}"
+        );
+    }
+
+    /// Esc 清整队：␣ → ， 后 Esc 取消组合，迟到的 settle 结果对已清空
+    /// 的组合不产生任何动作（队列随组合一起清）。
+    #[test]
+    fn escape_clears_whole_queue() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert!(matches!(m.feed_escape(), Action::Cancel));
+        assert!(m.deferred_intents.is_empty(), "Esc 应清空整队");
+        assert!(
+            m.on_llm_candidates("ni", &["你".into()], true).is_empty(),
+            "组合已取消，迟到的候选与队列都不应产生动作"
+        );
+    }
+
+    /// 数字键不污染队列：在途数字按既有语义忽略（idx 越界保护），不入队；
+    /// settle 只重放真队列里的意图。
+    #[test]
+    fn digit_in_blind_window_does_not_enqueue() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char('5'), Action::None);
+        assert!(m.deferred_intents.is_empty(), "数字不入队");
+        assert!(matches!(m.feed_char(','), Action::UpdatePinyin { .. }));
+        assert_eq!(m.deferred_intents.len(), 1);
+        let a = m.on_llm_candidates("ni", &["你".into(), "拟".into()], true);
+        assert!(
+            matches!(a.as_slice(), [Action::CommitImmediate(t)] if t == "你，"),
+            "只应重放标点意图，实际 {a:?}"
+        );
+    }
+
+    /// '/' 直出折进队列意图：盲窗中 ␣ → / 时，'/' 按裁决原文直出并进
+    /// PendingSlash，已暂缓的空格折成后缀接上（"ni "），不再随组合清掉
+    /// 而丢键。
+    #[test]
+    fn slash_folds_deferred_queue_into_raw_commit() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('n');
+        m.feed_char('i');
+        assert_eq!(m.feed_char(' '), Action::None);
+        assert_eq!(
+            m.feed_char('/'),
+            Action::CommitImmediate("ni ".into()),
+            "'/' 直出应带上已暂缓的空格后缀"
+        );
+        assert_eq!(m.state(), MachineState::PendingSlash);
+        assert!(m.deferred_intents.is_empty());
     }
 
     /// 数字选字在途忽略行为钉住：查询未达时数字键无效且不吞组合；结果到达

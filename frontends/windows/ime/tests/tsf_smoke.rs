@@ -260,10 +260,12 @@ fn tsf_streaming_preedit() {
             ));
         }
         data.on_timer();
+        // #89 新契约：组合只持**短状态串**（结果全文在结果浮层渲染，
+        // 不再挤窄 preedit）；全文的可见性由 Enter 提交断言钉住。
         assert_eq!(
             read_context_text(&ctx, tid),
-            "你好",
-            "流式 preedit 应实时进入组合"
+            "✨ 已就绪",
+            "流式完成后组合持短状态串（全文在结果浮层）"
         );
 
         // Enter 提交
@@ -355,11 +357,113 @@ fn tsf_stream_epoch_filter_drops_stale_events() {
             ));
         }
         data.on_timer();
+        // #89 后组合持短状态串（过滤效果不再体现在组合文本）——改从
+        // 状态机累积结果直接断言：旧代际 "旧" 不得混入当前流。
         assert_eq!(
-            read_context_text(&ctx, tid),
+            data.machine.borrow().result(),
             "新",
             "旧代际事件应被过滤（若混入则结果为 旧新）"
         );
+
+        svc.Deactivate().expect("Deactivate");
+        let _ = tm.Deactivate();
+        CoUninitialize();
+    }
+}
+
+/// 回归（PR #91 复审 P1）：ResultReady 结果浮层上按 `e` 回提示词编辑，
+/// 浮层窗口必须收起——旧码只 set_preedit，浮层带着旧结果全文与
+/// 「r 重试 e 改提示词」状态行继续悬浮，而按键语义已全部改变。
+#[test]
+fn tsf_result_overlay_e_edit_hides_window() {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        assert_eq!(hr.0, 0);
+        let tm: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).expect("ThreadMgr");
+        let tid = tm.Activate().expect("Activate");
+        let doc = tm.CreateDocumentMgr().expect("DocumentMgr");
+        let mut ctx_out: Option<ITfContext> = None;
+        let mut cookie = 0u32;
+        doc.CreateContext(tid, 0, None, &mut ctx_out, &mut cookie)
+            .expect("CreateContext");
+        let ctx = ctx_out.expect("context");
+        doc.Push(&ctx).expect("Push");
+        let _ = tm.SetFocus(&doc);
+
+        let svc_struct = verba_ime_windows::text_service::TextService::new();
+        let data = svc_struct.data.clone();
+        let svc: ITfTextInputProcessor = svc_struct.into();
+        svc.Activate(&tm, tid).expect("Activate");
+        *data.context.borrow_mut() = Some(ctx.clone());
+
+        // 进 Streaming → 注入 chunk + Final → ResultReady + 结果浮层显示
+        {
+            let mut m = data.machine.borrow_mut();
+            for c in "//翻译".chars() {
+                m.feed_char(c);
+            }
+            assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        }
+        {
+            let mut q = data.chunks.lock().unwrap();
+            q.push_back((
+                0,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Chunk(
+                        verba_protos::Chunk {
+                            text: "你好".into(),
+                        },
+                    )),
+                },
+            ));
+            q.push_back((
+                0,
+                verba_protos::StreamEvent {
+                    id: 1,
+                    kind: Some(verba_protos::stream_event::Kind::Final(
+                        verba_protos::Final {
+                            text: "你好".into(),
+                        },
+                    )),
+                },
+            ));
+        }
+        data.on_timer();
+        assert!(
+            data.machine.borrow().ai_previewing(),
+            "Final 后应处结果浮层态"
+        );
+        let visible = data
+            .candidate_window
+            .borrow()
+            .as_ref()
+            .map(|cw| cw.is_visible())
+            .unwrap_or(false);
+        assert!(visible, "ResultReady 浮层窗口应显示");
+
+        // `e`：回提示词编辑（原文带出），浮层窗口收起
+        let eaten = verba_ime_windows::text_service::handle_key_down(&data, 0x45, 0x12 << 16)
+            .expect("handle_key_down(E)");
+        assert_eq!(eaten, true, "结果浮层上 e 应被吞（AiKey::Edit）");
+        assert_eq!(
+            data.machine.borrow().state(),
+            verba_core::machine::MachineState::Prompt,
+            "e 后回提示词编辑态"
+        );
+        assert!(
+            data.machine.borrow().preedit().starts_with("//"),
+            "提示词原文带出，实际 {:?}",
+            data.machine.borrow().preedit()
+        );
+        let visible_after = data
+            .candidate_window
+            .borrow()
+            .as_ref()
+            .map(|cw| cw.is_visible())
+            .unwrap_or(false);
+        assert!(!visible_after, "离开结果浮层后窗口应收起（复审 P1）");
 
         svc.Deactivate().expect("Deactivate");
         let _ = tm.Deactivate();
