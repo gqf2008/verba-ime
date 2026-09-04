@@ -31,8 +31,8 @@ use objc2_input_method_kit::{
 };
 
 use verba_core::machine::{
-    result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, ResultPhase,
-    REWRITE_SYSTEM_PROMPT,
+    result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, PreviewKey,
+    ResultPhase, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
@@ -773,7 +773,12 @@ define_class!(
                         if had_marked {
                             owed |= CAPS_OWE_CLEAR_MARKED;
                         }
-                        self.ivars().caps_host_cleanup.set(owed);
+                        // 累积不覆盖：重入窗内二次进 caps 清理（翻两次
+                        // CapsLock）时，前一笔未补做的欠账不得被抹掉
+                        // （独立复审 P3）。
+                        self.ivars()
+                            .caps_host_cleanup
+                            .set(self.ivars().caps_host_cleanup.get() | owed);
                     }
                 }
                 return Bool::new(false);
@@ -782,80 +787,55 @@ define_class!(
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
             self.drain_stream(sel!(drainVerbaStream));
-            // OCR/改写对照预览拦截：数字 1/Enter 选首条（识别文本/改写结果）、
-            // 数字 2 选改写原文、Esc 取消；其他键不动预览交宿主。
-            // '2' 仅在改写对照预览算选中（审查 F10，对齐 Windows Digit2 语义）：
-            // OCR 预览无次条，'2' 落「其他键」清预览并重走路由，此前会把
-            // 识别文本当次条上屏（idx=1 越界回退取 ocr 文本提交）。
-            if self.ivars().ocr_preview.borrow().is_some()
-                || self.ivars().rewrite_preview.borrow().is_some()
-            {
+            // 改写对照预览拦截（**core 槽位为门**，与 Windows 同构单源：
+            // RewriteReady 臂已调 begin_rewrite_preview，ai_preview 同时撤销
+            // ——旁路直喂（重入窗重放/候选点击）的 r/e 只会从 feed_char 得
+            // 到 None，不会误触重试/改提示词后让前端预览槽与 core 失同步，
+            // 独立复审 P2）：1/Enter/空格=改写上屏、2=原文上屏、Esc 取消；
+            // 其余键不属于预览，落回正常路由（此刻仍 ResultReady：可打印
+            // 键被认领后 feed_char 返 None 照常吞掉，不会字母泄漏进宿主）。
+            if self.ivars().machine.borrow().rewrite_previewing() {
+                if let Some(pk) = preview_key_of(classify_key(string, key_code)) {
+                    dbg_log(&format!("改写预览键: {pk:?}"));
+                    self.handle_rewrite_preview_key(pk);
+                    return Bool::new(true);
+                }
+            }
+            // OCR 预览拦截：数字 1/Enter 选首条（识别文本）、Esc 取消；'2'
+            // 与其他键在 OCR 预览无语义（仅一条，F10 对齐 Windows Digit2）
+            // ——清预览收面板后**继续正常路由**（对齐 Windows feed_ocr_preview
+            // 的 Other 语义：退出预览、该键重走拼音路径——透传会字母泄漏，
+            // 真机踩坑）。
+            if self.ivars().ocr_preview.borrow().is_some() {
                 dbg_log(&format!(
-                    "预览拦截命中: ocr={} rewrite={} key={:?}",
-                    self.ivars().ocr_preview.borrow().is_some(),
-                    self.ivars().rewrite_preview.borrow().is_some(),
+                    "OCR 预览拦截: key={:?}",
                     string.map(|x| x.to_string())
                 ));
-                let key = classify_key(string, key_code);
-                let pick: Option<usize> = match key {
-                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => Some(0),
-                    Some(ImkKey::Char('2'))
-                        if self.ivars().rewrite_preview.borrow().is_some() =>
-                    {
-                        Some(1)
+                match classify_key(string, key_code) {
+                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => {
+                        let text = self.ivars().ocr_preview.borrow().clone();
+                        let _ = self.clear_previews();
+                        self.hide_candidate_window();
+                        if let Some(t) = text {
+                            self.commit(&t);
+                        }
+                        return Bool::new(true);
                     }
-                    _ => None,
-                };
-                let esc = matches!(key, Some(ImkKey::Escape));
-                if esc {
-                    self.clear_previews();
-                    // 机器同步回 Idle（Windows 经 feed_rewrite_preview 的
-                    // Cancel 同款）：改写预览取消后机器仍停在 ResultReady——
-                    // 后续字母会被结果浮层键语义吞掉、`r` 误触发重试。
-                    // ResultReady 下 feed_escape 产 Cancel（含组合清理），
-                    // 走统一派发点；OCR 预览态机器本就在 Idle → None 无副作用。
-                    let action = self.ivars().machine.borrow_mut().feed_escape();
-                    let _ = self.apply_action(action);
-                    // 空候选下 refresh 直接 return 不隐藏面板——显式 hide
-                    // （姊妹路径同款修复，审查 F11）。
-                    self.hide_candidate_window();
-                    return Bool::new(true);
-                }
-                if let Some(idx) = pick {
-                    let text = if let Some((rw, src)) =
-                        self.ivars().rewrite_preview.borrow().as_ref()
-                    {
-                        [rw.clone(), src.clone()].get(idx).cloned()
-                    } else {
-                        self.ivars().ocr_preview.borrow().clone()
-                    };
-                    self.clear_previews();
-                    // 同上：选取路径也要把机器从 ResultReady 拉回 Idle，
-                    // 否则改写上屏后的第一串字母被吞（预存失同步，#89 顺修）。
-                    // Cancel 的组合清理后紧跟 commit 上屏（commit 自带空
-                    // setMarkedText + insertText，语义恰为「先清后插」）。
-                    let action = self.ivars().machine.borrow_mut().feed_escape();
-                    let _ = self.apply_action(action);
-                    // 同 F11：清空候选后 refresh 是空操作，面板会挂着旧预览
-                    // 条目直到下一次刷新——选中即显式收起（对齐 Windows）。
-                    self.hide_candidate_window();
-                    if let Some(t) = text {
-                        self.commit(&t);
+                    Some(ImkKey::Escape) => {
+                        let _ = self.clear_previews();
+                        // OCR 预览态机器本在 Idle → feed_escape 为 None；
+                        // 经统一派发点兜底（若有组合残留一并清理）。
+                        let action = self.ivars().machine.borrow_mut().feed_escape();
+                        let _ = self.apply_action(action);
+                        self.hide_candidate_window();
+                        return Bool::new(true);
                     }
-                    return Bool::new(true);
-                }
-                // 预览期间其他键：OCR 预览 → 清预览并**继续正常路由**（对齐
-                // Windows feed_ocr_preview 的 Other 语义：退出预览、该键重走
-                // 拼音路径——透传会字母泄漏，真机踩坑）；改写预览保持原样
-                // （Windows 同款：Other 不清、键透传、预览保持）。
-                if self.ivars().ocr_preview.borrow().is_some() {
-                    let _ = self.clear_previews();
-                    // 空候选时 refresh 直接 return 不隐藏面板——显式 hide，
-                    // 防截断预览面板粘滞（对齐 Windows 同路径的显式 hide）。
-                    self.hide_candidate_window();
-                    // 不 return：落到下方正常路由处理本键
-                } else {
-                    return Bool::new(false);
+                    // '2'/字母/退格等：退出预览、收面板，不 return——落回
+                    // 下方正常路由处理本键。
+                    _ => {
+                        let _ = self.clear_previews();
+                        self.hide_candidate_window();
+                    }
                 }
             }
             let panel_visible = self
@@ -1068,6 +1048,22 @@ define_class!(
                     .borrow_mut()
                     .push_back(PendingKey::Char(digit));
                 return;
+            }
+            // 改写对照预览期间点击条目：数字即预览选取键（1=改写 2=原文）
+            // ——core 已武装 rewrite_preview，直喂 feed_char 会因 ai_preview
+            // 已撤销而得 None 成死点（独立复审 P2）。
+            if self.ivars().machine.borrow().rewrite_previewing() {
+                match digit {
+                    '1' => {
+                        self.handle_rewrite_preview_key(PreviewKey::Digit1);
+                        return;
+                    }
+                    '2' => {
+                        self.handle_rewrite_preview_key(PreviewKey::Digit2);
+                        return;
+                    }
+                    _ => {}
+                }
             }
             let action = self.ivars().machine.borrow_mut().feed_char(digit);
             dbg_log(&format!("  -> digit={} action={:?}", digit, action));
@@ -1325,6 +1321,34 @@ fn classify_key(string: Option<&NSString>, key_code: NSInteger) -> Option<ImkKey
     }
 }
 
+/// 改写对照预览键分类（与 Windows `classify_preview_key` 同一份语义清单，
+/// 防两条路由各自漂移）：仅 1/2/空格/Enter/Esc 属于预览键；其余（字母、
+/// 退格、方向键）返回 None 落回正常路由——ResultReady 态可打印键被认领后
+/// feed_char 返 None 照常吞掉，不泄漏进宿主文档。
+fn preview_key_of(key: Option<ImkKey>) -> Option<PreviewKey> {
+    match key? {
+        ImkKey::Enter => Some(PreviewKey::Enter),
+        ImkKey::Escape => Some(PreviewKey::Escape),
+        ImkKey::Char(' ') => Some(PreviewKey::Space),
+        ImkKey::Char('1') => Some(PreviewKey::Digit1),
+        ImkKey::Char('2') => Some(PreviewKey::Digit2),
+        _ => None,
+    }
+}
+
+/// 待重放键 → 改写预览键（预览期间入队的 1/2/空格/Enter/Esc；replay_pending
+/// 用，与 preview_key_of 同一份语义清单）。
+fn pending_preview_key(pk: &PendingKey) -> Option<PreviewKey> {
+    match pk {
+        PendingKey::Char(' ') => Some(PreviewKey::Space),
+        PendingKey::Char('1') => Some(PreviewKey::Digit1),
+        PendingKey::Char('2') => Some(PreviewKey::Digit2),
+        PendingKey::Enter => Some(PreviewKey::Enter),
+        PendingKey::Escape => Some(PreviewKey::Escape),
+        _ => None,
+    }
+}
+
 impl VerbaIMKController {
     /// 当前页候选（candidates / candidates: 共用）。
     fn current_candidates(&self) -> Option<Retained<NSArray<NSString>>> {
@@ -1524,6 +1548,14 @@ impl VerbaIMKController {
                 // （预览期间不显示流式文本，候选窗即预览）。
                 // 停表：流已终结（本臂此前只被 feed_stream_event 内联处理、
                 // 从未真正走到；统一派发后成为活路径，保留原路径停表行为）。
+                // core 同步进对照预览态（与 Windows 同构）：ai_preview 撤销
+                // （互斥），旁路直喂的 r/e 从 feed_char 得 None，不再误触
+                // 重试/改提示词（独立复审 P2——此前只写前端槽，core 停在
+                // ResultReady 且浮层态仍武装）。
+                self.ivars()
+                    .machine
+                    .borrow_mut()
+                    .begin_rewrite_preview(rewritten.clone(), source.clone());
                 *self.ivars().rewrite_preview.borrow_mut() =
                     Some((rewritten.clone(), source.clone()));
                 *self.ivars().candidates.borrow_mut() = vec![rewritten, source];
@@ -1543,6 +1575,11 @@ impl VerbaIMKController {
                 true
             }
             Action::Cancel => {
+                // 旁路 Cancel（重入窗重放 Esc、浮层取消）也要清前端预览槽：
+                // clear_composition 会收面板，但 rewrite/ocr 前端槽不清则残留
+                // （core 侧已被 feed_escape 的 clear_composition_state 清掉，
+                // 两源失同步正是复审 P2 要消灭的形态）。
+                self.clear_previews();
                 self.cancel_stream();
                 self.invalidate_timer();
                 self.clear_composition();
@@ -1619,6 +1656,16 @@ impl VerbaIMKController {
                 }
             }
             _ => {
+                // 改写对照预览期间的重放键（独立复审 P2 旁路面）：预览键经
+                // 统一 helper 路由（core 直喂 feed_char 会得 None 成死点）；
+                // 其余键照常落 core——ResultReady + ai_preview=None → None，
+                // 吞掉保护结果（与 Windows 正常路由同语义）。
+                if self.ivars().machine.borrow().rewrite_previewing() {
+                    if let Some(pk) = pending_preview_key(&pk) {
+                        self.handle_rewrite_preview_key(pk);
+                        return;
+                    }
+                }
                 let action = {
                     let mut m = self.ivars().machine.borrow_mut();
                     match pk {
@@ -1740,6 +1787,19 @@ impl VerbaIMKController {
                 || s == result_hint(ResultPhase::Ready)
                 || s == result_hint(ResultPhase::Failed)
         })
+    }
+
+    /// 改写对照预览键统一处理（input_text 拦截 / 面板点击 / 重放三条路径
+    /// 共用一份，独立复审 P2——分头实现必致按键语义漂移）：core
+    /// feed_rewrite_preview 消费（上屏/取消）后前端槽位与面板同步收起
+    /// （commit/clear_composition 不清前端预览槽）。
+    fn handle_rewrite_preview_key(&self, pk: PreviewKey) {
+        let action = self.ivars().machine.borrow_mut().feed_rewrite_preview(pk);
+        if !self.ivars().machine.borrow().rewrite_previewing() {
+            self.clear_previews();
+            self.hide_candidate_window();
+        }
+        let _ = self.apply_action(action.unwrap_or(Action::None));
     }
 
     fn clear_composition(&self) {

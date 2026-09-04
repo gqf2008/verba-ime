@@ -98,7 +98,8 @@ impl CpuCandidateRenderer {
             parse_color(&theme.muted_color).unwrap_or(Color::from_rgba8(0x88, 0x88, 0x88, 0xFF));
         let size = (theme.font_size as f32 * 0.8).max(10.0);
         let ty = y + (status_h as f32 - size * 1.3) / 2.0;
-        self.draw_text(pixmap, status, theme.padding as f32, ty, muted, size);
+        let pw = pixmap.width() as f32;
+        self.draw_text(pixmap, status, theme.padding as f32, ty, muted, size, pw);
     }
 
     /// 卡片背景 + 圆角边框（两种布局共用）。
@@ -160,6 +161,7 @@ impl CpuCandidateRenderer {
             parse_color(&theme.muted_color).unwrap_or(Color::from_rgba8(0x88, 0x88, 0x88, 0xFF));
         let size = theme.font_size as f32;
         let ty = (header_h as f32 - size * 1.3) / 2.0;
+        let pw = pixmap.width() as f32;
         self.draw_text(
             pixmap,
             ctrl.preedit(),
@@ -167,6 +169,7 @@ impl CpuCandidateRenderer {
             ty,
             muted,
             size,
+            pw,
         );
         let mut line_paint = Paint::default();
         line_paint.set_color(
@@ -200,7 +203,8 @@ impl CpuCandidateRenderer {
         let tw = self.text_width(&page_label, size);
         let x = width as f32 - theme.padding as f32 - tw;
         let ty = y + (footer_h as f32 - size * 1.3) / 2.0;
-        self.draw_text(pixmap, &page_label, x, ty, muted, size);
+        let pw = pixmap.width() as f32;
+        self.draw_text(pixmap, &page_label, x, ty, muted, size, pw);
     }
 
     /// horizontal：拼音头 + 横向候选行 + 页码脚（微软拼音/手心风格）。
@@ -229,13 +233,14 @@ impl CpuCandidateRenderer {
         let line_top = item_y as f32 + (theme.item_height as f32 - font_size * 1.3) / 2.0;
         let mut x = pad as f32;
         let limit = width as f32 - pad as f32;
+        let pw = pixmap.width() as f32;
 
         for (idx, text) in items.iter().enumerate() {
             let is_selected = ctrl.selected_index() == Some(idx);
             let tw = self.text_width(text, font_size);
             let block_w = tw + theme.item_padding as f32 * 2.0;
             if x + block_w > limit {
-                self.draw_text(&mut pixmap, "…", x + 4.0, line_top, text_fg, font_size);
+                self.draw_text(&mut pixmap, "…", x + 4.0, line_top, text_fg, font_size, pw);
                 break;
             }
             if is_selected {
@@ -266,6 +271,7 @@ impl CpuCandidateRenderer {
                 line_top,
                 c,
                 font_size,
+                pw,
             );
             x += block_w + theme.gap as f32;
         }
@@ -309,6 +315,7 @@ impl CpuCandidateRenderer {
             .unwrap_or(Color::from_rgba8(0x1A, 0x56, 0xDB, 0xFF));
         let text_fg =
             parse_color(&theme.text_color).unwrap_or(Color::from_rgba8(0x33, 0x33, 0x33, 0xFF));
+        let pw = pixmap.width() as f32;
 
         for (idx, text) in items.iter().enumerate() {
             let y = pad + header + idx as u32 * theme.item_height;
@@ -344,6 +351,7 @@ impl CpuCandidateRenderer {
                 line_top,
                 fg,
                 theme.font_size as f32,
+                pw,
             );
         }
 
@@ -381,9 +389,11 @@ impl CpuCandidateRenderer {
         let text = ctrl.result_block().unwrap_or("");
         let text_fg =
             parse_color(&theme.text_color).unwrap_or(Color::from_rgba8(0x33, 0x33, 0x33, 0xFF));
-        // draw_text 已支持多行：按 pixmap 宽度自动换行并逐行下移
+        // draw_text 已支持多行：按 wrap_width 自动换行并逐行下移
         // （layout_runs 的 line_y 差值即行高）。换行宽度与 measure_lines
-        // 传入的 result_window_width 是同一个值，测量与渲染天然一致。
+        // 传入的 result_text_wrap_width 是同一个值，测量与渲染天然一致；
+        // 内容宽度 = 窗宽 - 左右内边距（draw 起点 x=pad，满行末字不再
+        // 侵入右边距被裁，独立复审 P4）。
         self.draw_text(
             &mut pixmap,
             text,
@@ -391,6 +401,7 @@ impl CpuCandidateRenderer {
             pad as f32,
             text_fg,
             theme.font_size as f32,
+            result_text_wrap_width(theme),
         );
         if status > 0 {
             self.draw_status(&mut pixmap, ctrl, width, (height - status) as f32, status);
@@ -425,7 +436,8 @@ impl CpuCandidateRenderer {
     /// 与实际换行不符（末行被裁或底部留白）。
     ///
     /// 注意：DPI 缩放场景须传入**缩放后**的 font_size 与窗口宽度再测
-    /// （wrap_width 取 `result_window_width(scaled_theme)`）。
+    /// （wrap_width 取 `result_text_wrap_width(scaled_theme)`——与
+    /// render_result 的 draw_text 用同一公式，测量/渲染换行点一致）。
     pub fn measure_lines(&mut self, text: &str, font_size: f32, wrap_width: f32) -> usize {
         let metrics = Metrics::new(font_size, font_size * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -437,6 +449,9 @@ impl CpuCandidateRenderer {
 
     /// 在 (x, y) 画一行文字（cosmic-text 排版 + swash 字形栅格化，
     /// 经 tiny-skia source-over 合成到背景，输出全不透明）。
+    /// wrap_width 显式传入（换行宽度不再隐式取整幅 pixmap 宽——结果浮层
+    /// 用窗宽减左右内边距的内容宽，独立复审 P4-1），多数调用点传 pixmap 宽。
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &mut self,
         pixmap: &mut Pixmap,
@@ -445,6 +460,7 @@ impl CpuCandidateRenderer {
         y: f32,
         color: Color,
         size: f32,
+        wrap_width: f32,
     ) {
         let (r8, g8, b8) = (
             (color.red() * 255.0) as u8,
@@ -453,7 +469,7 @@ impl CpuCandidateRenderer {
         );
         let metrics = Metrics::new(size, size * 1.3);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, Some(pixmap.width() as f32), None);
+        buffer.set_size(&mut self.font_system, Some(wrap_width), None);
         buffer.set_text(&mut self.font_system, text, Attrs::new(), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         let runs: Vec<_> = buffer.layout_runs().collect();
@@ -556,6 +572,13 @@ pub fn result_window_width(theme: &Theme) -> u32 {
     }
 }
 
+/// AI 结果浮层的**文本换行宽度**（窗宽减左右内边距）：render_result 的
+/// draw_text 与平台层 measure_lines 共用这一份公式（独立复审 P4-1：以整幅
+/// pixmap 宽换行而 draw 起点 x=pad，满行末字会侵入右边距直至被裁）。
+pub fn result_text_wrap_width(theme: &Theme) -> f32 {
+    (result_window_width(theme).saturating_sub(theme.padding * 2)) as f32
+}
+
 /// 结果块总高度——`window_size` 与 `render_result` **共用此唯一公式**。
 /// 两处独立计算必致「建窗尺寸 ≠ 位图尺寸」的错位/裁切（本仓库已为
 /// 双公式漂移交过学费）。行高与 `draw_text` 的 `Metrics::new(size, size*1.3)`
@@ -604,7 +627,10 @@ fn premultiply_channel(v: u8, a: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::premultiply_channel;
-    use crate::renderer::{result_height, result_window_width, window_size, CpuCandidateRenderer};
+    use crate::renderer::{
+        result_height, result_text_wrap_width, result_window_width, window_size,
+        CpuCandidateRenderer,
+    };
     use crate::{CandidateWindowController, Theme};
 
     /// 组装一个已实测行数的结果浮层控制器（测量 → 回填的标准流程）。
@@ -613,7 +639,7 @@ mod tests {
     fn result_ctrl(renderer: &mut CpuCandidateRenderer, text: &str) -> CandidateWindowController {
         let mut ctrl = CandidateWindowController::new(Theme::default());
         ctrl.set_result_block(text);
-        let width = result_window_width(ctrl.theme()) as f32;
+        let width = result_text_wrap_width(ctrl.theme());
         let lines = renderer.measure_lines(
             ctrl.result_block().unwrap(),
             ctrl.theme().font_size as f32,
@@ -621,6 +647,22 @@ mod tests {
         );
         ctrl.set_result_lines(lines);
         ctrl
+    }
+
+    /// 换行宽度公式（独立复审 P4-1）：render_result 的 draw_text 与
+    /// measure_lines 调用方共用 `result_text_wrap_width`——文本区宽 =
+    /// 窗宽 - 左右内边距，满行末字不侵入右边距。锁住恒等式防两处漂移。
+    #[test]
+    fn result_text_wrap_width_leaves_both_paddings() {
+        let theme = Theme::default();
+        assert_eq!(
+            result_text_wrap_width(&theme),
+            (result_window_width(&theme) - theme.padding * 2) as f32
+        );
+        // 挤压防御：窗宽再小也不会换行到负宽（saturating）。
+        let mut tiny = theme.clone();
+        tiny.max_width = theme.padding; // 窗宽 < 2*padding
+        assert!(result_text_wrap_width(&tiny) >= 0.0);
     }
 
     #[test]

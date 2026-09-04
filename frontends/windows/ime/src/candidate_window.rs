@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use verba_candidate::renderer::{result_window_width, window_size, CpuCandidateRenderer};
+use verba_candidate::renderer::{result_text_wrap_width, window_size, CpuCandidateRenderer};
 use verba_candidate::CandidateWindowController;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -130,7 +130,7 @@ impl CandidateWindow {
             let lines = self.renderer.measure_lines(
                 ctrl.result_block().unwrap_or(""),
                 ctrl.theme().font_size as f32,
-                result_window_width(ctrl.theme()) as f32,
+                result_text_wrap_width(ctrl.theme()),
             );
             ctrl.set_result_lines(lines);
         }
@@ -243,6 +243,11 @@ impl CandidateWindow {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+    }
+
+    /// 窗口当前可见性（集成回归断言用：结果浮层的显示/收起契约）。
+    pub fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd).as_bool() }
     }
 }
 

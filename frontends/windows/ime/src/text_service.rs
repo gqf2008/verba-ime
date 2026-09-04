@@ -959,6 +959,14 @@ pub fn apply_action(
             }
         }
         Action::EnterPrompt { preedit } | Action::UpdatePrompt { preedit } => {
+            // 离开结果浮层回提示词编辑（e/退格）或 // 进入提示词模式时收起
+            // 结果浮层：不收起则旧结果全文与「r 重试 e 改提示词」状态行继续
+            // 悬浮，而组合已变提示词、按键语义已变（独立复审 P1；镜像 macOS
+            // 同场景的收起——两端同语义是 #89 的目标）。浮层态不产本动作，
+            // ai_previewing 守卫恒过，仅作显式声明。
+            if !data.machine.borrow().ai_previewing() {
+                hide_candidate_window(data);
+            }
             set_preedit(data, context, clientid, &preedit)
         }
         Action::UpdateResult { preedit, body } => {

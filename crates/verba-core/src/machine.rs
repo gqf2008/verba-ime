@@ -3000,9 +3000,13 @@ mod tests {
         assert_eq!(m.feed_char('"'), Action::CommitImmediate("“".into()));
     }
 
-    /// 重放不二次入队：settle 重放后队列必须为空（重放期间 blind_window
-    /// 恒假、无路径可入队）；且此后新的在途键正常重新暂缓（队列功能未
-    /// 被重放破坏）。
+    /// 重放不二次入队：settle 重放后队列必须为空。重放期间 blind_window
+    /// 基本恒假（settle 已置 candidates_in_flight=false），唯一理论例外是
+    /// 队首 SelectSpace 命中**分段承诺**候选时 `pinyin_action` 会重新置
+    /// in_flight——单引擎 Rime 下候选 consumed==active_len 恒整句提交，
+    /// 该路径实际不可达；即便将来出现，意图也只会顺延到下一轮 settle
+    /// 重放，不丢键（独立复审 P4 注明）。且此后新的在途键正常重新暂缓
+    /// （队列功能未被重放破坏）。
     #[test]
     fn replay_does_not_reenqueue() {
         let mut m = CompositionMachine::new();
