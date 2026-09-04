@@ -50,7 +50,8 @@ begin
   // ensure_daemon()「管道有人应答就不拉新」会一直连着旧版跑（v0.2.6 升级
   // 真机踩坑：新 DLL + 旧 daemon 混搭）。taskkill 无进程时返回非零，忽略。
   // DLL 已加载进运行中的应用进程不在此强杀（杀用户应用不可接受），由
-  // restartreplace 在重启时完成替换；新启动的应用进程自动加载新 DLL。
+  // restartreplace 在下次系统重启完成替换（重启前新进程加载的仍是旧
+  // DLL）；未被占用则立即替换。替换完成后新启动的应用进程加载新 DLL。
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM verba-daemon.exe /F /T', '',
     SW_HIDE, ewWaitUntilTerminated, TaskkillExitCode);
   Result := '';

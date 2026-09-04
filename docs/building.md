@@ -45,9 +45,11 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.2.6 verba-ime.iss
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
-   安装器会先停掉在跑的 `verba-daemon`（防新 DLL 连旧 daemon 混搭）；DLL 已加载进
-   运行中的应用进程时登记重启替换——升级后**新启动的应用进程**即用新 DLL（单进程
-   多窗口的应用需整个应用重启，不必重启系统）。卸载同样先停 daemon 再删文件。
+   安装器会先停掉在跑的 `verba-daemon`（防新 DLL 连旧 daemon 混搭）。DLL 已被
+   运行中的应用进程占用时登记重启替换——**下次系统重启完成替换**（安装结束会
+   提示重启），重启前新启动的应用进程加载的仍是旧 DLL；未被占用则立即替换。
+   替换完成后新启动的应用进程才用新 DLL（单进程多窗口应用需整个应用重启）。
+   卸载同样先停 daemon 再删文件。
 
 ### Rime 引擎（单引擎，librime）
 
