@@ -4216,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "verba-candidate"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "cosmic-text",
  "serde",
@@ -4225,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "verba-config"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "directories",
  "keyring",
@@ -4237,11 +4237,11 @@ dependencies = [
 
 [[package]]
 name = "verba-core"
-version = "0.2.6"
+version = "0.2.7"
 
 [[package]]
 name = "verba-ime-windows"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "embed-resource",
  "image",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "verba-ipc"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4273,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "verba-protos"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "prost",
  "prost-build",
@@ -4283,7 +4283,7 @@ dependencies = [
 
 [[package]]
 name = "verba-trigger"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "cpal",
  "env_logger",
