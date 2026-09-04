@@ -46,7 +46,8 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
    安装器会先停掉在跑的 `verba-daemon`（防新 DLL 连旧 daemon 混搭）；DLL 已加载进
-   运行中的应用进程时登记重启替换——升级后重开窗口即用新 DLL，无需强制重启。
+   运行中的应用进程时登记重启替换——升级后**新启动的应用进程**即用新 DLL（单进程
+   多窗口的应用需整个应用重启，不必重启系统）。卸载同样先停 daemon 再删文件。
 
 ### Rime 引擎（单引擎，librime）
 

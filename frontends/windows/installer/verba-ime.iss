@@ -42,27 +42,32 @@ Source: "..\..\..\vendor\rime\*"; DestDir: "{app}\rime"; Flags: ignoreversion re
 Source: "..\..\..\vendor\ocr\*"; DestDir: "{app}\models-rapidocr"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   TaskkillExitCode: Integer;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   // 升级前停掉在跑的 daemon：IPC 管道名固定，旧 daemon 存活时新 DLL 的
   // ensure_daemon()「管道有人应答就不拉新」会一直连着旧版跑（v0.2.6 升级
   // 真机踩坑：新 DLL + 旧 daemon 混搭）。taskkill 无进程时返回非零，忽略。
   // DLL 已加载进运行中的应用进程不在此强杀（杀用户应用不可接受），由
-  // restartreplace 在重启时完成替换；新开窗口自动加载新 DLL。
+  // restartreplace 在重启时完成替换；新启动的应用进程自动加载新 DLL。
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM verba-daemon.exe /F /T', '',
     SW_HIDE, ewWaitUntilTerminated, TaskkillExitCode);
   Result := '';
 end;
 
 [Run]
+; 复制窗口期内旧 DLL（仍驻留在运行中的应用进程）可能经 {app} 同目录解析
+; 拉起旧 daemon（ipc.rs daemon_exe_path），注册前再停一次，闭合竞态窗口。
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM verba-daemon.exe /F /T"; Flags: runhidden
 ; 先注销旧档案（清理早期版本遗留/损坏项），再注册（TSF 档案/类别，需管理员）
 Filename: "{app}\verba-reg.exe"; Parameters: "unregister"; Flags: runhidden
 Filename: "{app}\verba-reg.exe"; Parameters: "register ""{app}\verba_ime_windows.dll"""; Flags: runhidden
 
 [UninstallRun]
+; 卸载先停 daemon：运行中的 daemon 锁着自身 exe 与 {app}\rime\rime.dll，
+; 不停则卸载对锁定文件弹重试/忽略并残留进程。
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM verba-daemon.exe /F /T"; Flags: runhidden
 Filename: "{app}\verba-reg.exe"; Parameters: "unregister"; Flags: runhidden
 
 [Icons]
