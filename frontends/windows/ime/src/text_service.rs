@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use verba_core::machine::{
-    is_fullwidth_mapped_punct, Action, CompositionMachine, LlmCandidateRequest, MachineState,
-    PreviewKey, REWRITE_SYSTEM_PROMPT,
+    is_fullwidth_mapped_punct, result_hint, Action, CompositionMachine, LlmCandidateRequest,
+    MachineState, PreviewKey, ResultPhase, REWRITE_SYSTEM_PROMPT,
 };
+use verba_core::{parse_ai_command, AiCommand};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -657,6 +658,33 @@ fn show_rewrite_preview(
     });
 }
 
+/// AI 结果浮层候选窗：多行结果全文（显示层按 MAX_RESULT_CHARS 截断）+
+/// 阶段状态行（提示文案取 core 的 result_hint，两端一致）。流式/就绪/
+/// 失败三态共用；组合此时活跃（preedit 为短状态串），优先组合光标锚点。
+/// 行数实测回填不在前端做——由 CandidateWindow::update 在**缩放后**坐标
+/// 系实测（见 candidate_window.rs 注），建窗/渲染/换行同一控制器。
+fn show_result_overlay(
+    data: &Rc<TextServiceData>,
+    context: &ITfContext,
+    body: &str,
+    phase: ResultPhase,
+) {
+    let anchor = caret_screen_pos(data, context)
+        .or_else(|| view_screen_pos(context))
+        .unwrap_or((0, 0, 0));
+    show_overlay_window(data, anchor, |ctrl| {
+        ctrl.set_result_block(body);
+        ctrl.set_status(Some(result_hint(phase).to_owned()));
+    });
+}
+
+/// 查用户定义短语（`//短语 名称`）；无配置/无此名称返回 None
+/// （调用方按普通生成兜底）。
+fn lookup_phrase(name: &str) -> Option<String> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    verba_config::phrases::get(&dirs, name).ok().flatten()
+}
+
 /// Shift 孤立按切换中英：翻转模式 + 同步 GUID_COMPARTMENT_KEYBOARD_INPUTMODE
 /// （系统语言栏/输入法指示器显示中/英状态）+ 组合中则取消（干净进入英文）。
 fn toggle_ime(data: &Rc<TextServiceData>) {
@@ -930,9 +958,22 @@ pub fn apply_action(
                 edit_session::commit_text(context, clientid, &text)
             }
         }
-        Action::EnterPrompt { preedit }
-        | Action::UpdatePrompt { preedit }
-        | Action::UpdateResult { preedit, .. } => set_preedit(data, context, clientid, &preedit),
+        Action::EnterPrompt { preedit } | Action::UpdatePrompt { preedit } => {
+            set_preedit(data, context, clientid, &preedit)
+        }
+        Action::UpdateResult { preedit, body } => {
+            // 流式增量：preedit 只放**短状态串**——组合不再随流变长（此前
+            // 整串 setMarkedText 把长结果挤进窄 preedit，且每 chunk 一次宿主
+            // 往返）；全文进结果浮层（verba-candidate 多行结果块）。
+            set_preedit(data, context, clientid, &preedit)?;
+            let phase = data
+                .machine
+                .borrow()
+                .result_phase()
+                .unwrap_or(ResultPhase::Streaming);
+            show_result_overlay(data, context, &body, phase);
+            Ok(())
+        }
         Action::UpdatePinyin {
             preedit,
             candidates,
@@ -958,74 +999,82 @@ pub fn apply_action(
             Ok(())
         }
         Action::StartLlm { prompt, system: _ } => {
-            // 多模态命令路由：
-            // - `//朗读 <文本>` → TTS 合成并播放（不落盘文本）
-            // - `//截图` → 全屏截图 OCR，识别文本上屏
-            // - `//听写` → 录音 ASR，识别文本上屏
-            // 均以「结束当前组合 + 重置状态机」收尾；采集/合成/播放异步完成。
-            let cmd = prompt.trim();
-            if cmd.starts_with("朗读") {
-                let text = tts_text_of(cmd);
-                log::info!("朗读命令: text={text}");
-                if let Some(comp) = data.composition.borrow_mut().take() {
-                    let _ = edit_session::end_composition(context, clientid, &comp, "");
-                }
-                *data.machine.borrow_mut() = CompositionMachine::new();
-                start_tts_play(text);
-                return Ok(());
-            }
-            // `//短语 <名称>`：快捷插入用户定义的文本模板。
-            if let Some(name) = cmd.strip_prefix("短语") {
-                let name = name.trim();
-                if !name.is_empty() {
-                    if let Ok(dirs) = verba_config::VerbaDirs::locate() {
-                        if let Ok(Some(text)) = verba_config::phrases::get(&dirs, name) {
-                            log::info!("插入快捷短语: {name}");
-                            if let Some(comp) = data.composition.borrow_mut().take() {
-                                let _ = edit_session::end_composition(context, clientid, &comp, "");
-                            }
-                            *data.machine.borrow_mut() = CompositionMachine::new();
-                            let _ = edit_session::commit_text(context, clientid, &text);
-                            crate::clipboard::set_text_quiet(&text);
-                            return Ok(());
-                        }
+            // 多模态命令路由统一走 core commands::parse_ai_command（判定次序
+            // 与措辞两端一致；结果浮层的重试 feed_ai_preview 也经此还原命令
+            // 语义——重试 `//看图` 会重走 vision 截屏）。`//重置`/`//会话` 等
+            // daemon 命令解析为 Llm 原样透传，前端不得拦截。
+            // 进入生成前先收掉可能残留的拼音候选窗（提示词内拼音组合的候选）。
+            hide_candidate_window(data);
+            // 短语未命中（无配置/无此名称）按普通生成兜底，与原内联实现一致
+            // （config 依赖留在前端，core 不引配置）。
+            let cmd = parse_ai_command(prompt.trim());
+            if let AiCommand::Phrase { name } = &cmd {
+                if let Some(text) = lookup_phrase(name) {
+                    log::info!("插入快捷短语: {name}");
+                    if let Some(comp) = data.composition.borrow_mut().take() {
+                        let _ = edit_session::end_composition(context, clientid, &comp, "");
                     }
+                    *data.machine.borrow_mut() = CompositionMachine::new();
+                    let _ = edit_session::commit_text(context, clientid, &text);
+                    crate::clipboard::set_text_quiet(&text);
+                    return Ok(());
                 }
             }
-            // `//看图`：多模态 vision，直接捕捉眼睛区域（或全屏回退）发图给 LLM。
-            // 与普通 `//` LLM 命令一致：不结束组合、不重置状态机，保持流式输出。
-            if cmd == "看图" {
-                log::info!("看图命令（vision）");
-                start_llm(data, prompt, eye_rect_for(data, context), true);
-                return Ok(());
-            }
-            let kind = if cmd == "截图" {
-                Some(TriggerKind::OcrFullScreen)
-            } else if cmd == "听写" {
-                Some(TriggerKind::Asr)
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
-                log::info!("触发命令: {kind:?}");
-                if let Some(comp) = data.composition.borrow_mut().take() {
-                    let _ = edit_session::end_composition(context, clientid, &comp, "");
+            match cmd {
+                // `//朗读 <文本>` → TTS 合成并播放（不落盘文本）。
+                AiCommand::Tts { text } => {
+                    log::info!("朗读命令: text={text}");
+                    if let Some(comp) = data.composition.borrow_mut().take() {
+                        let _ = edit_session::end_composition(context, clientid, &comp, "");
+                    }
+                    *data.machine.borrow_mut() = CompositionMachine::new();
+                    start_tts_play(text);
                 }
-                *data.machine.borrow_mut() = CompositionMachine::new();
-                trigger_async(data, kind);
-                return Ok(());
+                // `//看图`：多模态 vision，直接捕捉眼睛区域（或全屏回退）发图给
+                // LLM。与普通 `//` LLM 命令一致：不结束组合、不重置状态机，
+                // 保持流式输出通道。
+                AiCommand::Vision => {
+                    log::info!("看图命令（vision）");
+                    start_llm(data, prompt, eye_rect_for(data, context), true);
+                }
+                // `//截图` / `//听写`：结束当前组合 + 重置状态机，异步采集识别。
+                AiCommand::FullScreenOcr | AiCommand::Asr => {
+                    let kind = if matches!(cmd, AiCommand::FullScreenOcr) {
+                        TriggerKind::OcrFullScreen
+                    } else {
+                        TriggerKind::Asr
+                    };
+                    log::info!("触发命令: {kind:?}");
+                    if let Some(comp) = data.composition.borrow_mut().take() {
+                        let _ = edit_session::end_composition(context, clientid, &comp, "");
+                    }
+                    *data.machine.borrow_mut() = CompositionMachine::new();
+                    trigger_async(data, kind);
+                }
+                // `//短语 名称` 未命中（已查表）与普通生成同路；daemon 命令
+                // （`//重置` 等）解析为 Llm 原样透传。
+                AiCommand::Phrase { .. } | AiCommand::Llm => {
+                    // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
+                    // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
+                    // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult
+                    // 替换为短状态串。
+                    let eye_rect = eye_rect_for(data, context);
+                    let (eye_enabled, eye_mode) =
+                        load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
+                    let use_vision = eye_enabled && eye_mode == "vision";
+                    start_llm(data, prompt, eye_rect, use_vision);
+                }
             }
-            // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
-            // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
-            // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult 替换文本。
-            let eye_rect = eye_rect_for(data, context);
-            let (eye_enabled, eye_mode) =
-                load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
-            let use_vision = eye_enabled && eye_mode == "vision";
-            start_llm(data, prompt, eye_rect, use_vision);
             Ok(())
         }
-        Action::ResultReady { .. } => Ok(()),
+        Action::ResultReady { text } => {
+            // 生成完成 → 结果浮层就绪态（状态行切换为上屏/重试/改提示词提示）。
+            // preedit 的短状态串刷新由同批 Final 的 Step::Preedit 负责（单一
+            // preedit 写点），此处不碰组合。
+            show_result_overlay(data, context, &text, ResultPhase::Ready);
+            log::info!("AI 结果就绪: chars={}", text.chars().count());
+            Ok(())
+        }
         Action::RewriteReady { rewritten, source } => {
             // 改写完成 → 进入对照预览态 + 弹对照预览候选窗（1=改写结果
             // 2=原文）。机器必须同步 begin_rewrite_preview——此后 1/Enter/
@@ -1082,11 +1131,20 @@ pub fn apply_action(
             Ok(())
         }
         Action::LlmFailed { message } => {
-            hide_candidate_window(data);
-            if let Some(comp) = data.composition.borrow_mut().take() {
-                edit_session::end_composition(context, clientid, &comp, "")?;
-            }
+            // 失败浮层保留：core 已入 Failed 态并保留 last_request（Enter/`r`
+            // 重试、`e` 改提示词）。**不得结束组合**——组合里是短状态串，
+            // end_composition("") 既踩空串陷阱又把刚弹的失败浮层立刻收掉
+            // （表现为「错误一闪而过、按 r 无反应」，见 Action::LlmFailed 注）。
             log::warn!("LLM 失败: {message}");
+            let (body, phase) = {
+                let m = data.machine.borrow();
+                (m.result().to_owned(), m.result_phase())
+            };
+            if phase == Some(ResultPhase::Failed) {
+                // body 为已生成的部分结果（失败于首块前则为空——浮层仍有
+                // 状态行的重试提示）。
+                show_result_overlay(data, context, &body, ResultPhase::Failed);
+            }
             Ok(())
         }
     }
@@ -1949,15 +2007,6 @@ fn start_tts_play(text: String) {
     });
 }
 
-/// `//朗读 xxx` → 提取朗读文本（去前缀与分隔符）。
-fn tts_text_of(prompt: &str) -> String {
-    prompt
-        .trim_start_matches("朗读")
-        .trim_start_matches(|c| ":： \t".contains(c))
-        .trim()
-        .to_owned()
-}
-
 // ---- 定时器窗口 ----
 
 /// # Safety
@@ -2054,7 +2103,6 @@ enum Step {
         selected: usize,
     },
     Act(Action),
-    EndCompositionQuiet,
 }
 
 /// 把队列中捞出的流事件逐个喂给状态机，收集两段式派发步骤（纯函数，
@@ -2062,25 +2110,46 @@ enum Step {
 /// 等布线语义，issue #44）。
 fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> Vec<Step> {
     let mut steps: Vec<Step> = Vec::new();
-    // 合并 chunk 预编辑：每个胶子只调一次 set_preedit，降低 TSF 回调压力。
+    // 合并结果更新：一个 tick 内多条 chunk 只派发**最后一条** UpdateResult
+    // （body 是累积全文，中间态无显示价值）——每 chunk 一次 set_preedit +
+    // 结果浮层全窗重绘 + GDI blit 代价高。preedit 的刷新在 apply_action 的
+    // UpdateResult 臂内做（恒定短状态串），不再单独积累。
+    let mut pending_result: Option<Action> = None;
     let mut pending_preedit: Option<String> = None;
     for evt in events {
         match evt.kind {
             Some(stream_event::Kind::Chunk(ch)) => {
-                if let Action::UpdateResult { preedit, .. } = machine.on_llm_chunk(&ch.text) {
-                    pending_preedit = Some(preedit);
+                if let action @ Action::UpdateResult { .. } = machine.on_llm_chunk(&ch.text) {
+                    pending_result = Some(action);
                 }
             }
             Some(stream_event::Kind::Final(_)) => {
-                // 改写流完成 → RewriteReady（对照预览）须走 Act 派发；
-                // 自由生成 → ResultReady（无动作）。
-                if let action @ Action::RewriteReady { .. } = machine.on_llm_done() {
+                // 先刷干容尽的结果更新，再派发完成动作（浮层先见末段流、
+                // 再切就绪态）。
+                if let Some(a) = pending_result.take() {
+                    steps.push(Step::Act(a));
+                }
+                // 流完成 → 改写流产 RewriteReady（对照预览）、自由生成产
+                // ResultReady（结果浮层就绪态），**两者都必须走 Act 派发**
+                // ——此前 ResultReady 被静默丢弃且 apply_action 侧是空实现，
+                // 两跳皆缺（与 RewriteReady 曾经的 bug 同型，issue #89）。
+                if let action @ (Action::RewriteReady { .. } | Action::ResultReady { .. }) =
+                    machine.on_llm_done()
+                {
                     steps.push(Step::Act(action));
                 }
-                pending_preedit = Some(machine.result().to_owned());
+                // preedit 换短状态串（不再塞全文——长结果进浮层）。空串会
+                // 触发应用终止组合（空串陷阱），Idle 等场景丢弃不推。
+                let p = machine.preedit();
+                if !p.is_empty() {
+                    pending_preedit = Some(p);
+                }
             }
             Some(stream_event::Kind::Candidates(c)) => {
-                // 先刷干容尽的 chunk 预编辑，再显示候选。
+                // 先刷干容尽的结果更新与 chunk 预编辑，再显示候选。
+                if let Some(a) = pending_result.take() {
+                    steps.push(Step::Act(a));
+                }
                 if let Some(p) = pending_preedit.take() {
                     steps.push(Step::Preedit(p));
                 }
@@ -2109,12 +2178,26 @@ fn collect_steps(machine: &mut CompositionMachine, events: Vec<StreamEvent>) -> 
                 }
             }
             Some(stream_event::Kind::Error(e)) => {
-                if matches!(machine.on_llm_error(&e.message), Action::LlmFailed { .. }) {
-                    steps.push(Step::EndCompositionQuiet);
+                // 失败浮层保留（core 已入 Failed 态，Enter/`r` 重试、`e` 改
+                // 提示词）：LlmFailed 走 Act 派发，**不再 EndCompositionQuiet**
+                // ——结束组合既踩空串陷阱，又会把刚弹的失败浮层与重试基础
+                // 一并收掉（错误一闪而过、按 r 无反应）。
+                if let Some(a) = pending_result.take() {
+                    steps.push(Step::Act(a));
+                }
+                if let a @ Action::LlmFailed { .. } = machine.on_llm_error(&e.message) {
+                    steps.push(Step::Act(a));
+                }
+                let p = machine.preedit();
+                if !p.is_empty() {
+                    pending_preedit = Some(p);
                 }
             }
             None => {}
         }
+    }
+    if let Some(a) = pending_result.take() {
+        steps.push(Step::Act(a));
     }
     if let Some(p) = pending_preedit {
         steps.push(Step::Preedit(p));
@@ -2189,11 +2272,6 @@ impl TextServiceData {
                 Step::Act(action) => {
                     let _ = apply_action(&rc, &context, action);
                 }
-                Step::EndCompositionQuiet => {
-                    if let Some(comp) = self.composition.borrow_mut().take() {
-                        let _ = edit_session::end_composition(&context, clientid, &comp, "");
-                    }
-                }
             }
         }
     }
@@ -2239,15 +2317,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tts_text_of_strips_command_prefix() {
-        assert_eq!(tts_text_of("朗读你好"), "你好");
-        assert_eq!(tts_text_of("朗读 你好世界"), "你好世界");
-        assert_eq!(tts_text_of("朗读：你好"), "你好");
-        assert_eq!(tts_text_of("朗读: 你好"), "你好");
-        assert_eq!(tts_text_of("朗读"), "");
-    }
-
-    #[test]
     fn trigger_kind_requires_modifier_but_maps_vk() {
         // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
         assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
@@ -2270,14 +2339,6 @@ mod tests {
         assert_eq!(trigger_kind_for_hotkey_vk(0x4D), None, "M 热键已移除");
         // 其他键不在热键集合
         assert_eq!(trigger_kind_for_hotkey_vk(VK_UP.0 as u32), None);
-    }
-
-    #[test]
-    fn prompt_routing_classifies_commands() {
-        assert!("朗读 你好".trim().starts_with("朗读"));
-        assert_eq!("截图".trim(), "截图");
-        assert_eq!("听写".trim(), "听写");
-        assert_ne!("翻译：你好".trim(), "截图");
     }
 
     #[test]
@@ -2415,11 +2476,11 @@ mod tests {
         assert_eq!(m.state(), MachineState::Idle);
     }
 
-    /// 流 token 打包/安装属性（issue #44 真机项的可自动化部分）：
     /// 改写流完成布线钉住：Final 事件 → Step::Act(RewriteReady) 派发（不得
-    /// 静默丢弃），自由生成 Final 则无 Act。apply_action 侧须接住该动作调
-    /// begin_rewrite_preview——两跳缺一，对照预览按键路由整条失效（审查
-    /// 发现：后一跳曾漏接，拦截分支成死代码而单测全绿）。
+    /// 静默丢弃）。apply_action 侧须接住该动作调 begin_rewrite_preview——
+    /// 两跳缺一，对照预览按键路由整条失效（审查发现：后一跳曾漏接，拦截
+    /// 分支成死代码而单测全绿）。preedit 语义随 #89 改为**短状态串**（改写
+    /// 结果全文进对照预览候选，不再塞 preedit）。
     #[test]
     fn collect_steps_rewrite_final_emits_rewrite_ready_act() {
         let mut m = CompositionMachine::new();
@@ -2447,15 +2508,180 @@ mod tests {
         assert!(
             matches!(
                 &steps[..],
-                [Step::Act(Action::RewriteReady { rewritten, source }), Step::Preedit(p)]
-                    if rewritten == "尊敬的经理：" && source == "请假条" && p == "尊敬的经理："
+                [Step::Act(Action::UpdateResult { body, .. }),
+                 Step::Act(Action::RewriteReady { rewritten, source }),
+                 Step::Preedit(p)]
+                    if body == "尊敬的经理："
+                        && rewritten == "尊敬的经理："
+                        && source == "请假条"
+                        && p == "✨ 已就绪"
             ),
-            "改写 Final 应派发 RewriteReady 并保留组合 preedit，实际 {steps:?}"
+            "改写 Final 应先派发末段流更新，再派发 RewriteReady，preedit 为短状态串，实际 {steps:?}"
         );
         assert_eq!(m.state(), MachineState::ResultReady);
         assert!(
             !m.rewrite_previewing(),
             "预览态由 apply_action 接住 RewriteReady 后才进入（前端职责）"
+        );
+    }
+
+    /// 布线钉住（#89 两处丢弃的修复）：自由生成 Final → ResultReady **必须
+    /// 产出 Step::Act**（此前被静默丢弃）且 preedit 为短状态串（不再塞全文）。
+    /// apply_action 侧由 ResultReady 臂接住弹就绪浮层（原空实现，两跳皆缺
+    /// 的第三个实例）。
+    #[test]
+    fn collect_steps_result_ready_final_emits_act_and_short_preedit() {
+        let mut m = CompositionMachine::new();
+        for c in "//123".chars() {
+            let _ = m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        let steps = collect_steps(
+            &mut m,
+            vec![
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                        text: "Hel".into(),
+                    })),
+                },
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                        text: "lo".into(),
+                    })),
+                },
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Final(verba_protos::Final {
+                        text: "Hello".into(),
+                    })),
+                },
+            ],
+        );
+        assert!(
+            matches!(
+                &steps[..],
+                [Step::Act(Action::UpdateResult { body, .. }),
+                 Step::Act(Action::ResultReady { text }),
+                 Step::Preedit(p)]
+                    if body == "Hello" && text == "Hello" && p == "✨ 已就绪"
+            ),
+            "自由生成 Final 应派发末段流更新 + ResultReady，preedit 为短状态串，实际 {steps:?}"
+        );
+        assert_eq!(m.state(), MachineState::ResultReady);
+        assert_eq!(m.result(), "Hello");
+    }
+
+    /// 失败浮层保留（#89 风险 5——后果最不对称的一处）：流错误经
+    /// collect_steps 派发 LlmFailed 走 Act（apply_action 只弹失败浮层），
+    /// **不得再产出结束组合步骤**；状态机停在 Failed 且重试基础保留
+    /// （Enter 应产出 StartLlm 而非无动作）。
+    #[test]
+    fn collect_steps_error_keeps_failed_state_for_retry() {
+        let mut m = CompositionMachine::new();
+        for c in "//123".chars() {
+            let _ = m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        let steps = collect_steps(
+            &mut m,
+            vec![
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                        text: "He".into(),
+                    })),
+                },
+                StreamEvent {
+                    id: 0,
+                    kind: Some(stream_event::Kind::Error(verba_protos::Error {
+                        code: 500,
+                        message: "模拟失败".into(),
+                    })),
+                },
+            ],
+        );
+        assert!(
+            matches!(
+                &steps[..],
+                [Step::Act(Action::UpdateResult { .. }),
+                 Step::Act(Action::LlmFailed { .. }),
+                 Step::Preedit(p)]
+                    if p == "✨ 生成失败"
+            ),
+            "流错误应派发 LlmFailed（浮层保留），无结束组合步骤，实际 {steps:?}"
+        );
+        assert_eq!(m.state(), MachineState::Failed);
+        assert_eq!(m.result(), "He", "已生成的部分结果保留");
+        assert!(
+            matches!(m.feed_enter(), Action::StartLlm { .. }),
+            "失败态 Enter = 重试（last_request 保留）"
+        );
+    }
+
+    /// 节流钉住（#89）：一个 tick 内多条 chunk 只派发**最后一条**
+    /// UpdateResult（body 为累积全文，中间态无显示价值）——每 chunk 一次
+    /// 全窗重绘 + GDI blit 不可接受。
+    #[test]
+    fn collect_steps_merges_chunks_per_tick() {
+        let mut m = CompositionMachine::new();
+        for c in "//123".chars() {
+            let _ = m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        let chunks: Vec<StreamEvent> = ["Hel", "lo ", "AI"]
+            .iter()
+            .map(|t| StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                    text: (*t).into(),
+                })),
+            })
+            .collect();
+        let steps = collect_steps(&mut m, chunks);
+        assert!(
+            matches!(
+                &steps[..],
+                [Step::Act(Action::UpdateResult { body, .. })] if body == "Hello AI"
+            ),
+            "一个 tick 的多条 chunk 应合并为一条 UpdateResult，实际 {steps:?}"
+        );
+    }
+
+    /// 空串陷阱防御（Notepad-- 教训）：机器已离开流态（如用户中途 Enter
+    /// 提交）后迟到的 Final 不得推出空 preedit 步骤——组合文本置空会触发
+    /// 应用终止组合，把下一条流式输出全吞掉。
+    #[test]
+    fn collect_steps_stale_final_pushes_no_empty_preedit() {
+        let mut m = CompositionMachine::new();
+        for c in "//123".chars() {
+            let _ = m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        let _ = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Chunk(verba_protos::Chunk {
+                    text: "He".into(),
+                })),
+            }],
+        );
+        // 用户中途 Enter：提交已生成部分 → Idle。
+        assert!(matches!(m.feed_enter(), Action::CommitResult { .. }));
+        let steps = collect_steps(
+            &mut m,
+            vec![StreamEvent {
+                id: 0,
+                kind: Some(stream_event::Kind::Final(verba_protos::Final {
+                    text: "He".into(),
+                })),
+            }],
+        );
+        assert!(
+            steps.is_empty(),
+            "迟到 Final（机器 Idle）不应产出任何步骤（尤其空 preedit），实际 {steps:?}"
         );
     }
 

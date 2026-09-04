@@ -260,10 +260,12 @@ fn tsf_streaming_preedit() {
             ));
         }
         data.on_timer();
+        // #89 新契约：组合只持**短状态串**（结果全文在结果浮层渲染，
+        // 不再挤窄 preedit）；全文的可见性由 Enter 提交断言钉住。
         assert_eq!(
             read_context_text(&ctx, tid),
-            "你好",
-            "流式 preedit 应实时进入组合"
+            "✨ 已就绪",
+            "流式完成后组合持短状态串（全文在结果浮层）"
         );
 
         // Enter 提交
@@ -355,8 +357,10 @@ fn tsf_stream_epoch_filter_drops_stale_events() {
             ));
         }
         data.on_timer();
+        // #89 后组合持短状态串（过滤效果不再体现在组合文本）——改从
+        // 状态机累积结果直接断言：旧代际 "旧" 不得混入当前流。
         assert_eq!(
-            read_context_text(&ctx, tid),
+            data.machine.borrow().result(),
             "新",
             "旧代际事件应被过滤（若混入则结果为 旧新）"
         );

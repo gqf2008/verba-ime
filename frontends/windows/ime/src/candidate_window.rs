@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use verba_candidate::renderer::{window_size, CpuCandidateRenderer};
+use verba_candidate::renderer::{result_window_width, window_size, CpuCandidateRenderer};
 use verba_candidate::CandidateWindowController;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -116,11 +116,24 @@ impl CandidateWindow {
         // 按 96（1:1）兜底——绝不让 scale=0 把主题尺寸全部缩成 1px
         // （候选窗将不可见）。日志记录实际 dpi 便于真机排查。
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-        let ctrl = if (scale - 1.0).abs() > f32::EPSILON {
+        let mut ctrl = if (scale - 1.0).abs() > f32::EPSILON {
             ctrl.scaled(scale)
         } else {
             ctrl.clone()
         };
+        // AI 结果浮层：行数在**缩放后**坐标系实测回填——scaled 的逐字段
+        // round 会微调宽度/字号比，换行点可能漂一行（末行被裁或底部留白）。
+        // 测量/建窗/渲染三者落在同一控制器实例上（measure_lines 与 draw_text
+        // 同一套 Buffer 参数），结构性一致，不靠「两处小心同步」。
+        // 非结果形态跳过（候选高度不依赖字体度量）。
+        if ctrl.result_block().is_some() {
+            let lines = self.renderer.measure_lines(
+                ctrl.result_block().unwrap_or(""),
+                ctrl.theme().font_size as f32,
+                result_window_width(ctrl.theme()) as f32,
+            );
+            ctrl.set_result_lines(lines);
+        }
         let (w, h) = window_size(&ctrl);
         let (px, py) = fit_position(
             anchor,
