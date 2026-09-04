@@ -293,23 +293,22 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
 
     create_timer_window(data)?;
-    // 读初始中英状态（系统 compartment 保留上次切换结果）。
-    // 默认中文：compartment 空值/未设置（VT_EMPTY 或 0）时按中文模式起——
-    // 拼音输入法的自然默认（真机：首次激活 GetValue 成功但值为 0 → 误判英文）。
+    // 初始中英状态：激活一律中文起步（拼音输入法的自然默认）。
+    // 不读系统 compartment 的遗留值：Shift 切英文时写入的
+    // ALPHANUMERIC(0) 会全局留存，把之后的每次激活都误判成英文起步
+    // （真机 2026-09-04：升级后新开窗口全程英文、`//`/`///` 因按键
+    // 不被认领而失效，按一次 Shift 才恢复；DLL 日志连续 claim=false
+    // 为证）。英文模式只在会话内经 Shift 显式进入，不跨激活继承。
+    // 同时把 compartment 写回 NATIVE，让系统语言栏指示器与实际
+    // 模式一致（遗留的英文值不清会让指示器显示「英」）。
+    data.ime_chinese.set(true);
     unsafe {
         if let Ok(mgr) = ptim.GetGlobalCompartment() {
             if let Ok(comp) = mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE) {
-                match comp.GetValue() {
-                    Ok(var) => {
-                        let vt = var.Anonymous.Anonymous.vt;
-                        let mode = var.Anonymous.Anonymous.Anonymous.lVal;
-                        // VT_I4 且显式 ALPHANUMERIC 才判英文；其余（NATIVE/
-                        // VT_EMPTY/0）默认中文。
-                        data.ime_chinese
-                            .set(vt.0 == 3 && mode == TF_CONVERSIONMODE_ALPHANUMERIC as i32);
-                    }
-                    Err(_) => data.ime_chinese.set(true),
-                }
+                let _ = comp.SetValue(
+                    0,
+                    &crate::display_attribute::variant_i4(TF_CONVERSIONMODE_NATIVE as i32),
+                );
             }
         }
     }
