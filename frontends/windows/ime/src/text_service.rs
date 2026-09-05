@@ -667,9 +667,12 @@ fn stash_ocr_anchor(data: &Rc<TextServiceData>, context: &ITfContext) {
 /// ocr_preview 槽（完整原文），与本处显示串（带标题前缀）无关。
 /// 锚点优先触发时记下的光标位置（见 stash_ocr_anchor），兜底视图粗定位。
 fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
+    // take() 一次性消费：热键路径（Ctrl+Alt+O，无组合不 stash）不得复用
+    // 上一次触发留下的陈旧锚点——「卡片甩到远处」不能从这扇门回来
+    // （独立审查 P2）。无 stash 的触发自然落回视图兜底。
     let anchor = data
         .ocr_anchor
-        .get()
+        .take()
         .unwrap_or_else(|| view_fallback_anchor(data));
     show_overlay_window(data, anchor, |ctrl| {
         // 标题用 CJK 括号标记而非 emoji：cosmic-text/swash 渲染路径只验证过
@@ -1044,8 +1047,12 @@ pub fn apply_action(
             // 发送即反馈：组合文本立刻换成短状态串——发送 → 首块的 1-3s
             // 此前完全无反馈，用户以为没发出而习惯性再敲 Enter，空提交把
             // 被改写的原文一并抹掉。非空短串不触发 Notepad-- 的「空组合
-            // 文本 → 应用终止组合」陷阱（该陷阱专指空串）。
-            let _ = set_preedit(data, context, clientid, &data.machine.borrow().preedit());
+            // 文本 → 应用终止组合」陷阱（该陷阱专指空串）。经 helper 两
+            // 语句写法：行内 &machine.borrow().preedit() 会让 Ref 存活
+            // 跨越整个 set_preedit 调用，若 update_composition 同步触发
+            // OnCompositionTerminated（内部 machine.borrow_mut()）即
+            // BorrowMutError panic（独立审查 P3）。
+            set_preedit_streaming_status(data, context, clientid);
             start_llm_with_system(data, &content, system, None, false);
             Ok(())
         }
