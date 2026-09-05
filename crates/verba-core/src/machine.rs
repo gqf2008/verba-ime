@@ -521,6 +521,7 @@ impl CompositionMachine {
             MachineState::Streaming => {
                 // 流中空格/1：停流并提交已生成部分（Enter 走 feed_enter 同一
                 // 通道；此前返回 None 被前端吞掉无反馈——AI 交互「死感」来源）。
+                // 结果尚空时 feed_enter 会吞掉按键（见其注释），流不中断。
                 if c == ' ' || c == '1' {
                     self.feed_enter()
                 } else {
@@ -876,6 +877,14 @@ impl CompositionMachine {
                 }
             }
             MachineState::Streaming | MachineState::ResultReady => {
+                // 首 token 延迟窗口内连按 Enter（发送后习惯性再敲一次「确认」）：
+                // 结果尚空时「提交已生成部分」只会把组合里的提示词一并抹掉、
+                // 上屏空串并取消流（真机 2026-09-04：两次 Enter 同秒，
+                // CommitResult{text:""}，用户感知「AI 没回复」）。空结果不
+                // 结算——吞掉本次 Enter，流继续，用户等首块到达或 Esc 取消。
+                if self.result.is_empty() {
+                    return Action::None;
+                }
                 let text = std::mem::take(&mut self.result);
                 self.state = MachineState::Idle;
                 // 流中提前 Enter：本条流已终结（前端 cancel_stream），改写标记
@@ -2234,6 +2243,53 @@ mod tests {
             );
             assert_eq!(m.state(), MachineState::Idle);
         }
+    }
+
+    /// 首 token 延迟内的「确认式」连按（真机 2026-09-04：两次 Enter 同秒）：
+    /// 结果尚空时 Enter/空格/1 必须被吞掉——提交空串只会把组合里的提示词
+    /// 一并抹掉并取消流（用户感知「AI 没回复」）。流态保持 Streaming，
+    /// 首块到达后仍正常显示与结算。
+    #[test]
+    fn streaming_empty_result_enter_is_swallowed() {
+        for fire in ['\r', ' ', '1'] {
+            let mut m = CompositionMachine::new();
+            m.feed_char('/');
+            m.feed_char('/');
+            m.feed_enter();
+            assert_eq!(m.state(), MachineState::Streaming);
+            let a = if fire == '\r' {
+                m.feed_enter()
+            } else {
+                m.feed_char(fire)
+            };
+            assert!(
+                matches!(a, Action::None),
+                "{fire:?} 空结果应被吞，实际 {a:?}"
+            );
+            assert_eq!(m.state(), MachineState::Streaming, "流不得被空结算中断");
+            // 首块照常到达并结算。
+            assert!(matches!(m.on_llm_chunk("首"), Action::UpdateResult { .. }));
+            m.on_llm_done();
+            assert!(matches!(m.feed_enter(), Action::CommitResult { ref text } if text == "首"));
+        }
+    }
+
+    /// ResultReady 但结果为空（模型零字返回的病态角落）：Enter 同样不结算
+    /// 空串——提示词不丢，用户可 Esc 取消或 r/e 重试。
+    #[test]
+    fn result_ready_empty_result_enter_is_swallowed() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_enter();
+        m.on_llm_done(); // Final 且空文 → ResultReady + 空结果
+        assert_eq!(m.state(), MachineState::ResultReady);
+        assert!(matches!(m.feed_enter(), Action::None));
+        assert_eq!(
+            m.state(),
+            MachineState::ResultReady,
+            "空结果不回 Idle（组合与提示词不丢）"
+        );
     }
 
     /// 结果态 `r` 重试：回 Streaming、重发同一条 StartLlm（原文带命令前缀，

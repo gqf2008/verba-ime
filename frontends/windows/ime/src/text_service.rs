@@ -138,6 +138,11 @@ pub struct TextServiceData {
     shift_combined: Cell<bool>,
     /// 中英切换状态提示的到期时刻（候选窗闪「中/英」后自动隐藏）。
     ime_status_until: Cell<Option<std::time::Instant>>,
+    /// OCR/触发结果浮窗锚点：触发命令结束组合**前**记下的组合光标位置。
+    /// 预览几秒后异步显示时组合已不在（caret_screen_pos 依赖组合引用），
+    /// 无此槽则只剩「视图左上角」兜底——离用户视线（拖选区/光标）可能
+    /// 相距甚远（真机 2026-09-05 `///` 后「啥也没看到」的定位嫌疑）。
+    ocr_anchor: Cell<Option<(i32, i32, i32)>>,
     pub stream_request_id: Arc<AtomicU64>,
     /// 流代际（epoch）：每次发起新 LLM 流 +1；chunks 队列事件携带 epoch，
     /// 过滤只消费当前代际——请求 id 每连接从 1 自增（恒为 2），不能作跨流依据。
@@ -182,6 +187,7 @@ impl TextServiceData {
             shift_down: Cell::new(false),
             shift_combined: Cell::new(false),
             ime_status_until: Cell::new(None),
+            ocr_anchor: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
@@ -631,10 +637,42 @@ fn view_fallback_anchor(data: &Rc<TextServiceData>) -> (i32, i32, i32) {
         .unwrap_or((0, 0, 0))
 }
 
-/// OCR 预览候选窗：状态行提示操作 + 首条候选=识别文本。
+/// 发送即反馈：LLM 流（自由生成 / 看图 / 改写管道）发起时把组合文本立刻
+/// 换成机器的短状态串（Streaming 态 =「✨ 生成中…」）。发送 → 首块的
+/// 首 token 延迟内此前完全无反馈，用户以为没发出而习惯性再敲 Enter——
+/// 空提交把提示词一并抹掉（真机 2026-09-04「AI 没回复」）。非空短串不
+/// 触发 Notepad-- 的「空组合文本 → 应用终止组合」陷阱（该陷阱专指空串）；
+/// 后续 chunk 仍由 on_timer 的 UpdateResult 走同一条 set_preedit 路径。
+fn set_preedit_streaming_status(data: &Rc<TextServiceData>, context: &ITfContext, clientid: u32) {
+    let status = data.machine.borrow().preedit();
+    let _ = set_preedit(data, context, clientid, &status);
+}
+
+/// 触发命令（`///` 选区截图 / `//截图` 全屏 / `//听写`）结束组合**前**记下
+/// 光标锚点：预览几秒后异步回来时组合已结束，caret_screen_pos 依赖组合
+/// 引用将不可用。只按视图左上角兜底会把预览甩到应用文本区左上角，离
+/// 用户视线（刚拖选的区域 / 光标）可能相距数屏——真机 2026-09-05 `///`
+/// 全链路正常、窗口可见 9s+，用户却感知「啥也没看到」的定位主嫌疑。
+fn stash_ocr_anchor(data: &Rc<TextServiceData>, context: &ITfContext) {
+    let anchor = caret_screen_pos(data, context).or_else(|| view_screen_pos(context));
+    if let Some(a) = anchor {
+        data.ocr_anchor.set(Some(a));
+    }
+}
+
+/// OCR 预览浮窗：识别文本进多行结果块（与 AI 结果浮层同一条渲染路径，
+/// 长文本换行可读、宽度撑满浮层）+ 标题行自解释 + 状态行操作提示。
+/// 此前识别文本塞单条候选行：360px 宽内单行截断 + 「1.」前缀，36 字
+/// 只剩半行——真机上不像任何「识别结果」。上屏文本取 machine 的
+/// ocr_preview 槽（完整原文），与本处显示串（带标题前缀）无关。
+/// 锚点优先触发时记下的光标位置（见 stash_ocr_anchor），兜底视图粗定位。
 fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
-    show_overlay_window(data, view_fallback_anchor(data), |ctrl| {
-        ctrl.set_candidates(vec![text.to_owned()]);
+    let anchor = data
+        .ocr_anchor
+        .get()
+        .unwrap_or_else(|| view_fallback_anchor(data));
+    show_overlay_window(data, anchor, |ctrl| {
+        ctrl.set_result_block(&format!("📷 OCR 识别结果\n{text}"));
         ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
     });
 }
@@ -1000,8 +1038,11 @@ pub fn apply_action(
             // 提示词与 macOS 前端共用 verba-core 的常量，杜绝两端措辞漂移。
             log::info!("改写管道: content_len={}", content.chars().count());
             let system = Some(REWRITE_SYSTEM_PROMPT.to_owned());
-            // 保持组合（首个流式块由 on_timer 的 UpdateResult 替换文本），
-            // 与 StartLlm 的自由生成同通道。
+            // 发送即反馈：组合文本立刻换成短状态串——发送 → 首块的 1-3s
+            // 此前完全无反馈，用户以为没发出而习惯性再敲 Enter，空提交把
+            // 被改写的原文一并抹掉。非空短串不触发 Notepad-- 的「空组合
+            // 文本 → 应用终止组合」陷阱（该陷阱专指空串）。
+            let _ = set_preedit(data, context, clientid, &data.machine.borrow().preedit());
             start_llm_with_system(data, &content, system, None, false);
             Ok(())
         }
@@ -1042,6 +1083,7 @@ pub fn apply_action(
                 // 保持流式输出通道。
                 AiCommand::Vision => {
                     log::info!("看图命令（vision）");
+                    set_preedit_streaming_status(data, context, clientid);
                     start_llm(data, prompt, eye_rect_for(data, context), true);
                 }
                 // `//截图` / `//听写`：结束当前组合 + 重置状态机，异步采集识别。
@@ -1052,6 +1094,7 @@ pub fn apply_action(
                         TriggerKind::Asr
                     };
                     log::info!("触发命令: {kind:?}");
+                    stash_ocr_anchor(data, context);
                     if let Some(comp) = data.composition.borrow_mut().take() {
                         let _ = edit_session::end_composition(context, clientid, &comp, "");
                     }
@@ -1061,10 +1104,13 @@ pub fn apply_action(
                 // `//短语 名称` 未命中（已查表）与普通生成同路；daemon 命令
                 // （`//重置` 等）解析为 Llm 原样透传。
                 AiCommand::Phrase { .. } | AiCommand::Llm => {
-                    // 不要 set_preedit("")：把组合文本置空会触发应用终止组合
-                    // （OnCompositionTerminated → cancel_stream → 流式输出全丢，实测 Notepad--）。
-                    // 保持提示词组合，首个流式块到达时由 on_timer 的 UpdateResult
-                    // 替换为短状态串。
+                    // 发送即反馈：组合文本立刻换成「✨ 生成中…」——发送 → 首块
+                    // 的 1-3s 此前完全无反馈（旧实现刻意不碰 preedit），用户
+                    // 以为没发出而习惯性再敲一次 Enter，空提交把提示词一并
+                    // 抹掉（真机 2026-09-04「AI 没回复」的直接根因）。非空
+                    // 短串不触发 Notepad-- 的「空组合文本 → 应用终止组合」
+                    // 陷阱（该陷阱专指空串，见 set_preedit_streaming_status 注）。
+                    set_preedit_streaming_status(data, context, clientid);
                     let eye_rect = eye_rect_for(data, context);
                     let (eye_enabled, eye_mode) =
                         load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
@@ -1122,6 +1168,7 @@ pub fn apply_action(
         Action::TriggerOcr => {
             // `///`：结束当前组合，触发选区截图 OCR（Ctrl+Alt+O 的键盘化替代）。
             hide_candidate_window(data);
+            stash_ocr_anchor(data, context);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 let _ = edit_session::end_composition(context, clientid, &comp, "");
             }

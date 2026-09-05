@@ -535,4 +535,97 @@ mod tests {
             (100, 240)
         );
     }
+
+    /// 真机自证（`cargo test -- --ignored`，CI 默认跳过）：结果浮层形态
+    /// （AI 结果 / OCR 预览同一条渲染路径）的候选窗**确实合成上屏**。
+    ///
+    /// 起因：真机 2026-09-05 `///` 全链路正常——日志有「候选窗渲染 …
+    /// 现可见=true」且持续 9s+——用户却感知「啥也没看到」。渲染层是否
+    /// 真的画上了屏幕，只有截屏比对能证明，窗口日志证明不了。
+    ///
+    /// 方法：品红卡片背景（任何桌面背景下可判定像素来源）→ 显示 →
+    /// 截主屏全屏 → 全屏扫描品红像素（对进程 DPI 感知状态免疫：不依赖
+    /// GetWindowRect 与物理坐标的对齐，DPI 虚拟化只影响窗口落点，不影响
+    /// 「有没有画上」）→ 断言 ①品红覆盖量可观 ②包围盒尺寸合理 ③盒内
+    /// 有深色字形像素（标题 + 正文确实栅格化）。
+    #[test]
+    #[ignore = "真机屏幕截取（需交互桌面会话）"]
+    fn overlay_window_paints_on_real_screen() {
+        let theme = verba_candidate::Theme {
+            background: "#FF00FF".into(),
+            ..verba_candidate::Theme::default()
+        };
+        let mut ctrl = CandidateWindowController::new(theme);
+        ctrl.set_result_block("📷 OCR 识别结果\n真机绘制自证：候选窗结果浮层文本。");
+        ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
+        ctrl.show();
+
+        // 主屏中部锚点（安静区域；fit_position 保证窗口完整落在工作区内）。
+        let work_rect = monitor_work_area(200, 200);
+        let mid_x = (work_rect.left + work_rect.right) / 3;
+        let mid_y = (work_rect.top + work_rect.bottom) / 3;
+        let anchor = (mid_x, mid_y, mid_y + 28);
+
+        let mut cw = CandidateWindow::new().expect("创建候选窗");
+        cw.update(&ctrl, anchor);
+        assert!(cw.is_visible(), "update 后窗口应可见");
+
+        // DWM 合成一帧的时间余量。
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let shot = verba_trigger::capture::capture_primary_screen().expect("截取主屏");
+        let img = image::load_from_memory(&shot.bmp)
+            .expect("解码截屏 BMP")
+            .to_rgba8();
+        let (iw, ih) = img.dimensions();
+        let mut magenta = 0usize;
+        let mut min_x = u32::MAX;
+        let mut max_x = 0u32;
+        let mut min_y = u32::MAX;
+        let mut max_y = 0u32;
+        for (x, y, p) in img.enumerate_pixels() {
+            let [r, g, b, _] = p.0;
+            if r > 180 && b > 180 && g < 120 {
+                magenta += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        if magenta < 2_000 {
+            let path = std::env::temp_dir().join("verba-paint-fail.png");
+            let _ = img.save_with_format(&path, image::ImageFormat::Png);
+            panic!(
+                "浮层未画上屏幕：品红像素仅 {magenta}（期望 ≥2000），截屏已存 {}",
+                path.display()
+            );
+        }
+        let (bw, bh) = (max_x - min_x + 1, max_y - min_y + 1);
+        assert!(
+            bw >= 180 && bh >= 40,
+            "品红包围盒尺寸异常 {bw}x{bh}（主屏 {}x{}）",
+            iw,
+            ih
+        );
+
+        // 盒内深色字形（标题 + 正文 #333333）：证明文字确实栅格化上屏。
+        let mut dark = 0usize;
+        for (x, y, p) in img.enumerate_pixels() {
+            if x < min_x || x > max_x || y < min_y || y > max_y {
+                continue;
+            }
+            let [r, g, b, _] = p.0;
+            if r < 110 && g < 110 && b < 110 {
+                dark += 1;
+            }
+        }
+        assert!(
+            dark >= 150,
+            "盒内字形像素过少（{dark}）：标题/正文未栅格化或不可读"
+        );
+
+        cw.hide();
+        assert!(!cw.is_visible());
+    }
 }

@@ -1935,6 +1935,13 @@ impl VerbaIMKController {
     // ---- LLM 流式 ----
 
     fn start_llm(&self, prompt: String, system: Option<String>) {
+        // 发送即反馈：标记文本立刻换成机器的短状态串（Streaming 态 =
+        // 「✨ 生成中…」）——发送 → 首块的首 token 延迟内此前完全无反馈，
+        // 用户以为没发出而习惯性再敲 Enter，空提交把提示词一并抹掉
+        // （Windows 真机 2026-09-04「AI 没回复」根因；两端口径一致）。
+        // set_marked 内部按内容去重，首块到达时的同串刷新零宿主往返。
+        let status = self.ivars().machine.borrow().preedit();
+        self.set_marked(&status);
         self.cancel_stream();
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
