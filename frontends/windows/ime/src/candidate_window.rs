@@ -556,7 +556,7 @@ mod tests {
             ..verba_candidate::Theme::default()
         };
         let mut ctrl = CandidateWindowController::new(theme);
-        ctrl.set_result_block("📷 OCR 识别结果\n真机绘制自证：候选窗结果浮层文本。");
+        ctrl.set_result_block("【OCR 识别结果】\n真机绘制自证：候选窗结果浮层文本。");
         ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
         ctrl.show();
 

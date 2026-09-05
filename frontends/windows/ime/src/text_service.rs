@@ -672,7 +672,10 @@ fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
         .get()
         .unwrap_or_else(|| view_fallback_anchor(data));
     show_overlay_window(data, anchor, |ctrl| {
-        ctrl.set_result_block(&format!("📷 OCR 识别结果\n{text}"));
+        // 标题用 CJK 括号标记而非 emoji：cosmic-text/swash 渲染路径只验证过
+        // CJK+ASCII 字形（✨ 等都在 preedit 文本里由宿主应用渲染），彩色
+        // emoji 字形经 swash 栅格化的表现未验证，不拿可发现性冒险。
+        ctrl.set_result_block(&format!("【OCR 识别结果】\n{text}"));
         ctrl.set_status(Some("Enter/空格/1 上屏 · Esc 取消".to_owned()));
     });
 }
