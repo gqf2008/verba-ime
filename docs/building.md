@@ -39,10 +39,10 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    - daemon + 设置面板：根目录 `cargo build -p verba-daemon --release && cargo build -p verba-settings --release`
 2. 获取 Rime 运行时：`pwsh scripts/fetch-rime-vendor.ps1`（见下节）。
 3. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
-4. 编译（`/DMyAppVersion` 可选，默认 0.2.7；发布流水线注入根 Cargo.toml 版本）：
+4. 编译（`/DMyAppVersion` 可选，默认 0.2.8；发布流水线注入根 Cargo.toml 版本）：
    ```powershell
    cd frontends/windows/installer
-   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.2.7 verba-ime.iss
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.2.8 verba-ime.iss
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
    安装器会先停掉在跑的 `verba-daemon`（防新 DLL 连旧 daemon 混搭）。DLL 已被
@@ -125,7 +125,7 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ### 发布流程（`.github/workflows/release.yml`）
 
-打 tag `v*`（如 `git tag v0.2.7 && git push origin v0.2.7`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
+打 tag `v*`（如 `git tag v0.2.8 && git push origin v0.2.8`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
 
 1. **macOS job**（macos-14，Apple Silicon）：拉取 Rime vendor → `package.sh` 组装（版本注入 + Rime 捆绑）→ 逐二进制 + .app 签名（hardened runtime + timestamp）→ notarytool 公证 + staple → Rime 冒烟 → 打包 DMG + 签名 + 公证 + staple
 2. **Windows job**（windows-latest，MSVC）：构建 workspace + 前端 → PE 子系统守卫（daemon 必须 GUI 子系统，防控制台回归）→ Inno Setup 打包（`/DMyAppVersion` 注入）→ Rime 冒烟 → 可选 signtool 签名
