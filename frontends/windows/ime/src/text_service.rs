@@ -645,6 +645,14 @@ fn view_fallback_anchor(data: &Rc<TextServiceData>) -> (i32, i32, i32) {
 /// 后续 chunk 仍由 on_timer 的 UpdateResult 走同一条 set_preedit 路径。
 fn set_preedit_streaming_status(data: &Rc<TextServiceData>, context: &ITfContext, clientid: u32) {
     let status = data.machine.borrow().preedit();
+    // 空串防御下沉到唯一写点：preedit() 仅在 Idle 无组合时为空，而
+    // set_preedit("") 会触发应用终止组合（Notepad-- 空组合陷阱 →
+    // OnCompositionTerminated → 机器重置 + cancel_stream，新流被自己掐死）。
+    // 各调用点当前均先置 Streaming（preedit 恒为短状态串），此处守卫防止
+    // 未来出现 Idle 态直派 StartLlm/StartRewrite 的新调用点踩坑（审查 P3）。
+    if status.is_empty() {
+        return;
+    }
     let _ = set_preedit(data, context, clientid, &status);
 }
 
@@ -660,6 +668,24 @@ fn stash_ocr_anchor(data: &Rc<TextServiceData>, context: &ITfContext) {
     }
 }
 
+/// 取 OCR 预览锚点并**一次性消费**：优先本次触发 stash 的光标锚点；槽空
+/// （热键路径 / 已消费）则落视图兜底。纯 Cell 语义，供单测钉住「一次
+/// stash 至多被一次预览消费」。
+fn take_ocr_anchor(data: &Rc<TextServiceData>) -> (i32, i32, i32) {
+    data.ocr_anchor
+        .take()
+        .unwrap_or_else(|| view_fallback_anchor(data))
+}
+
+/// 热键触发（Ctrl+Alt+O 选区 OCR，无组合、不 stash）入口清空锚点槽：
+/// 命令路径 stash 后存在不消费路径（结果非 Idle 直上屏 / 空文本 / 用户
+/// 取消选区 / 采集失败），残留的陈旧光标不得被后续热键预览的 take() 当
+/// 成本次锚点——「卡片甩到远处」不能从热键这扇门回来（审查 P2 收口：
+/// 每个触发起点都显式确定槽状态，命令路径重 stash、热键路径清槽）。
+fn reset_ocr_anchor_for_hotkey(data: &Rc<TextServiceData>) {
+    data.ocr_anchor.set(None);
+}
+
 /// OCR 预览浮窗：识别文本进多行结果块（与 AI 结果浮层同一条渲染路径，
 /// 长文本换行可读、宽度撑满浮层）+ 标题行自解释 + 状态行操作提示。
 /// 此前识别文本塞单条候选行：360px 宽内单行截断 + 「1.」前缀，36 字
@@ -667,13 +693,10 @@ fn stash_ocr_anchor(data: &Rc<TextServiceData>, context: &ITfContext) {
 /// ocr_preview 槽（完整原文），与本处显示串（带标题前缀）无关。
 /// 锚点优先触发时记下的光标位置（见 stash_ocr_anchor），兜底视图粗定位。
 fn show_ocr_preview(data: &Rc<TextServiceData>, text: &str) {
-    // take() 一次性消费：热键路径（Ctrl+Alt+O，无组合不 stash）不得复用
-    // 上一次触发留下的陈旧锚点——「卡片甩到远处」不能从这扇门回来
-    // （独立审查 P2）。无 stash 的触发自然落回视图兜底。
-    let anchor = data
-        .ocr_anchor
-        .take()
-        .unwrap_or_else(|| view_fallback_anchor(data));
+    // take() 一次性消费：无 stash 的触发（热键 Ctrl+Alt+O）自然落视图兜底；
+    // 陈旧残留由热键入口的清槽拦截（reset_ocr_anchor_for_hotkey），不会在
+    // take 这扇门被当成这次锚点（审查 P2）。
+    let anchor = take_ocr_anchor(data);
     show_overlay_window(data, anchor, |ctrl| {
         // 标题用 CJK 括号标记而非 emoji：cosmic-text/swash 渲染路径只验证过
         // CJK+ASCII 字形（✨ 等都在 preedit 文本里由宿主应用渲染），彩色
@@ -815,6 +838,11 @@ pub fn handle_key_down(
     // 触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）：异步采集识别，结果经定时器上屏。
     if let Some(kind) = trigger_kind_for_vk(wparam) {
         log::info!("触发热键: {kind:?}");
+        // 选区 OCR 无组合、不 stash：先清掉命令路径可能残留的陈旧锚点，
+        // 保证本次预览落视图兜底而非旧光标（审查 P2，见 reset 注）。
+        if matches!(kind, TriggerKind::Ocr) {
+            reset_ocr_anchor_for_hotkey(data);
+        }
         trigger_async(data, kind);
         return Ok(TRUE);
     }
@@ -2379,6 +2407,31 @@ impl TextServiceData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_anchor_stash_consumed_once_then_falls_back() {
+        let data = Rc::new(TextServiceData::new());
+        // 命令路径 stash 光标锚点。
+        data.ocr_anchor.set(Some((100, 200, 228)));
+        assert_eq!(
+            take_ocr_anchor(&data),
+            (100, 200, 228),
+            "首次取应消费 stash"
+        );
+        // 槽已空：二次取不得复用同一锚点（一次 stash 至多一次预览）。
+        assert_eq!(take_ocr_anchor(&data), (0, 0, 0), "二次取应落视图兜底");
+    }
+
+    #[test]
+    fn hotkey_trigger_resets_stale_ocr_anchor() {
+        let data = Rc::new(TextServiceData::new());
+        // 命令路径 stash 后未被消费的陈旧残留（取消选区/空结果/非 Idle 直上屏）。
+        data.ocr_anchor.set(Some((300, 400, 428)));
+        // 热键 Ctrl+Alt+O 触发入口清槽：陈旧锚点不得被本次预览当成锚点。
+        reset_ocr_anchor_for_hotkey(&data);
+        assert!(data.ocr_anchor.get().is_none(), "热键触发必须清掉陈旧锚点");
+        assert_eq!(take_ocr_anchor(&data), (0, 0, 0), "应落视图兜底而非旧光标");
+    }
 
     #[test]
     fn trigger_kind_requires_modifier_but_maps_vk() {
