@@ -476,13 +476,48 @@ fn should_claim_key_idle_slash_and_letters() {
     use verba_core::machine::MachineState;
     use verba_ime_windows::text_service::should_claim_key;
     // Idle：认领 `/`（AI 触发）与字母（进入拼音组合）；数字/空格/控制键不认领（直通）
-    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16)); // '/'
-    assert!(should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
-    assert!(!should_claim_key(MachineState::Idle, 0x32, 0x03 << 16)); // '2'
-    assert!(!should_claim_key(MachineState::Idle, 0x20, 0x39 << 16)); // Space
-    assert!(!should_claim_key(MachineState::Idle, 0x0D, 0x1C << 16)); // Enter
-    assert!(!should_claim_key(MachineState::Idle, 0x08, 0x0E << 16)); // Backspace
-    assert!(!should_claim_key(MachineState::Idle, 0x11, 0x1D << 16)); // Ctrl
+    assert!(should_claim_key(
+        MachineState::Idle,
+        false,
+        0xBF,
+        0x35 << 16
+    )); // '/'
+    assert!(should_claim_key(
+        MachineState::Idle,
+        false,
+        0x48,
+        0x23 << 16
+    )); // 'h'
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x32,
+        0x03 << 16
+    )); // '2'
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x20,
+        0x39 << 16
+    )); // Space
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x0D,
+        0x1C << 16
+    )); // Enter
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x08,
+        0x0E << 16
+    )); // Backspace
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x11,
+        0x1D << 16
+    )); // Ctrl
 }
 
 #[test]
@@ -490,18 +525,73 @@ fn should_claim_key_pinyin_claims_letters_digits_space() {
     use verba_core::machine::MachineState;
     use verba_ime_windows::text_service::should_claim_key;
     // 拼音态：字母/数字/空格/控制键都认领；方向键不认领
-    assert!(should_claim_key(MachineState::Pinyin, 0x48, 0x23 << 16)); // 'h'
-    assert!(should_claim_key(MachineState::Pinyin, 0x32, 0x03 << 16)); // '2'
-    assert!(should_claim_key(MachineState::Pinyin, 0x20, 0x39 << 16)); // Space
-    assert!(should_claim_key(MachineState::Pinyin, 0x08, 0x0E << 16)); // Backspace
-    assert!(should_claim_key(MachineState::Pinyin, 0x0D, 0x1C << 16)); // Enter
-    assert!(!should_claim_key(MachineState::Pinyin, 0x25, 0x4B << 16)); // 方向键
-    assert!(!should_claim_key(MachineState::Pinyin, 0x11, 0x1D << 16)); // Ctrl
-                                                                        // Idle：字母与 `/` 认领，数字/空格不认领
-    assert!(should_claim_key(MachineState::Idle, 0x48, 0x23 << 16)); // 'h'
-    assert!(should_claim_key(MachineState::Idle, 0xBF, 0x35 << 16)); // '/'
-    assert!(!should_claim_key(MachineState::Idle, 0x32, 0x03 << 16)); // '2'
-    assert!(!should_claim_key(MachineState::Idle, 0x20, 0x39 << 16)); // Space
+    assert!(should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x48,
+        0x23 << 16
+    )); // 'h'
+    assert!(should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x32,
+        0x03 << 16
+    )); // '2'
+    assert!(should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x20,
+        0x39 << 16
+    )); // Space
+    assert!(should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x08,
+        0x0E << 16
+    )); // Backspace
+    assert!(should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x0D,
+        0x1C << 16
+    )); // Enter
+    assert!(!should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x25,
+        0x4B << 16
+    )); // 方向键
+    assert!(!should_claim_key(
+        MachineState::Pinyin,
+        false,
+        0x11,
+        0x1D << 16
+    )); // Ctrl
+        // Idle：字母与 `/` 认领，数字/空格不认领
+    assert!(should_claim_key(
+        MachineState::Idle,
+        false,
+        0x48,
+        0x23 << 16
+    )); // 'h'
+    assert!(should_claim_key(
+        MachineState::Idle,
+        false,
+        0xBF,
+        0x35 << 16
+    )); // '/'
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x32,
+        0x03 << 16
+    )); // '2'
+    assert!(!should_claim_key(
+        MachineState::Idle,
+        false,
+        0x20,
+        0x39 << 16
+    )); // Space
 }
 
 #[test]
@@ -515,22 +605,28 @@ fn should_claim_key_composition_claims_all() {
         MachineState::Streaming,
         MachineState::ResultReady,
     ] {
-        assert!(should_claim_key(st, 0xBF, 0x35 << 16), "state {st:?} slash");
         assert!(
-            should_claim_key(st, 0x48, 0x23 << 16),
+            should_claim_key(st, false, 0xBF, 0x35 << 16),
+            "state {st:?} slash"
+        );
+        assert!(
+            should_claim_key(st, false, 0x48, 0x23 << 16),
             "state {st:?} letter"
         );
-        assert!(should_claim_key(st, 0x0D, 0x1C << 16), "state {st:?} Enter");
         assert!(
-            should_claim_key(st, 0x08, 0x0E << 16),
+            should_claim_key(st, false, 0x0D, 0x1C << 16),
+            "state {st:?} Enter"
+        );
+        assert!(
+            should_claim_key(st, false, 0x08, 0x0E << 16),
             "state {st:?} Backspace"
         );
         assert!(
-            !should_claim_key(st, 0x11, 0x1D << 16),
+            !should_claim_key(st, false, 0x11, 0x1D << 16),
             "state {st:?} Ctrl 不认领"
         );
         assert!(
-            !should_claim_key(st, 0x25, 0x4B << 16),
+            !should_claim_key(st, false, 0x25, 0x4B << 16),
             "state {st:?} 方向键不认领"
         );
     }

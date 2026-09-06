@@ -393,7 +393,7 @@ impl KeyEventSink {
 ///   全部可打印字符与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被
 ///   吞/丢字符。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
-pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
+pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lparam: u32) -> bool {
     // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
     if state == MachineState::Idle && is_trigger_hotkey(vk) {
         return true;
@@ -407,6 +407,13 @@ pub fn should_claim_key(state: MachineState, vk: u32, lparam: u32) -> bool {
     // 控制/翻页键分支不受影响（沿用既有语义；实机验收项在 issue #44）。
     if ctrl_or_alt_held() {
         return false;
+    }
+    // OCR 预览态（机器 state 仍为 Idle，begin_ocr_preview 不改 state）：
+    // Enter/Esc/空格/1/2 与其它可打印键都必须认领，否则 OnTestKeyDown 返回
+    // FALSE → OnKeyDown 永不回调，预览分支成死代码，OCR 结果无法上屏/取消
+    // （真机 #75 发现：state=Idle 下 Enter claim=false 直接透传）。
+    if ocr_previewing {
+        return is_control || get_char_for_vk(vk, lparam).is_some();
     }
     match state {
         MachineState::Idle => match get_char_for_vk(vk, lparam) {
@@ -483,7 +490,10 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         lparam: LPARAM,
     ) -> Result<windows::core::BOOL> {
         let vk = wparam.0 as u32;
-        let state = self.data.machine.borrow().state();
+        let machine = self.data.machine.borrow();
+        let state = machine.state();
+        let ocr_previewing = machine.ocr_previewing();
+        drop(machine);
         // Shift 始终认领（仅用于接收 OnKeyUp 检测孤立按；OnKeyDown 返回 FALSE
         // 不吞键，Shift 照常交宿主）——TSF 对不认领的键不回调 OnKeyUp，切换
         // 检测会永远不触发（真机复现）。
@@ -491,10 +501,14 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         // 不过 IME）；中文模式走 should_claim_key 正常路由。
         let claim = if vk == VK_SHIFT.0 as u32 {
             true
+        } else if ocr_previewing {
+            // OCR 预览态无论中英文都要认领（否则英文模式触发预览同样无法
+            // 上屏/取消，见 should_claim_key 注）。
+            should_claim_key(state, true, vk, lparam.0 as u32)
         } else if !self.data.ime_chinese.get() && !is_trigger_hotkey(vk) {
             false
         } else {
-            should_claim_key(state, vk, lparam.0 as u32)
+            should_claim_key(state, false, vk, lparam.0 as u32)
         };
         unsafe {
             log::info!(
@@ -825,6 +839,12 @@ fn preview_digit_by_vk(vk: u32) -> Option<PreviewKey> {
     }
 }
 
+/// OCR 预览态未命中预览键（Digit2 或其它）时的路由决策：英文模式透传
+/// 宿主（保持英文直输语义），中文模式落回下方正常状态机路由。
+pub fn ocr_preview_miss_passthrough(ime_chinese: bool) -> bool {
+    !ime_chinese
+}
+
 /// 处理一次 key down。pub 供 tsf_smoke 集成测试直驱按键路由（曾在
 /// 重构中被收回私有，测试目标随之编译失败）。
 pub fn handle_key_down(
@@ -884,9 +904,14 @@ pub fn handle_key_down(
             // 2 在 OCR 预览无语义（仅识别文本一项）：按未命中处理——退出
             // 预览，该键落回下方正常路由。
             Some(PreviewKey::Digit2) | None => {
-                // 未命中预览键：退出预览，隐藏候选窗，落回下方正常路由。
+                // 未命中预览键：退出预览，隐藏候选窗。英文模式下把该键
+                // 透传宿主（保持英文直输），否则会落入中文状态机产生拼音/全角
+                // 副作用；中文模式则落回下方正常路由。
                 machine.end_ocr_preview();
                 hide_candidate_window(data);
+                if ocr_preview_miss_passthrough(data.ime_chinese.get()) {
+                    return Ok(FALSE);
+                }
             }
             Some(k) => {
                 let action = machine.feed_ocr_preview(k).unwrap_or(Action::None);
@@ -2472,6 +2497,41 @@ mod tests {
 
     /// 键位认领的字符级判定：状态机标点在 Idle/Pinyin 两态都认领（全角输出，
     /// 与 macOS 契约对齐）；未映射字符不认领。
+    #[test]
+    fn ocr_preview_miss_passthrough_respects_language_mode() {
+        // 英文模式：非预览键退出预览后必须透传宿主，不能落入中文状态机。
+        assert!(ocr_preview_miss_passthrough(false));
+        // 中文模式：退出预览后继续下方正常路由。
+        assert!(!ocr_preview_miss_passthrough(true));
+    }
+
+    #[test]
+    fn ocr_preview_control_keys_are_claimed() {
+        // OCR 预览态机器 state=Idle，但 Enter/Esc 必须认领才能进 OnKeyDown 的
+        // 预览分支（真机 #75：此前 state=Idle 下 claim=false，Enter 透传、预览
+        // 无法上屏/取消）。空格/1/2 走 get_char_for_vk 的可打印分支，依赖键盘
+        // 布局，由同一 is_some 分支覆盖；此处只钉控制键。
+        assert!(should_claim_key(
+            MachineState::Idle,
+            true,
+            VK_RETURN.0 as u32,
+            0
+        ));
+        assert!(should_claim_key(
+            MachineState::Idle,
+            true,
+            VK_ESCAPE.0 as u32,
+            0
+        ));
+        // 空格依赖 oem_fallback_char 兜底，不随键盘布局变化，可确定性断言。
+        assert!(should_claim_key(
+            MachineState::Idle,
+            true,
+            0x20, // VK_SPACE（测试模块未导入该常量）
+            0x39 << 16
+        ));
+    }
+
     #[test]
     fn claim_chars_cover_machine_punct() {
         for c in [
