@@ -5,7 +5,7 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_ThreadMgr, ITfContext, ITfTextInputProcessor, ITfThreadMgr,
+    CLSID_TF_ThreadMgr, ITfContext, ITfKeyEventSink, ITfTextInputProcessor, ITfThreadMgr,
 };
 
 use verba_ime_windows::text_service::TextService;
@@ -715,10 +715,11 @@ fn tsf_ocr_preview_key_routing() {
         // 认领层钉子（#75 主防线）：OnTestKeyDown 的 ocr_previewing 分支若被
         // 删除/挪到 `!ime_chinese` 门之后，这里必须先红（handle_key_down 单驱
         // 测试不到认领，两半必须成对钉）。
-        // Activate 的 sink 挂载在测试环境（无前台上下文）可能失败，
-        // on_timer 会重试挂载（真机同路径）——先泵一次再取。
-        data.on_timer();
-        let sink = data.keysink.borrow().clone().expect("keysink 应已挂载");
+        // 直构真实认领对象（pub-for-test）：不取 data.keysink——测试环境
+        // AdviseKeyEventSink 拿不到前台上下文必失败（真机由 on_timer 重试），
+        // 认领逻辑在 KeyEventSink 本身上，与 advise 动作无关。
+        let sink: ITfKeyEventSink =
+            verba_ime_windows::text_service::KeyEventSink::new(data.clone()).into();
         let claim = sink
             .OnTestKeyDown(&ctx, WPARAM(VK_RETURN.0 as usize), LPARAM(0x1C << 16))
             .expect("OnTestKeyDown(Enter)");

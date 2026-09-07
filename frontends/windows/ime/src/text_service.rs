@@ -114,7 +114,7 @@ pub struct TextServiceData {
     pub machine: RefCell<CompositionMachine>,
     /// pub 供 tsf_smoke 集成测试直驱 OnTestKeyDown 认领层（#75 回归防线：
     /// 认领/处理两半必须成对钉住）。
-    pub keysink: RefCell<Option<ITfKeyEventSink>>,
+    keysink: RefCell<Option<ITfKeyEventSink>>,
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
     pub chunks: Arc<Mutex<VecDeque<(u64, StreamEvent)>>>,
@@ -376,12 +376,17 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
 // ---- KeyEventSink ----
 
 #[implement(ITfKeyEventSink)]
-struct KeyEventSink {
+// pub-for-test：集成测试直接构造真实认领对象驱动 OnTestKeyDown
+// （tsf_smoke 预览路由 e2e）。测试环境不走 advise——AdviseKeyEventSink
+// 拿不到前台上下文必失败（真机由 on_timer 持续重试挂载），而认领逻辑
+// 就在本对象上，与 advise 动作无关，直构是更干净的钉法。
+pub struct KeyEventSink {
     data: Rc<TextServiceData>,
 }
 
 impl KeyEventSink {
-    fn new(data: Rc<TextServiceData>) -> Self {
+    /// pub-for-test：构造理据见类型注释。
+    pub fn new(data: Rc<TextServiceData>) -> Self {
         Self { data }
     }
 }
