@@ -715,6 +715,9 @@ fn tsf_ocr_preview_key_routing() {
         // 认领层钉子（#75 主防线）：OnTestKeyDown 的 ocr_previewing 分支若被
         // 删除/挪到 `!ime_chinese` 门之后，这里必须先红（handle_key_down 单驱
         // 测试不到认领，两半必须成对钉）。
+        // Activate 的 sink 挂载在测试环境（无前台上下文）可能失败，
+        // on_timer 会重试挂载（真机同路径）——先泵一次再取。
+        data.on_timer();
         let sink = data.keysink.borrow().clone().expect("keysink 应已挂载");
         let claim = sink
             .OnTestKeyDown(&ctx, WPARAM(VK_RETURN.0 as usize), LPARAM(0x1C << 16))
