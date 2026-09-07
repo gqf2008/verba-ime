@@ -112,8 +112,8 @@ pub struct TextServiceData {
     pub context: RefCell<Option<ITfContext>>,
     pub composition: RefCell<Option<ITfComposition>>,
     pub machine: RefCell<CompositionMachine>,
-    /// pub 供 tsf_smoke 集成测试直驱 OnTestKeyDown 认领层（#75 回归防线：
-    /// 认领/处理两半必须成对钉住）。
+    /// advise 成功后缓存的 sink 句柄（供后续 unadvise/复用；认领测试见
+    /// `KeyEventSink` 直构，不经此字段）。
     keysink: RefCell<Option<ITfKeyEventSink>>,
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
