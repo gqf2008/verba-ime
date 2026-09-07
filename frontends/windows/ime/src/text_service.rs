@@ -112,6 +112,8 @@ pub struct TextServiceData {
     pub context: RefCell<Option<ITfContext>>,
     pub composition: RefCell<Option<ITfComposition>>,
     pub machine: RefCell<CompositionMachine>,
+    /// advise 成功后缓存的 sink 句柄（供后续 unadvise/复用；认领测试见
+    /// `KeyEventSink` 直构，不经此字段）。
     keysink: RefCell<Option<ITfKeyEventSink>>,
     keysink_advised: Cell<bool>,
     timer_hwnd: Cell<Option<HWND>>,
@@ -131,7 +133,9 @@ pub struct TextServiceData {
     /// 打包携带所属代际是为了让清理可「只认自己的票」——裸 id 会数值撞车
     /// （每连接自增恒为 2），store(0)/store(new) 都可能误伤他流；0 = 空槽。
     /// 中英模式（Shift 孤立按切换）：true = 中文（拼音），false = 英文直输。
-    ime_chinese: Cell<bool>,
+    /// pub 供 tsf_smoke 集成测试驱动「OCR 预览 × 中英模式」按键路由
+    /// （同 handle_key_down 的 pub 理由）。
+    pub ime_chinese: Cell<bool>,
     /// Shift 按下中（孤立 Shift 抬起时切换中英）。
     shift_down: Cell<bool>,
     /// Shift 按下期间是否与其他键组合（组合则不切换）。
@@ -372,12 +376,17 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
 // ---- KeyEventSink ----
 
 #[implement(ITfKeyEventSink)]
-struct KeyEventSink {
+// pub-for-test：集成测试直接构造真实认领对象驱动 OnTestKeyDown
+// （tsf_smoke 预览路由 e2e）。测试环境不走 advise——AdviseKeyEventSink
+// 拿不到前台上下文必失败（真机由 on_timer 持续重试挂载），而认领逻辑
+// 就在本对象上，与 advise 动作无关，直构是更干净的钉法。
+pub struct KeyEventSink {
     data: Rc<TextServiceData>,
 }
 
 impl KeyEventSink {
-    fn new(data: Rc<TextServiceData>) -> Self {
+    /// pub-for-test：构造理据见类型注释。
+    pub fn new(data: Rc<TextServiceData>) -> Self {
         Self { data }
     }
 }
@@ -392,6 +401,12 @@ impl KeyEventSink {
 /// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady` / `Failed`：认领
 ///   全部可打印字符与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被
 ///   吞/丢字符。
+/// - `ocr_previewing`（OCR 预览态，机器 state 仍为 `Idle`）：Enter/Backspace/
+///   Esc 与一切可解出字符的键都认领（否则 OnKeyDown 不回调、预览分支成死
+///   代码，真机 #75）；未命中键一律退出预览后照常处理（Backspace 亦
+///   作废预览，与 macOS「退格等：退出预览」一致），其中解出控制字符的键
+///   中文模式也透传宿主（见 `ocr_preview_miss_passthrough`），不进状态机
+///   直插字面量。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lparam: u32) -> bool {
     // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
@@ -454,6 +469,11 @@ fn ctrl_or_alt_held() -> bool {
         (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
             || (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
     }
+}
+
+/// Shift 当前按下（同一位约定；供预览数字 VK 兜底避让组合键用）。
+fn shift_held() -> bool {
+    unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 }
 }
 
 /// Idle 态认领的字符判定（VK 解耦，单测直测；调用点见 `should_claim_key`）。
@@ -793,6 +813,20 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
             *data.machine.borrow_mut() = CompositionMachine::new();
         }
     }
+    // OCR 预览槽挂在 Idle 态（begin_ocr_preview 不改 state，#75），上面那道
+    // `state != Idle` 重置门永远放过它；预览/改写/状态卡共用同一个候选窗——
+    // 下面这张 status-only 卡过不了 should_render 门槛（update 直接 hide），
+    // 会当场收掉正在显示的预览窗，留下「活着的隐形预览」，之后任意
+    // Enter/空格/1 把陈旧识别文本上屏（#103 放宽认领后英文模式同中招）。
+    // 对齐 macOS caps-on 清理（imk.rs had_previews → clear_previews）；方向
+    // 不分成败两向都清：Windows 英文模式热键照样能触发预览（handle_key_down
+    // 热键分支先于中英门），不像 macOS caps-on 全键早退无从武装。
+    // 两语句写法：同一表达式里 borrow 跨 borrow_mut 会 BorrowMutError。
+    let ocr_previewing = data.machine.borrow().ocr_previewing();
+    if ocr_previewing {
+        data.machine.borrow_mut().end_ocr_preview();
+        log::info!("中英切换：作废在途 OCR 预览（防隐形预览误上屏）");
+    }
     // 视觉反馈：候选窗位置闪「中/英」状态卡（2 秒后由 on_timer 隐藏）。
     show_overlay_window(data, view_fallback_anchor(data), |ctrl| {
         ctrl.set_status(Some(
@@ -830,7 +864,9 @@ fn classify_preview_key(vk: u32, ch: Option<char>) -> Option<PreviewKey> {
 
 /// 数字列的 VK 回退：AZERTY 等布局数字键不经 Shift 不产生数字字符（法语
 /// 布局原样产出 é 等），只看成字符会让「1/2 选定」在这些布局永远触发不了。
-/// 仅改写对照预览使用——OCR 预览发生在 Idle 态，数字键本就不会被认领送达。
+/// 改写对照预览无条件使用；OCR 预览自 #103（预览态认领数字键，旧注
+/// 「Idle 不认领送达」已失效）起同样需要，但仅在未按 Shift 时兜底——
+/// 否则 QWERTY 的 Shift+1（'!'）会被吞成「1 选定」上屏。
 fn preview_digit_by_vk(vk: u32) -> Option<PreviewKey> {
     match vk {
         0x31 => Some(PreviewKey::Digit1), // VK_1
@@ -839,10 +875,27 @@ fn preview_digit_by_vk(vk: u32) -> Option<PreviewKey> {
     }
 }
 
+/// OCR 预览的数字 VK 兜底闸门（纯函数，供单测钉住，同 idle_claim_char 惯例）：
+/// 仅未按 Shift 时按 VK 判定 1/2——OCR 未命中即销毁预览，若像改写预览那样
+/// 无条件兜底，QWERTY 的 Shift+1（'!'）会被吞成「1 选定」把整段识别文本
+/// 打进文档。
+fn ocr_preview_digit_fallback(shift_down: bool, vk: u32) -> Option<PreviewKey> {
+    if shift_down {
+        None
+    } else {
+        preview_digit_by_vk(vk)
+    }
+}
+
 /// OCR 预览态未命中预览键（Digit2 或其它）时的路由决策：英文模式透传
 /// 宿主（保持英文直输语义），中文模式落回下方正常状态机路由。
-pub fn ocr_preview_miss_passthrough(ime_chinese: bool) -> bool {
-    !ime_chinese
+/// 例外：ToUnicode 解出的控制字符（如 Tab→'\t'，Back/Enter/Esc 的 ch 恒为
+/// None）在中文模式也不落状态机——feed_char 的 Idle 兜底会 CommitImmediate
+/// 直插字面量（Tab 变「插一个制表符」，焦点移动丢失），与 macOS
+/// （imk.rs is_pasteable_char 过滤 c>=' '，预览清掉后交宿主导航）对齐：
+/// 退出预览 + 收面板后透传宿主。
+pub fn ocr_preview_miss_passthrough(ime_chinese: bool, ch: Option<char>) -> bool {
+    !ime_chinese || ch.is_some_and(|c| c.is_control())
 }
 
 /// 处理一次 key down。pub 供 tsf_smoke 集成测试直驱按键路由（曾在
@@ -900,16 +953,20 @@ pub fn handle_key_down(
     // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
     // 后照常走下方路由（不打断打字流）。
     if machine.ocr_previewing() {
-        match classify_preview_key(vk, ch) {
+        // 数字 VK 兜底对齐改写预览（AZERTY 等未按 Shift 时 '1' 键解不出
+        // 数字，只按成字符会把「1 上屏」的预览直接销毁）。
+        let key =
+            classify_preview_key(vk, ch).or_else(|| ocr_preview_digit_fallback(shift_held(), vk));
+        match key {
             // 2 在 OCR 预览无语义（仅识别文本一项）：按未命中处理——退出
             // 预览，该键落回下方正常路由。
             Some(PreviewKey::Digit2) | None => {
-                // 未命中预览键：退出预览，隐藏候选窗。英文模式下把该键
-                // 透传宿主（保持英文直输），否则会落入中文状态机产生拼音/全角
-                // 副作用；中文模式则落回下方正常路由。
+                // 未命中预览键：退出预览，隐藏候选窗。英文模式（或本键解出
+                // 控制字符，如 Tab）把该键透传宿主，否则会落入中文状态机产生
+                // 拼音/全角/字面控制符副作用；中文模式普通字符落回下方正常路由。
                 machine.end_ocr_preview();
                 hide_candidate_window(data);
-                if ocr_preview_miss_passthrough(data.ime_chinese.get()) {
+                if ocr_preview_miss_passthrough(data.ime_chinese.get(), ch) {
                     return Ok(FALSE);
                 }
             }
@@ -2328,10 +2385,18 @@ impl TextServiceData {
             return;
         };
         // 中英切换状态提示超时：Idle（无候选）时隐藏候选窗。
+        // 追加 !ocr_previewing 守卫：候选窗为状态卡与预览共用——卡弹出后
+        // 2s 内预览才到达（Ctrl+Alt+O 异步出结果）时，到点 state 仍是 Idle
+        // 且预览挂在该槽上，隐藏会造出「隐形活预览」，配合 #103 的放宽认领
+        // 即成误上屏。预览的收起由它自己的按键路径负责，此处让位。
         if let Some(until) = self.ime_status_until.get() {
             if std::time::Instant::now() >= until {
                 self.ime_status_until.set(None);
-                if self.machine.borrow().state() == MachineState::Idle {
+                let may_hide = {
+                    let m = self.machine.borrow();
+                    m.state() == MachineState::Idle && !m.ocr_previewing()
+                };
+                if may_hide {
                     hide_candidate_window(&rc);
                 }
             }
@@ -2413,7 +2478,12 @@ impl TextServiceData {
             // 剪贴板照常（识别文本随手可粘贴）；上屏改为候选窗预览——
             // 用户看到再决定（Enter/空格/数字 1 上屏，Esc 取消）。
             crate::clipboard::set_text_quiet(&text);
-            match self.machine.borrow_mut().begin_ocr_preview(text.clone()) {
+            // 两语句写法：match  scrutinee 的临时 borrow 会存活整个 match 体
+            // （Edition 2021），而 `_` 分支的 commit_text 可同步触发宿主终止
+            // 组合 → OnCompositionTerminated 再 borrow_mut(machine) →
+            // BorrowMutError panic（同 collect_steps 两段式派发注释的陷阱）。
+            let begun = self.machine.borrow_mut().begin_ocr_preview(text.clone());
+            match begun {
                 Some(Action::OcrPreview { text: t }) => {
                     show_ocr_preview(&rc, &t);
                     log::info!("OCR 结果进预览: chars={}", t.chars().count());
@@ -2495,14 +2565,19 @@ mod tests {
         assert_ne!(a & 0xffff_ffff, b & 0xffff_ffff);
     }
 
-    /// 键位认领的字符级判定：状态机标点在 Idle/Pinyin 两态都认领（全角输出，
-    /// 与 macOS 契约对齐）；未映射字符不认领。
     #[test]
     fn ocr_preview_miss_passthrough_respects_language_mode() {
         // 英文模式：非预览键退出预览后必须透传宿主，不能落入中文状态机。
-        assert!(ocr_preview_miss_passthrough(false));
-        // 中文模式：退出预览后继续下方正常路由。
-        assert!(!ocr_preview_miss_passthrough(true));
+        assert!(ocr_preview_miss_passthrough(false, None));
+        // 中文模式：退出预览后普通字符继续下方正常路由。
+        assert!(!ocr_preview_miss_passthrough(true, Some('a')));
+        assert!(!ocr_preview_miss_passthrough(true, Some('2')));
+        // 中文模式例外：解出控制字符（Tab→'\t'）也透传——状态机 Idle 兜底会
+        // 把字面量直插文档、吞掉宿主焦点导航（与 macOS is_pasteable_char 对齐）。
+        assert!(ocr_preview_miss_passthrough(true, Some('\t')));
+        // Enter/Back/Esc 的 ch 恒为 None（handle_key_down 按 VK 置 None），
+        // 语义不受本条件影响。
+        assert!(!ocr_preview_miss_passthrough(true, None));
     }
 
     #[test]
@@ -2523,15 +2598,80 @@ mod tests {
             VK_ESCAPE.0 as u32,
             0
         ));
-        // 空格依赖 oem_fallback_char 兜底，不随键盘布局变化，可确定性断言。
+        // 空格：ToUnicodeEx(VK_SPACE) 通常直接返回 ' '，oem_fallback_char 表
+        // 亦含 VK_SPACE 作第二重保险——两条路都不随键盘布局变化，可确定性断言。
         assert!(should_claim_key(
             MachineState::Idle,
             true,
             0x20, // VK_SPACE（测试模块未导入该常量）
             0x39 << 16
         ));
+        // 反向钉子：方向键/翻页键预览态不得认领（宿主导航必须保留；认领集
+        // 未来若被扩宽，预览会变成「键盘陷阱」——#103 复审防回归）。
+        assert!(!should_claim_key(
+            MachineState::Idle,
+            true,
+            0x25,
+            0x4B << 16
+        )); // Left
+        assert!(!should_claim_key(
+            MachineState::Idle,
+            true,
+            0x21,
+            0x49 << 16
+        )); // PageUp
     }
 
+    #[test]
+    fn ocr_preview_digit_fallback_gated_by_shift() {
+        // 纯函数钉子（同 idle_claim_char 惯例）：未按 Shift 才按 VK 兜底
+        // 1/2（AZERTY 的 '1' 键解出 '&' 也能「1 上屏」）；按了 Shift 不得
+        // 兜底——QWERTY Shift+1（'!'）若被吞成「1 选定」会把整段识别文本
+        // 打进文档（改写预览的无条件兜底不可照搬，此处漂移即数据事故）。
+        assert_eq!(
+            ocr_preview_digit_fallback(false, 0x31),
+            Some(PreviewKey::Digit1)
+        );
+        assert_eq!(
+            ocr_preview_digit_fallback(false, 0x32),
+            Some(PreviewKey::Digit2)
+        );
+        assert_eq!(ocr_preview_digit_fallback(true, 0x31), None);
+        assert_eq!(ocr_preview_digit_fallback(true, 0x32), None);
+        assert_eq!(
+            ocr_preview_digit_fallback(false, 0x48),
+            None,
+            "非数字键不兜底"
+        );
+    }
+
+    #[test]
+    fn toggle_ime_invalidates_live_ocr_preview() {
+        // #103 配套修复：预览槽挂在 Idle 态（begin_ocr_preview 不改 state），
+        // toggle_ime 的 `state != Idle` 重置门放过它；状态卡与预览共用候选窗
+        // （卡过不了 should_render → update 直接 hide），不作废预览就留下
+        // 「隐形活预览」，之后任意 Enter/空格/1 误上屏陈旧识别文本（对齐
+        // macOS caps-on clear_previews）。方向不分成败两向都清：Windows
+        // 英文模式热键照样能武装预览。
+        for chinese_now in [true, false] {
+            let data = Rc::new(TextServiceData::new());
+            data.ime_chinese.set(chinese_now);
+            assert!(data
+                .machine
+                .borrow_mut()
+                .begin_ocr_preview("识别文本".to_owned())
+                .is_some());
+            toggle_ime(&data);
+            assert_eq!(data.ime_chinese.get(), !chinese_now, "模式应翻转");
+            assert!(
+                !data.machine.borrow().ocr_previewing(),
+                "中英切换（当前中文={chinese_now}）必须作废在途 OCR 预览"
+            );
+        }
+    }
+
+    /// 键位认领的字符级判定：状态机标点在 Idle/Pinyin 两态都认领（全角输出，
+    /// 与 macOS 契约对齐）；未映射字符不认领。
     #[test]
     fn claim_chars_cover_machine_punct() {
         for c in [

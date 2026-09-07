@@ -5,7 +5,7 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::TextServices::{
-    CLSID_TF_ThreadMgr, ITfContext, ITfTextInputProcessor, ITfThreadMgr,
+    CLSID_TF_ThreadMgr, ITfContext, ITfKeyEventSink, ITfTextInputProcessor, ITfThreadMgr,
 };
 
 use verba_ime_windows::text_service::TextService;
@@ -567,31 +567,6 @@ fn should_claim_key_pinyin_claims_letters_digits_space() {
         0x11,
         0x1D << 16
     )); // Ctrl
-        // Idle：字母与 `/` 认领，数字/空格不认领
-    assert!(should_claim_key(
-        MachineState::Idle,
-        false,
-        0x48,
-        0x23 << 16
-    )); // 'h'
-    assert!(should_claim_key(
-        MachineState::Idle,
-        false,
-        0xBF,
-        0x35 << 16
-    )); // '/'
-    assert!(!should_claim_key(
-        MachineState::Idle,
-        false,
-        0x32,
-        0x03 << 16
-    )); // '2'
-    assert!(!should_claim_key(
-        MachineState::Idle,
-        false,
-        0x20,
-        0x39 << 16
-    )); // Space
 }
 
 #[test]
@@ -696,6 +671,168 @@ fn tsf_display_attribute_roundtrip() {
         );
 
         svc.Deactivate().expect("TextService.Deactivate");
+        let _ = tm.Deactivate();
+        CoUninitialize();
+    }
+}
+
+/// 回归（真机 #75 / PR #103）：OCR 预览态按键路由端到端——修复前预览态
+/// state=Idle 不认领 Enter/Esc/空格 → OnKeyDown 不被回调、预览分支成死代码；
+/// 且英文模式未命中键会漏进中文状态机。这里钉住修复后的 down 侧路由：
+/// Enter 上屏、英文 miss 透传、中文 miss 落状态机、Esc 取消、Tab 透传宿主。
+#[test]
+fn tsf_ocr_preview_key_routing() {
+    use verba_core::machine::MachineState;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_H, VK_RETURN, VK_TAB};
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        assert_eq!(hr.0, 0);
+        let tm: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).expect("ThreadMgr");
+        let tid = tm.Activate().expect("Activate");
+        let doc = tm.CreateDocumentMgr().expect("DocumentMgr");
+        let mut ctx_out: Option<ITfContext> = None;
+        let mut cookie = 0u32;
+        doc.CreateContext(tid, 0, None, &mut ctx_out, &mut cookie)
+            .expect("CreateContext");
+        let ctx = ctx_out.expect("context");
+        doc.Push(&ctx).expect("Push");
+        let _ = tm.SetFocus(&doc);
+
+        let svc_struct = verba_ime_windows::text_service::TextService::new();
+        let data = svc_struct.data.clone();
+        let svc: ITfTextInputProcessor = svc_struct.into();
+        svc.Activate(&tm, tid).expect("Activate");
+        *data.context.borrow_mut() = Some(ctx.clone());
+
+        // ① 命中（Enter）→ 识别文本上屏、预览槽收口。
+        assert!(data
+            .machine
+            .borrow_mut()
+            .begin_ocr_preview("识别文本".to_owned())
+            .is_some());
+        // 认领层钉子（#75 主防线）：OnTestKeyDown 的 ocr_previewing 分支若被
+        // 删除/挪到 `!ime_chinese` 门之后，这里必须先红（handle_key_down 单驱
+        // 测试不到认领，两半必须成对钉）。
+        // 直构真实认领对象（pub-for-test）：不取 data.keysink——测试环境
+        // AdviseKeyEventSink 拿不到前台上下文必失败（真机由 on_timer 重试），
+        // 认领逻辑在 KeyEventSink 本身上，与 advise 动作无关。
+        let sink: ITfKeyEventSink =
+            verba_ime_windows::text_service::KeyEventSink::new(data.clone()).into();
+        let claim = sink
+            .OnTestKeyDown(&ctx, WPARAM(VK_RETURN.0 as usize), LPARAM(0x1C << 16))
+            .expect("OnTestKeyDown(Enter)");
+        assert_eq!(claim, true, "中文模式预览态 Enter 必须被认领（#75）");
+        let eaten =
+            verba_ime_windows::text_service::handle_key_down(&data, VK_RETURN.0 as u32, 0x1C << 16)
+                .expect("handle_key_down(Enter)");
+        assert_eq!(eaten, true, "预览态 Enter 应认领并提交识别文本");
+        assert_eq!(read_context_text(&ctx, tid), "识别文本");
+        assert!(!data.machine.borrow().ocr_previewing(), "提交后应退出预览");
+
+        // ② 英文模式未命中键（'h'）→ 退出预览 + 透传宿主（#103：不得进拼音态）。
+        data.ime_chinese.set(false);
+        assert!(data
+            .machine
+            .borrow_mut()
+            .begin_ocr_preview("英文透传".to_owned())
+            .is_some());
+        let claim = sink
+            .OnTestKeyDown(&ctx, WPARAM(VK_H.0 as usize), LPARAM(0x23 << 16))
+            .expect("OnTestKeyDown(H en)");
+        assert_eq!(
+            claim, true,
+            "英文模式预览态可打印键须认领（预览 bypass 英文门）"
+        );
+        let eaten =
+            verba_ime_windows::text_service::handle_key_down(&data, VK_H.0 as u32, 0x23 << 16)
+                .expect("handle_key_down(H en)");
+        assert_eq!(eaten, false, "英文模式未命中键应透传宿主");
+        assert!(!data.machine.borrow().ocr_previewing(), "未命中应退出预览");
+        assert_eq!(
+            data.machine.borrow().state(),
+            MachineState::Idle,
+            "英文透传不得进状态机"
+        );
+        assert_eq!(
+            read_context_text(&ctx, tid),
+            "识别文本",
+            "英文透传不得上屏预览文本"
+        );
+        // 反向钉子：无预览的英文模式可打印键仍不认领（宿主直输通道未被放宽波及）。
+        let claim = sink
+            .OnTestKeyDown(&ctx, WPARAM(VK_H.0 as usize), LPARAM(0x23 << 16))
+            .expect("OnTestKeyDown(H en idle)");
+        assert_eq!(claim, false, "无预览英文模式不得认领字母");
+
+        // ③ 中文模式未命中键（'h'）→ 退出预览、落回正常路由起拼音组合。
+        data.ime_chinese.set(true);
+        assert!(data
+            .machine
+            .borrow_mut()
+            .begin_ocr_preview("中文落路由".to_owned())
+            .is_some());
+        let eaten =
+            verba_ime_windows::text_service::handle_key_down(&data, VK_H.0 as u32, 0x23 << 16)
+                .expect("handle_key_down(H zh)");
+        assert_eq!(eaten, true, "中文模式未命中键应被状态机认领");
+        assert_eq!(data.machine.borrow().state(), MachineState::Pinyin);
+        assert!(
+            !read_context_text(&ctx, tid).contains("中文落路由"),
+            "预览刚退出，文本不得上屏"
+        );
+        let esc_teardown =
+            verba_ime_windows::text_service::handle_key_down(&data, VK_ESCAPE.0 as u32, 0)
+                .expect("handle_key_down(Esc teardown)");
+        assert_eq!(esc_teardown, true, "拼音组合应被 Esc 取消");
+        assert_eq!(
+            data.machine.borrow().state(),
+            MachineState::Idle,
+            "收尾后须回 Idle（后续 begin_ocr_preview 依赖）"
+        );
+
+        // ④ 中文模式 Tab（解出控制字符）→ 退出预览且透传宿主保持焦点导航
+        //   （#103 复审：状态机 Idle 兜底会把字面 TAB 直插文档、吞掉焦点移动）。
+        assert!(data
+            .machine
+            .borrow_mut()
+            .begin_ocr_preview("Tab应透传".to_owned())
+            .is_some());
+        let claim = sink
+            .OnTestKeyDown(&ctx, WPARAM(VK_TAB.0 as usize), LPARAM(0x0F << 16))
+            .expect("OnTestKeyDown(Tab)");
+        assert_eq!(
+            claim, true,
+            "预览态 Tab 须认领（否则 OnKeyDown 不回调、预览收不掉）"
+        );
+        let eaten =
+            verba_ime_windows::text_service::handle_key_down(&data, VK_TAB.0 as u32, 0x0F << 16)
+                .expect("handle_key_down(Tab)");
+        assert_eq!(eaten, false, "预览态 Tab 应透传宿主（焦点导航优先）");
+        assert!(!data.machine.borrow().ocr_previewing());
+        assert!(
+            !read_context_text(&ctx, tid).contains("Tab应透传"),
+            "Tab 不得触发预览上屏"
+        );
+
+        // ⑤ Esc → 取消预览，不上屏。
+        assert!(data
+            .machine
+            .borrow_mut()
+            .begin_ocr_preview("应取消".to_owned())
+            .is_some());
+        let claim = sink
+            .OnTestKeyDown(&ctx, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0x1))
+            .expect("OnTestKeyDown(Esc)");
+        assert_eq!(claim, true, "预览态 Esc 必须被认领（#75 取消路径）");
+        let eaten = verba_ime_windows::text_service::handle_key_down(&data, VK_ESCAPE.0 as u32, 0)
+            .expect("handle_key_down(Esc)");
+        assert_eq!(eaten, true, "预览态 Esc 应认领并取消");
+        assert!(!data.machine.borrow().ocr_previewing());
+        assert!(!read_context_text(&ctx, tid).contains("应取消"));
+
+        svc.Deactivate().expect("Deactivate");
         let _ = tm.Deactivate();
         CoUninitialize();
     }
