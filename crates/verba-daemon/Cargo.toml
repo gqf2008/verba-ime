@@ -23,5 +23,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 log.workspace = true
 env_logger.workspace = true
+regex.workspace = true
 async-trait = "0.1"
 futures-util.workspace = true
