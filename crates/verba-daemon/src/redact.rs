@@ -16,7 +16,7 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(
         // 常见密钥赋值：<field>[:=] <value>，保留字段名便于排查，掩掉值
         (Regex::new(r"(?i)(api[_-]?key|api_keys?|access[_-]?token|token|secret|password|passwd)\s*[:=]\s*\S+").unwrap(), "$1=[REDACTED]"),
         // OpenAI 风格 key：sk-<base62>
-        (Regex::new(r"sk-[A-Za-z0-9_-]{6,}").unwrap(), "sk-[REDACTED]"),
+        (Regex::new(r"\bsk-[A-Za-z0-9_-]{6,}").unwrap(), "sk-[REDACTED]"),
         // GitHub / GitLab PAT：ghp_/gho_/ghs_/ghr_/glpat-
         (Regex::new(r"(gh[pousr]_)[A-Za-z0-9]{20,}").unwrap(), "$1[REDACTED]"),
         (Regex::new(r"glpat-[A-Za-z0-9_-]{16,}").unwrap(), "glpat-[REDACTED]"),
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn masks_openai_style_key() {
         let s = "llm api_key=sk-abcdef1234567890";
-        let r = redact_secrets(&s);
+        let r = redact_secrets(s);
         assert!(r.contains("api_key=[REDACTED]"), "got: {r}");
         assert!(!r.contains("sk-abcdef1234567890"), "got: {r}");
     }
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn masks_bearer_token() {
         let s = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.token.value";
-        let r = redact_secrets(&s);
+        let r = redact_secrets(s);
         assert!(!r.contains("eyJhbGciOiJIUzI1NiJ9"), "got: {r}");
         assert!(
             r.contains("Bearer [REDACTED]") || r.contains("[REDACTED]"),
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn masks_pem_private_key() {
         let s = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----";
-        let r = redact_secrets(&s);
+        let r = redact_secrets(s);
         assert!(!r.contains("AAAA"), "got: {r}");
         assert!(r.contains("[REDACTED PRIVATE KEY]"), "got: {r}");
     }
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn leaves_plain_normal_text_untouched() {
         let s = "模式切换: 中文 Rime 候选请求: pinyin=nihao";
-        assert_eq!(redact_secrets(&s), s);
+        assert_eq!(redact_secrets(s), s);
     }
 
     #[test]
@@ -189,10 +189,33 @@ mod tests {
     }
 
     #[test]
+    fn masks_bare_sk_key() {
+        // 无字段标签的裸 sk- key：必须命中 sk- 分支（不被字段模式遮蔽）。
+        let s = seg(&["sk-", "abcdef1234567890abcdef"]);
+        let r = redact_secrets(&s);
+        assert_eq!(r, "sk-[REDACTED]", "got: {r}");
+    }
+
+    #[test]
+    fn masks_bare_bearer() {
+        let s = seg(&["Bearer ", "eyJhbGciOiJIUzI1NiJ", ".token.value"]);
+        let r = redact_secrets(&s);
+        assert!(!r.contains("eyJhbGciOiJIUzI1NiJ"), "got: {r}");
+        assert!(r.contains("[REDACTED]"), "got: {r}");
+    }
+
+    #[test]
+    fn masks_bare_github_pat() {
+        let s = seg(&["gh", "p_1234567890abcdefghijklmnopqrstuvwxyz"]);
+        let r = redact_secrets(&s);
+        assert_eq!(r, "ghp_[REDACTED]", "got: {r}");
+    }
+
+    #[test]
     fn documents_unrecognized_secret_form_residual_risk() {
         // 负向对照：无前缀的裸 token / 自定义密钥本表无法识别——这是
         // 本实现的已知上限（best-effort），真正的保证是调用点不落密钥。
         let mysterious = "aRANDOMopaquevaluewithoutprefix123456";
-        assert_eq!(redact_secrets(&mysterious), mysterious);
+        assert_eq!(redact_secrets(mysterious), mysterious);
     }
 }
