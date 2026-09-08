@@ -401,7 +401,7 @@ impl KeyEventSink {
 /// - `PendingSlash` / `Prompt` / `Streaming` / `ResultReady` / `Failed`：认领
 ///   全部可打印字符与控制键（Enter/Backspace/Esc），避免 `/` 或提示词被
 ///   吞/丢字符。
-/// - `ocr_previewing`（OCR 预览态，机器 state 仍为 `Idle`）：Enter/Backspace/
+/// - `ocr_previewing`（OCR 预览态，机器 state = `OcrPreviewing`）：Enter/Backspace/
 ///   Esc 与一切可解出字符的键都认领（否则 OnKeyDown 不回调、预览分支成死
 ///   代码，真机 #75）；未命中键一律退出预览后照常处理（Backspace 亦
 ///   作废预览，与 macOS「退格等：退出预览」一致），其中解出控制字符的键
@@ -410,7 +410,7 @@ impl KeyEventSink {
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lparam: u32) -> bool {
     // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
-    if state == MachineState::Idle && is_trigger_hotkey(vk) {
+    if matches!(state, MachineState::Idle | MachineState::OcrPreviewing) && is_trigger_hotkey(vk) {
         return true;
     }
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
@@ -423,7 +423,7 @@ pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lpar
     if ctrl_or_alt_held() {
         return false;
     }
-    // OCR 预览态（机器 state 仍为 Idle，begin_ocr_preview 不改 state）：
+    // OCR 预览态（begin_ocr_preview 将 state 置为 OcrPreviewing）：
     // Enter/Esc/空格/1/2 与其它可打印键都必须认领，否则 OnTestKeyDown 返回
     // FALSE → OnKeyDown 永不回调，预览分支成死代码，OCR 结果无法上屏/取消
     // （真机 #75 发现：state=Idle 下 Enter claim=false 直接透传）。
@@ -455,6 +455,14 @@ pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lpar
         | MachineState::Streaming
         | MachineState::ResultReady
         | MachineState::Failed => {
+            if is_control {
+                return true;
+            }
+            get_char_for_vk(vk, lparam).is_some()
+        }
+        MachineState::OcrPreviewing => {
+            // 预览态由上方 `ocr_previewing` 分支提前认领；此臂仅保 match 穷尽
+            // （若调用方传入 state=OcrPreviewing 但 ocr_previewing=false 的异常组合）。
             if is_control {
                 return true;
             }

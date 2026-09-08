@@ -62,6 +62,9 @@ impl Mode {
 pub enum MachineState {
     /// 空闲：普通直输。
     Idle,
+    /// OCR 识别结果预览中：识别文本暂存（`ocr_preview`），Enter/空格/1 上屏、
+    /// Esc 取消。收敛为单状态，取代独立的 `ocr_previewing()` 布尔（#105 item4）。
+    OcrPreviewing,
     /// 拼音组合中（缓冲区见 [`CompositionMachine::pinyin_buffer`]）。
     Pinyin,
     /// 已输入一个 `/`，等待第二个 `/` 或其它字符。
@@ -401,6 +404,7 @@ impl CompositionMachine {
             MachineState::Streaming => "✨ 生成中…".to_owned(),
             MachineState::ResultReady => "✨ 已就绪".to_owned(),
             MachineState::Failed => "✨ 生成失败".to_owned(),
+            MachineState::OcrPreviewing => String::new(),
             MachineState::Idle => String::new(),
         }
     }
@@ -532,6 +536,12 @@ impl CompositionMachine {
                 Some(key) => self.feed_ai_preview(key).unwrap_or(Action::None),
                 None => Action::None,
             },
+            MachineState::OcrPreviewing => {
+                // 防御：预览态由前端走 feed_ocr_preview，不直接喂字符；若真有
+                // 字符进状态机，先退出预览再按 Idle 处理（「其他键照常」）。
+                self.end_ocr_preview();
+                self.feed_char(c)
+            }
         }
     }
 
@@ -831,6 +841,12 @@ impl CompositionMachine {
                 // 退格 = 改提示词（与 `e` 同义：浮层态退格的意图是回去改）。
                 self.feed_ai_preview(AiKey::Edit).unwrap_or(Action::None)
             }
+            MachineState::OcrPreviewing => {
+                // 防御：预览态 Backspace 由前端走 feed_ocr_preview；若直进状态机，
+                // 退出预览并按 Idle 处理（旧 Idle 退格 = None）。
+                self.end_ocr_preview();
+                Action::None
+            }
         }
     }
 
@@ -898,6 +914,12 @@ impl CompositionMachine {
             MachineState::Failed => {
                 // 失败态无结果可提交：Enter = 重试（见 retry_last_llm 注）。
                 self.retry_last_llm()
+            }
+            MachineState::OcrPreviewing => {
+                // 防御：预览态 Enter 由前端走 feed_ocr_preview；若直进状态机，
+                // 退出预览并按 Idle 处理（旧 Idle Enter = None）。
+                self.end_ocr_preview();
+                Action::None
             }
         }
     }
@@ -1207,11 +1229,16 @@ impl CompositionMachine {
     }
 
     /// OCR 结果进入预览：候选窗首条 = 识别文本（选中态），非流式通道。
-    /// 不覆盖已有组合（OCR 触发时组合已结束，状态应 Idle）。
+    /// 允许在 Idle 或已有预览（OcrPreviewing）上进入/重触发：后者会覆盖旧识别文本。
     pub fn begin_ocr_preview(&mut self, text: String) -> Option<Action> {
-        if self.state != MachineState::Idle || text.is_empty() {
+        // 单状态化：预览期间 state 即 OcrPreviewing（取代独立的 ocr_previewing 布尔）。
+        // 允许在已有预览上重触发（Idle | OcrPreviewing），后者会覆盖旧识别文本。
+        if !matches!(self.state, MachineState::Idle | MachineState::OcrPreviewing)
+            || text.is_empty()
+        {
             return None;
         }
+        self.state = MachineState::OcrPreviewing;
         self.ocr_preview = Some(text.clone());
         Some(Action::OcrPreview { text })
     }
@@ -1223,15 +1250,18 @@ impl CompositionMachine {
         let text = self.ocr_preview.clone().unwrap_or_default();
         match key {
             PreviewKey::Enter | PreviewKey::Space | PreviewKey::Digit1 => {
+                self.state = MachineState::Idle;
                 self.ocr_preview = None;
                 Some(Action::CommitImmediate(text))
             }
             PreviewKey::Escape => {
+                self.state = MachineState::Idle;
                 self.ocr_preview = None;
                 Some(Action::Cancel)
             }
             PreviewKey::Digit2 | PreviewKey::Other => {
                 // 其他键：退出预览（丢弃），该键交回调用方重走正常路径。
+                self.state = MachineState::Idle;
                 self.ocr_preview = None;
                 None
             }
@@ -1239,11 +1269,14 @@ impl CompositionMachine {
     }
 
     pub fn ocr_previewing(&self) -> bool {
-        self.ocr_preview.is_some()
+        self.state == MachineState::OcrPreviewing
     }
 
     /// 退出预览（丢弃识别文本；其他键照常处理时调用）。
     pub fn end_ocr_preview(&mut self) {
+        if self.state == MachineState::OcrPreviewing {
+            self.state = MachineState::Idle;
+        }
         self.ocr_preview = None;
     }
 
@@ -1593,6 +1626,7 @@ impl fmt::Display for MachineState {
             Self::Streaming => "streaming",
             Self::ResultReady => "result-ready",
             Self::Failed => "failed",
+            Self::OcrPreviewing => "ocr-preview",
         })
     }
 }
