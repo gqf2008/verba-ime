@@ -110,6 +110,26 @@ fn decode_rgb(image: &[u8]) -> Result<image::RgbImage, OcrError> {
     Ok(img.to_rgb8())
 }
 
+/// OCR 前对超长边降采样：控制推理耗时（预算：截图 OCR < 2s，本地 RapidOCR）。
+///
+/// 实测延迟随分辨率近似线性增长（4K 6099ms / 1080p 3909ms / 720p 1976ms），
+/// 把最长边压到 [`OCR_MAX_EDGE`] 以内换取速度；小图不缩放，不影响低分辨率识别。
+/// 注：优先保证截图场景（屏幕文本普遍足够大），小字号极端场景可通过提升阈值权衡。
+const OCR_MAX_EDGE: u32 = 1600;
+
+/// 超长边图降采样；未超阈值原样返回（避免不必要的拷贝）。
+fn downsample(img: image::RgbImage) -> image::RgbImage {
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    if longest <= OCR_MAX_EDGE {
+        return img;
+    }
+    let scale = OCR_MAX_EDGE as f64 / longest as f64;
+    let nw = ((w as f64) * scale).round().clamp(1.0, OCR_MAX_EDGE as f64) as u32;
+    let nh = ((h as f64) * scale).round().clamp(1.0, OCR_MAX_EDGE as f64) as u32;
+    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3)
+}
+
 /// 在常驻运行器上执行一次识别。
 fn run_native(image: &[u8]) -> Result<String, OcrError> {
     let mut guard = pool()
@@ -119,7 +139,7 @@ fn run_native(image: &[u8]) -> Result<String, OcrError> {
         *guard = Some(build_runner()?);
     }
     let runner = guard.as_mut().expect("set 后必有运行器");
-    let img = decode_rgb(image)?;
+    let img = downsample(decode_rgb(image)?);
     let result = runner.runner.run_image(&img);
     let output = result.map_err(|e| OcrError::Rapid(format!("RapidOCR 识别失败: {e}")))?;
     let mut lines = Vec::new();
@@ -201,5 +221,27 @@ mod tests {
         // 任意字节必须优雅报错（此前写 .bmp 临时文件的路径对任意字节都能走通）
         let err = decode_rgb(b"not an image at all").unwrap_err();
         assert!(err.to_string().contains("图像解码失败"));
+    }
+
+    /// 降采样：超长边缩放，未超阈值原样返回。
+    #[test]
+    fn downsample_caps_longest_edge_and_passthrough_small() {
+        // 未超阈值：原样（size 不变）
+        let small = image::RgbImage::new(320, 200);
+        let d = downsample(small);
+        assert_eq!((d.width(), d.height()), (320, 200));
+
+        // 超阈值：4K 3840x2160 -> 最长边 1600
+        let big = image::RgbImage::new(3840, 2160);
+        let d = downsample(big);
+        assert_eq!(d.width(), OCR_MAX_EDGE);
+        assert_eq!(d.height(), 900);
+        assert!(d.width() <= OCR_MAX_EDGE && d.height() <= OCR_MAX_EDGE);
+
+        // 纵向图：宽 < 高
+        let tall = image::RgbImage::new(1080, 3840);
+        let d = downsample(tall);
+        assert_eq!(d.height(), OCR_MAX_EDGE);
+        assert_eq!(d.width(), 450);
     }
 }
