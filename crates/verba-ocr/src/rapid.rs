@@ -127,7 +127,7 @@ fn downsample(img: image::RgbImage) -> image::RgbImage {
     let scale = OCR_MAX_EDGE as f64 / longest as f64;
     let nw = ((w as f64) * scale).round().clamp(1.0, OCR_MAX_EDGE as f64) as u32;
     let nh = ((h as f64) * scale).round().clamp(1.0, OCR_MAX_EDGE as f64) as u32;
-    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3)
+    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle)
 }
 
 /// 在常驻运行器上执行一次识别。
