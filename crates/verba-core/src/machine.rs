@@ -3483,6 +3483,40 @@ mod tests {
         assert!(!m.ocr_previewing());
     }
 
+    /// #105 item4 单状态化：OcrPreviewing 是唯一预览信号——begin 置状态、
+    /// end/feed 各分支复位到 Idle，杜绝「state=Idle + 正交布尔」的漂移。
+    #[test]
+    fn ocr_preview_state_single_source_of_truth() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(
+            m.begin_ocr_preview("识别文本".to_owned()),
+            Some(Action::OcrPreview {
+                text: "识别文本".to_owned()
+            })
+        );
+        assert_eq!(m.state(), MachineState::OcrPreviewing);
+        assert!(m.ocr_previewing());
+
+        // macOS 提交路径：前端只调 end_ocr_preview → 必须回 Idle。
+        m.end_ocr_preview();
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(!m.ocr_previewing());
+
+        // Windows 提交路径：feed_ocr_preview(Enter) → 回 Idle。
+        assert!(m.begin_ocr_preview("文本2".to_owned()).is_some());
+        assert_eq!(m.state(), MachineState::OcrPreviewing);
+        let _ = m.feed_ocr_preview(PreviewKey::Enter);
+        assert_eq!(m.state(), MachineState::Idle);
+
+        // 其他键/取消路径同样复位。
+        assert!(m.begin_ocr_preview("文本3".to_owned()).is_some());
+        let _ = m.feed_ocr_preview(PreviewKey::Escape);
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(m.begin_ocr_preview("文本4".to_owned()).is_some());
+        let _ = m.feed_ocr_preview(PreviewKey::Other);
+        assert_eq!(m.state(), MachineState::Idle);
+    }
+
     /// `///`：Prompt 态空提示词按第三个斜杠 → TriggerOcr（选区截图）。
     #[test]
     fn triple_slash_triggers_ocr() {

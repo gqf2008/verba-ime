@@ -2655,8 +2655,8 @@ mod tests {
 
     #[test]
     fn toggle_ime_invalidates_live_ocr_preview() {
-        // #103 配套修复：预览槽挂在 Idle 态（begin_ocr_preview 不改 state），
-        // toggle_ime 的 `state != Idle` 重置门放过它；状态卡与预览共用候选窗
+        // #103 配套修复：预览单状态化后 begin_ocr_preview 置 OcrPreviewing，
+        // toggle_ime 的 `state != Idle` 重置门在预览态也会触发；状态卡与预览共用候选窗
         // （卡过不了 should_render → update 直接 hide），不作废预览就留下
         // 「隐形活预览」，之后任意 Enter/空格/1 误上屏陈旧识别文本（对齐
         // macOS caps-on clear_previews）。方向不分成败两向都清：Windows

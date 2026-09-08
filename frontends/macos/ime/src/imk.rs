@@ -815,6 +815,9 @@ define_class!(
                     Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => {
                         let text = self.ivars().ocr_preview.borrow().clone();
                         let _ = self.clear_previews();
+                        // 单状态化（#105 item4）：移除核心侧 OcrPreviewing，避免
+                        // 状态滞留在预览态吞掉后续 Enter/Backspace/Esc。
+                        self.ivars().machine.borrow_mut().end_ocr_preview();
                         self.hide_candidate_window();
                         if let Some(t) = text {
                             self.commit(&t);
@@ -831,9 +834,11 @@ define_class!(
                         return Bool::new(true);
                     }
                     // '2'/字母/退格等：退出预览、收面板，不 return——落回
-                    // 下方正常路由处理本键。
+                    // 下方正常路由处理本键。同时复位核心侧 OcrPreviewing，
+                    // 使落回路由的 was_idle/按键语义与旧「Idle + 正交布尔」一致。
                     _ => {
                         let _ = self.clear_previews();
+                        self.ivars().machine.borrow_mut().end_ocr_preview();
                         self.hide_candidate_window();
                     }
                 }
