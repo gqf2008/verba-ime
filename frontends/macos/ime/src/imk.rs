@@ -132,12 +132,15 @@ fn style_candidate_panel(mtm: MainThreadMarker) {
     }
 }
 
-/// IMKServer 连接名（与 app/Info.plist 的 `InputMethodConnectionName` 保持一致）。
+/// 现代 macOS 的 IMK 连接名约定：`<CFBundleIdentifier>_Connection`。
 ///
-/// 现代 macOS 的 IMK 连接名约定为 `<CFBundleIdentifier>_Connection`；旧式
-/// `Verba_1_Connection` 会让 IMKLaunchAgent 拒绝 XPC endpoint（真机日志：
-/// `requestIMKXPCEndpointInvalid`），输入源因此无法进入菜单/被选中。
-pub const CONNECTION_NAME: &str = "dev.verba.inputmethod.Verba_Connection";
+/// 旧式 `Verba_1_Connection` 会让 IMKLaunchAgent 拒绝 XPC endpoint（真机日志：
+/// `requestIMKXPCEndpointInvalid`），输入源因此无法进入菜单/被选中。运行时从
+/// 主 bundle 的 CFBundleIdentifier 派生，避免常量与 Info.plist 双源漂移。
+fn connection_name_for_bundle_id(bundle_id: &str) -> String {
+    format!("{bundle_id}_Connection")
+}
+
 /// 控制器 ObjC 类名（与 app/Info.plist 的 `InputMethodServerControllerClass` 保持一致）。
 pub const CONTROLLER_CLASS: &str = "VerbaIMKController";
 /// daemon 兼容的错误事件（无真实请求 id，序号匹配由全局 seq 完成）。
@@ -1026,8 +1029,7 @@ define_class!(
         /// UTF-16 末尾即可，既避免宿主往返也消除该崩溃面。
         #[unsafe(method(selectionRange))]
         fn selection_range(&self) -> NSRange {
-            let composed = self.ivars().composed.borrow();
-            NSRange::new(composed.encode_utf16().count() as NSUInteger, 0)
+            selection_range_for(&self.ivars().composed.borrow())
         }
 
         /// 组合文本数据源：updateComposition 调用它取当前 preedit 发给 client。
@@ -1297,6 +1299,13 @@ enum ImkKey {
     PageDown,
     ArrowUp,
     ArrowDown,
+}
+
+/// `selectionRange` 的生产实现：返回 composed text 的 UTF-16 末尾。
+///
+/// 抽成纯函数供控制器与单测共用，防止测试复制实现而无法捕获回归。
+fn selection_range_for(text: &str) -> NSRange {
+    NSRange::new(text.encode_utf16().count() as NSUInteger, 0)
 }
 
 /// 候选分页切片（纯逻辑，供 candidates: 数据源与测试复用）。
@@ -2294,7 +2303,7 @@ pub fn run_server() -> ! {
     let bundle_id = bundle
         .bundleIdentifier()
         .unwrap_or_else(|| NSString::from_str("dev.verba.inputmethod.Verba"));
-    let conn = NSString::from_str(CONNECTION_NAME);
+    let conn = NSString::from_str(&connection_name_for_bundle_id(&bundle_id.to_string()));
 
     // SAFETY: initWithName:bundleIdentifier: 从主 bundle Info.plist 解析控制器类。
     let _server = unsafe {
@@ -2317,9 +2326,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_name_matches_bundle_id_convention() {
+    fn connection_name_derives_from_bundle_id() {
         assert_eq!(
-            CONNECTION_NAME,
+            connection_name_for_bundle_id("dev.verba.inputmethod.Verba"),
             "dev.verba.inputmethod.Verba_Connection",
             "IMK 连接名必须是 <CFBundleIdentifier>_Connection"
         );
@@ -2328,8 +2337,14 @@ mod tests {
     #[test]
     fn selection_range_uses_utf16_units() {
         let text = "ni你🦀";
-        let range = NSRange::new(text.encode_utf16().count() as NSUInteger, 0);
-        assert_eq!(range.location, 5);
+        assert_eq!(text.len(), 9, "UTF-8 字节数不是 selectionRange 的单位");
+        assert_eq!(
+            text.chars().count(),
+            4,
+            "Unicode scalar 数不是 selectionRange 的单位"
+        );
+        let range = selection_range_for(text);
+        assert_eq!(range.location, 5, "selectionRange 使用 UTF-16 code unit");
         assert_eq!(range.length, 0);
     }
 
