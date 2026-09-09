@@ -63,6 +63,18 @@ jobs:
       - name: 校验 .app
         run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-settings && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-trigger && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register && test -f frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf && frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register --list && ls -la frontends/macos/ime/dist/Verba.app/Contents
 
+      - name: 打包 PKG 并校验
+        run: |
+          bash frontends/macos/ime/scripts/package-pkg.sh
+          PKG="$(ls frontends/macos/ime/dist/Verba-*.pkg | head -1)"
+          test -f "$PKG"
+          # 校验系统级安装位置与 postinstall 已内嵌（防脚本漂移）
+          EXP="$(mktemp -d)/expanded"
+          pkgutil --expand-full "$PKG" "$EXP"
+          grep -q 'install-location="/Library/Input Methods"' "$EXP/Verba-component.pkg/PackageInfo"
+          test -x "$EXP/Verba-component.pkg/Scripts/postinstall"
+          echo "PKG 校验通过: $PKG"
+
   frontend-windows:
     runs-on: windows-latest
     defaults:

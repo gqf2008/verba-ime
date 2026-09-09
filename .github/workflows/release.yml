@@ -157,6 +157,38 @@ jobs:
             spctl --assess --type open --context context:primary-signature -v "Verba-$VERSION.dmg" || true
           fi
 
+      - name: 打包 PKG（有 Installer 身份时签名 + 公证 + staple）
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          # Developer ID Installer 证书与 Application 不同：有则签名+公证，无则产出
+          # 未签名 pkg（不阻塞发布；正式分发建议补齐 Installer 证书）。
+          INSTALLER_IDENTITY="$(security find-identity -v | awk -F'"' '/Developer ID Installer/ {print $2; exit}')"
+          if [ -n "$INSTALLER_IDENTITY" ]; then
+            echo "使用 Installer 身份: $INSTALLER_IDENTITY"
+            INSTALLER_IDENTITY="$INSTALLER_IDENTITY" bash frontends/macos/ime/scripts/package-pkg.sh
+            PKG="frontends/macos/ime/dist/Verba-$VERSION.pkg"
+            set +e
+            NOTARY_OUT="$(xcrun notarytool submit "$PKG" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+            NOTARY_RC=$?
+            set -e
+            printf '%s\n' "$NOTARY_OUT"
+            if [ $NOTARY_RC -ne 0 ]; then
+              SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+              if [ -n "$SUB_ID" ]; then
+                echo "::error::PKG 公证失败（submission=$SUB_ID），详细原因：" >&2
+                xcrun notarytool log "$SUB_ID" \
+                  --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+              fi
+              exit $NOTARY_RC
+            fi
+            xcrun stapler staple "$PKG"
+            pkgutil --check-signature "$PKG"
+          else
+            echo "::warning::未找到 Developer ID Installer 身份——产出未签名 PKG（正式分发需补齐 Installer 证书）"
+            bash frontends/macos/ime/scripts/package-pkg.sh
+          fi
+
       - name: 校验（tag 发布必须已签名）
         if: startsWith(github.ref, 'refs/tags/') && env.IDENTITY == ''
         run: |
@@ -166,7 +198,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dist
-          path: Verba-*.dmg
+          path: |
+            Verba-*.dmg
+            frontends/macos/ime/dist/Verba-*.pkg
           if-no-files-found: error
 
   # ─────────────────────────── Windows（x64 + Inno Setup）───────────────────────────
@@ -310,7 +344,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum Verba-*.dmg verba-ime-setup-*.exe > SHA256SUMS
+          sha256sum Verba-*.dmg Verba-*.pkg verba-ime-setup-*.exe > SHA256SUMS
           cat SHA256SUMS
 
       - name: Prepare release notes
