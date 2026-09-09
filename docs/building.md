@@ -146,16 +146,20 @@ bash scripts/setup-release-secrets.sh            # 默认 gqf2008/verba-ime
 ```
 
 手动等价命令（注意 P12 必须带私钥——`-t identities` 而非 `-t certs`，后者 CI 会报找不到私钥；
-`-P '<密码>'` 会进 shell 历史，用完删除临时文件）：
+密码交互读入、secret 走 stdin 管道，均不进 argv/shell 历史；临时 P12 用 trap 保证清理）：
 
 ```bash
-security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
-gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-cert.p12)"
-# .pkg 签名（tag 发布必需；证书类型是 Developer ID Installer，与 Application 不同）
-security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-installer-cert.p12 "Developer ID Installer: <姓名> (<TEAM_ID>)"
-gh secret set APPLE_INSTALLER_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-installer-cert.p12)"
-gh secret set APPLE_INSTALLER_CERT_PASSWORD -R gqf2008/verba-ime --body '<密码>'
-rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12
+read -r -s -p 'P12 密码: ' P12_PW; echo
+trap 'rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12' EXIT
+
+security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P "$P12_PW" -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
+base64 < /tmp/verba-cert.p12 | gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime
+printf '%s' "$P12_PW" | gh secret set APPLE_CERT_PASSWORD -R gqf2008/verba-ime
+
+# .pkg 签名（tag 发布必需；Developer ID Installer 与 Application 是不同证书类型）
+security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P "$P12_PW" -o /tmp/verba-installer-cert.p12 "Developer ID Installer: <姓名> (<TEAM_ID>)"
+base64 < /tmp/verba-installer-cert.p12 | gh secret set APPLE_INSTALLER_CERT_P12 -R gqf2008/verba-ime
+printf '%s' "$P12_PW" | gh secret set APPLE_INSTALLER_CERT_PASSWORD -R gqf2008/verba-ime
 ```
 
 - `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64（`.app`/`.dmg`）
