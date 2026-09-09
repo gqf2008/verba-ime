@@ -145,10 +145,13 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 bash scripts/setup-release-secrets.sh            # 默认 gqf2008/verba-ime
 ```
 
-手动等价命令（注意 P12 必须带私钥——`-t identities` 而非 `-t certs`，后者 CI 会报找不到私钥；
-密码交互读入、secret 走 stdin 管道，均不进 argv/shell 历史；临时 P12 用 trap 保证清理）：
+手动等价命令（**需在 bash 下执行**，默认 macOS zsh 的 `read` 参数不同；P12 必须带私钥
+——`-t identities` 而非 `-t certs`。`gh secret set` 走 stdin 管道，不进 argv/shell 历史；
+但 `security export -P` 本身会短暂进入 `security` 进程 argv（Apple 标注 insecure），
+如需完全避免可省略 `-P` 改用其默认 GUI 口令提示。临时 P12 立即删除并以 trap 兜底）：
 
 ```bash
+set -euo pipefail
 read -r -s -p 'P12 密码: ' P12_PW; echo
 trap 'rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12' EXIT
 
@@ -160,6 +163,8 @@ printf '%s' "$P12_PW" | gh secret set APPLE_CERT_PASSWORD -R gqf2008/verba-ime
 security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P "$P12_PW" -o /tmp/verba-installer-cert.p12 "Developer ID Installer: <姓名> (<TEAM_ID>)"
 base64 < /tmp/verba-installer-cert.p12 | gh secret set APPLE_INSTALLER_CERT_P12 -R gqf2008/verba-ime
 printf '%s' "$P12_PW" | gh secret set APPLE_INSTALLER_CERT_PASSWORD -R gqf2008/verba-ime
+
+rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12
 ```
 
 - `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64（`.app`/`.dmg`）
