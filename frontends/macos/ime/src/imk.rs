@@ -573,10 +573,10 @@ struct Ivars {
     /// 清理欠账（CAPS_OWE_* 组合），挂起待下一键补做（见 input_text 顶部
     /// 的补做块与 caps 分支）。
     caps_host_cleanup: Cell<u8>,
-    /// 当前 `drain_stream` 是否由 `input_text` 同步调用（正在处理一个按键）。
+    /// `input_text` 同步 drain 的嵌套深度（>0 表示正在处理按键）。
     /// OCR 结果恰好在此期间到达时不能进预览：同一按键会立刻走预览 Other
     /// 分支清掉结果（真机 2026-09-09：OCR 560 字被同 tick 的 `o` 吞掉）。
-    drain_during_input: Cell<bool>,
+    drain_during_input: Cell<usize>,
 }
 
 impl Default for Ivars {
@@ -602,7 +602,7 @@ impl Default for Ivars {
             host_call_depth: Cell::new(0),
             pending_keys: RefCell::new(VecDeque::new()),
             caps_host_cleanup: Cell::new(0),
-            drain_during_input: Cell::new(false),
+            drain_during_input: Cell::new(0),
         }
     }
 }
@@ -795,15 +795,29 @@ define_class!(
                 }
                 return Bool::new(false);
             }
+            // 带修饰键的组合键不吞（Cmd/Ctrl/Option 留给系统或宿主应用）。
+            // 必须放在 OCR 预览/同步 drain 之前：否则 Cmd+C、Cmd+Space 等
+            // 可能在透传前误触发 OCR 文本上屏。
+            let mods = NSEventModifierFlags(flags);
+            if mods.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            ) {
+                return Bool::new(false);
+            }
             // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
             //
-            // 标记本次 drain 来自输入回调：若 OCR 结果恰在此时到达，不能进入
-            // 预览（否则当前按键会立刻清掉预览，识别文本丢失）。
-            self.ivars().drain_during_input.set(true);
+            // 用深度计数标记本次 drain 来自输入回调：若 OCR 结果恰在此时到达，
+            // 不能进入预览（否则当前按键会立刻清掉预览，识别文本丢失）。
+            let drain_depth = self.ivars().drain_during_input.get();
+            self.ivars().drain_during_input.set(drain_depth + 1);
             self.drain_stream(sel!(drainVerbaStream));
-            self.ivars().drain_during_input.set(false);
+            self.ivars()
+                .drain_during_input
+                .set(self.ivars().drain_during_input.get().saturating_sub(1));
             // 改写对照预览拦截（**core 槽位为门**，与 Windows 同构单源：
             // RewriteReady 臂已调 begin_rewrite_preview，ai_preview 同时撤销
             // ——旁路直喂（重入窗重放/候选点击）的 r/e 只会从 feed_char 得
@@ -818,64 +832,10 @@ define_class!(
                     return Bool::new(true);
                 }
             }
-            // OCR 预览拦截：数字 1/Enter 选首条（识别文本）、Esc 取消；'2'
-            // 与其他键在 OCR 预览无语义（仅一条，F10 对齐 Windows Digit2）
-            // ——清预览收面板后**继续正常路由**（对齐 Windows feed_ocr_preview
-            // 的 Other 语义：退出预览、该键重走拼音路径——透传会字母泄漏，
-            // 真机踩坑）。
-            // #105 item3 预览 TTL：过期预览先作废（前端槽位 + core），本键按
-            // 正常路由处理——陈旧识别文本不得随本键误上屏。
-            if self.ivars().machine.borrow().ocr_preview_ttl_expired() {
-                let _ = self.clear_previews();
-                self.ivars().machine.borrow_mut().end_ocr_preview();
-                self.hide_candidate_window();
-            }
-            if self.ivars().ocr_preview.borrow().is_some() {
-                dbg_log(&format!(
-                    "OCR 预览拦截: key={:?}",
-                    string.map(|x| x.to_string())
-                ));
-                let preview_key = classify_key(string, key_code);
-                match preview_key {
-                    Some(ImkKey::Escape) => {
-                        let _ = self.clear_previews();
-                        // OCR 预览态机器本在 Idle → feed_escape 为 None；
-                        // 经统一派发点兜底（若有组合残留一并清理）。
-                        let action = self.ivars().machine.borrow_mut().feed_escape();
-                        let _ = self.apply_action(action);
-                        self.hide_candidate_window();
-                        return Bool::new(true);
-                    }
-                    Some(k) if ocr_preview_confirm_key(Some(k)) => {
-                        let text = self.ivars().ocr_preview.borrow().clone();
-                        let _ = self.clear_previews();
-                        // 单状态化（#105 item4）：移除核心侧 OcrPreviewing，避免
-                        // 状态滞留在预览态吞掉后续 Enter/Backspace/Esc。
-                        self.ivars().machine.borrow_mut().end_ocr_preview();
-                        self.hide_candidate_window();
-                        if let Some(t) = text {
-                            self.commit(&t);
-                        }
-                        return Bool::new(true);
-                    }
-                    // '2'/字母/退格等：退出预览、收面板，不 return——落回
-                    // 下方正常路由处理本键。可打印字符（'2' 除外，保持 F10
-                    // 非选取语义）先把 OCR 文本安全上屏，避免用户打字把识别
-                    // 结果静默丢弃；其余控制键仍只退预览。
-                    _ => {
-                        let text = self.ivars().ocr_preview.borrow().clone();
-                        let commit_first = ocr_preview_other_commits(preview_key);
-                        let _ = self.clear_previews();
-                        self.ivars().machine.borrow_mut().end_ocr_preview();
-                        self.hide_candidate_window();
-                        if commit_first {
-                            if let Some(t) = text {
-                                dbg_log("OCR: 非确认可打印键触发，先安全上屏再继续该键");
-                                self.commit(&t);
-                            }
-                        }
-                    }
-                }
+            // OCR 预览拦截：与 replay_pending 共用同一 helper，避免重入队列
+            // 绕过「确认/可打印键先提交」语义。返回 true 表示本键已被消费。
+            if self.handle_ocr_preview_key(classify_key(string, key_code)) {
+                return Bool::new(true);
             }
             let panel_visible = self
                 .ivars()
@@ -903,16 +863,6 @@ define_class!(
                 sender_cls,
                 sender.map_or(std::ptr::null(), |s| s as *const AnyObject),
             ));
-
-            // 带修饰键的组合键不吞（Cmd/Ctrl/Option 留给系统或宿主应用）。
-            let mods = NSEventModifierFlags(flags);
-            if mods.intersects(
-                NSEventModifierFlags::Command
-                    | NSEventModifierFlags::Control
-                    | NSEventModifierFlags::Option,
-            ) {
-                return Bool::new(false);
-            }
 
             let key = classify_key(string, key_code);
             // Shift+方向键等：交给宿主做文本选择，不当候选翻页。
@@ -1218,7 +1168,7 @@ define_class!(
             if let Some(text) = ocr_result_slot().lock().ok().and_then(|mut s| s.take()) {
                 dbg_log(&format!("OCR: 槽位消费 len={}", text.chars().count()));
                 set_clipboard_text_quiet(&text);
-                if should_commit_ocr_during_input(self.ivars().drain_during_input.get()) {
+                if should_commit_ocr_during_input(self.ivars().drain_during_input.get() > 0) {
                     // 输入回调期间结果到达：当前按键尚未处理完，若进预览会被
                     // 同一按键的 Other 分支立即清掉（真机 560 字丢失）。直接
                     // 上屏，当前按键随后继续走正常路由。
@@ -1426,6 +1376,21 @@ fn preview_key_of(key: Option<ImkKey>) -> Option<PreviewKey> {
         ImkKey::Char('1') => Some(PreviewKey::Digit1),
         ImkKey::Char('2') => Some(PreviewKey::Digit2),
         _ => None,
+    }
+}
+
+/// 待重放键 → IMK 按键分类（OCR 预览重入队列与 input_text 共用路由）。
+fn pending_key_to_imk_key(pk: &PendingKey) -> Option<ImkKey> {
+    match pk {
+        PendingKey::Char(c) => Some(ImkKey::Char(*c)),
+        PendingKey::Backspace => Some(ImkKey::Backspace),
+        PendingKey::Enter => Some(ImkKey::Enter),
+        PendingKey::Escape => Some(ImkKey::Escape),
+        PendingKey::PageUp => Some(ImkKey::PageUp),
+        PendingKey::PageDown => Some(ImkKey::PageDown),
+        PendingKey::ArrowUp => Some(ImkKey::ArrowUp),
+        PendingKey::ArrowDown => Some(ImkKey::ArrowDown),
+        PendingKey::Paste(_) => None,
     }
 }
 
@@ -1759,6 +1724,13 @@ impl VerbaIMKController {
                         return;
                     }
                 }
+                // OCR 预览重入队列：必须走与 input_text 同一 helper，否则
+                // 直接喂 core 会由 OcrPreviewing 防御分支结束预览而丢掉文本。
+                if self.ivars().machine.borrow().ocr_previewing()
+                    && self.handle_ocr_preview_key(pending_key_to_imk_key(&pk))
+                {
+                    return;
+                }
                 let action = {
                     let mut m = self.ivars().machine.borrow_mut();
                     match pk {
@@ -1835,6 +1807,43 @@ impl VerbaIMKController {
         self.host_call("set_marked.updateComposition", || unsafe {
             let _: () = msg_send![self, updateComposition];
         });
+    }
+
+    /// 处理 OCR 预览中的按键；返回 true 表示该键已被消费。
+    ///
+    /// `input_text` 与 `replay_pending` 共用此实现，保证重入队列不会绕过
+    /// 「Enter/空格/1 确认、Esc 取消、可打印非确认键先提交再继续」语义。
+    fn handle_ocr_preview_key(&self, key: Option<ImkKey>) -> bool {
+        // #105 item3 预览 TTL：过期预览先作废（前端槽位 + core），本键按
+        // 正常路由处理——陈旧识别文本不得随本键误上屏。
+        if self.ivars().machine.borrow().ocr_preview_ttl_expired() {
+            let _ = self.clear_previews();
+            self.ivars().machine.borrow_mut().end_ocr_preview();
+            self.hide_candidate_window();
+        }
+        if self.ivars().ocr_preview.borrow().is_none() {
+            return false;
+        }
+        dbg_log(&format!("OCR 预览拦截: key={key:?}"));
+        if key == Some(ImkKey::Escape) {
+            let _ = self.clear_previews();
+            self.ivars().machine.borrow_mut().end_ocr_preview();
+            self.hide_candidate_window();
+            return true;
+        }
+        let text = self.ivars().ocr_preview.borrow().clone();
+        let confirm = ocr_preview_confirm_key(key);
+        let commit_first = confirm || ocr_preview_other_commits(key);
+        let _ = self.clear_previews();
+        self.ivars().machine.borrow_mut().end_ocr_preview();
+        self.hide_candidate_window();
+        if commit_first {
+            if let Some(t) = text {
+                dbg_log("OCR: 先安全上屏识别文本，再继续当前键");
+                self.commit(&t);
+            }
+        }
+        confirm
     }
 
     /// 清空 OCR/改写双预览槽并清空候选数据源；返回是否确有预览被清。
@@ -2419,6 +2428,26 @@ mod tests {
         assert!(!ocr_preview_other_commits(Some(ImkKey::Char('2'))));
         assert!(!ocr_preview_other_commits(Some(ImkKey::Backspace)));
         assert!(!ocr_preview_other_commits(None));
+    }
+
+    #[test]
+    fn pending_key_maps_to_shared_ocr_preview_route() {
+        assert_eq!(
+            pending_key_to_imk_key(&PendingKey::Char('o')),
+            Some(ImkKey::Char('o'))
+        );
+        assert_eq!(
+            pending_key_to_imk_key(&PendingKey::Enter),
+            Some(ImkKey::Enter)
+        );
+        assert_eq!(
+            pending_key_to_imk_key(&PendingKey::Backspace),
+            Some(ImkKey::Backspace)
+        );
+        assert_eq!(
+            pending_key_to_imk_key(&PendingKey::Paste("x".to_owned())),
+            None
+        );
     }
 
     #[test]
