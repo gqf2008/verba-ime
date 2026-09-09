@@ -183,7 +183,7 @@ fn remove_verba_entries_from_hitoolbox(root: &mut plist::Value) -> Result<bool, 
             };
             let bundle = entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string);
             let mode = entry.get("Input Mode").and_then(plist::Value::as_string);
-            bundle != Some(VERBA_SOURCE_ID) && !mode.is_some_and(|m| m.starts_with(VERBA_SOURCE_ID))
+            bundle != Some(VERBA_SOURCE_ID) && mode != Some(VERBA_MODE_ID)
         });
     }
     Ok(*root != original)
@@ -694,6 +694,89 @@ mod tests {
             entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
         }));
     }
+    #[test]
+    fn uninstall_preserves_other_input_sources_in_hitoolbox() {
+        let mut parent = plist::Dictionary::new();
+        parent.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+        );
+        parent.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
+        );
+        let mut mode = plist::Dictionary::new();
+        mode.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+        );
+        mode.insert(
+            "Input Mode".to_owned(),
+            plist::Value::String(VERBA_MODE_ID.to_owned()),
+        );
+        mode.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String("Input Mode".to_owned()),
+        );
+        let mut other = plist::Dictionary::new();
+        other.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String("example.other.inputmethod".to_owned()),
+        );
+        other.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
+        );
+        let mut near_miss = plist::Dictionary::new();
+        near_miss.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String("dev.verba.inputmethod.VerbaOther".to_owned()),
+        );
+        near_miss.insert(
+            "Input Mode".to_owned(),
+            plist::Value::String("dev.verba.inputmethod.VerbaOther.Pinyin".to_owned()),
+        );
+
+        for key in [
+            "AppleEnabledInputSources",
+            "AppleSelectedInputSources",
+            "AppleInputSourceHistory",
+        ] {
+            let mut root = plist::Value::Dictionary(plist::Dictionary::new());
+            root.as_dictionary_mut().unwrap().insert(
+                key.to_owned(),
+                plist::Value::Array(vec![
+                    plist::Value::Dictionary(parent.clone()),
+                    plist::Value::Dictionary(mode.clone()),
+                    plist::Value::Dictionary(other.clone()),
+                    plist::Value::Dictionary(near_miss.clone()),
+                    plist::Value::String("opaque".to_owned()),
+                ]),
+            );
+            assert!(remove_verba_entries_from_hitoolbox(&mut root).unwrap());
+            let entries = root
+                .as_dictionary()
+                .and_then(|d| d.get(key))
+                .and_then(plist::Value::as_array)
+                .unwrap();
+            assert_eq!(entries.len(), 3, "{key} 应保留其他输入源和非字典条目");
+            assert!(entries.iter().any(|value| {
+                value
+                    .as_dictionary()
+                    .and_then(|d| d.get(BUNDLE_ID_KEY))
+                    .and_then(plist::Value::as_string)
+                    == Some("example.other.inputmethod")
+            }));
+            assert!(entries.iter().any(|value| {
+                value
+                    .as_dictionary()
+                    .and_then(|d| d.get(BUNDLE_ID_KEY))
+                    .and_then(plist::Value::as_string)
+                    == Some("dev.verba.inputmethod.VerbaOther")
+            }));
+        }
+    }
+
     #[test]
     fn uninstall_removes_verba_from_third_party_and_hitoolbox() {
         let mut inputsources = plist::Value::Dictionary(plist::Dictionary::new());

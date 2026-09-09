@@ -157,18 +157,37 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           # 显式校验 bundle 签名未被冒烟等步骤破坏（seal 失效会直接导致 DMG 公证 Invalid）
           codesign --verify --deep --strict frontends/macos/ime/dist/Verba.app
+          rm -rf dmg-staging
           mkdir -p dmg-staging
           cp -R frontends/macos/ime/dist/Verba.app dmg-staging/
-          # 输入法不是 /Applications 应用：不要放 Applications 快捷方式误导用户。
-          test ! -e dmg-staging/Applications
           cp frontends/macos/ime/scripts/install-dmg.command dmg-staging/安装.command
           cp frontends/macos/ime/scripts/uninstall-dmg.command dmg-staging/卸载.command
           cp frontends/macos/ime/scripts/使用说明.txt dmg-staging/使用说明.txt
           chmod +x dmg-staging/安装.command dmg-staging/卸载.command
+          test -d dmg-staging/Verba.app
           test -x dmg-staging/安装.command
           test -x dmg-staging/卸载.command
           test -f dmg-staging/使用说明.txt
+          # 输入法不是 /Applications 应用：staging 组装完成后校验，避免早于实际布局。
+          test ! -e dmg-staging/Applications
+          test ! -L dmg-staging/Applications
           hdiutil create -volname "Verba" -srcfolder dmg-staging -ov -format UDZO "Verba-$VERSION.dmg"
+          # 校验最终 DMG 产物，而不是只校验 staging 或源脚本。
+          DMG_MOUNT="$(mktemp -d)"
+          cleanup_dmg_mount() {
+            hdiutil detach "$DMG_MOUNT" >/dev/null 2>&1 || true
+            rmdir "$DMG_MOUNT" 2>/dev/null || true
+          }
+          trap cleanup_dmg_mount EXIT
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint "$DMG_MOUNT" "Verba-$VERSION.dmg"
+          test -d "$DMG_MOUNT/Verba.app"
+          test -x "$DMG_MOUNT/安装.command"
+          test -x "$DMG_MOUNT/卸载.command"
+          test -f "$DMG_MOUNT/使用说明.txt"
+          test ! -e "$DMG_MOUNT/Applications"
+          test ! -L "$DMG_MOUNT/Applications"
+          cleanup_dmg_mount
+          trap - EXIT
           if [ -n "$IDENTITY" ]; then
             # DMG 也要签名 + 公证（分发的盘片本身要过 Gatekeeper）
             codesign --force --sign "$IDENTITY" --timestamp "Verba-$VERSION.dmg"

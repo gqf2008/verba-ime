@@ -63,6 +63,22 @@ jobs:
       - name: 校验 DMG 安装/卸载脚本
         run: test -x frontends/macos/ime/scripts/install-dmg.command && test -x frontends/macos/ime/scripts/uninstall-dmg.command && test -f frontends/macos/ime/scripts/使用说明.txt && bash -n frontends/macos/ime/scripts/install-dmg.command && bash -n frontends/macos/ime/scripts/uninstall-dmg.command
 
+      - name: 校验 DMG staging 布局
+        run: |
+          STAGE="$(mktemp -d)"
+          trap 'rm -rf "$STAGE"' EXIT
+          cp -R frontends/macos/ime/dist/Verba.app "$STAGE/"
+          cp frontends/macos/ime/scripts/install-dmg.command "$STAGE/安装.command"
+          cp frontends/macos/ime/scripts/uninstall-dmg.command "$STAGE/卸载.command"
+          cp frontends/macos/ime/scripts/使用说明.txt "$STAGE/使用说明.txt"
+          chmod +x "$STAGE/安装.command" "$STAGE/卸载.command"
+          test -d "$STAGE/Verba.app"
+          test -x "$STAGE/安装.command"
+          test -x "$STAGE/卸载.command"
+          test -f "$STAGE/使用说明.txt"
+          test ! -e "$STAGE/Applications"
+          test ! -L "$STAGE/Applications"
+
       - name: 校验 .app
         run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-settings && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-trigger && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register && test -f frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf && frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register --list && ls -la frontends/macos/ime/dist/Verba.app/Contents
 

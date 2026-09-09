@@ -7,17 +7,42 @@ cd "$(dirname "$0")"
 
 APP="$PWD/Verba.app"
 [ -d "$APP" ] || { echo "错误：找不到同目录的 Verba.app" >&2; exit 1; }
+[ -x "$APP/Contents/MacOS/verba-register" ] || { echo "错误：Verba.app 缺少可执行的 verba-register" >&2; exit 1; }
 
-DEST="$HOME/Library/Input Methods"
-mkdir -p "$DEST"
+DEST_DIR="$HOME/Library/Input Methods"
+DEST="$DEST_DIR/Verba.app"
+mkdir -p "$DEST_DIR"
 
-if [ -d "$DEST/Verba.app" ]; then
-    echo "更新安装：移除旧版 Verba.app（用户词库在 ~/Library/Application Support，不受影响）"
-    rm -rf "$DEST/Verba.app"
+STAGING="$DEST_DIR/.Verba.app.installing.$$"
+BACKUP="$DEST_DIR/.Verba.app.previous.$$"
+cleanup() { rm -rf "$STAGING"; }
+trap cleanup EXIT
+
+rm -rf "$STAGING"
+cp -R "$APP" "$STAGING"
+[ -x "$STAGING/Contents/MacOS/verba-register" ] || { echo "错误：暂存安装副本不完整" >&2; exit 1; }
+
+# 更新前停止旧进程，避免旧二进制继续运行并干扰新版本。
+/usr/bin/pkill -f "$DEST/Contents/MacOS/verba-mac" 2>/dev/null || true
+/usr/bin/pkill -f "$DEST/Contents/MacOS/verba-daemon" 2>/dev/null || true
+
+if [ -d "$DEST" ]; then
+    echo "更新安装：替换旧版 Verba.app（用户词库在 ~/Library/Application Support，不受影响）"
+    rm -rf "$BACKUP"
+    mv "$DEST" "$BACKUP"
 fi
-cp -R "$APP" "$DEST/"
-echo "已安装到 $DEST/Verba.app，正在注册并启用输入源…"
 
-"$DEST/Verba.app/Contents/MacOS/verba-register"
-open "$DEST/Verba.app" 2>/dev/null || true
+if ! mv "$STAGING" "$DEST"; then
+    if [ -d "$BACKUP" ]; then
+        mv "$BACKUP" "$DEST"
+    fi
+    echo "错误：安装替换失败，已保留或恢复原版本" >&2
+    exit 1
+fi
+rm -rf "$BACKUP"
+trap - EXIT
+
+echo "已安装到 ${DEST}，正在注册并启用输入源…"
+"$DEST/Contents/MacOS/verba-register"
+open "$DEST" 2>/dev/null || true
 echo "完成。无需手动到系统设置添加；在输入法菜单选择「拾言输入法」即可。"
