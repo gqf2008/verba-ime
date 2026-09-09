@@ -63,6 +63,15 @@ jobs:
       - name: 校验 DMG 安装/卸载脚本
         run: test -x frontends/macos/ime/scripts/install-dmg.command && test -x frontends/macos/ime/scripts/uninstall-dmg.command && test -f frontends/macos/ime/scripts/使用说明.txt && bash -n frontends/macos/ime/scripts/install-dmg.command && bash -n frontends/macos/ime/scripts/uninstall-dmg.command
 
+      - name: 校验 PKG postinstall helper 链路
+        run: |
+          test -x frontends/macos/ime/scripts/pkg-postinstall.sh
+          bash -n frontends/macos/ime/scripts/pkg-postinstall.sh
+          grep -q 'pkg-postinstall.sh' frontends/macos/ime/scripts/package-pkg.sh
+          grep -q 'open -n -W' frontends/macos/ime/scripts/pkg-postinstall.sh
+          grep -q -- '--register' frontends/macos/ime/scripts/pkg-postinstall.sh
+          frontends/macos/ime/scripts/test-pkg-postinstall.sh
+
       - name: 校验 DMG staging 布局
         run: |
           STAGE="$(mktemp -d)"
