@@ -1,0 +1,11 @@
+Verba · 拾言输入法
+
+安装：
+  双击「安装.command」。安装到 ~/Library/Input Methods/Verba.app，
+  并自动注册/启用「拾言输入法」，无需手动到系统设置添加。
+
+卸载：
+  双击「卸载.command」。
+
+注意：
+  本输入法不是 /Applications 里的普通应用，不需要拖到 Applications。
