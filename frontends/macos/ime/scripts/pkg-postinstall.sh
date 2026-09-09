@@ -51,7 +51,7 @@ fi
 LAUNCHCTL="${VERBA_PKG_LAUNCHCTL:-/bin/launchctl}"
 # 不使用 open -W：旧 payload 若忽略 --register 会进入 IMK 主循环并永久阻塞安装。
 # open 只负责交给 LaunchServices，随后由 root 侧有界轮询状态文件。
-if ! "$LAUNCHCTL" asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" --     /usr/bin/open -n "$APP" --args --register --status "$STATUS_FILE" --log "$LOG_FILE"; then
+if ! /usr/bin/perl -e 'alarm shift; exec @ARGV' 15     "$LAUNCHCTL" asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" --     /usr/bin/open -n "$APP" --args --register --status "$STATUS_FILE" --log "$LOG_FILE"; then
     echo "error: 在用户会话内启动 Verba 注册 helper 失败" >&2
     if [ -f "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; then
         /usr/bin/head -c 65536 "$LOG_FILE" 2>/dev/null | /usr/bin/sed 's/^/  /' >&2 || true
@@ -60,7 +60,8 @@ if ! "$LAUNCHCTL" asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" --     
 fi
 
 STATUS=""
-for _ in $(/usr/bin/seq 1 80); do
+POLL_COUNT="${VERBA_PKG_POLL_COUNT:-80}"
+for _ in $(/usr/bin/seq 1 "$POLL_COUNT"); do
     if [ -f "$STATUS_FILE" ] && [ ! -L "$STATUS_FILE" ]; then
         STATUS="$(/usr/bin/head -c 64 "$STATUS_FILE" 2>/dev/null || true)"
         [ -n "$STATUS" ] && break

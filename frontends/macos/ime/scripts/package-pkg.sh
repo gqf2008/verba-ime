@@ -43,13 +43,6 @@ if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
     echo "::error::payload 版本 $VERSION 与 workspace $EXPECTED_VERSION 不一致；拒绝打包旧 app" >&2
     exit 1
 fi
-# 无副作用探针：旧版 verba-mac 忽略 --register 会进入 IMK 主循环并挂死安装。
-PROBE_OUT="$("$APP/Contents/MacOS/verba-mac" --register-probe 2>/dev/null || true)"
-if [ "$PROBE_OUT" != "verba-register-mode-supported" ]; then
-    echo "::error::payload verba-mac 不支持 --register（probe=${PROBE_OUT:-empty}）；请重新构建 dist/Verba.app" >&2
-    exit 1
-fi
-
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/verba-pkg.XXXXXX")"
 cleanup() {
     local status=$?
@@ -57,6 +50,37 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
+
+# 无副作用探针：旧版 verba-mac 忽略 --register 会进入 IMK 主循环。用 Perl
+# fork + 独立进程组设置硬超时，超时杀整组，避免打包本身被旧 payload 挂住。
+PROBE_FILE="$WORK/probe.out"
+set +e
+/usr/bin/perl -e '
+my $timeout = shift;
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+if ($pid == 0) {
+    setpgrp(0, 0);
+    exec @ARGV;
+    exit 127;
+}
+setpgrp($pid, $pid);
+local $SIG{ALRM} = sub {
+    kill "TERM", -$pid;
+    waitpid($pid, 0);
+    exit 124;
+};
+alarm $timeout;
+waitpid($pid, 0);
+exit($? >> 8);
+' 5 "$APP/Contents/MacOS/verba-mac" --register-probe >"$PROBE_FILE" 2>/dev/null
+PROBE_RC=$?
+set -e
+PROBE_OUT="$(/usr/bin/head -c 256 "$PROBE_FILE" 2>/dev/null || true)"
+if [ "$PROBE_RC" -ne 0 ] || [ "$PROBE_OUT" != "verba-register-mode-supported" ]; then
+    echo "::error::payload verba-mac 不支持 --register（probe_rc=$PROBE_RC probe=${PROBE_OUT:-empty}）；请重新构建 dist/Verba.app" >&2
+    exit 1
+fi
 
 PAYLOAD="$WORK/payload"
 mkdir -p "$PAYLOAD"
@@ -69,6 +93,10 @@ cp "$IME_ROOT/scripts/pkg-postinstall.sh" "$SCRIPTS/postinstall"
 chmod +x "$SCRIPTS/postinstall"
 # 防止 postinstall 被改回 package_script_service 内直调 CLI。
 grep -q 'open -n' "$SCRIPTS/postinstall"
+if grep -q 'open -n -W' "$SCRIPTS/postinstall"; then
+    echo "::error::postinstall 不应使用会永久阻塞的 open -W" >&2
+    exit 1
+fi
 grep -q -- '--register' "$SCRIPTS/postinstall"
 
 COMPONENT="$WORK/Verba-component.pkg"
@@ -115,6 +143,10 @@ pkgutil --expand "$COMPONENT" "$EXPANDED_COMPONENT"
 POSTINSTALL_EXPANDED="$EXPANDED_COMPONENT/Scripts/postinstall"
 test -x "$POSTINSTALL_EXPANDED"
 grep -q 'open -n' "$POSTINSTALL_EXPANDED"
+if grep -q 'open -n -W' "$POSTINSTALL_EXPANDED"; then
+    echo "::error::最终 PKG postinstall 不应使用 open -W" >&2
+    exit 1
+fi
 grep -q -- '--register' "$POSTINSTALL_EXPANDED"
 RELOCATE_BUNDLES="$(xmllint --xpath \
     'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \

@@ -69,6 +69,7 @@ jobs:
           bash -n frontends/macos/ime/scripts/pkg-postinstall.sh
           grep -q 'pkg-postinstall.sh' frontends/macos/ime/scripts/package-pkg.sh
           grep -q 'open -n' frontends/macos/ime/scripts/pkg-postinstall.sh
+          if grep -q 'open -n -W' frontends/macos/ime/scripts/pkg-postinstall.sh; then exit 1; fi
           grep -q -- '--register' frontends/macos/ime/scripts/pkg-postinstall.sh
           frontends/macos/ime/scripts/test-pkg-postinstall.sh
 

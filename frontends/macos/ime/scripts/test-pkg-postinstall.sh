@@ -71,4 +71,16 @@ if VERBA_PKG_APP="$APP" \
 fi
 grep -q '启动 Verba 注册 helper 失败' "$TMP/launch-fail.out"
 
-echo "PASS: pkg postinstall helper 成功/失败路径"
+FAKE_NO_STATUS="$TMP/fake-launchctl-no-status"
+cat > "$FAKE_NO_STATUS" <<'FAKE'
+#!/bin/bash
+exit 0
+FAKE
+chmod +x "$FAKE_NO_STATUS"
+if VERBA_PKG_APP="$APP"     VERBA_PKG_CONSOLE_USER="$(id -un)"     VERBA_PKG_CONSOLE_UID="$(id -u)"     VERBA_PKG_POLL_COUNT=2     VERBA_PKG_LAUNCHCTL="$FAKE_NO_STATUS"     bash "$POSTINSTALL" >"$TMP/no-status.out" 2>&1; then
+    echo "error: helper 不写状态时 postinstall 仍返回成功" >&2
+    exit 1
+fi
+grep -q 'helper status=missing' "$TMP/no-status.out"
+
+echo "PASS: pkg postinstall helper 成功/失败/无状态路径"
