@@ -21,6 +21,7 @@ verba-protos = { path = "../../../crates/verba-protos" }
 verba-config = { path = "../../../crates/verba-config" }
 log = { version = "0.4", features = ["std"] }
 env_logger = "0.11"
+plist = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # exception 特性：catch_void/host_call 捕获 IMK 客户端包装器抛出的 ObjC
