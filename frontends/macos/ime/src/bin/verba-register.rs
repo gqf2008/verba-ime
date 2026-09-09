@@ -139,9 +139,8 @@ fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
 
 /// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
 ///
-/// 只写文件、不刷新 agent：PKG postinstall 会以 root 调用本函数（package
-/// sandbox 下以用户身份写 prefs 会被 PermissionDenied），随后再以 console
-/// user 身份 killall cfprefsd/TextInputMenuAgent 完成刷新。
+/// 由当前用户会话内的安装脚本调用；写文件与 agent 刷新分离，便于测试和
+/// 后续复用。
 fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
     let path = home.join(INPUT_SOURCES_PLIST);
     let mut root = if path.exists() {
