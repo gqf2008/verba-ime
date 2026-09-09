@@ -54,3 +54,4 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }

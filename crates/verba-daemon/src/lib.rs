@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod handler;
+pub mod redact;
 
 pub use handler::DaemonHandler;
 
@@ -20,11 +21,15 @@ struct TeeLog {
 
 impl Write for TeeLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = std::io::stderr().write(buf);
+        // 脱敏后双写：stderr 与日志文件均经过 redact_secrets，确保密钥类字段不落盘。
+        let line = String::from_utf8_lossy(buf);
+        let redacted = redact::redact_secrets(&line);
+        let _ = std::io::stderr().write_all(redacted.as_bytes());
         let mut f = self.file.lock().unwrap();
-        let n = f.write(buf)?;
+        f.write_all(redacted.as_bytes())?;
         let _ = f.flush();
-        Ok(n)
+        // 声明消费了全部输入字节（内容已改写为脱敏输出，长度允许不同）。
+        Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stderr().flush()

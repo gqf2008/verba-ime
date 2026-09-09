@@ -7611,6 +7611,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "log",
+ "regex",
  "tokio",
  "tokio-util",
  "verba-ai",
