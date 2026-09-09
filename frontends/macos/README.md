@@ -10,6 +10,8 @@
     `r` 重试、`e` 改提示词（经 daemon）
   - `//` 多模态命令：`//朗读`（TTS 播放）、`//短语`（配置短语直插）、`//截图`/
     `//听写`（verba-trigger ocr/asr → OCR 预览管线）；`//看图` 一期回退普通生成
+  - OCR 结果预览期间继续打字：先提交识别文本，再继续处理当前键；Enter/空格/1
+    显式确认，Esc 取消
 - 关键点：
   - 基础输入**无需**辅助功能权限。
   - 麦克风：需 `NSMicrophoneUsageDescription`（TCC 弹窗）；截图 OCR：需屏幕录制权限（ScreenCaptureKit）。
