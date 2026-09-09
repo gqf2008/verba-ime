@@ -57,7 +57,12 @@ CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -x "$APP/Contents/MacOS/verba-register" ]; then
     CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
     if [ -n "$CONSOLE_UID" ]; then
-        launchctl asuser "$CONSOLE_UID" "$APP/Contents/MacOS/verba-register" || true
+        # launchctl asuser 只切 Mach bootstrap/audit session，不降 euid；须再 sudo -u
+        # 真正以 console 用户执行（TIS 注册/启用是 per-user 状态）。
+        if ! launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" -- \
+            "$APP/Contents/MacOS/verba-register"; then
+            echo "warning: verba-register 自动注册失败，请在系统设置 → 键盘 → 输入法手动启用「拾言输入法」" >&2
+        fi
     fi
 fi
 exit 0
@@ -73,13 +78,15 @@ pkgbuild \
     --scripts "$SCRIPTS" \
     "$COMPONENT"
 
-OUT="$IME_ROOT/dist/Verba-$VERSION.pkg"
-rm -f "$OUT"
+STAGED="$WORK/Verba-$VERSION.pkg"
 if [ -n "${INSTALLER_IDENTITY:-}" ]; then
-    productbuild --package "$COMPONENT" --sign "$INSTALLER_IDENTITY" "$OUT"
+    productbuild --package "$COMPONENT" --sign "$INSTALLER_IDENTITY" "$STAGED"
 else
-    productbuild --package "$COMPONENT" "$OUT"
+    productbuild --package "$COMPONENT" "$STAGED"
 fi
+# 成功后再替换 dist 产物，避免签名/打包失败时丢失上一份有效 pkg。
+OUT="$IME_ROOT/dist/Verba-$VERSION.pkg"
+mv -f "$STAGED" "$OUT"
 
 echo "打包完成: $OUT"
 echo "安装: 双击 ${OUT}（需管理员；装到 ${INSTALL_LOCATION}/Verba.app）"

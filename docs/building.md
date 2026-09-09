@@ -154,13 +154,14 @@ gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-
 rm -f /tmp/verba-cert.p12
 ```
 
-- `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64
-- `APPLE_CERT_PASSWORD`：P12 导出密码；`APPLE_TEAM_ID` / `APPLE_ID` / `APPLE_APP_PASSWORD`：Apple 账号与 App 专用密码
+- `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64（`.app`/`.dmg`）
+- `APPLE_INSTALLER_CERT_P12`：Developer ID Installer 证书 + 私钥的 PKCS12 base64（`.pkg` 签名；tag 发布必需，缺失会 fail；`workflow_dispatch` 干跑可产出未签名 pkg）
+- `APPLE_CERT_PASSWORD` / `APPLE_INSTALLER_CERT_PASSWORD`：P12 导出密码；`APPLE_TEAM_ID` / `APPLE_ID` / `APPLE_APP_PASSWORD`：Apple 账号与 App 专用密码
 - `WIN_SIGN_PFX`（可选）：Windows 代码签名证书 base64 + `WIN_SIGN_PASSWORD`
 
 ### 产物校验（发布前）
 
-- macOS：`codesign -dv --strict`、`spctl -a -t open --context context:primary-signature`、`stapler validate`、逐个二进制 `codesign -dvv | grep Timestamp`
+- macOS：`codesign -dv --strict`、`spctl -a -t open --context context:primary-signature`、`stapler validate`、逐个二进制 `codesign -dvv | grep Timestamp`；`.pkg` 另加 `pkgutil --check-signature` + `stapler validate`
 - Windows：PE 子系统断言（流水线内自动）、安装后切换输入法无控制台、`verba-cli rime nishishui` 出词
 
 ## 调试建议

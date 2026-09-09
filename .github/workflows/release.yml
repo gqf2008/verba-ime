@@ -34,10 +34,13 @@ jobs:
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
           APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_INSTALLER_CERT_P12: ${{ secrets.APPLE_INSTALLER_CERT_P12 }}
+          APPLE_INSTALLER_CERT_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERT_PASSWORD }}
         run: |
           if [ -z "$APPLE_CERT_P12" ]; then
-            echo "::warning::APPLE_CERT_P12 未配置——产出未签名产物（仅 dry-run）"
+            echo "::warning::APPLE_CERT_P12 未配置——产出未签名 .app/.dmg（仅 dry-run）"
             echo "IDENTITY=" >> "$GITHUB_ENV"
+            echo "INSTALLER_IDENTITY=" >> "$GITHUB_ENV"
             exit 0
           fi
           echo "$APPLE_CERT_P12" | base64 --decode > /tmp/cert.p12
@@ -51,6 +54,15 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k temp /tmp/temp.keychain
           IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')
           echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          # Developer ID Installer（.pkg 签名；与 Application 是不同证书类型）
+          if [ -n "$APPLE_INSTALLER_CERT_P12" ]; then
+            echo "$APPLE_INSTALLER_CERT_P12" | base64 --decode > /tmp/installer.p12
+            security import /tmp/installer.p12 -k /tmp/temp.keychain -P "$APPLE_INSTALLER_CERT_PASSWORD" \
+              -T /usr/bin/productbuild -T /usr/bin/pkgbuild
+            security set-key-partition-list -S apple-tool:,apple:,productbuild:,pkgbuild: -s -k temp /tmp/temp.keychain
+          fi
+          INSTALLER_IDENTITY=$(security find-identity -v | awk -F'"' '/Developer ID Installer/ {print $2; exit}')
+          echo "INSTALLER_IDENTITY=$INSTALLER_IDENTITY" >> "$GITHUB_ENV"
 
       - name: 获取 Rime vendor（librime.dylib + data/）
         env:
@@ -160,47 +172,56 @@ jobs:
       - name: 打包 PKG（有 Installer 身份时签名 + 公证 + staple）
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
-          # Developer ID Installer 证书与 Application 不同：有则签名+公证，无则产出
-          # 未签名 pkg（不阻塞发布；正式分发建议补齐 Installer 证书）。
-          INSTALLER_IDENTITY="$(security find-identity -v | awk -F'"' '/Developer ID Installer/ {print $2; exit}')"
-          if [ -n "$INSTALLER_IDENTITY" ]; then
-            echo "使用 Installer 身份: $INSTALLER_IDENTITY"
-            INSTALLER_IDENTITY="$INSTALLER_IDENTITY" bash frontends/macos/ime/scripts/package-pkg.sh
-            PKG="frontends/macos/ime/dist/Verba-$VERSION.pkg"
-            set +e
-            NOTARY_OUT="$(xcrun notarytool submit "$PKG" \
-              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
-            NOTARY_RC=$?
-            set -e
-            printf '%s\n' "$NOTARY_OUT"
-            if [ $NOTARY_RC -ne 0 ]; then
-              SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
-              if [ -n "$SUB_ID" ]; then
-                echo "::error::PKG 公证失败（submission=$SUB_ID），详细原因：" >&2
-                xcrun notarytool log "$SUB_ID" \
-                  --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
-              fi
-              exit $NOTARY_RC
+          # Developer ID Installer 证书与 Application 不同：tag 发布必须已签名；
+          # 仅 workflow_dispatch 干跑允许未签名 fallback。
+          if [ -z "$INSTALLER_IDENTITY" ]; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::warning::未配置 Developer ID Installer——dry-run 产出未签名 PKG"
+              bash frontends/macos/ime/scripts/package-pkg.sh
+              exit 0
             fi
-            xcrun stapler staple "$PKG"
-            pkgutil --check-signature "$PKG"
-          else
-            echo "::warning::未找到 Developer ID Installer 身份——产出未签名 PKG（正式分发需补齐 Installer 证书）"
-            bash frontends/macos/ime/scripts/package-pkg.sh
+            echo "::error::tag 发布缺少 Developer ID Installer 身份（APPLE_INSTALLER_CERT_P12 未配置）" >&2
+            exit 1
           fi
+          echo "使用 Installer 身份: $INSTALLER_IDENTITY"
+          INSTALLER_IDENTITY="$INSTALLER_IDENTITY" bash frontends/macos/ime/scripts/package-pkg.sh
+          PKG="frontends/macos/ime/dist/Verba-$VERSION.pkg"
+          set +e
+          NOTARY_OUT="$(xcrun notarytool submit "$PKG" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait 2>&1)"
+          NOTARY_RC=$?
+          set -e
+          printf '%s\n' "$NOTARY_OUT"
+          if [ $NOTARY_RC -ne 0 ]; then
+            SUB_ID="$(printf '%s\n' "$NOTARY_OUT" | sed -n 's/.*id: \([0-9a-f-]\{36\}\).*/\1/p' | head -1)"
+            if [ -n "$SUB_ID" ]; then
+              echo "::error::PKG 公证失败（submission=$SUB_ID），详细原因：" >&2
+              xcrun notarytool log "$SUB_ID" \
+                --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" 2>&1 | sed 's/^/  /' || true
+            fi
+            exit $NOTARY_RC
+          fi
+          xcrun stapler staple "$PKG"
+          pkgutil --check-signature "$PKG"
 
       - name: 校验（tag 发布必须已签名）
-        if: startsWith(github.ref, 'refs/tags/') && env.IDENTITY == ''
+        if: startsWith(github.ref, 'refs/tags/') && (env.IDENTITY == '' || env.INSTALLER_IDENTITY == '')
         run: |
-          echo "::error::tag 发布缺少签名身份（APPLE_* secrets 未配置）" >&2
+          echo "::error::tag 发布缺少签名身份（APPLE_CERT_P12 / APPLE_INSTALLER_CERT_P12 未配置）" >&2
           exit 1
+
+      - name: 汇总 macOS 产物（扁平目录，供 artifact/SHA/Release 统一 glob）
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          mkdir -p release-assets
+          cp "Verba-$VERSION.dmg" release-assets/
+          cp "frontends/macos/ime/dist/Verba-$VERSION.pkg" release-assets/
+          ls -la release-assets
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dist
-          path: |
-            Verba-*.dmg
-            frontends/macos/ime/dist/Verba-*.pkg
+          path: release-assets/*
           if-no-files-found: error
 
   # ─────────────────────────── Windows（x64 + Inno Setup）───────────────────────────
