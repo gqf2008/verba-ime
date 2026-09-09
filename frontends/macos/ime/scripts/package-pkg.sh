@@ -20,6 +20,7 @@ set -euo pipefail
 
 IME_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$IME_ROOT/dist/Verba.app"
+REPO_ROOT="$(cd "$IME_ROOT/../../.." && pwd)"
 PKG_ID="dev.verba.inputmethod"
 INSTALL_LOCATION="/Library/Input Methods"
 
@@ -35,6 +36,17 @@ fi
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true)"
 if [ -z "$VERSION" ]; then
     echo "::error::无法从 $APP/Contents/Info.plist 读取 CFBundleShortVersionString" >&2
+    exit 1
+fi
+EXPECTED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml")"
+if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+    echo "::error::payload 版本 $VERSION 与 workspace $EXPECTED_VERSION 不一致；拒绝打包旧 app" >&2
+    exit 1
+fi
+# 无副作用探针：旧版 verba-mac 忽略 --register 会进入 IMK 主循环并挂死安装。
+PROBE_OUT="$("$APP/Contents/MacOS/verba-mac" --register-probe 2>/dev/null || true)"
+if [ "$PROBE_OUT" != "verba-register-mode-supported" ]; then
+    echo "::error::payload verba-mac 不支持 --register（probe=${PROBE_OUT:-empty}）；请重新构建 dist/Verba.app" >&2
     exit 1
 fi
 
@@ -56,7 +68,7 @@ mkdir -p "$SCRIPTS"
 cp "$IME_ROOT/scripts/pkg-postinstall.sh" "$SCRIPTS/postinstall"
 chmod +x "$SCRIPTS/postinstall"
 # 防止 postinstall 被改回 package_script_service 内直调 CLI。
-grep -q 'open -n -W' "$SCRIPTS/postinstall"
+grep -q 'open -n' "$SCRIPTS/postinstall"
 grep -q -- '--register' "$SCRIPTS/postinstall"
 
 COMPONENT="$WORK/Verba-component.pkg"
@@ -102,7 +114,7 @@ EXPANDED_COMPONENT="$WORK/expanded-component"
 pkgutil --expand "$COMPONENT" "$EXPANDED_COMPONENT"
 POSTINSTALL_EXPANDED="$EXPANDED_COMPONENT/Scripts/postinstall"
 test -x "$POSTINSTALL_EXPANDED"
-grep -q 'open -n -W' "$POSTINSTALL_EXPANDED"
+grep -q 'open -n' "$POSTINSTALL_EXPANDED"
 grep -q -- '--register' "$POSTINSTALL_EXPANDED"
 RELOCATE_BUNDLES="$(xmllint --xpath \
     'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \

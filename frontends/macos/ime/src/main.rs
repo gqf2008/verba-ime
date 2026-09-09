@@ -12,6 +12,8 @@
 use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 #[derive(Default)]
@@ -57,6 +59,9 @@ fn write_register_log(path: Option<&str>, message: &str) {
 }
 
 #[cfg(target_os = "macos")]
+const REGISTER_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(target_os = "macos")]
 fn run_registration(log_path: Option<&str>) -> i32 {
     let helper = match std::env::current_exe() {
         Ok(exe) => exe.with_file_name("verba-register"),
@@ -95,13 +100,39 @@ fn run_registration(log_path: Option<&str>) -> i32 {
         }
     }
 
-    match command.status() {
-        Ok(status) => status.code().unwrap_or(1),
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(e) => {
             let message = format!("错误: 启动 verba-register 失败: {e}");
             eprintln!("{message}");
             write_register_log(log_path, &message);
-            1
+            return 1;
+        }
+    };
+    let deadline = Instant::now() + REGISTER_HELPER_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(1),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let message = format!(
+                    "错误: verba-register 超过 {} 秒未退出，已终止",
+                    REGISTER_HELPER_TIMEOUT.as_secs()
+                );
+                eprintln!("{message}");
+                write_register_log(log_path, &message);
+                return 1;
+            }
+            Err(e) => {
+                let message = format!("错误: 等待 verba-register 失败: {e}");
+                eprintln!("{message}");
+                write_register_log(log_path, &message);
+                return 1;
+            }
         }
     }
 }
@@ -109,11 +140,17 @@ fn run_registration(log_path: Option<&str>) -> i32 {
 #[cfg(target_os = "macos")]
 fn run_register_mode() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--register-probe") {
+        println!("verba-register-mode-supported");
+        return Some(0);
+    }
     let mode = parse_register_mode(&args)?;
     let status = run_registration(mode.log_path.as_deref());
     if let Some(path) = mode.status_path.as_deref() {
         if let Err(e) = std::fs::write(path, format!("{status}\n")) {
-            eprintln!("错误: 写入注册状态 {path} 失败: {e}");
+            let message = format!("错误: 写入注册状态 {path} 失败: {e}");
+            eprintln!("{message}");
+            write_register_log(mode.log_path.as_deref(), &message);
         }
     }
     Some(status)
