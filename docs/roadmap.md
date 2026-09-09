@@ -2,10 +2,11 @@
 
 > 更新：2026-09-09 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
 > librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；**OCR（截图/看图）为正式能力**；**ASR/TTS 冻结为实验性（2026-08-29 Owner 决策：代码保留、默认关闭、入口隐藏，不承诺）**；
-> Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.9
+> Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.10
 > 签名公证产物；v0.2.8 上线：AI 发送即反馈 / 空 Enter 防误杀 / OCR 预览可发现，PR #98；
 > v0.2.9 上线：Windows OCR 预览按键链修复，PR #102/#103/#104；
-> v0.2.10 已发布：日志脱敏 + OCR 预览状态机/TTL/状态卡收敛 + macOS 系统级 PKG）。
+> v0.2.10 已发布：日志脱敏 + OCR 预览状态机/TTL/状态卡收敛 + macOS 系统级 PKG；
+> v0.2.11 发布中：macOS 输入法菜单栏品牌「言」字图标重设计）。
 > 剩余：性能预算（范围缩减为 LLM 核心输入链路 + OCR）真机复测。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
@@ -19,7 +20,7 @@
 | M3 | 多模态 | OCR（截图/看图）在至少一个平台跑通（ASR 冻结为实验性，不在 M6 承诺） | M1 / M2 |
 | M4 | 体验打磨 | 候选窗口、Slint 设置面板、性能预算（LLM 核心输入链路 + OCR）、隐私开关（TTS 冻结为实验性） | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
-| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.10 已发布；v0.2.10：日志脱敏 / OCR 预览收敛 / macOS PKG） | M5 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.10 已发布；v0.2.11 发布中：macOS 菜单栏品牌图标） | M5 |
 
 ## M0 详细任务（已完成）
 
@@ -167,3 +168,4 @@
 | 2026-09-08 | v0.2.9 已发布（tag 指向 merge commit bf132c9，DMG/exe/SHA256SUMS 校验通过：SHA256 双资产匹配 + 公证 staple 有效）；「已发布」注记按惯例仅存 main（见 v0.2.5 备注） |
 | 2026-09-09 | v0.2.10 发布准备：版本号统一 0.2.10（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容：daemon 日志脱敏（#59）+ OCR 预览 TTL/状态卡收敛/单状态化（#105 item3/4/5）+ macOS `.pkg` 系统级安装包与 Developer ID Installer 签名/公证（#111）+ 性能预算表重定范围/OCR 降采样（#58）。 |
 | 2026-09-09 | v0.2.10 已发布（tag 指向 merge commit 1f563da，GitHub Release run 34308079932 全绿：version-guard + macOS + Windows + release；DMG/PKG/EXE/SHA256SUMS 资产完整，SHA256 与 Release API digest 一致；macOS PKG 使用 Developer ID Installer 签名、公证 trusted、staple 成功）。 |
+| 2026-09-09 | v0.2.11 发布准备：版本号统一 0.2.11（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容：macOS 输入法菜单栏图标重设计——实心圆角气泡 + 品牌「言」字负空间模板，18pt 画布（#116，PR #117）。 |
