@@ -112,6 +112,7 @@ fn verba_entries() -> Vec<plist::Value> {
 /// 才能让父源/mode 同时 enable（macOS 26.5 真机复现）。先移除所有历史 Verba
 /// 条目再追加，避免重复 mode。
 fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
+    let original = root.clone();
     let root_dict = root
         .as_dictionary_mut()
         .ok_or_else(|| "com.apple.inputsources 根节点不是 dictionary，拒绝改写".to_owned())?;
@@ -127,7 +128,6 @@ fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
     let entries = list
         .as_array_mut()
         .ok_or_else(|| format!("{THIRD_PARTY_INPUT_SOURCES_KEY} 不是 array，拒绝覆盖已有输入源"))?;
-    let before = entries.len();
     entries.retain(|value| {
         value
             .as_dictionary()
@@ -135,9 +135,8 @@ fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
             .and_then(plist::Value::as_string)
             != Some(VERBA_SOURCE_ID)
     });
-    let after_verba_removed = entries.len();
     entries.extend(verba_entries());
-    Ok(before != after_verba_removed + 2)
+    Ok(*root != original)
 }
 
 /// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
@@ -348,7 +347,15 @@ fn list_sources() -> ExitCode {
 }
 
 fn parse_home_arg(args: &[String]) -> Result<PathBuf, String> {
-    let home = if let Some(pos) = args.iter().position(|arg| arg == "--home") {
+    let home_positions: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, arg)| (arg == "--home").then_some(i))
+        .collect();
+    if home_positions.len() > 1 {
+        return Err("--home 只能出现一次".to_owned());
+    }
+    let home = if let Some(pos) = home_positions.first().copied() {
         let value = args
             .get(pos + 1)
             .ok_or_else(|| "--home 缺少路径参数".to_owned())?;
@@ -368,6 +375,18 @@ fn parse_home_arg(args: &[String]) -> Result<PathBuf, String> {
         .map_err(|e| format!("--home 路径不可访问 {}: {e}", home.display()))?;
     if !canonical.is_dir() {
         return Err(format!("--home 不是目录: {}", canonical.display()));
+    }
+    let users_root = Path::new("/Users");
+    if !canonical.starts_with(users_root) || canonical == users_root {
+        return Err(format!(
+            "--home 必须是 /Users/<用户> 下的真实用户目录: {}",
+            canonical.display()
+        ));
+    }
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| format!("读取 {} 元数据失败: {e}", canonical.display()))?;
+    if meta.uid() == 0 {
+        return Err(format!("拒绝写入 root 用户目录: {}", canonical.display()));
     }
     Ok(canonical)
 }
@@ -594,16 +613,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_home_arg_requires_absolute_existing_directory() {
+    fn parse_home_arg_requires_real_user_home() {
+        let home = std::env::var("HOME").expect("测试环境应有 HOME");
         let ok = vec![
             "--write-input-sources-plist".to_owned(),
             "--home".to_owned(),
-            "/tmp".to_owned(),
+            home.clone(),
         ];
         assert_eq!(
             parse_home_arg(&ok).unwrap(),
-            fs::canonicalize("/tmp").unwrap()
+            fs::canonicalize(&home).unwrap()
         );
+        for bad in ["/", "/tmp", "/Users"] {
+            let args = vec![
+                "--write-input-sources-plist".to_owned(),
+                "--home".to_owned(),
+                bad.to_owned(),
+            ];
+            assert!(parse_home_arg(&args).is_err(), "{bad} 应被拒绝");
+        }
         let relative = vec![
             "--write-input-sources-plist".to_owned(),
             "--home".to_owned(),
@@ -615,5 +643,13 @@ mod tests {
             "--home".to_owned(),
         ];
         assert!(parse_home_arg(&missing).is_err());
+        let duplicate = vec![
+            "--write-input-sources-plist".to_owned(),
+            "--home".to_owned(),
+            home.clone(),
+            "--home".to_owned(),
+            home,
+        ];
+        assert!(parse_home_arg(&duplicate).is_err());
     }
 }
