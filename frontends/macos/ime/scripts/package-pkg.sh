@@ -38,7 +38,12 @@ if [ -z "$VERSION" ]; then
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/verba-pkg.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+    local status=$?
+    rm -rf "$WORK"
+    exit "$status"
+}
+trap cleanup EXIT
 
 PAYLOAD="$WORK/payload"
 mkdir -p "$PAYLOAD"
@@ -114,7 +119,7 @@ RELOCATE_BUNDLES="$(xmllint --xpath \
     'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \
     "$EXPANDED_COMPONENT/PackageInfo")"
 if [ "$RELOCATE_BUNDLES" != "0" ]; then
-    echo "::error::PKG 仍允许 bundle relocation（relocate 子元素数=$RELOCATE_BUNDLES），拒绝产出" >&2
+    echo "::error::PKG 仍允许 bundle relocation（relocate 子元素数=${RELOCATE_BUNDLES}），拒绝产出" >&2
     exit 1
 fi
 

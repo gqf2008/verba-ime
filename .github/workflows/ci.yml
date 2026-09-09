@@ -93,6 +93,11 @@ jobs:
             'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \
             "$EXP/Verba-component.pkg/PackageInfo")"
           test "$RELOCATE_BUNDLES" = "0"
+          # 最终 Distribution 也必须没有 relocation；防未来自定义 Distribution 绕过组件检查。
+          DIST_RELOCATE_BUNDLES="$(xmllint --xpath \
+            'count(/*[local-name()="installer-gui-script"]/*[local-name()="pkg-ref"]/*[local-name()="relocate"]/*)' \
+            "$EXP/Distribution")"
+          test "$DIST_RELOCATE_BUNDLES" = "0"
           test -x "$EXP/Verba-component.pkg/Scripts/postinstall"
           # 钉住降权行为：launchctl asuser 不降 euid，必须配合 sudo -u（防回退）
           grep -q '/usr/bin/sudo -u' "$EXP/Verba-component.pkg/Scripts/postinstall"
