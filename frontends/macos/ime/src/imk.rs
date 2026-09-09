@@ -806,6 +806,13 @@ define_class!(
             // ——清预览收面板后**继续正常路由**（对齐 Windows feed_ocr_preview
             // 的 Other 语义：退出预览、该键重走拼音路径——透传会字母泄漏，
             // 真机踩坑）。
+            // #105 item3 预览 TTL：过期预览先作废（前端槽位 + core），本键按
+            // 正常路由处理——陈旧识别文本不得随本键误上屏。
+            if self.ivars().machine.borrow().ocr_preview_ttl_expired() {
+                let _ = self.clear_previews();
+                self.ivars().machine.borrow_mut().end_ocr_preview();
+                self.hide_candidate_window();
+            }
             if self.ivars().ocr_preview.borrow().is_some() {
                 dbg_log(&format!(
                     "OCR 预览拦截: key={:?}",
@@ -1149,6 +1156,11 @@ define_class!(
             // 退栈后下一个 tick 补排（见 host_call 与真机崩溃分析）。
             if self.ivars().host_call_depth.get() > 0 {
                 return;
+            }
+            // #105 item3 预览 TTL：超时自动作废（前端槽位 + core）+ 收起候选窗。
+            if self.ivars().machine.borrow_mut().expire_stale_ocr_preview() {
+                *self.ivars().ocr_preview.borrow_mut() = None;
+                self.hide_candidate_window();
             }
             // 补放重入窗积压的键：必须先于事件排空（「键 → 由它触发的查询」
             // 顺序不可倒置），也必须先于下方空队列快速路径（积压键 + 空事件

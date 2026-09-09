@@ -140,8 +140,7 @@ pub struct TextServiceData {
     shift_down: Cell<bool>,
     /// Shift 按下期间是否与其他键组合（组合则不切换）。
     shift_combined: Cell<bool>,
-    /// 中英切换状态提示的到期时刻（候选窗闪「中/英」后自动隐藏）。
-    ime_status_until: Cell<Option<std::time::Instant>>,
+
     /// OCR/触发结果浮窗锚点：触发命令结束组合**前**记下的组合光标位置。
     /// 预览几秒后异步显示时组合已不在（caret_screen_pos 依赖组合引用），
     /// 无此槽则只剩「视图左上角」兜底——离用户视线（拖选区/光标）可能
@@ -190,7 +189,6 @@ impl TextServiceData {
             ime_chinese: Cell::new(true),
             shift_down: Cell::new(false),
             shift_combined: Cell::new(false),
-            ime_status_until: Cell::new(None),
             ocr_anchor: Cell::new(None),
             stream_request_id: Arc::new(AtomicU64::new(0)),
             stream_epoch: Arc::new(AtomicU64::new(0)),
@@ -520,7 +518,7 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         let vk = wparam.0 as u32;
         let machine = self.data.machine.borrow();
         let state = machine.state();
-        let ocr_previewing = machine.ocr_previewing();
+        let ocr_previewing = machine.ocr_previewing() && !machine.ocr_preview_ttl_expired();
         drop(machine);
         // Shift 始终认领（仅用于接收 OnKeyUp 检测孤立按；OnKeyDown 返回 FALSE
         // 不吞键，Shift 照常交宿主）——TSF 对不认领的键不回调 OnKeyUp，切换
@@ -653,7 +651,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 
 // ---- 按键处理 ----
 
-/// 构建覆盖层候选窗并按给定锚点显示。OCR 预览 / 改写对照预览 / 中英状态卡
+/// 构建覆盖层候选窗并按给定锚点显示。OCR 预览 / 改写对照预览 / OCR/改写/AI 结果卡
 /// 共用这套「主题克隆 → 控制器 → 显示 → 锚点」管线——三处各抄一份时兜底
 /// 定位与借锁顺序已经开始漂移，收口到这里后改一处即三处生效。
 fn show_overlay_window(
@@ -835,20 +833,9 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
         data.machine.borrow_mut().end_ocr_preview();
         log::info!("中英切换：作废在途 OCR 预览（防隐形预览误上屏）");
     }
-    // 视觉反馈：候选窗位置闪「中/英」状态卡（2 秒后由 on_timer 隐藏）。
-    show_overlay_window(data, view_fallback_anchor(data), |ctrl| {
-        ctrl.set_status(Some(
-            if chinese {
-                "中文模式"
-            } else {
-                "英文模式"
-            }
-            .to_owned(),
-        ));
-    });
-    data.ime_status_until.set(Some(
-        std::time::Instant::now() + std::time::Duration::from_secs(2),
-    ));
+    // 中英切换：直接收起候选窗（旧「中/英」状态卡从未真正渲染——
+    // status-only 过不了 should_render 门槛，其超时隐藏只是破坏性副作用；#105 item5=B）。
+    hide_candidate_window(data);
     log::info!("中英模式切换: {}", if chinese { "中文" } else { "英文" });
 }
 
@@ -960,6 +947,12 @@ pub fn handle_key_down(
     }
     // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
     // 后照常走下方路由（不打断打字流）。
+    // #105 item3 预览 TTL：若预览已超时，先作废（不进入预览路由），该键按
+    // 正常 Idle 处理——陈旧识别文本不得随本键误上屏。
+    if machine.ocr_previewing() && machine.ocr_preview_ttl_expired() {
+        machine.end_ocr_preview();
+        hide_candidate_window(data);
+    }
     if machine.ocr_previewing() {
         // 数字 VK 兜底对齐改写预览（AZERTY 等未按 Shift 时 '1' 键解不出
         // 数字，只按成字符会把「1 上屏」的预览直接销毁）。
@@ -2392,22 +2385,9 @@ impl TextServiceData {
         let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
             return;
         };
-        // 中英切换状态提示超时：Idle（无候选）时隐藏候选窗。
-        // 追加 !ocr_previewing 守卫：候选窗为状态卡与预览共用——卡弹出后
-        // 2s 内预览才到达（Ctrl+Alt+O 异步出结果）时，到点 state 仍是 Idle
-        // 且预览挂在该槽上，隐藏会造出「隐形活预览」，配合 #103 的放宽认领
-        // 即成误上屏。预览的收起由它自己的按键路径负责，此处让位。
-        if let Some(until) = self.ime_status_until.get() {
-            if std::time::Instant::now() >= until {
-                self.ime_status_until.set(None);
-                let may_hide = {
-                    let m = self.machine.borrow();
-                    m.state() == MachineState::Idle && !m.ocr_previewing()
-                };
-                if may_hide {
-                    hide_candidate_window(&rc);
-                }
-            }
+        // #105 item3 预览 TTL：超时自动作废预览并收起候选窗（防御跨窗格陈旧文本误上屏）。
+        if self.machine.borrow_mut().expire_stale_ocr_preview() {
+            hide_candidate_window(&rc);
         }
         // 持续重试挂载键盘 sink（Activate 时可能失败）
         try_advise_keysink(&rc);

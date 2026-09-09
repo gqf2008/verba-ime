@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// 候选：文本 + 覆盖的输入拼音字符数（用于分段承诺/整句提交）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +234,10 @@ impl std::str::FromStr for Mode {
     }
 }
 
+/// OCR 预览 TTL：超过该时长未确认（Enter/空格/1）自动失效，防止跨窗格/跨长时间
+/// 后按 Enter 把陈旧识别文本误上屏（#105 item3，焦点切换预览失效策略·A）。
+pub const OCR_PREVIEW_TTL: Duration = Duration::from_secs(10);
+
 /// 组合状态机。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionMachine {
@@ -268,6 +273,9 @@ pub struct CompositionMachine {
     selected_index: usize,
     /// OCR 预览文本（preview 状态期间候选窗首条显示它；None=非预览态）。
     ocr_preview: Option<String>,
+    /// OCR 预览到期时刻（begin_ocr_preview 置位；确认/取消/退出/TTL 清除）。
+    /// 用于 [#105 item3] 预览 TTL：超时自动失效，防御跨窗格陈旧文本误上屏。
+    ocr_preview_deadline: Option<Instant>,
     /// 改写流的原内容（StartRewrite 时保留；流完成时进入对照预览）。
     rewrite_source: Option<String>,
     /// 改写对照预览（Some((改写结果, 原文)) = 预览中；期间候选窗显示双候选）。
@@ -361,6 +369,7 @@ impl CompositionMachine {
             pinyin_page: 0,
             selected_index: 0,
             ocr_preview: None,
+            ocr_preview_deadline: None,
             rewrite_source: None,
             rewrite_preview: None,
             prompt: String::new(),
@@ -1110,6 +1119,7 @@ impl CompositionMachine {
         self.pinyin_page = 0;
         self.selected_index = 0;
         self.ocr_preview = None;
+        self.ocr_preview_deadline = None;
         self.rewrite_source = None;
         self.rewrite_preview = None;
         // last_request 刻意不在清单（Esc 后保留，见其类型注）；ai_preview
@@ -1240,6 +1250,7 @@ impl CompositionMachine {
         }
         self.state = MachineState::OcrPreviewing;
         self.ocr_preview = Some(text.clone());
+        self.ocr_preview_deadline = Some(Instant::now() + OCR_PREVIEW_TTL);
         Some(Action::OcrPreview { text })
     }
 
@@ -1252,17 +1263,20 @@ impl CompositionMachine {
             PreviewKey::Enter | PreviewKey::Space | PreviewKey::Digit1 => {
                 self.state = MachineState::Idle;
                 self.ocr_preview = None;
+                self.ocr_preview_deadline = None;
                 Some(Action::CommitImmediate(text))
             }
             PreviewKey::Escape => {
                 self.state = MachineState::Idle;
                 self.ocr_preview = None;
+                self.ocr_preview_deadline = None;
                 Some(Action::Cancel)
             }
             PreviewKey::Digit2 | PreviewKey::Other => {
                 // 其他键：退出预览（丢弃），该键交回调用方重走正常路径。
                 self.state = MachineState::Idle;
                 self.ocr_preview = None;
+                self.ocr_preview_deadline = None;
                 None
             }
         }
@@ -1278,6 +1292,24 @@ impl CompositionMachine {
             self.state = MachineState::Idle;
         }
         self.ocr_preview = None;
+        self.ocr_preview_deadline = None;
+    }
+
+    /// OCR 预览是否已超时（#105 item3 TTL）。仅预览态有意义；无预览恒 false。
+    pub fn ocr_preview_ttl_expired(&self) -> bool {
+        match self.ocr_preview_deadline {
+            Some(dl) => Instant::now() >= dl,
+            None => false,
+        }
+    }
+
+    /// 若 OCR 预览已超时，立即作废并返回 true（前端据此隐藏候选窗）。
+    pub fn expire_stale_ocr_preview(&mut self) -> bool {
+        if self.ocr_previewing() && self.ocr_preview_ttl_expired() {
+            self.end_ocr_preview();
+            return true;
+        }
+        false
     }
 
     /// 改写对照预览：进入（流完成时前端调用）。
@@ -3515,6 +3547,38 @@ mod tests {
         assert!(m.begin_ocr_preview("文本4".to_owned()).is_some());
         let _ = m.feed_ocr_preview(PreviewKey::Other);
         assert_eq!(m.state(), MachineState::Idle);
+    }
+
+    /// #105 item3 预览 TTL：超时后 expire_stale_ocr_preview 自动作废。
+    #[test]
+    fn ocr_preview_ttl_expiry_auto_invalidates() {
+        let mut m = CompositionMachine::new();
+        assert!(m.begin_ocr_preview("识别文本".to_owned()).is_some());
+        assert!(m.ocr_previewing());
+        assert!(!m.ocr_preview_ttl_expired(), "刚进入不应超时");
+        // 阈值落地即验证（RULE_阈值变更）：deadline 应 = now + OCR_PREVIEW_TTL。
+        let expect = Instant::now() + OCR_PREVIEW_TTL;
+        let got = m.ocr_preview_deadline.expect("begin 应置 deadline");
+        let delta = if got > expect {
+            got - expect
+        } else {
+            expect - got
+        };
+        assert!(
+            delta < Duration::from_millis(200),
+            "deadline 应 ≈ now+TTL, got delta {delta:?}"
+        );
+
+        // 手动把到期时刻拨到过去（模拟 TTL 已过），验证自动作废。
+        m.ocr_preview_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert!(m.ocr_preview_ttl_expired());
+        assert!(m.expire_stale_ocr_preview(), "过期预览应被作废");
+        assert!(!m.ocr_previewing());
+        assert!(!m.ocr_preview_ttl_expired());
+
+        // 未超时 / 无预览：恒 false。
+        assert!(!m.expire_stale_ocr_preview());
+        assert!(!m.ocr_preview_ttl_expired());
     }
 
     /// `///`：Prompt 态空提示词按第三个斜杠 → TriggerOcr（选区截图）。
