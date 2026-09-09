@@ -1,11 +1,12 @@
 # 路线图
 
-> 更新：2026-09-06 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
+> 更新：2026-09-09 · 当前状态：**单引擎化（Rime）已定案并实机验证**（Windows TSF + macOS IMK 共用 daemon 内
 > librime；内置 `verba-pinyin`、`config engine` 开关、打字过程 LLM 候选融合均已移除）；**OCR（截图/看图）为正式能力**；**ASR/TTS 冻结为实验性（2026-08-29 Owner 决策：代码保留、默认关闭、入口隐藏，不承诺）**；
-> Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.8
+> Slint 设置面板已落地（apps/settings）；M6 发布已达成（v0.2.0–v0.2.9
 > 签名公证产物；v0.2.8 上线：AI 发送即反馈 / 空 Enter 防误杀 / OCR 预览可发现，PR #98；
-> v0.2.9 上线：Windows OCR 预览按键链修复，PR #102/#103/#104）。
-> 剩余：性能预算（范围缩减为 LLM 核心输入链路 + OCR）、日志脱敏。
+> v0.2.9 上线：Windows OCR 预览按键链修复，PR #102/#103/#104；
+> v0.2.10 发布中：日志脱敏 + OCR 预览状态机/TTL/状态卡收敛 + macOS 系统级 PKG）。
+> 剩余：性能预算（范围缩减为 LLM 核心输入链路 + OCR）真机复测。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
 ## 里程碑总览
@@ -18,7 +19,7 @@
 | M3 | 多模态 | OCR（截图/看图）在至少一个平台跑通（ASR 冻结为实验性，不在 M6 承诺） | M1 / M2 |
 | M4 | 体验打磨 | 候选窗口、Slint 设置面板、性能预算（LLM 核心输入链路 + OCR）、隐私开关（TTS 冻结为实验性） | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
-| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.9 已发布；v0.2.9：Windows OCR 预览按键链修复） | M5 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.9 已发布；v0.2.10 发布中：日志脱敏 / OCR 预览收敛 / macOS PKG） | M5 |
 
 ## M0 详细任务（已完成）
 
@@ -164,3 +165,4 @@
 | 2026-09-06 | v0.2.8 已发布（tag 指向 merge commit cae26c4，DMG/exe/SHA256SUMS 校验通过；插曲：PowerShell 解析 `^{commit}` 致 tag 首推错指 e7763f5，删远端重打并取消孤儿 release run）；「已发布」注记按惯例仅存 main（见 v0.2.5 备注） |
 | 2026-09-08 | v0.2.9 发布准备：版本号统一 0.2.9（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容（Windows OCR 预览按键链修复，PR #102/#103/#104）：OCR 预览锚点热键清槽收口 + 空串防御（#102）、预览态按键认领（Enter/Esc/空格 可上屏或取消，#103）、max 审查加固 11 项（隐形预览误上屏/中文态 Tab 吞焦点/AZERTY 数字键洞/RefMut 跨 match panic/契约文档/回归 e2e 直构 KeyEventSink，#104） |
 | 2026-09-08 | v0.2.9 已发布（tag 指向 merge commit bf132c9，DMG/exe/SHA256SUMS 校验通过：SHA256 双资产匹配 + 公证 staple 有效）；「已发布」注记按惯例仅存 main（见 v0.2.5 备注） |
+| 2026-09-09 | v0.2.10 发布准备：版本号统一 0.2.10（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容：daemon 日志脱敏（#59）+ OCR 预览 TTL/状态卡收敛/单状态化（#105 item3/4/5）+ macOS `.pkg` 系统级安装包与 Developer ID Installer 签名/公证（#111）+ 性能预算表重定范围/OCR 降采样（#58）。 |
