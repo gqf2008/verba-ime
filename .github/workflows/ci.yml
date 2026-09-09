@@ -63,6 +63,15 @@ jobs:
       - name: 校验 .app
         run: test -d frontends/macos/ime/dist/Verba.app && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-mac && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-daemon && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-settings && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-trigger && test -x frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register && test -f frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf && frontends/macos/ime/dist/Verba.app/Contents/MacOS/verba-register --list && ls -la frontends/macos/ime/dist/Verba.app/Contents
 
+      - name: 校验菜单栏图标生成器与产物一致
+        run: |
+          TMP_ICON="$(mktemp)"
+          trap 'unlink "$TMP_ICON"' EXIT
+          python3 scripts/gen-macos-icon.py --out "$TMP_ICON"
+          cmp "$TMP_ICON" frontends/macos/ime/app/Resources/Icon.pdf
+          grep -q '/MediaBox \[0 0 18 18\]' frontends/macos/ime/app/Resources/Icon.pdf
+          echo "菜单栏图标生成器/产物一致，MediaBox 18x18"
+
       - name: 打包 PKG 并校验
         run: |
           bash frontends/macos/ime/scripts/package-pkg.sh
