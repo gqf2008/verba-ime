@@ -33,7 +33,7 @@
     <key>NSSupportsSuddenTermination</key>
     <false/>
     <key>InputMethodConnectionName</key>
-    <string>Verba_1_Connection</string>
+    <string>dev.verba.inputmethod.Verba_Connection</string>
     <key>InputMethodServerControllerClass</key>
     <string>VerbaIMKController</string>
     <key>ComponentInputModeDict</key>
