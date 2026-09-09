@@ -9,6 +9,12 @@
 - [ ] 不手动添加输入源：安装脚本调用 `verba-register` 后，父源与 Pinyin mode 自动 `enabled=1`，菜单可直接切换
 - [ ] 切换输入法后 IMK 控制器激活（可输入）
 
+## PKG 系统级自动启用（v0.2.14）
+- [ ] 干净系统执行 `Verba-<版本>.pkg`，装到 `/Library/Input Methods/Verba.app`
+- [ ] 不打开键盘设置、不手动添加、不重启：菜单出现「拾言输入法」
+- [ ] 父源与 Pinyin mode 均 `enabled=1`，可直接切换并输入
+- [ ] 故意让 helper 失败（如临时破坏 helper 可执行位）时，Installer 报错且日志可见，不显示假成功
+
 ## 直输
 - [ ] 英文/数字/标点直输上屏（无残留 preedit）
 - [ ] 退格删除、Esc 取消组合、Enter 提交

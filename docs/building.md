@@ -39,10 +39,10 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
    - daemon + 设置面板：根目录 `cargo build -p verba-daemon --release && cargo build -p verba-settings --release`
 2. 获取 Rime 运行时：`pwsh scripts/fetch-rime-vendor.ps1`（见下节）。
 3. 安装 Inno Setup 6（`winget install JRSoftware.InnoSetup --scope user`）。
-4. 编译（`/DMyAppVersion` 可选，默认 0.2.13；发布流水线注入根 Cargo.toml 版本）：
+4. 编译（`/DMyAppVersion` 可选，默认 0.2.14；发布流水线注入根 Cargo.toml 版本）：
    ```powershell
    cd frontends/windows/installer
-   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.2.13 verba-ime.iss
+   & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.2.14 verba-ime.iss
    ```
    产物：`frontends/windows/installer/output/verba-ime-setup-<版本>.exe`（需管理员运行安装）。
    安装器会先停掉在跑的 `verba-daemon`（防新 DLL 连旧 daemon 混搭）。DLL 已被
@@ -108,8 +108,10 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
   - **发布 DMG 一键安装**：DMG 不提供 `/Applications` 快捷方式（输入法不是普通应用）；双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 写 `com.apple.inputsources` 第三方输入源白名单并刷新 TextInputMenuAgent，自动启用输入源（无需手动添加）。卸载 = 双击「卸载.command」。
   - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（自动写白名单并启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
   - **PKG 安装包（系统级）**：`scripts/package-pkg.sh` 把已组装的 `dist/Verba.app` 打成
-    `dist/Verba-<版本>.pkg`，安装到 `/Library/Input Methods`（需管理员）；postinstall 会以当前
-    登录用户身份调用 `verba-register` 注册并启用输入源。`INSTALLER_IDENTITY="Developer ID Installer: ..."`
+    `dist/Verba-<版本>.pkg`，安装到 `/Library/Input Methods`（需管理员）；postinstall 经
+    LaunchServices 在 console 用户会话内启动 `Verba.app` 的 `--register` 短命模式，再由它
+    调用 `verba-register` 注册并启用输入源（直接 CLI 会受 `package_script_service` 沙盒限制）。
+    helper 失败时 postinstall 返回非零并打印日志，不把“未启用”当成功。`INSTALLER_IDENTITY="Developer ID Installer: ..."`
     时用 `productbuild --sign` 签名（正式分发还需 notarytool 公证）；未提供则产出未签名 pkg（仅本地/dry-run）。
     `verba-register` 会把 `com.apple.inputsources` 的 `AppleEnabledThirdPartyInputSources` 规范化为 Verba 父源 + Pinyin mode，并刷新 TextInputMenuAgent；macOS 12+ 仅调 TIS API 可能返回 noErr 但父源仍 disabled。
     卸载 = 删除 `/Library/Input Methods/Verba.app`（或在系统设置移除输入源）。
@@ -131,7 +133,7 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ### 发布流程（`.github/workflows/release.yml`）
 
-打 tag `v*`（如 `git tag v0.2.13 && git push origin v0.2.13`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
+打 tag `v*`（如 `git tag v0.2.14 && git push origin v0.2.14`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
 
 1. **macOS job**（macos-14，Apple Silicon）：拉取 Rime vendor → `package.sh` 组装（版本注入 + Rime 捆绑）→ 逐二进制 + .app 签名（hardened runtime + timestamp）→ notarytool 公证 + staple → Rime 冒烟 → 打包 DMG + PKG + 各自签名 + 公证 + staple
 2. **Windows job**（windows-latest，MSVC）：构建 workspace + 前端 → PE 子系统守卫（daemon 必须 GUI 子系统，防控制台回归）→ Inno Setup 打包（`/DMyAppVersion` 注入）→ Rime 冒烟 → 可选 signtool 签名

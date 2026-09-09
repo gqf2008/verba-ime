@@ -16,6 +16,7 @@
   - 基础输入**无需**辅助功能权限。
   - 麦克风：需 `NSMicrophoneUsageDescription`（TCC 弹窗）；截图 OCR：需屏幕录制权限（ScreenCaptureKit）。
 - 打包：`.app` 内含 `verba-mac`（IMK 主程序）、`verba-daemon`（Rust 核心）与 `verba-register`（TIS 注册/启用）；`verba-register` 会写 `com.apple.inputsources` 第三方输入源白名单并刷新 TextInputMenuAgent，无需用户手动添加。正式发布需 Developer ID 签名 + 公证。
+- PKG 系统级安装：`scripts/package-pkg.sh` 的 postinstall 不直接调用 CLI，而是经 LaunchServices 在用户会话启动 `verba-mac --register` 短命 helper；helper 调用同 bundle 的 `verba-register`，失败会返回非零并保留日志，避免 package_script_service 沙盒导致假成功。
 
 ## 构建与安装
 
@@ -24,6 +25,13 @@ cd frontends/macos/ime
 scripts/package.sh
 cp -R dist/Verba.app "$HOME/Library/Input Methods/"
 # 然后运行 verba-register（安装脚本会自动执行；无需手动到系统设置添加）
+```
+
+系统级 PKG：
+
+```bash
+scripts/package-pkg.sh
+# 双击 dist/Verba-<版本>.pkg；postinstall 会在 console 用户会话内自动注册/启用
 ```
 
 开发期快速验证：
