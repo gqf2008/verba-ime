@@ -8,7 +8,7 @@
 > v0.2.10 已发布：日志脱敏 + OCR 预览状态机/TTL/状态卡收敛 + macOS 系统级 PKG；
 > v0.2.11 已发布：macOS 输入法菜单栏品牌「言」字图标重设计；
 > v0.2.12 已发布：修复 macOS PKG 被 Installer 重定位导致系统级安装后菜单不出现；
-> v0.2.13 发布中：macOS 用户级 DMG 自动启用 + IMK 连接名/markedRange 修复 + OCR 上屏竞态修复）。
+> v0.2.13 已发布：macOS 用户级 DMG 自动启用 + IMK 连接名/markedRange 修复 + OCR 上屏竞态修复）。
 > 剩余：性能预算（范围缩减为 LLM 核心输入链路 + OCR）真机复测。
 > 原则：每个里程碑都有可验收的端到端结果；先打通一条完整链路（Windows + LLM），再铺平台，再加能力，最后打磨发布。
 
@@ -22,7 +22,7 @@
 | M3 | 多模态 | OCR（截图/看图）在至少一个平台跑通（ASR 冻结为实验性，不在 M6 承诺） | M1 / M2 |
 | M4 | 体验打磨 | 候选窗口、Slint 设置面板、性能预算（LLM 核心输入链路 + OCR）、隐私开关（TTS 冻结为实验性） | M3 |
 | M5 | 中文引擎 | **Rime（librime）单引擎**已落地（拼音/五笔 + 候选窗/分页/主题，实机验收通过）；内置 `verba-pinyin` 已移除 | M4 |
-| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.12 已发布；v0.2.13 发布中：macOS 自动启用 + IMK/OCR 修复） | M5 |
+| M6 | 发布 | 打包、签名、公证、Alpha / Beta、文档与社区运营（v0.2.0–v0.2.13 已发布） | M5 |
 
 ## M0 详细任务（已完成）
 
@@ -174,3 +174,4 @@
 | 2026-09-09 | v0.2.11 已发布（tag 指向 merge commit 24841cc，GitHub Release run 34316844410 全绿：version-guard + macOS + Windows + release；DMG/PKG/EXE/SHA256SUMS 资产完整，SHA256 与 Release API digest 一致；macOS 菜单栏新版实心「言」字图标随包发布，#116 收口）。 |
 | 2026-09-09 | v0.2.12 发布准备：版本号统一 0.2.12（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容：修复 macOS PKG 被 Installer 重定位到 dist/Verba.app（#121，PR #122）——component plist 关闭 BundleIsRelocatable，生成空 `<relocate/>`，并加 CI/打包脚本防回归守卫。 |
 | 2026-09-09 | v0.2.13 发布准备：版本号统一 0.2.13（根 workspace + 两前端 Cargo.toml + 3 个 Cargo.lock + ISS/Info.plist/building.md 示例同步）；随版内容：macOS IMK 连接名/markedRange 崩溃修复（#126）、OCR 结果与输入回调竞态修复（#127）、用户级 DMG 自动启用第三方输入源（#128）。系统级 PKG 自动启用留待 v0.2.14 GUI helper。 |
+| 2026-09-09 | v0.2.13 已发布（tag 指向 merge commit 4a211e6，GitHub Release run 34356976512 全绿：version-guard + macOS + Windows + release；DMG/PKG/EXE/SHA256SUMS 资产完整，SHA256 与 Release API digest 一致；.app/PKG 公证 Accepted、staple 成功）。 |
