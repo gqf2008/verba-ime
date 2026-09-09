@@ -20,6 +20,8 @@
 //! 非零退出码，让「安装.command」能如实提示。
 
 use std::ffi::c_void;
+use std::fs;
+use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -36,6 +38,8 @@ const VERBA_SOURCE_ID: &str = "dev.verba.inputmethod.Verba";
 const VERBA_MODE_ID: &str = "dev.verba.inputmethod.Verba.Pinyin";
 /// kTISPropertyInputSourceID（TextInputSources.h 公开常量）。
 const TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
+/// kTISPropertyInputSourceIsEnabled（TextInputSources.h 公开常量）。
+const TIS_PROPERTY_INPUT_SOURCE_IS_ENABLED: &str = "TISPropertyInputSourceIsEnabled";
 /// 第三方输入法启用白名单（macOS 12+）：父源 entry 存在时系统会把该 bundle
 /// 的父源和模式一起加入 HIToolbox 的启用列表。只写 TISEnableInputSource 时
 /// 在部分真机会返回 noErr 但父源仍 disabled；写入该父源 entry 并刷新
@@ -67,6 +71,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CFArrayGetCount(array: *const c_void) -> i64;
     fn CFArrayGetValueAtIndex(array: *const c_void, index: i64) -> *const c_void;
+    fn CFBooleanGetValue(boolean: *const c_void) -> bool;
 }
 
 /// 构造 `com.apple.inputsources` 的 Verba 父源 + Pinyin mode entry。
@@ -106,13 +111,10 @@ fn verba_entries() -> Vec<plist::Value> {
 /// 只写父源时用户级安装可用，但系统级 app 的 mode 可能仍 disabled；两条都写
 /// 才能让父源/mode 同时 enable（macOS 26.5 真机复现）。先移除所有历史 Verba
 /// 条目再追加，避免重复 mode。
-fn ensure_verba_entries(root: &mut plist::Value) -> bool {
-    if !root.as_dictionary().is_some() {
-        *root = plist::Value::Dictionary(plist::Dictionary::new());
-    }
+fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
     let root_dict = root
         .as_dictionary_mut()
-        .expect("root 已规范化为 dictionary");
+        .ok_or_else(|| "com.apple.inputsources 根节点不是 dictionary，拒绝改写".to_owned())?;
     if !root_dict.contains_key(THIRD_PARTY_INPUT_SOURCES_KEY) {
         root_dict.insert(
             THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
@@ -121,11 +123,10 @@ fn ensure_verba_entries(root: &mut plist::Value) -> bool {
     }
     let list = root_dict
         .get_mut(THIRD_PARTY_INPUT_SOURCES_KEY)
-        .expect("刚插入的 key 应存在");
-    if !list.as_array().is_some() {
-        *list = plist::Value::Array(Vec::new());
-    }
-    let entries = list.as_array_mut().expect("list 已规范化为 array");
+        .ok_or_else(|| format!("{THIRD_PARTY_INPUT_SOURCES_KEY} 缺失"))?;
+    let entries = list
+        .as_array_mut()
+        .ok_or_else(|| format!("{THIRD_PARTY_INPUT_SOURCES_KEY} 不是 array，拒绝覆盖已有输入源"))?;
     let before = entries.len();
     entries.retain(|value| {
         value
@@ -136,7 +137,7 @@ fn ensure_verba_entries(root: &mut plist::Value) -> bool {
     });
     let after_verba_removed = entries.len();
     entries.extend(verba_entries());
-    before != after_verba_removed + 2
+    Ok(before != after_verba_removed + 2)
 }
 
 /// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
@@ -151,10 +152,47 @@ fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
     } else {
         plist::Value::Dictionary(plist::Dictionary::new())
     };
-    let changed = ensure_verba_entries(&mut root);
-    plist::to_file_binary(&path, &root)
-        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
-    Ok(changed)
+    let changed = ensure_verba_entries(&mut root)?;
+    if !changed {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} 无父目录", path.display()))?;
+    let tmp = parent.join(format!(
+        ".com.apple.inputsources.{}.tmp",
+        std::process::id()
+    ));
+    plist::to_file_binary(&tmp, &root)
+        .map_err(|e| format!("写入临时文件 {} 失败: {e}", tmp.display()))?;
+    let source_meta = fs::metadata(&path).ok();
+    let home_meta;
+    let owner_meta = match source_meta.as_ref() {
+        Some(meta) => meta,
+        None => {
+            home_meta =
+                fs::metadata(home).map_err(|e| format!("读取 {} 失败: {e}", home.display()))?;
+            &home_meta
+        }
+    };
+    fs::set_permissions(
+        &tmp,
+        source_meta
+            .as_ref()
+            .map(|m| m.permissions())
+            .unwrap_or_else(|| fs::Permissions::from_mode(0o600)),
+    )
+    .map_err(|e| format!("设置临时文件权限失败: {e}"))?;
+    chown(&tmp, Some(owner_meta.uid()), Some(owner_meta.gid()))
+        .map_err(|e| format!("设置临时文件所有者失败: {e}"))?;
+    fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("同步临时文件失败: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("原子替换 {} 失败: {e}", path.display())
+    })?;
+    Ok(true)
 }
 
 fn refresh_input_source_agents() {
@@ -227,6 +265,34 @@ fn find_and_enable_source(select: bool) -> (bool, i32) {
     (false, 0)
 }
 
+/// 查询指定输入源当前是否 enabled（不能只信 TISEnableInputSource 的返回值）。
+fn input_source_enabled(want_id: &str) -> bool {
+    let raw = unsafe { TISCreateInputSourceList(std::ptr::null(), true) };
+    if raw.is_null() {
+        return false;
+    }
+    let _owned = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(raw as CFArrayRef) };
+    let id_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_ID);
+    let id_key_ref = id_key.as_concrete_TypeRef() as *const c_void;
+    let enabled_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_IS_ENABLED);
+    let enabled_key_ref = enabled_key.as_concrete_TypeRef() as *const c_void;
+    let want = CFString::new(want_id);
+    for i in 0..unsafe { CFArrayGetCount(raw) } {
+        let src = unsafe { CFArrayGetValueAtIndex(raw, i) };
+        let id_prop = unsafe { TISGetInputSourceProperty(src, id_key_ref) };
+        if id_prop.is_null() {
+            continue;
+        }
+        let id = unsafe { CFString::wrap_under_get_rule(id_prop as CFStringRef) };
+        if id != want {
+            continue;
+        }
+        let enabled = unsafe { TISGetInputSourceProperty(src, enabled_key_ref) };
+        return !enabled.is_null() && unsafe { CFBooleanGetValue(enabled) };
+    }
+    false
+}
+
 /// 注册（app 路径 → TISRegisterInputSource）并启用（源列表匹配 → TISEnableInputSource）。
 /// 返回 (注册成功, 找到并尝试启用, 启用返回码)。
 fn register_and_enable(app: &Path, select: bool) -> (bool, bool, i32) {
@@ -281,6 +347,31 @@ fn list_sources() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn parse_home_arg(args: &[String]) -> Result<PathBuf, String> {
+    let home = if let Some(pos) = args.iter().position(|arg| arg == "--home") {
+        let value = args
+            .get(pos + 1)
+            .ok_or_else(|| "--home 缺少路径参数".to_owned())?;
+        if value.is_empty() || value.starts_with('-') {
+            return Err("--home 路径参数无效".to_owned());
+        }
+        PathBuf::from(value)
+    } else {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME 未设置".to_owned())?
+    };
+    if !home.is_absolute() {
+        return Err(format!("--home 必须是绝对路径: {}", home.display()));
+    }
+    let canonical = fs::canonicalize(&home)
+        .map_err(|e| format!("--home 路径不可访问 {}: {e}", home.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("--home 不是目录: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 fn usage() {
     eprintln!(
         "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --write-input-sources-plist [--home <用户 home>] | --help\n\
@@ -302,15 +393,12 @@ fn main() -> ExitCode {
         return list_sources();
     }
     if args.iter().any(|arg| arg == "--write-input-sources-plist") {
-        let home = args
-            .iter()
-            .position(|arg| arg == "--home")
-            .and_then(|i| args.get(i + 1))
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-        let Some(home) = home else {
-            eprintln!("错误: --write-input-sources-plist 需要 --home 或 HOME");
-            return ExitCode::from(2);
+        let home = match parse_home_arg(&args) {
+            Ok(home) => home,
+            Err(e) => {
+                eprintln!("错误: {e}");
+                return ExitCode::from(2);
+            }
         };
         return match write_third_party_input_source_at_home(&home) {
             Ok(true) => {
@@ -366,30 +454,33 @@ fn main() -> ExitCode {
     match enable_third_party_input_source() {
         Ok(true) => println!("已更新第三方输入源启用列表（com.apple.inputsources）"),
         Ok(false) => println!("第三方输入源启用列表已是最新"),
-        Err(e) => eprintln!("警告: 更新第三方输入源启用列表失败: {e}"),
+        Err(e) => {
+            eprintln!("错误: 更新第三方输入源启用列表失败: {e}");
+            return ExitCode::from(1);
+        }
     }
     let (registered, found, enable_rc) = register_and_enable(&app, select);
     if registered {
         println!("已注册输入源（TISRegisterInputSource）");
     }
-    match (found, enable_rc) {
-        (true, 0) => {
-            println!("已启用「拾言输入法」（系统可能弹出确认，请允许）");
-            ExitCode::SUCCESS
-        }
-        (true, rc) => {
-            eprintln!(
-                "警告: TISEnableInputSource 返回 {rc}，请到 系统设置 → 键盘 → 输入法 手动启用"
-            );
-            ExitCode::from(1)
-        }
-        (false, _) => {
-            eprintln!(
-                "未在输入源列表中找到 Verba（app 已安装到 ~/Library/Input Methods）。\n\
-                 请注销并重新登录后重试，或到 系统设置 → 键盘 → 输入法 手动添加「拾言输入法」。"
-            );
-            ExitCode::from(1)
-        }
+    if !found {
+        eprintln!(
+            "未在输入源列表中找到 Verba（app 已安装到 ~/Library/Input Methods）。\n\
+             请注销并重新登录后重试，或到 系统设置 → 键盘 → 输入法手动添加「拾言输入法」。"
+        );
+        return ExitCode::from(1);
+    }
+    let parent_enabled = input_source_enabled(VERBA_SOURCE_ID);
+    let mode_enabled = input_source_enabled(VERBA_MODE_ID);
+    if parent_enabled && mode_enabled {
+        println!("已启用「拾言输入法」（父源 + Pinyin mode）");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "错误: 输入源启用状态未落盘（parent_enabled={parent_enabled}, mode_enabled={mode_enabled}, TISEnableInputSource_rc={enable_rc}）。\n\
+             请重新运行 verba-register；若仍失败，请在 系统设置 → 键盘 → 输入法 检查「拾言输入法」。"
+        );
+        ExitCode::from(1)
     }
 }
 
@@ -417,7 +508,7 @@ mod tests {
     #[test]
     fn third_party_input_sources_adds_verba_parent_and_mode() {
         let mut root = plist::Value::Dictionary(plist::Dictionary::new());
-        assert!(ensure_verba_entries(&mut root));
+        assert!(ensure_verba_entries(&mut root).unwrap());
         let entries = root
             .as_dictionary()
             .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
@@ -472,7 +563,7 @@ mod tests {
                 plist::Value::Dictionary(old_mode),
             ]),
         );
-        assert!(ensure_verba_entries(&mut root));
+        assert!(ensure_verba_entries(&mut root).unwrap());
         let entries = root
             .as_dictionary()
             .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
@@ -485,5 +576,44 @@ mod tests {
                 .and_then(plist::Value::as_string)
                 == Some("example.other.inputmethod")
         }));
+    }
+    #[test]
+    fn third_party_input_sources_fails_closed_on_wrong_root_type() {
+        let mut root = plist::Value::Array(Vec::new());
+        assert!(ensure_verba_entries(&mut root).is_err());
+    }
+
+    #[test]
+    fn third_party_input_sources_fails_closed_on_wrong_list_type() {
+        let mut root = plist::Value::Dictionary(plist::Dictionary::new());
+        root.as_dictionary_mut().unwrap().insert(
+            THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::String("not-an-array".to_owned()),
+        );
+        assert!(ensure_verba_entries(&mut root).is_err());
+    }
+
+    #[test]
+    fn parse_home_arg_requires_absolute_existing_directory() {
+        let ok = vec![
+            "--write-input-sources-plist".to_owned(),
+            "--home".to_owned(),
+            "/tmp".to_owned(),
+        ];
+        assert_eq!(
+            parse_home_arg(&ok).unwrap(),
+            fs::canonicalize("/tmp").unwrap()
+        );
+        let relative = vec![
+            "--write-input-sources-plist".to_owned(),
+            "--home".to_owned(),
+            "relative".to_owned(),
+        ];
+        assert!(parse_home_arg(&relative).is_err());
+        let missing = vec![
+            "--write-input-sources-plist".to_owned(),
+            "--home".to_owned(),
+        ];
+        assert!(parse_home_arg(&missing).is_err());
     }
 }
