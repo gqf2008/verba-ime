@@ -11,8 +11,6 @@
 //! ```text
 //! verba-register [--app <Verba.app 路径>]   注册并启用（默认自身所在 bundle）
 //! verba-register --list                     仅列出已注册输入源（只读，CI 冒烟）
-//! verba-register --write-input-sources-plist [--home <home>]
-//!                                              仅写第三方输入源白名单（PKG postinstall 用）
 //! ```
 //!
 //! 说明：TIS 的注册/启用为尽力而为——`TISRegisterInputSource` 失败不阻塞
@@ -346,56 +344,10 @@ fn list_sources() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse_home_arg(args: &[String]) -> Result<PathBuf, String> {
-    let home_positions: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter_map(|(i, arg)| (arg == "--home").then_some(i))
-        .collect();
-    if home_positions.len() > 1 {
-        return Err("--home 只能出现一次".to_owned());
-    }
-    let home = if let Some(pos) = home_positions.first().copied() {
-        let value = args
-            .get(pos + 1)
-            .ok_or_else(|| "--home 缺少路径参数".to_owned())?;
-        if value.is_empty() || value.starts_with('-') {
-            return Err("--home 路径参数无效".to_owned());
-        }
-        PathBuf::from(value)
-    } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "HOME 未设置".to_owned())?
-    };
-    if !home.is_absolute() {
-        return Err(format!("--home 必须是绝对路径: {}", home.display()));
-    }
-    let canonical = fs::canonicalize(&home)
-        .map_err(|e| format!("--home 路径不可访问 {}: {e}", home.display()))?;
-    if !canonical.is_dir() {
-        return Err(format!("--home 不是目录: {}", canonical.display()));
-    }
-    let users_root = Path::new("/Users");
-    if !canonical.starts_with(users_root) || canonical == users_root {
-        return Err(format!(
-            "--home 必须是 /Users/<用户> 下的真实用户目录: {}",
-            canonical.display()
-        ));
-    }
-    let meta = fs::metadata(&canonical)
-        .map_err(|e| format!("读取 {} 元数据失败: {e}", canonical.display()))?;
-    if meta.uid() == 0 {
-        return Err(format!("拒绝写入 root 用户目录: {}", canonical.display()));
-    }
-    Ok(canonical)
-}
-
 fn usage() {
     eprintln!(
-        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --write-input-sources-plist [--home <用户 home>] | --help\n\
+        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --help\n\
          \x20 --select：注册启用后把系统当前输入源切到 Verba\n\
-         \x20 --write-input-sources-plist：仅写第三方输入源白名单（PKG postinstall 用）\n\
          \x20 无参数：注册并启用自身所在 bundle 的 Verba 输入源"
     );
 }
@@ -411,30 +363,6 @@ fn main() -> ExitCode {
     if args.first().map(|s| s.as_str()) == Some("--list") {
         return list_sources();
     }
-    if args.iter().any(|arg| arg == "--write-input-sources-plist") {
-        let home = match parse_home_arg(&args) {
-            Ok(home) => home,
-            Err(e) => {
-                eprintln!("错误: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        return match write_third_party_input_source_at_home(&home) {
-            Ok(true) => {
-                println!("已更新第三方输入源启用列表: {}", home.display());
-                ExitCode::SUCCESS
-            }
-            Ok(false) => {
-                println!("第三方输入源启用列表已是最新: {}", home.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("错误: {e}");
-                ExitCode::from(1)
-            }
-        };
-    }
-
     // 解析 --app 路径；缺省为自身所在 bundle（Contents/MacOS 上两级）。
     let app = match args.first().map(|s| s.as_str()) {
         Some("--app") => match args.get(1) {
@@ -613,43 +541,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_home_arg_requires_real_user_home() {
-        let home = std::env::var("HOME").expect("测试环境应有 HOME");
-        let ok = vec![
-            "--write-input-sources-plist".to_owned(),
-            "--home".to_owned(),
-            home.clone(),
-        ];
-        assert_eq!(
-            parse_home_arg(&ok).unwrap(),
-            fs::canonicalize(&home).unwrap()
+    fn third_party_input_sources_rewrites_malformed_same_count_entries() {
+        let mut malformed_a = plist::Dictionary::new();
+        malformed_a.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
         );
-        for bad in ["/", "/tmp", "/Users"] {
-            let args = vec![
-                "--write-input-sources-plist".to_owned(),
-                "--home".to_owned(),
-                bad.to_owned(),
-            ];
-            assert!(parse_home_arg(&args).is_err(), "{bad} 应被拒绝");
-        }
-        let relative = vec![
-            "--write-input-sources-plist".to_owned(),
-            "--home".to_owned(),
-            "relative".to_owned(),
-        ];
-        assert!(parse_home_arg(&relative).is_err());
-        let missing = vec![
-            "--write-input-sources-plist".to_owned(),
-            "--home".to_owned(),
-        ];
-        assert!(parse_home_arg(&missing).is_err());
-        let duplicate = vec![
-            "--write-input-sources-plist".to_owned(),
-            "--home".to_owned(),
-            home.clone(),
-            "--home".to_owned(),
-            home,
-        ];
-        assert!(parse_home_arg(&duplicate).is_err());
+        malformed_a.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String("Wrong Kind".to_owned()),
+        );
+        let mut malformed_b = plist::Dictionary::new();
+        malformed_b.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+        );
+        malformed_b.insert(
+            "Input Mode".to_owned(),
+            plist::Value::String("wrong.mode".to_owned()),
+        );
+        malformed_b.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String("Input Mode".to_owned()),
+        );
+        let mut root = plist::Value::Dictionary(plist::Dictionary::new());
+        root.as_dictionary_mut().unwrap().insert(
+            THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(vec![
+                plist::Value::Dictionary(malformed_a),
+                plist::Value::Dictionary(malformed_b),
+            ]),
+        );
+        assert!(ensure_verba_entries(&mut root).unwrap());
+        let entries = root
+            .as_dictionary()
+            .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|value| {
+            value
+                .as_dictionary()
+                .and_then(|entry| entry.get(INPUT_SOURCE_KIND_KEY))
+                .and_then(plist::Value::as_string)
+                == Some(KEYBOARD_INPUT_METHOD_KIND)
+        }));
+        assert!(entries.iter().any(|value| {
+            let Some(entry) = value.as_dictionary() else {
+                return false;
+            };
+            entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
+        }));
     }
 }
