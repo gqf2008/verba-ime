@@ -573,6 +573,10 @@ struct Ivars {
     /// 清理欠账（CAPS_OWE_* 组合），挂起待下一键补做（见 input_text 顶部
     /// 的补做块与 caps 分支）。
     caps_host_cleanup: Cell<u8>,
+    /// 当前 `drain_stream` 是否由 `input_text` 同步调用（正在处理一个按键）。
+    /// OCR 结果恰好在此期间到达时不能进预览：同一按键会立刻走预览 Other
+    /// 分支清掉结果（真机 2026-09-09：OCR 560 字被同 tick 的 `o` 吞掉）。
+    drain_during_input: Cell<bool>,
 }
 
 impl Default for Ivars {
@@ -598,6 +602,7 @@ impl Default for Ivars {
             host_call_depth: Cell::new(0),
             pending_keys: RefCell::new(VecDeque::new()),
             caps_host_cleanup: Cell::new(0),
+            drain_during_input: Cell::new(false),
         }
     }
 }
@@ -793,7 +798,12 @@ define_class!(
             // 先排空在途候选事件再处理按键：Rime 响应通常在下一击键前已入队
             // （worker 查询仅数 ms），先送达状态机可让空格/数字立即看到候选，
             // 免去 16ms 定时器延迟被感知为「输入卡」。
+            //
+            // 标记本次 drain 来自输入回调：若 OCR 结果恰在此时到达，不能进入
+            // 预览（否则当前按键会立刻清掉预览，识别文本丢失）。
+            self.ivars().drain_during_input.set(true);
             self.drain_stream(sel!(drainVerbaStream));
+            self.ivars().drain_during_input.set(false);
             // 改写对照预览拦截（**core 槽位为门**，与 Windows 同构单源：
             // RewriteReady 臂已调 begin_rewrite_preview，ai_preview 同时撤销
             // ——旁路直喂（重入窗重放/候选点击）的 r/e 只会从 feed_char 得
@@ -1198,19 +1208,27 @@ define_class!(
             if let Some(text) = ocr_result_slot().lock().ok().and_then(|mut s| s.take()) {
                 dbg_log(&format!("OCR: 槽位消费 len={}", text.chars().count()));
                 set_clipboard_text_quiet(&text);
-                match self
-                    .ivars()
-                    .machine
-                    .borrow_mut()
-                    .begin_ocr_preview(text.clone())
-                {
-                    Some(Action::OcrPreview { text: t }) => {
-                        dbg_log("OCR: 进入候选窗预览");
-                        self.apply_action(Action::OcrPreview { text: t });
-                    }
-                    _ => {
-                        dbg_log("OCR: 非 Idle 回退直接上屏");
-                        self.commit(&text);
+                if should_commit_ocr_during_input(self.ivars().drain_during_input.get()) {
+                    // 输入回调期间结果到达：当前按键尚未处理完，若进预览会被
+                    // 同一按键的 Other 分支立即清掉（真机 560 字丢失）。直接
+                    // 上屏，当前按键随后继续走正常路由。
+                    dbg_log("OCR: 输入期间结果到达，直接上屏");
+                    self.commit(&text);
+                } else {
+                    match self
+                        .ivars()
+                        .machine
+                        .borrow_mut()
+                        .begin_ocr_preview(text.clone())
+                    {
+                        Some(Action::OcrPreview { text: t }) => {
+                            dbg_log("OCR: 进入候选窗预览");
+                            self.apply_action(Action::OcrPreview { text: t });
+                        }
+                        _ => {
+                            dbg_log("OCR: 非 Idle 回退直接上屏");
+                            self.commit(&text);
+                        }
                     }
                 }
                 return;
@@ -1306,6 +1324,14 @@ enum ImkKey {
 /// 抽成纯函数供控制器与单测共用，防止测试复制实现而无法捕获回归。
 fn selection_range_for(text: &str) -> NSRange {
     NSRange::new(text.encode_utf16().count() as NSUInteger, 0)
+}
+
+/// OCR 结果在输入回调期间到达时，是否直接提交上屏。
+///
+/// 抽成纯函数供单测钉住：输入期间必须 commit（否则当前按键会清掉预览），
+/// 空闲时仍走预览确认。
+fn should_commit_ocr_during_input(during_input: bool) -> bool {
+    during_input
 }
 
 /// 候选分页切片（纯逻辑，供 candidates: 数据源与测试复用）。
@@ -2346,6 +2372,13 @@ mod tests {
         let range = selection_range_for(text);
         assert_eq!(range.location, 5, "selectionRange 使用 UTF-16 code unit");
         assert_eq!(range.length, 0);
+    }
+
+    #[test]
+    fn ocr_commits_when_result_arrives_during_input() {
+        // 输入回调期间到达必须直接上屏；空闲时保留预览确认。
+        assert!(should_commit_ocr_during_input(true));
+        assert!(!should_commit_ocr_during_input(false));
     }
 
     #[test]
