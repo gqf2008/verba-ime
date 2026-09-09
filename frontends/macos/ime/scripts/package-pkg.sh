@@ -38,7 +38,12 @@ if [ -z "$VERSION" ]; then
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/verba-pkg.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+cleanup() {
+    local status=$?
+    rm -rf "$WORK"
+    exit "$status"
+}
+trap cleanup EXIT
 
 PAYLOAD="$WORK/payload"
 mkdir -p "$PAYLOAD"
@@ -70,13 +75,53 @@ POSTINSTALL
 chmod +x "$SCRIPTS/postinstall"
 
 COMPONENT="$WORK/Verba-component.pkg"
+# 关键：pkgbuild --root 默认 BundleIsRelocatable=true。若用户机器上任意位置
+# 存在同 bundle id 的 Verba.app（常见于仓库 dist/ 构建产物），Installer 会把
+# payload 重定位到那里而不是 /Library/Input Methods，导致“PKG 已安装但系统级
+# 路径为空、输入法菜单不出现”。显式关闭 relocation，并钉住 identifier/version。
+COMPONENT_PLIST="$WORK/components.plist"
+cat > "$COMPONENT_PLIST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+  <dict>
+    <key>RootRelativeBundlePath</key>
+    <string>Verba.app</string>
+    <key>BundleIsRelocatable</key>
+    <false/>
+    <key>BundleIsVersionChecked</key>
+    <true/>
+    <key>BundleHasStrictIdentifier</key>
+    <true/>
+    <key>BundleOverwriteAction</key>
+    <string>upgrade</string>
+  </dict>
+</array>
+</plist>
+PLIST
+
 pkgbuild \
     --root "$PAYLOAD" \
+    --component-plist "$COMPONENT_PLIST" \
     --identifier "$PKG_ID" \
     --version "$VERSION" \
     --install-location "$INSTALL_LOCATION" \
     --scripts "$SCRIPTS" \
     "$COMPONENT"
+
+# 防回归：关闭 BundleIsRelocatable 后，pkgbuild 必须生成空的 <relocate/>。
+# 仅检查 pkg-info 的 relocatable="false" 不够——默认可重定位包同样带这个属性，
+# 但会保留 <relocate><bundle .../></relocate>，Installer 仍会重定位到已有 app。
+EXPANDED_COMPONENT="$WORK/expanded-component"
+pkgutil --expand "$COMPONENT" "$EXPANDED_COMPONENT"
+RELOCATE_BUNDLES="$(xmllint --xpath \
+    'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \
+    "$EXPANDED_COMPONENT/PackageInfo")"
+if [ "$RELOCATE_BUNDLES" != "0" ]; then
+    echo "::error::PKG 仍允许 bundle relocation（relocate 子元素数=${RELOCATE_BUNDLES}），拒绝产出" >&2
+    exit 1
+fi
 
 STAGED="$WORK/Verba-$VERSION.pkg"
 if [ -n "${INSTALLER_IDENTITY:-}" ]; then
