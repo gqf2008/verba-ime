@@ -133,7 +133,11 @@ fn style_candidate_panel(mtm: MainThreadMarker) {
 }
 
 /// IMKServer 连接名（与 app/Info.plist 的 `InputMethodConnectionName` 保持一致）。
-pub const CONNECTION_NAME: &str = "Verba_1_Connection";
+///
+/// 现代 macOS 的 IMK 连接名约定为 `<CFBundleIdentifier>_Connection`；旧式
+/// `Verba_1_Connection` 会让 IMKLaunchAgent 拒绝 XPC endpoint（真机日志：
+/// `requestIMKXPCEndpointInvalid`），输入源因此无法进入菜单/被选中。
+pub const CONNECTION_NAME: &str = "dev.verba.inputmethod.Verba_Connection";
 /// 控制器 ObjC 类名（与 app/Info.plist 的 `InputMethodServerControllerClass` 保持一致）。
 pub const CONTROLLER_CLASS: &str = "VerbaIMKController";
 /// daemon 兼容的错误事件（无真实请求 id，序号匹配由全局 seq 完成）。
@@ -1011,6 +1015,19 @@ define_class!(
             dbg_log(&format!("  -> key={:?} action={:?} was_idle={}", key, action, was_idle));
             let _ = self.apply_action(action);
             Bool::new(true)
+        }
+
+        /// 标记文本内光标位置（UTF-16，末尾）。
+        ///
+        /// IMKInputController 的默认 selectionRange 会向客户端查询 markedRange；
+        /// 宿主 XPC 在部分应用/系统版本上会抛 ObjC 异常，并在 Rust 异常清理途中
+        /// abort（crash report：_IPMDServerClientWrapperLegacy markedRange →
+        /// invocationAwaitXPCReply）。组合文本由本控制器单源维护，直接返回其
+        /// UTF-16 末尾即可，既避免宿主往返也消除该崩溃面。
+        #[unsafe(method(selectionRange))]
+        fn selection_range(&self) -> NSRange {
+            let composed = self.ivars().composed.borrow();
+            NSRange::new(composed.encode_utf16().count() as NSUInteger, 0)
         }
 
         /// 组合文本数据源：updateComposition 调用它取当前 preedit 发给 client。
@@ -2298,6 +2315,23 @@ pub fn register() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_name_matches_bundle_id_convention() {
+        assert_eq!(
+            CONNECTION_NAME,
+            "dev.verba.inputmethod.Verba_Connection",
+            "IMK 连接名必须是 <CFBundleIdentifier>_Connection"
+        );
+    }
+
+    #[test]
+    fn selection_range_uses_utf16_units() {
+        let text = "ni你🦀";
+        let range = NSRange::new(text.encode_utf16().count() as NSUInteger, 0);
+        assert_eq!(range.location, 5);
+        assert_eq!(range.length, 0);
+    }
 
     #[test]
     fn classify_printable_char() {

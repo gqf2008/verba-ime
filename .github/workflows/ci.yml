@@ -72,7 +72,8 @@ jobs:
           cmp frontends/macos/ime/app/Resources/Icon.pdf frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf
           grep -q '/MediaBox \[0 0 18 18\]' frontends/macos/ime/app/Resources/Icon.pdf
           test "$(plutil -extract TISIconIsTemplate raw frontends/macos/ime/dist/Verba.app/Contents/Info.plist)" = "true"
-          echo "菜单栏图标生成器/产物/bundle 一致，MediaBox 18x18，模板模式"
+          test "$(plutil -extract InputMethodConnectionName raw frontends/macos/ime/dist/Verba.app/Contents/Info.plist)" = "dev.verba.inputmethod.Verba_Connection"
+          echo "菜单栏图标生成器/产物/bundle 一致，MediaBox 18x18，模板模式；IMK 连接名符合 bundle id 约定"
 
       - name: 打包 PKG 并校验
         run: |
