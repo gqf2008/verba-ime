@@ -6,7 +6,9 @@ name: Build & Release
 #
 # 密钥说明（运行时判空，缺失时优雅降级）：
 #   APPLE_CERT_P12 / APPLE_CERT_PASSWORD / APPLE_TEAM_ID / APPLE_ID / APPLE_APP_PASSWORD
-#     → macOS 签名 + 公证；未配置时产出未签名 DMG（仅 dry-run；tag 发布会显式失败）
+#     → macOS .app/.dmg 签名 + 公证；未配置时产出未签名产物（仅 dry-run；tag 发布会显式失败）
+#   APPLE_INSTALLER_CERT_P12 / APPLE_INSTALLER_CERT_PASSWORD
+#     → macOS .pkg 签名（Developer ID Installer）；tag 发布必需，缺失时显式失败
 #   WIN_SIGN_PFX / WIN_SIGN_PASSWORD
 #     → Windows 安装包签名；未配置时跳过（SmartScreen 会提示）
 on:

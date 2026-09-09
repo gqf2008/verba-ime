@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 配置 GitHub Actions 发布 secrets（Apple 签名/公证，5 项）。
+# 配置 GitHub Actions 发布 secrets（Apple 签名/公证，最多 7 项：Application + Installer）。
 # 用法: bash scripts/setup-release-secrets.sh [owner/repo]   （默认 gqf2008/verba-ime）
 #
 # 说明:

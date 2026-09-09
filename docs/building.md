@@ -151,7 +151,11 @@ bash scripts/setup-release-secrets.sh            # 默认 gqf2008/verba-ime
 ```bash
 security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
 gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-cert.p12)"
-rm -f /tmp/verba-cert.p12
+# .pkg 签名（tag 发布必需；证书类型是 Developer ID Installer，与 Application 不同）
+security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-installer-cert.p12 "Developer ID Installer: <姓名> (<TEAM_ID>)"
+gh secret set APPLE_INSTALLER_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-installer-cert.p12)"
+gh secret set APPLE_INSTALLER_CERT_PASSWORD -R gqf2008/verba-ime --body '<密码>'
+rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12
 ```
 
 - `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64（`.app`/`.dmg`）

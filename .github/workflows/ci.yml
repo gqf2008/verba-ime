@@ -75,6 +75,8 @@ jobs:
           pkgutil --expand-full "$PKG" "$EXP"
           grep -q 'install-location="/Library/Input Methods"' "$EXP/Verba-component.pkg/PackageInfo"
           test -x "$EXP/Verba-component.pkg/Scripts/postinstall"
+          # 钉住降权行为：launchctl asuser 不降 euid，必须配合 sudo -u（防回退）
+          grep -q '/usr/bin/sudo -u' "$EXP/Verba-component.pkg/Scripts/postinstall"
           codesign --verify --deep --strict "$EXP/Verba-component.pkg/Payload/Verba.app"
           echo "PKG 校验通过: $PKG"
 
