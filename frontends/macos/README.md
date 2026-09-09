@@ -1,7 +1,7 @@
 # macOS 前端（IMK）
 
 - 技术：**全 Rust**（`objc2` + `objc2-input-method-kit`），薄壳 + 共享 Rust 核心（`verba-core`）+ daemon（`verba-daemon`）。
-- 形态：`.app`（`Verba.app`），装入 `~/Library/Input Methods`，在系统设置「键盘 → 输入法」中启用。
+- 形态：`.app`（`Verba.app`），装入 `~/Library/Input Methods`；`verba-register` 自动写 `com.apple.inputsources` 白名单并启用，无需手动添加。
 - 能力（M2 对齐）：
   - 拼音组合 / 候选窗（数字键与候选窗点击选择，←/→ 翻页）
   - 英文与标点直输、退格 / Esc 取消组合、Enter 提交
@@ -15,7 +15,7 @@
 - 关键点：
   - 基础输入**无需**辅助功能权限。
   - 麦克风：需 `NSMicrophoneUsageDescription`（TCC 弹窗）；截图 OCR：需屏幕录制权限（ScreenCaptureKit）。
-- 打包：`.app` 内含 `verba-mac`（IMK 主程序）与 `verba-daemon`（Rust 核心），ad-hoc 签名；正式发布需 Developer ID 签名 + 公证。
+- 打包：`.app` 内含 `verba-mac`（IMK 主程序）、`verba-daemon`（Rust 核心）与 `verba-register`（TIS 注册/启用）；`verba-register` 会写 `com.apple.inputsources` 第三方输入源白名单并刷新 TextInputMenuAgent，无需用户手动添加。正式发布需 Developer ID 签名 + 公证。
 
 ## 构建与安装
 
@@ -23,7 +23,7 @@
 cd frontends/macos/ime
 scripts/package.sh
 cp -R dist/Verba.app "$HOME/Library/Input Methods/"
-# 然后到 系统设置 → 键盘 → 输入法，添加「拾言输入法」
+# 然后运行 verba-register（安装脚本会自动执行；无需手动到系统设置添加）
 ```
 
 开发期快速验证：

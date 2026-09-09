@@ -1,13 +1,18 @@
 //! verba-register：macOS 输入源安装注册助手（用户级，无需管理员）。
 //!
 //! 由 DMG 内的「安装.command」在 Verba.app 拷入 `~/Library/Input Methods` 后
-//! 调用：走 TextInputSources C API 把 Verba 注册为输入源并启用（系统会弹一次
-//! 确认，macOS 26 已真机验证），免去手动到系统设置添加输入源的步骤。
+//! 调用：先走 TextInputSources C API 把 Verba 注册为输入源，再把
+//! `com.apple.inputsources` 的 `AppleEnabledThirdPartyInputSources` 白名单
+//! 规范化为「父源 + Pinyin mode」两条并刷新 TextInputMenuAgent。
+//! macOS 12+ 只调 `TISEnableInputSource` 可能返回 noErr 但父源仍 disabled；
+//! 写入白名单后系统会同时启用父源和 mode，免去用户手动到系统设置添加。
 //!
 //! 用法：
 //! ```text
 //! verba-register [--app <Verba.app 路径>]   注册并启用（默认自身所在 bundle）
 //! verba-register --list                     仅列出已注册输入源（只读，CI 冒烟）
+//! verba-register --write-input-sources-plist [--home <home>]
+//!                                              仅写第三方输入源白名单（PKG postinstall 用）
 //! ```
 //!
 //! 说明：TIS 的注册/启用为尽力而为——`TISRegisterInputSource` 失败不阻塞
@@ -16,7 +21,7 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use core_foundation::array::{CFArray, CFArrayRef};
@@ -31,6 +36,15 @@ const VERBA_SOURCE_ID: &str = "dev.verba.inputmethod.Verba";
 const VERBA_MODE_ID: &str = "dev.verba.inputmethod.Verba.Pinyin";
 /// kTISPropertyInputSourceID（TextInputSources.h 公开常量）。
 const TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
+/// 第三方输入法启用白名单（macOS 12+）：父源 entry 存在时系统会把该 bundle
+/// 的父源和模式一起加入 HIToolbox 的启用列表。只写 TISEnableInputSource 时
+/// 在部分真机会返回 noErr 但父源仍 disabled；写入该父源 entry 并刷新
+/// TextInputMenuAgent 后可稳定生效（macOS 26.5 真机复现/验证）。
+const INPUT_SOURCES_PLIST: &str = "Library/Preferences/com.apple.inputsources.plist";
+const THIRD_PARTY_INPUT_SOURCES_KEY: &str = "AppleEnabledThirdPartyInputSources";
+const BUNDLE_ID_KEY: &str = "Bundle ID";
+const INPUT_SOURCE_KIND_KEY: &str = "InputSourceKind";
+const KEYBOARD_INPUT_METHOD_KIND: &str = "Keyboard Input Method";
 
 // TextInputSources C API（符号在 Carbon.framework；OSStatus = i32）。
 // FFI 签名统一用 *const c_void，配合 core-foundation 类型封装的
@@ -53,6 +67,110 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CFArrayGetCount(array: *const c_void) -> i64;
     fn CFArrayGetValueAtIndex(array: *const c_void, index: i64) -> *const c_void;
+}
+
+/// 构造 `com.apple.inputsources` 的 Verba 父源 + Pinyin mode entry。
+fn verba_entries() -> Vec<plist::Value> {
+    let mut parent = plist::Dictionary::new();
+    parent.insert(
+        BUNDLE_ID_KEY.to_owned(),
+        plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+    );
+    parent.insert(
+        INPUT_SOURCE_KIND_KEY.to_owned(),
+        plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
+    );
+
+    let mut mode = plist::Dictionary::new();
+    mode.insert(
+        BUNDLE_ID_KEY.to_owned(),
+        plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+    );
+    mode.insert(
+        "Input Mode".to_owned(),
+        plist::Value::String(VERBA_MODE_ID.to_owned()),
+    );
+    mode.insert(
+        INPUT_SOURCE_KIND_KEY.to_owned(),
+        plist::Value::String("Input Mode".to_owned()),
+    );
+
+    vec![
+        plist::Value::Dictionary(parent),
+        plist::Value::Dictionary(mode),
+    ]
+}
+
+/// 把 `com.apple.inputsources` plist 规范化为「Verba 父源 + Pinyin mode」两条。
+///
+/// 只写父源时用户级安装可用，但系统级 app 的 mode 可能仍 disabled；两条都写
+/// 才能让父源/mode 同时 enable（macOS 26.5 真机复现）。先移除所有历史 Verba
+/// 条目再追加，避免重复 mode。
+fn ensure_verba_entries(root: &mut plist::Value) -> bool {
+    if !root.as_dictionary().is_some() {
+        *root = plist::Value::Dictionary(plist::Dictionary::new());
+    }
+    let root_dict = root
+        .as_dictionary_mut()
+        .expect("root 已规范化为 dictionary");
+    if !root_dict.contains_key(THIRD_PARTY_INPUT_SOURCES_KEY) {
+        root_dict.insert(
+            THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(Vec::new()),
+        );
+    }
+    let list = root_dict
+        .get_mut(THIRD_PARTY_INPUT_SOURCES_KEY)
+        .expect("刚插入的 key 应存在");
+    if !list.as_array().is_some() {
+        *list = plist::Value::Array(Vec::new());
+    }
+    let entries = list.as_array_mut().expect("list 已规范化为 array");
+    let before = entries.len();
+    entries.retain(|value| {
+        value
+            .as_dictionary()
+            .and_then(|d| d.get(BUNDLE_ID_KEY))
+            .and_then(plist::Value::as_string)
+            != Some(VERBA_SOURCE_ID)
+    });
+    let after_verba_removed = entries.len();
+    entries.extend(verba_entries());
+    before != after_verba_removed + 2
+}
+
+/// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
+///
+/// 只写文件、不刷新 agent：PKG postinstall 会以 root 调用本函数（package
+/// sandbox 下以用户身份写 prefs 会被 PermissionDenied），随后再以 console
+/// user 身份 killall cfprefsd/TextInputMenuAgent 完成刷新。
+fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
+    let path = home.join(INPUT_SOURCES_PLIST);
+    let mut root = if path.exists() {
+        plist::Value::from_file(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?
+    } else {
+        plist::Value::Dictionary(plist::Dictionary::new())
+    };
+    let changed = ensure_verba_entries(&mut root);
+    plist::to_file_binary(&path, &root)
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    Ok(changed)
+}
+
+fn refresh_input_source_agents() {
+    let _ = Command::new("/usr/bin/killall").arg("cfprefsd").status();
+    let _ = Command::new("/usr/bin/killall")
+        .arg("TextInputMenuAgent")
+        .status();
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+/// 写入当前用户白名单并刷新 cfprefsd / TextInputMenuAgent。
+fn enable_third_party_input_source() -> Result<bool, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME 未设置".to_owned())?;
+    let changed = write_third_party_input_source_at_home(Path::new(&home))?;
+    refresh_input_source_agents();
+    Ok(changed)
 }
 
 /// 从 verba-register 自身路径推导 Verba.app 根目录（Contents/MacOS 上两级）。
@@ -165,8 +283,9 @@ fn list_sources() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --help\n\
+        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --write-input-sources-plist [--home <用户 home>] | --help\n\
          \x20 --select：注册启用后把系统当前输入源切到 Verba\n\
+         \x20 --write-input-sources-plist：仅写第三方输入源白名单（PKG postinstall 用）\n\
          \x20 无参数：注册并启用自身所在 bundle 的 Verba 输入源"
     );
 }
@@ -181,6 +300,32 @@ fn main() -> ExitCode {
     }
     if args.first().map(|s| s.as_str()) == Some("--list") {
         return list_sources();
+    }
+    if args.iter().any(|arg| arg == "--write-input-sources-plist") {
+        let home = args
+            .iter()
+            .position(|arg| arg == "--home")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let Some(home) = home else {
+            eprintln!("错误: --write-input-sources-plist 需要 --home 或 HOME");
+            return ExitCode::from(2);
+        };
+        return match write_third_party_input_source_at_home(&home) {
+            Ok(true) => {
+                println!("已更新第三方输入源启用列表: {}", home.display());
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("第三方输入源启用列表已是最新: {}", home.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("错误: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     // 解析 --app 路径；缺省为自身所在 bundle（Contents/MacOS 上两级）。
@@ -214,6 +359,15 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // 先注册一次，让 TIS 知道当前 bundle；再写第三方输入源启用白名单并刷新
+    // HIToolbox，最后重新 enable/select。只调 TISEnableInputSource 在部分真机
+    // 返回 noErr 但父源仍 disabled。
+    let _ = register_and_enable(&app, false);
+    match enable_third_party_input_source() {
+        Ok(true) => println!("已更新第三方输入源启用列表（com.apple.inputsources）"),
+        Ok(false) => println!("第三方输入源启用列表已是最新"),
+        Err(e) => eprintln!("警告: 更新第三方输入源启用列表失败: {e}"),
+    }
     let (registered, found, enable_rc) = register_and_enable(&app, select);
     if registered {
         println!("已注册输入源（TISRegisterInputSource）");
@@ -258,5 +412,78 @@ mod tests {
         // 非标准布局：退化为原路径，由 Info.plist 校验兜底报错。
         let exe = Path::new("/tmp/verba-register");
         assert_eq!(app_root_from_exe(exe), PathBuf::from("/tmp/verba-register"));
+    }
+
+    #[test]
+    fn third_party_input_sources_adds_verba_parent_and_mode() {
+        let mut root = plist::Value::Dictionary(plist::Dictionary::new());
+        assert!(ensure_verba_entries(&mut root));
+        let entries = root
+            .as_dictionary()
+            .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .expect("应有第三方输入源数组");
+        assert_eq!(entries.len(), 2, "父源 + Pinyin mode");
+        assert!(entries.iter().any(|value| {
+            value
+                .as_dictionary()
+                .and_then(|entry| entry.get(INPUT_SOURCE_KIND_KEY))
+                .and_then(plist::Value::as_string)
+                == Some(KEYBOARD_INPUT_METHOD_KIND)
+        }));
+        assert!(entries.iter().any(|value| {
+            let Some(entry) = value.as_dictionary() else {
+                return false;
+            };
+            entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string) == Some(VERBA_SOURCE_ID)
+                && entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
+        }));
+    }
+
+    #[test]
+    fn third_party_input_sources_preserves_others_and_deduplicates_verba() {
+        let mut root = plist::Value::Dictionary(plist::Dictionary::new());
+        let mut other = plist::Dictionary::new();
+        other.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String("example.other.inputmethod".to_owned()),
+        );
+        other.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
+        );
+        let mut old_mode = plist::Dictionary::new();
+        old_mode.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+        );
+        old_mode.insert(
+            "Input Mode".to_owned(),
+            plist::Value::String(VERBA_MODE_ID.to_owned()),
+        );
+        old_mode.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String("Input Mode".to_owned()),
+        );
+        root.as_dictionary_mut().unwrap().insert(
+            THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(vec![
+                plist::Value::Dictionary(other),
+                plist::Value::Dictionary(old_mode),
+            ]),
+        );
+        assert!(ensure_verba_entries(&mut root));
+        let entries = root
+            .as_dictionary()
+            .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        assert_eq!(entries.len(), 3, "其他输入源保留，Verba 规范化为父源+mode");
+        assert!(entries.iter().any(|v| {
+            v.as_dictionary()
+                .and_then(|d| d.get(BUNDLE_ID_KEY))
+                .and_then(plist::Value::as_string)
+                == Some("example.other.inputmethod")
+        }));
     }
 }

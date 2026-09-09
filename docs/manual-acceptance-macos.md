@@ -2,10 +2,11 @@
 
 > 目标：安装/启用 → 直输 → 候选窗 → // AI 流式 → OCR → 冻结能力负向验证。
 > 口径：OCR=正式能力；ASR/TTS=实验性冻结（默认关闭、入口隐藏，M6 不验收效果）。
-> 前置：`frontends/macos/ime` 构建 → `scripts/package.sh` → 装入 `~/Library/Input Methods` → 系统设置→键盘→输入法启用「拾言输入法」。
+> 前置：`frontends/macos/ime` 构建 → `scripts/package.sh` → 装入 `~/Library/Input Methods` → 运行 `verba-register`（安装脚本自动执行）。
 
 ## 安装与启用
 - [ ] Verba.app 装入 ~/Library/Input Methods，系统设置可见「拾言输入法」
+- [ ] 不手动添加输入源：安装脚本调用 `verba-register` 后，父源与 Pinyin mode 自动 `enabled=1`，菜单可直接切换
 - [ ] 切换输入法后 IMK 控制器激活（可输入）
 
 ## 直输

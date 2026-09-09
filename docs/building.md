@@ -105,12 +105,13 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
 - **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` / `verba-daemon` / `verba-register`，ad-hoc 签名）。
-  - **发布 DMG 一键安装**：双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 走 TIS C API 注册并启用输入源（系统弹一次确认，macOS 26 已验证）。卸载 = 删除 `~/Library/Input Methods/Verba.app`。
-  - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（或系统设置「键盘 → 输入法」手动启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
+  - **发布 DMG 一键安装**：双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 写 `com.apple.inputsources` 第三方输入源白名单并刷新 TextInputMenuAgent，自动启用输入源（无需手动添加）。卸载 = 删除 `~/Library/Input Methods/Verba.app`。
+  - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（自动写白名单并启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
   - **PKG 安装包（系统级）**：`scripts/package-pkg.sh` 把已组装的 `dist/Verba.app` 打成
     `dist/Verba-<版本>.pkg`，安装到 `/Library/Input Methods`（需管理员）；postinstall 会以当前
     登录用户身份调用 `verba-register` 注册并启用输入源。`INSTALLER_IDENTITY="Developer ID Installer: ..."`
     时用 `productbuild --sign` 签名（正式分发还需 notarytool 公证）；未提供则产出未签名 pkg（仅本地/dry-run）。
+    `verba-register` 会把 `com.apple.inputsources` 的 `AppleEnabledThirdPartyInputSources` 规范化为 Verba 父源 + Pinyin mode，并刷新 TextInputMenuAgent；macOS 12+ 仅调 TIS API 可能返回 noErr 但父源仍 disabled。
     卸载 = 删除 `/Library/Input Methods/Verba.app`（或在系统设置移除输入源）。
   - 正式发布需 Developer ID 签名 + 公证（`.app`/`.dmg` 用 Application 证书，`.pkg` 用 Installer 证书）。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
