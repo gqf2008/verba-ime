@@ -835,8 +835,18 @@ define_class!(
                     "OCR 预览拦截: key={:?}",
                     string.map(|x| x.to_string())
                 ));
-                match classify_key(string, key_code) {
-                    Some(ImkKey::Char('1')) | Some(ImkKey::Enter) => {
+                let preview_key = classify_key(string, key_code);
+                match preview_key {
+                    Some(ImkKey::Escape) => {
+                        let _ = self.clear_previews();
+                        // OCR 预览态机器本在 Idle → feed_escape 为 None；
+                        // 经统一派发点兜底（若有组合残留一并清理）。
+                        let action = self.ivars().machine.borrow_mut().feed_escape();
+                        let _ = self.apply_action(action);
+                        self.hide_candidate_window();
+                        return Bool::new(true);
+                    }
+                    Some(k) if ocr_preview_confirm_key(Some(k)) => {
                         let text = self.ivars().ocr_preview.borrow().clone();
                         let _ = self.clear_previews();
                         // 单状态化（#105 item4）：移除核心侧 OcrPreviewing，避免
@@ -848,22 +858,22 @@ define_class!(
                         }
                         return Bool::new(true);
                     }
-                    Some(ImkKey::Escape) => {
-                        let _ = self.clear_previews();
-                        // OCR 预览态机器本在 Idle → feed_escape 为 None；
-                        // 经统一派发点兜底（若有组合残留一并清理）。
-                        let action = self.ivars().machine.borrow_mut().feed_escape();
-                        let _ = self.apply_action(action);
-                        self.hide_candidate_window();
-                        return Bool::new(true);
-                    }
                     // '2'/字母/退格等：退出预览、收面板，不 return——落回
-                    // 下方正常路由处理本键。同时复位核心侧 OcrPreviewing，
-                    // 使落回路由的 was_idle/按键语义与旧「Idle + 正交布尔」一致。
+                    // 下方正常路由处理本键。可打印字符（'2' 除外，保持 F10
+                    // 非选取语义）先把 OCR 文本安全上屏，避免用户打字把识别
+                    // 结果静默丢弃；其余控制键仍只退预览。
                     _ => {
+                        let text = self.ivars().ocr_preview.borrow().clone();
+                        let commit_first = ocr_preview_other_commits(preview_key);
                         let _ = self.clear_previews();
                         self.ivars().machine.borrow_mut().end_ocr_preview();
                         self.hide_candidate_window();
+                        if commit_first {
+                            if let Some(t) = text {
+                                dbg_log("OCR: 非确认可打印键触发，先安全上屏再继续该键");
+                                self.commit(&t);
+                            }
+                        }
                     }
                 }
             }
@@ -1332,6 +1342,20 @@ fn selection_range_for(text: &str) -> NSRange {
 /// 空闲时仍走预览确认。
 fn should_commit_ocr_during_input(during_input: bool) -> bool {
     during_input
+}
+
+/// OCR 预览确认键（提交识别文本）：Enter/空格/1。
+fn ocr_preview_confirm_key(key: Option<ImkKey>) -> bool {
+    matches!(
+        key,
+        Some(ImkKey::Char('1')) | Some(ImkKey::Char(' ')) | Some(ImkKey::Enter)
+    )
+}
+
+/// OCR 预览期间遇到可打印非确认键：先提交识别文本再继续处理该键。
+/// `2` 保持既有 F10 语义（OCR 预览下不选取），不作为隐式确认。
+fn ocr_preview_other_commits(key: Option<ImkKey>) -> bool {
+    matches!(key, Some(ImkKey::Char(c)) if c != '2')
 }
 
 /// 候选分页切片（纯逻辑，供 candidates: 数据源与测试复用）。
@@ -2379,6 +2403,22 @@ mod tests {
         // 输入回调期间到达必须直接上屏；空闲时保留预览确认。
         assert!(should_commit_ocr_during_input(true));
         assert!(!should_commit_ocr_during_input(false));
+    }
+
+    #[test]
+    fn ocr_preview_confirmation_keys_include_space() {
+        assert!(ocr_preview_confirm_key(Some(ImkKey::Char('1'))));
+        assert!(ocr_preview_confirm_key(Some(ImkKey::Char(' '))));
+        assert!(ocr_preview_confirm_key(Some(ImkKey::Enter)));
+        assert!(!ocr_preview_confirm_key(Some(ImkKey::Char('2'))));
+    }
+
+    #[test]
+    fn ocr_preview_other_printable_key_commits_first() {
+        assert!(ocr_preview_other_commits(Some(ImkKey::Char('o'))));
+        assert!(!ocr_preview_other_commits(Some(ImkKey::Char('2'))));
+        assert!(!ocr_preview_other_commits(Some(ImkKey::Backspace)));
+        assert!(!ocr_preview_other_commits(None));
     }
 
     #[test]
