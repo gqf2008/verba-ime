@@ -69,8 +69,10 @@ jobs:
           trap 'unlink "$TMP_ICON"' EXIT
           python3 scripts/gen-macos-icon.py --out "$TMP_ICON"
           cmp "$TMP_ICON" frontends/macos/ime/app/Resources/Icon.pdf
+          cmp frontends/macos/ime/app/Resources/Icon.pdf frontends/macos/ime/dist/Verba.app/Contents/Resources/Icon.pdf
           grep -q '/MediaBox \[0 0 18 18\]' frontends/macos/ime/app/Resources/Icon.pdf
-          echo "菜单栏图标生成器/产物一致，MediaBox 18x18"
+          test "$(plutil -extract TISIconIsTemplate raw frontends/macos/ime/dist/Verba.app/Contents/Info.plist)" = "true"
+          echo "菜单栏图标生成器/产物/bundle 一致，MediaBox 18x18，模板模式"
 
       - name: 打包 PKG 并校验
         run: |
