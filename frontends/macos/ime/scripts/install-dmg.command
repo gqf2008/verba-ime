@@ -1,7 +1,7 @@
 #!/bin/bash
 # Verba 输入法一键安装（DMG 内双击运行，issue #48 项 3）。
 # 把同目录的 Verba.app 安装到 ~/Library/Input Methods（用户级，无需管理员），
-# 并调用 app 内 verba-register 注册/启用输入源（系统会弹一次确认）。
+# 调用 app 内 verba-register 写第三方输入源白名单并启用；无需拖到 /Applications。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,4 +19,5 @@ cp -R "$APP" "$DEST/"
 echo "已安装到 $DEST/Verba.app，正在注册并启用输入源…"
 
 "$DEST/Verba.app/Contents/MacOS/verba-register"
-echo "完成。若系统未弹确认或输入法未出现，请在 系统设置 → 键盘 → 输入法 检查「拾言输入法」。更新安装后请重启 verba-mac 或注销/重启，否则旧进程会缓存旧菜单栏图标。"
+open "$DEST/Verba.app" 2>/dev/null || true
+echo "完成。无需手动到系统设置添加；在输入法菜单选择「拾言输入法」即可。"

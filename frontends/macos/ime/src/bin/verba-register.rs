@@ -11,6 +11,7 @@
 //! ```text
 //! verba-register [--app <Verba.app 路径>]   注册并启用（默认自身所在 bundle）
 //! verba-register --list                     仅列出已注册输入源（只读，CI 冒烟）
+//! verba-register --uninstall                移除当前用户的 Verba 输入源条目
 //! ```
 //!
 //! 说明：TIS 的注册/启用为尽力而为——`TISRegisterInputSource` 失败不阻塞
@@ -137,31 +138,72 @@ fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
     Ok(*root != original)
 }
 
-/// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
-///
-/// 由当前用户会话内的安装脚本调用；写文件与 agent 刷新分离，便于测试和
-/// 后续复用。
-fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
-    let path = home.join(INPUT_SOURCES_PLIST);
-    let mut root = if path.exists() {
-        plist::Value::from_file(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?
-    } else {
-        plist::Value::Dictionary(plist::Dictionary::new())
-    };
-    let changed = ensure_verba_entries(&mut root)?;
-    if !changed {
+/// 从 `com.apple.inputsources` 移除全部 Verba 条目。
+fn remove_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
+    let original = root.clone();
+    let root_dict = root
+        .as_dictionary_mut()
+        .ok_or_else(|| "com.apple.inputsources 根节点不是 dictionary，拒绝改写".to_owned())?;
+    let Some(list) = root_dict.get_mut(THIRD_PARTY_INPUT_SOURCES_KEY) else {
         return Ok(false);
+    };
+    let entries = list
+        .as_array_mut()
+        .ok_or_else(|| format!("{THIRD_PARTY_INPUT_SOURCES_KEY} 不是 array，拒绝覆盖已有输入源"))?;
+    entries.retain(|value| {
+        value
+            .as_dictionary()
+            .and_then(|d| d.get(BUNDLE_ID_KEY))
+            .and_then(plist::Value::as_string)
+            != Some(VERBA_SOURCE_ID)
+    });
+    Ok(*root != original)
+}
+
+/// 从 HIToolbox 的 enabled/selected/history 列表移除 Verba 条目。
+fn remove_verba_entries_from_hitoolbox(root: &mut plist::Value) -> Result<bool, String> {
+    let original = root.clone();
+    let root_dict = root
+        .as_dictionary_mut()
+        .ok_or_else(|| "com.apple.HIToolbox 根节点不是 dictionary，拒绝改写".to_owned())?;
+    for key in [
+        "AppleEnabledInputSources",
+        "AppleSelectedInputSources",
+        "AppleInputSourceHistory",
+    ] {
+        let Some(list) = root_dict.get_mut(key) else {
+            continue;
+        };
+        let entries = list
+            .as_array_mut()
+            .ok_or_else(|| format!("{key} 不是 array，拒绝覆盖已有输入源"))?;
+        entries.retain(|value| {
+            let Some(entry) = value.as_dictionary() else {
+                return true;
+            };
+            let bundle = entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string);
+            let mode = entry.get("Input Mode").and_then(plist::Value::as_string);
+            bundle != Some(VERBA_SOURCE_ID) && !mode.is_some_and(|m| m.starts_with(VERBA_SOURCE_ID))
+        });
     }
+    Ok(*root != original)
+}
+
+/// 原子写入 plist；保留已有文件权限/owner，新文件归属目标 home 用户。
+fn atomic_write_plist(path: &Path, home: &Path, root: &plist::Value) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} 无父目录", path.display()))?;
     let tmp = parent.join(format!(
-        ".com.apple.inputsources.{}.tmp",
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("com.apple.inputsources.plist"),
         std::process::id()
     ));
-    plist::to_file_binary(&tmp, &root)
+    plist::to_file_binary(&tmp, root)
         .map_err(|e| format!("写入临时文件 {} 失败: {e}", tmp.display()))?;
-    let source_meta = fs::metadata(&path).ok();
+    let source_meta = fs::metadata(path).ok();
     let home_meta;
     let owner_meta = match source_meta.as_ref() {
         Some(meta) => meta,
@@ -184,11 +226,51 @@ fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
     fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("同步临时文件失败: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| {
+    fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("原子替换 {} 失败: {e}", path.display())
     })?;
-    Ok(true)
+    Ok(())
+}
+
+/// 写入指定用户 home 下的 `com.apple.inputsources` 白名单。
+///
+/// 由当前用户会话内的安装脚本调用；写文件与 agent 刷新分离，便于测试和
+/// 后续复用。
+fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
+    let path = home.join(INPUT_SOURCES_PLIST);
+    let mut root = if path.exists() {
+        plist::Value::from_file(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?
+    } else {
+        plist::Value::Dictionary(plist::Dictionary::new())
+    };
+    let changed = ensure_verba_entries(&mut root)?;
+    if changed {
+        atomic_write_plist(&path, home, &root)?;
+    }
+    Ok(changed)
+}
+
+/// 卸载当前用户输入源条目（app 文件由「卸载.command」删除）。
+fn uninstall_input_source_at_home(home: &Path) -> Result<(), String> {
+    let inputsources = home.join(INPUT_SOURCES_PLIST);
+    if inputsources.exists() {
+        let mut root = plist::Value::from_file(&inputsources)
+            .map_err(|e| format!("读取 {} 失败: {e}", inputsources.display()))?;
+        if remove_verba_entries(&mut root)? {
+            atomic_write_plist(&inputsources, home, &root)?;
+        }
+    }
+    let hitoolbox = home.join("Library/Preferences/com.apple.HIToolbox.plist");
+    if hitoolbox.exists() {
+        let mut root = plist::Value::from_file(&hitoolbox)
+            .map_err(|e| format!("读取 {} 失败: {e}", hitoolbox.display()))?;
+        if remove_verba_entries_from_hitoolbox(&mut root)? {
+            atomic_write_plist(&hitoolbox, home, &root)?;
+        }
+    }
+    refresh_input_source_agents();
+    Ok(())
 }
 
 fn refresh_input_source_agents() {
@@ -345,8 +427,9 @@ fn list_sources() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --help\n\
+        "用法: verba-register [--app <Verba.app 路径>] [--select] | --list | --uninstall | --help\n\
          \x20 --select：注册启用后把系统当前输入源切到 Verba\n\
+         \x20 --uninstall：移除当前用户的 Verba 输入源条目（卸载脚本用）\n\
          \x20 无参数：注册并启用自身所在 bundle 的 Verba 输入源"
     );
 }
@@ -361,6 +444,25 @@ fn main() -> ExitCode {
     }
     if args.first().map(|s| s.as_str()) == Some("--list") {
         return list_sources();
+    }
+    if args.iter().any(|arg| arg == "--uninstall") {
+        let home = match std::env::var_os("HOME").map(PathBuf::from) {
+            Some(home) => home,
+            None => {
+                eprintln!("错误: HOME 未设置");
+                return ExitCode::from(2);
+            }
+        };
+        return match uninstall_input_source_at_home(&home) {
+            Ok(()) => {
+                println!("已移除「拾言输入法」输入源条目: {}", home.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("错误: 卸载输入源条目失败: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
     // 解析 --app 路径；缺省为自身所在 bundle（Contents/MacOS 上两级）。
     let app = match args.first().map(|s| s.as_str()) {
@@ -591,5 +693,42 @@ mod tests {
             };
             entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
         }));
+    }
+    #[test]
+    fn uninstall_removes_verba_from_third_party_and_hitoolbox() {
+        let mut inputsources = plist::Value::Dictionary(plist::Dictionary::new());
+        inputsources.as_dictionary_mut().unwrap().insert(
+            THIRD_PARTY_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(verba_entries()),
+        );
+        assert!(remove_verba_entries(&mut inputsources).unwrap());
+        assert!(inputsources
+            .as_dictionary()
+            .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .unwrap()
+            .is_empty());
+
+        let mut hitoolbox = plist::Value::Dictionary(plist::Dictionary::new());
+        let mut parent = plist::Dictionary::new();
+        parent.insert(
+            BUNDLE_ID_KEY.to_owned(),
+            plist::Value::String(VERBA_SOURCE_ID.to_owned()),
+        );
+        parent.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
+        );
+        hitoolbox.as_dictionary_mut().unwrap().insert(
+            "AppleEnabledInputSources".to_owned(),
+            plist::Value::Array(vec![plist::Value::Dictionary(parent)]),
+        );
+        assert!(remove_verba_entries_from_hitoolbox(&mut hitoolbox).unwrap());
+        assert!(hitoolbox
+            .as_dictionary()
+            .and_then(|d| d.get("AppleEnabledInputSources"))
+            .and_then(plist::Value::as_array)
+            .unwrap()
+            .is_empty());
     }
 }
