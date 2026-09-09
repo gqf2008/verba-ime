@@ -107,7 +107,12 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 - **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` / `verba-daemon` / `verba-register`，ad-hoc 签名）。
   - **发布 DMG 一键安装**：双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 走 TIS C API 注册并启用输入源（系统弹一次确认，macOS 26 已验证）。卸载 = 删除 `~/Library/Input Methods/Verba.app`。
   - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（或系统设置「键盘 → 输入法」手动启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
-  - 正式发布需 Developer ID 签名 + 公证。
+  - **PKG 安装包（系统级）**：`scripts/package-pkg.sh` 把已组装的 `dist/Verba.app` 打成
+    `dist/Verba-<版本>.pkg`，安装到 `/Library/Input Methods`（需管理员）；postinstall 会以当前
+    登录用户身份调用 `verba-register` 注册并启用输入源。`INSTALLER_IDENTITY="Developer ID Installer: ..."`
+    时用 `productbuild --sign` 签名（正式分发还需 notarytool 公证）；未提供则产出未签名 pkg（仅本地/dry-run）。
+    卸载 = 删除 `/Library/Input Methods/Verba.app`（或在系统设置移除输入源）。
+  - 正式发布需 Developer ID 签名 + 公证（`.app`/`.dmg` 用 Application 证书，`.pkg` 用 Installer 证书）。
 - **Linux**：CMake + corrosion 构建 Fcitx5 插件 → `sudo make install` → `fcitx5 -r` 重启；IBus / Wayland 后端为独立二进制。
 
 ## CI（GitHub Actions）
@@ -121,13 +126,13 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 | 平台 | 产物 | 签名 / 公证 |
 | --- | --- | --- |
 | Windows | `verba-ime-setup-<版本>.exe`（Inno Setup） | Authenticode 代码签名（可选，`WIN_SIGN_PFX` 配置时启用）；未签名 SmartScreen 会提示 |
-| macOS | `Verba-<版本>.dmg`（内含 Verba.app + Applications 快捷方式） | Developer ID + notarization + staple（必需，`APPLE_*` secrets 配置时启用）；未配置时产出未签名 DMG（仅 dry-run） |
+| macOS | `Verba-<版本>.dmg`（用户级一键安装）+ `Verba-<版本>.pkg`（系统级 Installer 包） | `.app`/`.dmg` 用 Developer ID Application，`.pkg` 用 Developer ID Installer；notarization + staple（`APPLE_*` secrets 配置时启用）；未配置时产出未签名产物（仅 dry-run） |
 
 ### 发布流程（`.github/workflows/release.yml`）
 
 打 tag `v*`（如 `git tag v0.2.9 && git push origin v0.2.9`）自动触发；也可 `workflow_dispatch` 干跑（只出 artifact，不发 Release）：
 
-1. **macOS job**（macos-14，Apple Silicon）：拉取 Rime vendor → `package.sh` 组装（版本注入 + Rime 捆绑）→ 逐二进制 + .app 签名（hardened runtime + timestamp）→ notarytool 公证 + staple → Rime 冒烟 → 打包 DMG + 签名 + 公证 + staple
+1. **macOS job**（macos-14，Apple Silicon）：拉取 Rime vendor → `package.sh` 组装（版本注入 + Rime 捆绑）→ 逐二进制 + .app 签名（hardened runtime + timestamp）→ notarytool 公证 + staple → Rime 冒烟 → 打包 DMG + PKG + 各自签名 + 公证 + staple
 2. **Windows job**（windows-latest，MSVC）：构建 workspace + 前端 → PE 子系统守卫（daemon 必须 GUI 子系统，防控制台回归）→ Inno Setup 打包（`/DMyAppVersion` 注入）→ Rime 冒烟 → 可选 signtool 签名
 3. **release job**（仅 tag 触发）：下载两平台产物 → SHA256SUMS → 自动生成 release notes（前置「仅 Apple Silicon」提示）→ 发布 GitHub Release
 
@@ -140,22 +145,36 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 bash scripts/setup-release-secrets.sh            # 默认 gqf2008/verba-ime
 ```
 
-手动等价命令（注意 P12 必须带私钥——`-t identities` 而非 `-t certs`，后者 CI 会报找不到私钥；
-`-P '<密码>'` 会进 shell 历史，用完删除临时文件）：
+手动等价命令（**需在 bash 下执行**，默认 macOS zsh 的 `read` 参数不同；P12 必须带私钥
+——`-t identities` 而非 `-t certs`。`gh secret set` 走 stdin 管道，不进 argv/shell 历史；
+但 `security export -P` 本身会短暂进入 `security` 进程 argv（Apple 标注 insecure），
+如需完全避免可省略 `-P` 改用其默认 GUI 口令提示。临时 P12 立即删除并以 trap 兜底）：
 
 ```bash
-security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P '<密码>' -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
-gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime --body "$(base64 < /tmp/verba-cert.p12)"
-rm -f /tmp/verba-cert.p12
+set -euo pipefail
+read -r -s -p 'P12 密码: ' P12_PW; echo
+trap 'rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12' EXIT
+
+security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P "$P12_PW" -o /tmp/verba-cert.p12 "Developer ID Application: <姓名> (<TEAM_ID>)"
+base64 < /tmp/verba-cert.p12 | gh secret set APPLE_CERT_P12 -R gqf2008/verba-ime
+printf '%s' "$P12_PW" | gh secret set APPLE_CERT_PASSWORD -R gqf2008/verba-ime
+
+# .pkg 签名（tag 发布必需；Developer ID Installer 与 Application 是不同证书类型）
+security export -k ~/Library/Keychains/login.keychain-db -t identities -f pkcs12 -P "$P12_PW" -o /tmp/verba-installer-cert.p12 "Developer ID Installer: <姓名> (<TEAM_ID>)"
+base64 < /tmp/verba-installer-cert.p12 | gh secret set APPLE_INSTALLER_CERT_P12 -R gqf2008/verba-ime
+printf '%s' "$P12_PW" | gh secret set APPLE_INSTALLER_CERT_PASSWORD -R gqf2008/verba-ime
+
+rm -f /tmp/verba-cert.p12 /tmp/verba-installer-cert.p12
 ```
 
-- `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64
-- `APPLE_CERT_PASSWORD`：P12 导出密码；`APPLE_TEAM_ID` / `APPLE_ID` / `APPLE_APP_PASSWORD`：Apple 账号与 App 专用密码
+- `APPLE_CERT_P12`：Developer ID Application 证书 + 私钥的 PKCS12 base64（`.app`/`.dmg`）
+- `APPLE_INSTALLER_CERT_P12`：Developer ID Installer 证书 + 私钥的 PKCS12 base64（`.pkg` 签名；tag 发布必需，缺失会 fail；`workflow_dispatch` 干跑可产出未签名 pkg）
+- `APPLE_CERT_PASSWORD` / `APPLE_INSTALLER_CERT_PASSWORD`：P12 导出密码；`APPLE_TEAM_ID` / `APPLE_ID` / `APPLE_APP_PASSWORD`：Apple 账号与 App 专用密码
 - `WIN_SIGN_PFX`（可选）：Windows 代码签名证书 base64 + `WIN_SIGN_PASSWORD`
 
 ### 产物校验（发布前）
 
-- macOS：`codesign -dv --strict`、`spctl -a -t open --context context:primary-signature`、`stapler validate`、逐个二进制 `codesign -dvv | grep Timestamp`
+- macOS：`codesign -dv --strict`、`spctl -a -t open --context context:primary-signature`、`stapler validate`、逐个二进制 `codesign -dvv | grep Timestamp`；`.pkg` 另加 `pkgutil --check-signature` + `stapler validate`
 - Windows：PE 子系统断言（流水线内自动）、安装后切换输入法无控制台、`verba-cli rime nishishui` 出词
 
 ## 调试建议

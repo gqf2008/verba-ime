@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 配置 GitHub Actions 发布 secrets（Apple 签名/公证，5 项）。
+# 配置 GitHub Actions 发布 secrets（Apple 签名/公证，最多 7 项：Application + Installer）。
 # 用法: bash scripts/setup-release-secrets.sh [owner/repo]   （默认 gqf2008/verba-ime）
 #
 # 说明:
@@ -22,6 +22,13 @@ fi
 TEAM_ID="$(printf '%s' "$CERT" | sed -n 's/.*(\([A-Z0-9]*\))/\1/p')"
 echo "证书: $CERT"
 echo "TEAM_ID: $TEAM_ID"
+# Developer ID Installer（.pkg 签名，可选但 tag 发布必需）
+INSTALLER_CERT="$(security find-identity -v "$KEYCHAIN" | awk -F'"' '/Developer ID Installer/ && $0 !~ /\(invalid\)/ {print $2; exit}')"
+if [ -n "$INSTALLER_CERT" ]; then
+    echo "Installer 证书: $INSTALLER_CERT"
+else
+    echo "::warning::本机钥匙串未找到 Developer ID Installer 证书——.pkg 将无法签名，tag 发布会失败" >&2
+fi
 
 # P12 导出密码：交互输入（可用 VERBA_P12_PASSWORD 环境变量覆盖，便于自动化）
 P12_PW="${VERBA_P12_PASSWORD:-}"
@@ -48,6 +55,11 @@ trap 'rm -rf "$TMP"' EXIT
 # -t identities = 证书 + 私钥（关键；-t certs 只有证书链）
 security export -k "$KEYCHAIN" -t identities -f pkcs12 -P "$P12_PW" -o "$TMP/verba-cert.p12" "$CERT"
 P12_B64="$(base64 < "$TMP/verba-cert.p12")"
+INSTALLER_P12_B64=""
+if [ -n "$INSTALLER_CERT" ]; then
+    security export -k "$KEYCHAIN" -t identities -f pkcs12 -P "$P12_PW" -o "$TMP/verba-installer-cert.p12" "$INSTALLER_CERT"
+    INSTALLER_P12_B64="$(base64 < "$TMP/verba-installer-cert.p12")"
+fi
 
 echo "==> 设置 secrets 到 $REPO"
 # 经 stdin 传入（gh 省略 --body 且 stdin 为管道时从 stdin 读值）：--body 会把密钥
@@ -58,6 +70,10 @@ printf '%s' "$P12_PW"   | gh secret set APPLE_CERT_PASSWORD  -R "$REPO"
 printf '%s' "$TEAM_ID"  | gh secret set APPLE_TEAM_ID        -R "$REPO"
 printf '%s' "$APPLE_ID" | gh secret set APPLE_ID             -R "$REPO"
 printf '%s' "$APP_PW"   | gh secret set APPLE_APP_PASSWORD   -R "$REPO"
+if [ -n "$INSTALLER_P12_B64" ]; then
+    printf '%s' "$INSTALLER_P12_B64" | gh secret set APPLE_INSTALLER_CERT_P12      -R "$REPO"
+    printf '%s' "$P12_PW"            | gh secret set APPLE_INSTALLER_CERT_PASSWORD -R "$REPO"
+fi
 
 echo "==> 完成。核对:"
 gh secret list -R "$REPO"
