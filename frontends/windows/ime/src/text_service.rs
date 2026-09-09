@@ -520,7 +520,7 @@ impl ITfKeyEventSink_Impl for KeyEventSink_Impl {
         let vk = wparam.0 as u32;
         let machine = self.data.machine.borrow();
         let state = machine.state();
-        let ocr_previewing = machine.ocr_previewing();
+        let ocr_previewing = machine.ocr_previewing() && !machine.ocr_preview_ttl_expired();
         drop(machine);
         // Shift 始终认领（仅用于接收 OnKeyUp 检测孤立按；OnKeyDown 返回 FALSE
         // 不吞键，Shift 照常交宿主）——TSF 对不认领的键不回调 OnKeyUp，切换
@@ -960,6 +960,12 @@ pub fn handle_key_down(
     }
     // OCR 预览态按键拦截：Enter/空格/1 上屏，Esc 取消，其他键退出预览
     // 后照常走下方路由（不打断打字流）。
+    // #105 item3 预览 TTL：若预览已超时，先作废（不进入预览路由），该键按
+    // 正常 Idle 处理——陈旧识别文本不得随本键误上屏。
+    if machine.ocr_previewing() && machine.ocr_preview_ttl_expired() {
+        machine.end_ocr_preview();
+        hide_candidate_window(data);
+    }
     if machine.ocr_previewing() {
         // 数字 VK 兜底对齐改写预览（AZERTY 等未按 Shift 时 '1' 键解不出
         // 数字，只按成字符会把「1 上屏」的预览直接销毁）。
@@ -2392,6 +2398,10 @@ impl TextServiceData {
         let Some(rc) = self.self_rc.borrow().as_ref().cloned() else {
             return;
         };
+        // #105 item3 预览 TTL：超时自动作废预览并收起候选窗（防御跨窗格陈旧文本误上屏）。
+        if self.machine.borrow_mut().expire_stale_ocr_preview() {
+            hide_candidate_window(&rc);
+        }
         // 中英切换状态提示超时：Idle（无候选）时隐藏候选窗。
         // 追加 !ocr_previewing 守卫：候选窗为状态卡与预览共用——卡弹出后
         // 2s 内预览才到达（Ctrl+Alt+O 异步出结果）时，到点 state 仍是 Idle
