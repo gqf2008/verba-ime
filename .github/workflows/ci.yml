@@ -85,6 +85,14 @@ jobs:
           EXP="$EXP_ROOT/expanded"
           pkgutil --expand-full "$PKG" "$EXP"
           grep -q 'install-location="/Library/Input Methods"' "$EXP/Verba-component.pkg/PackageInfo"
+          # 关键：禁止 Installer 把 app 重定位到同 bundle id 的 dist/Verba.app；
+          # 否则 PKG receipt 存在但 /Library/Input Methods 为空，菜单不出现。
+          # 注意：pkg-info 的 relocatable="false" 默认包也有，不能作为守卫；
+          # 必须断言 <relocate> 没有 bundle 子元素（即空 <relocate/>）。
+          RELOCATE_BUNDLES="$(xmllint --xpath \
+            'count(/*[local-name()="pkg-info"]/*[local-name()="relocate"]/*)' \
+            "$EXP/Verba-component.pkg/PackageInfo")"
+          test "$RELOCATE_BUNDLES" = "0"
           test -x "$EXP/Verba-component.pkg/Scripts/postinstall"
           # 钉住降权行为：launchctl asuser 不降 euid，必须配合 sudo -u（防回退）
           grep -q '/usr/bin/sudo -u' "$EXP/Verba-component.pkg/Scripts/postinstall"
