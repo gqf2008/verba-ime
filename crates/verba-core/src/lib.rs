@@ -11,7 +11,7 @@ pub mod machine;
 pub use commands::{parse_ai_command, AiCommand};
 pub use machine::{
     result_hint, Action, AiKey, CompositionMachine, LlmCandidateRequest, MachineState, Mode,
-    ResultPhase,
+    ResultPhase, PLACEHOLDER_RESULT_BODY,
 };
 
 /// 当前核心版本。

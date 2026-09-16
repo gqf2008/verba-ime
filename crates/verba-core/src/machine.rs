@@ -96,13 +96,33 @@ pub enum ResultPhase {
 /// 结果浮层状态行提示（两端共用文案——收口在 core，与
 /// REWRITE_SYSTEM_PROMPT 同一理由：两端措辞漂移会让同一状态在两个平台
 /// 给出不同的按键承诺）。
+///
+/// Streaming 一行与**空结果吞键**语义对齐：「Enter 提交已生成部分」在结果
+/// 尚空时是无操作（`feed_enter` 的 Streaming/ResultReady 臂对空结果直接吞
+/// 键——提交空串会抹掉提示词并踩「空组合文本 → 应用终止组合」陷阱），故文
+/// 案先声明时机（首字之后）：用户在占位期按 Enter 不会对着「承诺过的键」
+/// 空等，这也不改变任何按键行为。
 pub fn result_hint(phase: ResultPhase) -> &'static str {
     match phase {
-        ResultPhase::Streaming => "生成中… Enter 提交已生成部分 · Esc 取消",
+        ResultPhase::Streaming => "生成中… 首字后 Enter 提交已生成部分 · Esc 取消",
         ResultPhase::Ready => "Enter/空格/1 上屏 · r 重试 · e 改提示词 · Esc 关闭",
         ResultPhase::Failed => "Enter 或 r 重试 · e 改提示词 · Esc 关闭",
     }
 }
+
+/// 结果浮层的**占位正文**：`//`（含 `//看图`）与改写管道发送的**同一次按
+/// 键处理**里，结果浮层以本串**同步**出场——发送 → 首个 token 的 1–3s 里
+/// 用户视线正落在候选框上，此前那里什么都没有（用户感知「什么都没发生」）。
+///
+/// - **只影响显示**：占位不是结果，首块到达即由同一条浮层路径覆盖；提交路
+///   径一律取 `machine.result()` / `last_request`，绝不取本串。
+/// - **两端共用**：与 `result_hint` 同一理由收口在 core——各端各写一份会让
+///   同一状态在两个平台显示不同内容（本仓库已为措辞漂移付过学费）。
+/// - **与 Streaming 状态行自洽**：状态行已在说「生成中…」，正文只留一个
+///   「还在长」的视觉锚点，不重复状态行的措辞。
+/// - **非空**：空串过不了候选窗的显示门槛（`should_render`）、渲染出来也不
+///   可见；两端前端把它作为 `set_result_block` 的入参，不得再各自加料。
+pub const PLACEHOLDER_RESULT_BODY: &str = "…";
 
 /// AI 结果浮层态的按键分类（`feed_ai_preview` 的输入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2338,6 +2358,55 @@ mod tests {
             m.on_llm_done();
             assert!(matches!(m.feed_enter(), Action::CommitResult { ref text } if text == "首"));
         }
+    }
+
+    /// 占位期语义钉子（首 token 前：浮层已武装、结果仍空——前端此刻正把
+    /// `PLACEHOLDER_RESULT_BODY` 显示在结果浮层上）：
+    /// ① Enter/空格/1 一律无操作——绝不提交空串（提交空串会抹掉提示词并踩
+    ///    「空组合文本 → 应用终止组合」陷阱，真机 Notepad-- 教训）；
+    /// ② 占位期流与浮层都不被这次按键破坏（占位继续保持，首块照常覆盖）；
+    /// ③ Esc 正常取消：浮层撤销、回 Idle、组合串清空，提示词不残留成幽灵浮层。
+    /// 浮层**显示**由前端在发送的同一次按键处理里同步完成（零延迟硬约束），
+    /// core 这一侧只管按键语义与相位，故本测试不碰渲染。
+    #[test]
+    fn placeholder_phase_enter_is_noop_and_esc_cancels() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "翻译".chars() {
+            m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        // 占位期条件（浮层已武装 = Streaming 相位且结果空）。
+        assert!(m.ai_previewing(), "发送即武装浮层——占位显示的前提");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+        assert_eq!(m.result(), "", "首 token 前结果为空");
+        assert!(
+            !PLACEHOLDER_RESULT_BODY.trim().is_empty(),
+            "占位正文不得为空串（空块过不了候选窗显示门槛、渲染也不可见）"
+        );
+        // ① 占位期确认键全部吞掉：无动作、不结算、流不中断。
+        for fire in ['\r', ' ', '1'] {
+            let a = if fire == '\r' {
+                m.feed_enter()
+            } else {
+                m.feed_char(fire)
+            };
+            assert!(matches!(a, Action::None), "占位期 {fire:?} 应为无操作");
+            assert_eq!(m.state(), MachineState::Streaming, "占位期流不得被中断");
+            assert_eq!(m.result(), "", "空结果不得被结算");
+        }
+        // ② 首块到达：同一流式通道覆盖占位（前端据 UpdateResult 覆盖浮层）。
+        assert!(matches!(
+            m.on_llm_chunk("首"),
+            Action::UpdateResult { ref body, .. } if body == "首"
+        ));
+        // ③ Esc 取消：浮层撤销、组合结束、不留幽灵浮层。
+        assert_eq!(m.feed_escape(), Action::Cancel);
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(!m.ai_previewing(), "Esc 后浮层必须撤销");
+        assert_eq!(m.result(), "", "取消后不残留结果");
+        assert_eq!(m.preedit(), "", "组合串清空（宿主侧组合由前端结束）");
     }
 
     /// ResultReady 但结果为空（模型零字返回的病态角落）：Enter 同样不结算
