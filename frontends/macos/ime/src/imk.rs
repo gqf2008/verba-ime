@@ -32,7 +32,7 @@ use objc2_input_method_kit::{
 
 use verba_core::machine::{
     result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, PreviewKey,
-    ResultPhase, REWRITE_SYSTEM_PROMPT,
+    ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
@@ -951,6 +951,14 @@ define_class!(
                 return Bool::new(applied);
             }
 
+            // 占位期判定（发送后、首 token 前：浮层已武装且结果仍空）：下面
+            // 记一条可读日志——本轮 Enter/空格/1 会被 core 有意吞掉（空结果绝不
+            // 结算，见 feed_enter 的 Streaming/ResultReady 臂），真机上「按了没
+            // 反应」是设计语义，不是丢键。
+            let placeholder_phase = {
+                let m = self.ivars().machine.borrow();
+                m.ai_previewing() && m.result().is_empty()
+            };
             let was_idle = matches!(self.ivars().machine.borrow().state(), MachineState::Idle);
             let action = match key {
                 Some(ImkKey::Char(c)) => {
@@ -980,6 +988,15 @@ define_class!(
                     return Bool::new(false);
                 }
             };
+            if placeholder_phase
+                && matches!(action, Action::None)
+                && matches!(
+                    key,
+                    Some(ImkKey::Enter) | Some(ImkKey::Char(' ')) | Some(ImkKey::Char('1'))
+                )
+            {
+                dbg_log("占位期确认键已吞（结果为空，绝不提交空串）");
+            }
             // 空闲态且状态机无动作（如 Enter/Backspace/Esc）：交给宿主处理。
             if was_idle && matches!(action, Action::None) {
                 dbg_log("inputText idle+None -> return false");
@@ -2044,6 +2061,20 @@ impl VerbaIMKController {
         // set_marked 内部按内容去重，首块到达时的同串刷新零宿主往返。
         let status = self.ivars().machine.borrow().preedit();
         self.set_marked(&status);
+        // 发送即占位：候选面板在**同一次按键处理**里同步出场——首个 token 到达
+        // 前用户视线落在面板上，此前那里什么都没有（感知「什么都没发生」）。
+        // 正文取 core 的 `PLACEHOLDER_RESULT_BODY`（与 Windows 同一常量，杜绝
+        // 两端措辞漂移），状态行由 `ai_result_display_items` 取
+        // `result_hint(Streaming)`。
+        // 零延迟硬约束：本路径只做数据源赋值 + 一次面板刷新（与首块到达走同一
+        // 条 `show_ai_result` / `refresh_candidate_window`），无 daemon IPC、无线
+        // 程 spawn、无定时器；也**不为占位新增 `set_marked`**（组合串上面刚刷过
+        // 一次，再刷多一次宿主往返且违背「占位不引入额外 composition update」）。
+        // 顺序恒为 set_marked → 占位面板 → 发起流，同一栈内同步完成。
+        // 首块覆盖占位：面板按显示串去重，占位串与首块串不同故不会被跳过；模型
+        // 恰好只吐「…」时显示串相同而跳过刷新，面板内容本就正确，无副作用。
+        dbg_log("AI 占位浮层（首 token 前）已同步显示");
+        self.show_ai_result(PLACEHOLDER_RESULT_BODY, ResultPhase::Streaming);
         self.cancel_stream();
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
@@ -2584,6 +2615,23 @@ mod tests {
         assert_eq!(
             ai_result_display_items("你好", ResultPhase::Streaming)[0],
             "你好"
+        );
+    }
+
+    /// 占位面板条目（发送瞬间、首 token 前）：占位正文 + Streaming 状态行两条，
+    /// 且与首块条目**不同**——`show_ai_result` 按显示串去重，相同即跳过面板刷新
+    /// （占位若与首块同串，首块到达时面板不刷新；不同才保证覆盖生效）。
+    #[test]
+    fn placeholder_items_differ_from_first_chunk() {
+        let ph = ai_result_display_items(PLACEHOLDER_RESULT_BODY, ResultPhase::Streaming);
+        assert_eq!(ph.len(), 2, "占位 = 正文 + 状态行");
+        assert_eq!(ph[0], PLACEHOLDER_RESULT_BODY);
+        assert!(!ph[0].is_empty(), "占位正文不得为空串");
+        assert_eq!(ph[1], result_hint(ResultPhase::Streaming));
+        assert_ne!(
+            ph,
+            ai_result_display_items("你好", ResultPhase::Streaming),
+            "占位条目与首块条目必须不同（否则首块被去重跳过）"
         );
     }
 }
