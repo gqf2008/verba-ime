@@ -2409,6 +2409,50 @@ mod tests {
         assert_eq!(m.preedit(), "", "组合串清空（宿主侧组合由前端结束）");
     }
 
+    /// 占位 → 失败覆盖（R5）：daemon 连不上 / `llm_start` 失败时，错误可在
+    /// **首个 chunk 之前**到达——此刻结果仍空、前端正把占位正文显示在结果浮层
+    /// 上。core 必须据错误把相位转 Failed 并保留浮层（前端据此用 Failed 浮层
+    /// 覆盖占位，不留「永远生成中…」的僵尸浮层），提示词不丢、Enter/`r` 可重试。
+    #[test]
+    fn placeholder_phase_error_overwrites_placeholder_and_keeps_retry() {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for c in "翻译".chars() {
+            m.feed_char(c);
+        }
+        assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+        // 占位期：浮层已武装、结果仍空、相位 Streaming。
+        assert!(m.ai_previewing());
+        assert_eq!(m.result(), "", "首 token 前结果为空");
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+        // 错误在首个 chunk 前到达：转 Failed 且保留浮层（覆盖占位）。
+        assert_eq!(
+            m.on_llm_error("连接失败"),
+            Action::LlmFailed {
+                message: "连接失败".into()
+            }
+        );
+        assert_eq!(m.state(), MachineState::Failed);
+        assert!(
+            m.ai_previewing(),
+            "失败浮层保留（覆盖占位，不留僵尸「生成中」）"
+        );
+        assert_eq!(m.result_phase(), Some(ResultPhase::Failed));
+        assert_eq!(m.result(), "", "空结果不残留");
+        // 提示词不丢：Enter（或 r）重发同一条请求，回到占位相位。
+        assert_eq!(
+            m.feed_enter(),
+            Action::StartLlm {
+                prompt: "翻译".into(),
+                system: None
+            }
+        );
+        assert_eq!(m.state(), MachineState::Streaming);
+        assert_eq!(m.result_phase(), Some(ResultPhase::Streaming));
+        assert!(m.ai_previewing(), "重试后回到占位相位");
+    }
+
     /// ResultReady 但结果为空（模型零字返回的病态角落）：Enter 同样不结算
     /// 空串——提示词不丢，用户可 Esc 取消或 r/e 重试。
     #[test]
