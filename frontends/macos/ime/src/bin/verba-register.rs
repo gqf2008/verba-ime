@@ -54,6 +54,9 @@ const INPUT_MODE_KEY: &str = "Input Mode";
 /// HIToolbox 偏好文件——**输入法菜单按这里的 AppleEnabledInputSources 渲染**。
 const HITOOLBOX_PLIST: &str = "Library/Preferences/com.apple.HIToolbox.plist";
 const ENABLED_INPUT_SOURCES_KEY: &str = "AppleEnabledInputSources";
+/// 启用自检的有界重试（agent 重启窗口），约 2.4s 上限。
+const ENABLE_CHECK_ATTEMPTS: u32 = 6;
+const ENABLE_CHECK_DELAY_MS: u64 = 400;
 
 // TextInputSources C API（符号在 Carbon.framework；OSStatus = i32）。
 // FFI 签名统一用 *const c_void，配合 core-foundation 类型封装的
@@ -406,6 +409,43 @@ fn find_and_enable_source(select: bool) -> (bool, i32) {
 }
 
 /// 查询指定输入源当前是否 enabled（不能只信 TISEnableInputSource 的返回值）。
+/// 有界重试：反复探测直到 predicate 为真或次数用尽（失败不掩盖，只给窗口）。
+///
+/// 刚写完偏好并重启 cfprefsd / TextInputMenuAgent 时，TIS 属性可能仍是旧值
+/// （真机 2026-09-17：写入其实成功了，但立刻自检读到 parent/mode disabled →
+/// 退出码 1，安装脚本报「启用状态未落盘」的**假失败**）。delay 传 0 便于单测。
+fn wait_until<F: FnMut() -> (bool, bool)>(
+    mut probe: F,
+    attempts: u32,
+    delay: Duration,
+) -> (bool, bool) {
+    let mut last = (false, false);
+    for i in 0..attempts.max(1) {
+        last = probe();
+        if last.0 && last.1 {
+            break;
+        }
+        if i + 1 < attempts.max(1) {
+            std::thread::sleep(delay);
+        }
+    }
+    last
+}
+
+/// 「父源 + mode 都 enabled」的有界等待版本（给 agent 重启留窗口）。
+fn wait_input_sources_enabled() -> (bool, bool) {
+    wait_until(
+        || {
+            (
+                input_source_enabled(VERBA_SOURCE_ID),
+                input_source_enabled(VERBA_MODE_ID),
+            )
+        },
+        ENABLE_CHECK_ATTEMPTS,
+        Duration::from_millis(ENABLE_CHECK_DELAY_MS),
+    )
+}
+
 fn input_source_enabled(want_id: &str) -> bool {
     let raw = unsafe { TISCreateInputSourceList(std::ptr::null(), true) };
     if raw.is_null() {
@@ -582,8 +622,8 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(1);
     }
-    let parent_enabled = input_source_enabled(VERBA_SOURCE_ID);
-    let mode_enabled = input_source_enabled(VERBA_MODE_ID);
+    // 有界等待：写入后立刻读可能撞上 cfprefsd/TextInputMenuAgent 重启窗口。
+    let (parent_enabled, mode_enabled) = wait_input_sources_enabled();
     if parent_enabled && mode_enabled {
         println!("已启用「拾言输入法」（父源 + Pinyin mode）");
         ExitCode::SUCCESS
@@ -989,5 +1029,53 @@ mod tests {
             plist::Value::String("not-an-array".to_owned()),
         );
         assert!(ensure_verba_entries_in_hitoolbox(&mut hitoolbox).is_err());
+    }
+
+    /// 回归（2026-09-17 真机假失败）：probe 先假后真时必须拿到成功，且不早退。
+    #[test]
+    fn wait_until_retries_until_true() {
+        let mut calls = 0;
+        let (a, b) = wait_until(
+            || {
+                calls += 1;
+                (calls >= 3, calls >= 4)
+            },
+            6,
+            Duration::ZERO,
+        );
+        assert!(a && b, "重试到真值时应返回成功");
+        assert_eq!(calls, 4, "真值出现即停，不多探");
+    }
+
+    /// 始终为假时耗尽次数后如实判失败（不掩盖真失败）。
+    #[test]
+    fn wait_until_reports_failure_after_attempts() {
+        let mut calls = 0;
+        let (a, b) = wait_until(
+            || {
+                calls += 1;
+                (false, false)
+            },
+            5,
+            Duration::ZERO,
+        );
+        assert!(!a && !b);
+        assert_eq!(calls, 5, "次数用尽");
+    }
+
+    /// attempts=0 也不应 panic（防御 max(1)）。
+    #[test]
+    fn wait_until_handles_zero_attempts() {
+        let mut calls = 0;
+        let (a, b) = wait_until(
+            || {
+                calls += 1;
+                (true, true)
+            },
+            0,
+            Duration::ZERO,
+        );
+        assert!(a && b);
+        assert_eq!(calls, 1);
     }
 }
