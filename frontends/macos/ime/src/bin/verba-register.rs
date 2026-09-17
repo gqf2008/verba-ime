@@ -35,10 +35,6 @@ const VERBA_SOURCE_ID: &str = "dev.verba.inputmethod.Verba";
 /// 可选中的输入模式 ID（TISEnable/Select 须作用于 mode 而非父源——对父源
 /// select 返回 paramErr(-50)，macOS 26 实测）。
 const VERBA_MODE_ID: &str = "dev.verba.inputmethod.Verba.Pinyin";
-/// kTISPropertyInputSourceID（TextInputSources.h 公开常量）。
-const TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
-/// kTISPropertyInputSourceIsEnabled（TextInputSources.h 公开常量）。
-const TIS_PROPERTY_INPUT_SOURCE_IS_ENABLED: &str = "TISPropertyInputSourceIsEnabled";
 /// 第三方输入法启用白名单（macOS 12+）：父源 entry 存在时系统会把该 bundle
 /// 的父源和模式一起加入 HIToolbox 的启用列表。只写 TISEnableInputSource 时
 /// 在部分真机会返回 noErr 但父源仍 disabled；写入该父源 entry 并刷新
@@ -61,6 +57,16 @@ const ENABLE_CHECK_DELAY_MS: u64 = 400;
 // TextInputSources C API（符号在 Carbon.framework；OSStatus = i32）。
 // FFI 签名统一用 *const c_void，配合 core-foundation 类型封装的
 // as_concrete_TypeRef()/wrap_under_* 使用，不在签名里重复声明 CF 类型。
+// Carbon 导出的输入源属性 key（CFStringRef）。**必须引用这两个常量本身**：
+// `TISGetInputSourceProperty` 按**指针**比较 key，自造同名字符串匹配不上。
+// 而且 `kTISPropertyInputSourceIsEnabled` 的字符串值其实是历史名
+// `TSMInputSourcePropertyIsEnabled`（真机实测）——照 TIS... 字面量硬编码更是
+// 必然落空，verba-register 的启用自检曾因此恒为 false、每次退出码 1。
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    static kTISPropertyInputSourceID: *const c_void;
+    static kTISPropertyInputSourceIsEnabled: *const c_void;
+}
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn TISCreateInputSourceList(
@@ -376,8 +382,7 @@ fn find_and_enable_source(select: bool) -> (bool, i32) {
     }
     // 所有权交给 CFArray 封装（drop 时 CFRelease），元素用裸指针遍历。
     let _owned = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(raw as CFArrayRef) };
-    let id_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_ID);
-    let id_key_ref = id_key.as_concrete_TypeRef() as *const c_void;
+    let id_key_ref = unsafe { kTISPropertyInputSourceID };
     let want = CFString::new(if select {
         VERBA_MODE_ID
     } else {
@@ -452,10 +457,8 @@ fn input_source_enabled(want_id: &str) -> bool {
         return false;
     }
     let _owned = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(raw as CFArrayRef) };
-    let id_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_ID);
-    let id_key_ref = id_key.as_concrete_TypeRef() as *const c_void;
-    let enabled_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_IS_ENABLED);
-    let enabled_key_ref = enabled_key.as_concrete_TypeRef() as *const c_void;
+    let id_key_ref = unsafe { kTISPropertyInputSourceID };
+    let enabled_key_ref = unsafe { kTISPropertyInputSourceIsEnabled };
     let want = CFString::new(want_id);
     for i in 0..unsafe { CFArrayGetCount(raw) } {
         let src = unsafe { CFArrayGetValueAtIndex(raw, i) };
@@ -506,8 +509,7 @@ fn list_sources() -> ExitCode {
         return ExitCode::from(2);
     }
     let _owned = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(raw as CFArrayRef) };
-    let id_key = CFString::new(TIS_PROPERTY_INPUT_SOURCE_ID);
-    let id_key_ref = id_key.as_concrete_TypeRef() as *const c_void;
+    let id_key_ref = unsafe { kTISPropertyInputSourceID };
     let (mut total, mut matched) = (0usize, 0usize);
     for i in 0..unsafe { CFArrayGetCount(raw) } {
         let src = unsafe { CFArrayGetValueAtIndex(raw, i) };
@@ -1077,5 +1079,26 @@ mod tests {
         );
         assert!(a && b);
         assert_eq!(calls, 1);
+    }
+
+    /// 回归（真机 2026-09-17）：verba-register 的启用自检曾**恒为 false**——
+    /// 它把 key 硬编码成 "TISPropertyInputSourceIsEnabled"，而
+    /// `TISGetInputSourceProperty` 按指针比较 key，系统常量
+    /// `kTISPropertyInputSourceIsEnabled` 的字符串值其实是历史名
+    /// "TSMInputSourcePropertyIsEnabled"，两边永远不相等。
+    /// 这条测试钉住真实值并说明为什么不能改回 TIS... 字面量。
+    #[test]
+    fn enabled_key_uses_system_constant_not_a_lookalike_string() {
+        let key = unsafe {
+            CFString::wrap_under_get_rule(kTISPropertyInputSourceIsEnabled as CFStringRef)
+        };
+        assert_eq!(
+            key.to_string(),
+            "TSMInputSourcePropertyIsEnabled",
+            "kTISPropertyInputSourceIsEnabled 的值是历史名，写 TISPropertyInputSourceIsEnabled 匹配不上"
+        );
+        let id_key =
+            unsafe { CFString::wrap_under_get_rule(kTISPropertyInputSourceID as CFStringRef) };
+        assert_eq!(id_key.to_string(), "TISPropertyInputSourceID");
     }
 }
