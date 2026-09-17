@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 
 use verba_core::machine::{
     is_fullwidth_mapped_punct, result_hint, Action, CompositionMachine, LlmCandidateRequest,
-    MachineState, PreviewKey, ResultPhase, REWRITE_SYSTEM_PROMPT,
+    MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_protos::{stream_event, StreamEvent};
@@ -784,6 +784,33 @@ fn show_result_overlay(
     });
 }
 
+/// 发送即占位：结果浮层以**本地常量占位正文**（core 的
+/// `PLACEHOLDER_RESULT_BODY`）在 `//` 发送的**同一次按键处理**里同步出场，
+/// 状态行取 `result_hint(Streaming)`——发送 → 首个 token 的 1–3s 里用户视线
+/// 落在候选框上，此前那里完全空着（用户感知「什么都没发生」）。
+///
+/// **零延迟硬约束**：本路径只做「构造 controller + 渲染位图 +
+/// `cw.update(anchor)`」这类纯本地同步操作（即 `show_overlay_window` 这条
+/// 口径）——不得出现 IPC / 网络 / 文件 IO / 线程 spawn / 锁等待 / 重试定时
+/// 器；也**不得为占位新增 `set_preedit` 调用**（组合串在
+/// `set_preedit_streaming_status` 里已刷过一次，再刷一次既多一次宿主往返又
+/// 违背「占位不引入额外 composition update」）。调用顺序恒为
+/// `set_preedit_streaming_status` → 本函数 → `start_llm*`，同一栈内同步完成。
+/// 锚点沿用既有口径（`caret_screen_pos(...).or_else(view_screen_pos)
+/// .unwrap_or((0, 0, 0))`）：此刻组合活跃，正常走光标锚点；`TS_E_NOLAYOUT`
+/// 情形按既有视图兜底处理，不新造重试机制。首块到达后由同一条
+/// `show_result_overlay` 覆盖占位（宽度恒为主题配置宽度、锚点不变，只有底边
+/// 向下长——不闪断、不重排）。
+fn show_result_placeholder(data: &Rc<TextServiceData>, context: &ITfContext) {
+    log::info!("AI 占位浮层（首 token 前）已同步显示");
+    show_result_overlay(
+        data,
+        context,
+        PLACEHOLDER_RESULT_BODY,
+        ResultPhase::Streaming,
+    );
+}
+
 /// 查用户定义短语（`//短语 名称`）；无配置/无此名称返回 None
 /// （调用方按普通生成兜底）。
 fn lookup_phrase(name: &str) -> Option<String> {
@@ -926,6 +953,11 @@ pub fn handle_key_down(
 
     let mut machine = data.machine.borrow_mut();
     let state = machine.state();
+    // 占位期判定（发送后、首个 chunk 到达前：浮层已武装且结果仍空）：本轮的
+    // Enter/空格/1 会被 core 有意吞掉（空结果绝不结算——提交空串会抹掉提示词
+    // 并踩空组合陷阱，见 machine::feed_enter 的 Streaming 臂），下面记一条可读
+    // 日志：真机上「按了没反应」是设计语义，不是丢键。
+    let placeholder_phase = machine.ai_previewing() && machine.result().is_empty();
     // 改写对照预览态按键拦截（优先于 OCR 预览——两态互斥）：1/Enter/空格=
     // 改写上屏，2=原文上屏，Esc 取消；其他键不动预览，落回下方正常路由
     // （此刻仍 ResultReady：可打印键已被认领送达，feed_char 返回 None 后
@@ -1022,6 +1054,12 @@ pub fn handle_key_down(
         && (vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32)
     {
         return Ok(FALSE);
+    }
+    if placeholder_phase
+        && matches!(action, Some(Action::None))
+        && (vk == VK_RETURN.0 as u32 || ch == Some(' ') || ch == Some('1'))
+    {
+        log::info!("占位期确认键已吞（结果为空，绝不提交空串）vk=0x{vk:02X}");
     }
     let Some(action) = action else {
         log::info!("key 未处理 vk=0x{vk:02X} ch={ch:?} state={state:?}");
@@ -1164,6 +1202,9 @@ pub fn apply_action(
             // OnCompositionTerminated（内部 machine.borrow_mut()）即
             // BorrowMutError panic（独立审查 P3）。
             set_preedit_streaming_status(data, context, clientid);
+            // 改写管道与 `//` 同为「发送 → 首 token」的等待窗口：同一套占位
+            // 语义（结果浮层 + Streaming 状态行），首块到达后照常覆盖。
+            show_result_placeholder(data, context);
             start_llm_with_system(data, &content, system, None, false);
             Ok(())
         }
@@ -1204,7 +1245,9 @@ pub fn apply_action(
                 // 保持流式输出通道。
                 AiCommand::Vision => {
                     log::info!("看图命令（vision）");
+                    // 顺序（同栈同步）：组合串 → 占位浮层 → 发起请求。
                     set_preedit_streaming_status(data, context, clientid);
+                    show_result_placeholder(data, context);
                     start_llm(data, prompt, eye_rect_for(data, context), true);
                 }
                 // `//截图` / `//听写`：结束当前组合 + 重置状态机，异步采集识别。
@@ -1232,6 +1275,8 @@ pub fn apply_action(
                     // 短串不触发 Notepad-- 的「空组合文本 → 应用终止组合」
                     // 陷阱（该陷阱专指空串，见 set_preedit_streaming_status 注）。
                     set_preedit_streaming_status(data, context, clientid);
+                    // 发送即占位：同一次按键处理里同步挂上结果浮层（零延迟）。
+                    show_result_placeholder(data, context);
                     let eye_rect = eye_rect_for(data, context);
                     let (eye_enabled, eye_mode) =
                         load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
@@ -3014,5 +3059,43 @@ mod tests {
         slot.store(0, Ordering::SeqCst);
         assert!(install_stream_token(&slot, pack_stream_token(3, 7)));
         assert_eq!(stream_token_id(slot.load(Ordering::SeqCst)), 7);
+    }
+
+    /// 占位期（发送后、首 token 前）的按键链：Enter/Esc 必须被输入法**认领**
+    /// ——`OnTestKeyDown` 不认领则 `OnKeyDown` 永不回调，占位期的「Enter 无操作」
+    /// 会变成把回车透传给宿主应用（往文档里插换行）；认领之后机器侧对空结果的
+    /// 确认键一律回 `Action::None`（绝不提交空串，见 core `feed_enter`）。
+    /// 两段合起来才是 `handle_key_down` 占位期的真实语义：认领 + 吞键。
+    #[test]
+    fn placeholder_phase_confirm_key_claimed_and_swallowed() {
+        let data = Rc::new(TextServiceData::new());
+        {
+            let mut m = data.machine.borrow_mut();
+            m.feed_char('/');
+            m.feed_char('/');
+            assert!(matches!(m.feed_enter(), Action::StartLlm { .. }));
+            assert!(m.ai_previewing(), "发送即武装浮层（占位显示前提）");
+            assert_eq!(m.result(), "", "占位期条件：结果仍空");
+        }
+        let state = data.machine.borrow().state();
+        assert_eq!(state, MachineState::Streaming);
+        assert!(
+            should_claim_key(state, false, VK_RETURN.0 as u32, 0),
+            "占位期 Enter 必须认领（否则回车落进宿主文档）"
+        );
+        assert!(
+            should_claim_key(state, false, VK_ESCAPE.0 as u32, 0),
+            "占位期 Esc 必须认领（取消流 + 收浮层）"
+        );
+        assert!(
+            matches!(data.machine.borrow_mut().feed_enter(), Action::None),
+            "空结果 Enter = 无操作（core「绝不提交空串」语义）"
+        );
+        {
+            let mut m = data.machine.borrow_mut();
+            assert_eq!(m.feed_escape(), Action::Cancel);
+            assert_eq!(m.state(), MachineState::Idle);
+            assert!(!m.ai_previewing(), "Esc 后不留幽灵浮层");
+        }
     }
 }

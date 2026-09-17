@@ -135,6 +135,40 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 1. AI 模式触发（`//` 前缀或快捷键）→ 前端收集 prompt → daemon → LLM provider。
 2. SSE 流 → `StreamEvent` 增量 → 前端 preedit 实时刷新 → Enter 上屏 / Esc 取消。
 
+### AI 结果浮层的三相位与「候选框零延迟占位」（2026-09-16）
+
+发送 → 首个 token 之间有 1–3s 空窗（取决于服务商 / 网络）。此前这段窗口里只有
+**应用内的组合串**换成短状态串（`✨ 生成中…`），而用户视线所在的**候选框**完全
+空着——观感是「按了没反应 / 什么都没发生」。契约（Windows TSF 与 macOS IMK 两端
+同语义；组合串文案与占位正文收口在 `verba-core`，前端不得各写一份）：
+
+| 阶段 | 组合串（preedit / marked） | 结果浮层（候选框） | 状态行 |
+| --- | --- | --- | --- |
+| 发送瞬间（**占位**） | `✨ 生成中…` | `PLACEHOLDER_RESULT_BODY`（`…`） | `result_hint(Streaming)` |
+| 首个 chunk 到达 | 同上（**不随流变长**） | 流式全文（`Action::UpdateResult.body`） | 同上 |
+| 完成 / 失败 | `✨ 已就绪` / `✨ 生成失败` | 结果全文 / 已生成的部分结果 | `result_hint(Ready/Failed)` |
+
+- **零延迟**：占位在 `//`（含 `//看图`、改写管道 `//内容`+Tab）发送的**同一次
+  按键处理**里**同步**弹出——这条路径只做「构造 controller + 渲染位图 +
+  `cw.update(anchor)`」这类纯本地操作，不得出现 IPC / 网络 / 文件 IO / 线程
+  spawn / 锁等待 / 重试定时器。「零延迟」靠同步构造，不靠动画或定时器刷新循环。
+- **不引入额外 composition update**：组合串在发送时已刷成短状态串，占位只写
+  浮层，不再调 `set_preedit` / `setMarkedText`（每次宿主往返都要省）。
+- **幂等覆盖、不闪断**：首块到达走**同一条**浮层路径覆盖占位；浮层宽度恒为主题
+  配置宽度，锚点固定（组合光标下方），行数增加只让底边向下长，顶边与左缘不跳动，
+  同一批 chunk 内不反复重排。
+- **占位期按键**：Enter / 空格 / `1` 一律**无操作**（空结果绝不结算——提交空串会
+  抹掉提示词并触发「空组合文本 → 应用终止组合」陷阱，真机 Notepad-- 教训）；
+  Esc = 取消流 + 收起浮层 + 结束组合，不留幽灵浮层；其余按键语义与流式态一致。
+- **失败兜底**：daemon 连不上 / `llm_start` 失败 → 占位被 `Failed` 浮层覆盖
+  （提示词保留，`r` 重试 / `e` 改提示词仍可用），不留「永远生成中」的僵尸浮层。
+- **实现落点**：Windows `frontends/windows/ime/src/text_service.rs` 的
+  `show_result_placeholder`（复用 `show_overlay_window` 口径）、macOS
+  `frontends/macos/ime/src/imk.rs` 的 `start_llm`（`show_ai_result` 同一条面板
+  路径）；两端共用 core 的 `PLACEHOLDER_RESULT_BODY` 与 `result_hint`。真机验收
+  项见 [manual-acceptance-windows.md](manual-acceptance-windows.md) /
+  [manual-acceptance-macos.md](manual-acceptance-macos.md)。
+
 ## 7. 配置与密钥
 
 - 配置文件：`%APPDATA%/Verba/config.toml`、`~/Library/Application Support/Verba/config.toml`、`~/.config/verba/config.toml`。

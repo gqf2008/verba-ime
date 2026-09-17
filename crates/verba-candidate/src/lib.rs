@@ -632,4 +632,58 @@ mod tests {
         c.set_result_lines(7);
         assert_eq!(c.result_lines(), 7);
     }
+
+    /// 占位浮层的渲染契约（发送瞬间、首 token 前就把结果浮层挂上屏）：
+    /// ① 必须可渲染——非空正文得过 `should_render` 门槛，否则占位根本弹不出来
+    ///    （空块「显示」了也是不可见，用户照样看到「什么都没发生」）；
+    /// ② 宽度 = 主题配置宽度，不随内容忽宽忽窄（R4 几何稳定）；
+    /// ③ 同为 1 行时高度不变、行数增加只向下长——平台层锚点固定（光标下方），
+    ///    顶边与左边缘因此不跳动，只有底边下移；
+    /// ④ 占位正文与首块正文是**不同显示串**（macOS 面板按显示串去重，相同即
+    ///    跳过刷新；不同才保证首块一定覆盖占位）。
+    /// 占位串按字面量取 core 的 `PLACEHOLDER_RESULT_BODY`（verba-candidate 不
+    /// 依赖 verba-core，故此处钉字面量；改 core 常量时同步此处）。
+    #[test]
+    fn placeholder_result_block_renders_at_fixed_width() {
+        const PLACEHOLDER: &str = "…";
+        const FIRST_CHUNK: &str = "你好，这是流式结果的首块。";
+        let theme = Theme::default();
+        let mut c = CandidateWindowController::new(theme.clone());
+        assert!(
+            !c.should_render(),
+            "未设结果块前不渲染（占位正是它的内容来源）"
+        );
+        c.set_result_block(PLACEHOLDER);
+        c.set_status(Some("生成中…".to_owned()));
+        c.show();
+        assert!(c.should_render(), "占位浮层必须可渲染（零延迟显示的前提）");
+        let placeholder_block = c.result_block().map(str::to_owned);
+        assert_eq!(
+            placeholder_block.as_deref(),
+            Some(PLACEHOLDER),
+            "占位正文原样"
+        );
+        let (w_ph, h_ph) = crate::renderer::window_size(&c);
+        assert_eq!(
+            w_ph,
+            crate::renderer::result_window_width(&theme),
+            "占位宽度 = 主题配置宽度"
+        );
+        // 首块（同为 1 行）：宽度、高度都不跳，只有正文变。
+        c.set_result_block(FIRST_CHUNK);
+        assert_ne!(
+            placeholder_block.as_deref(),
+            c.result_block(),
+            "占位串与首块串必须不同（否则面板去重会把首块吃掉）"
+        );
+        let (w1, h1) = crate::renderer::window_size(&c);
+        assert_eq!(w1, w_ph, "宽度不随内容变化");
+        assert_eq!(h1, h_ph, "同为 1 行：高度不跳");
+        // 长结果（多行）：宽度仍恒定，高度只向下长。
+        c.set_result_block(&"长结果。".repeat(200));
+        c.set_result_lines(8);
+        let (w2, h2) = crate::renderer::window_size(&c);
+        assert_eq!(w2, w_ph, "长结果宽度仍为主题宽度");
+        assert!(h2 > h1, "行数增加只让浮层变高（顶边不动，向下长）");
+    }
 }
