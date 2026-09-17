@@ -48,6 +48,12 @@ const THIRD_PARTY_INPUT_SOURCES_KEY: &str = "AppleEnabledThirdPartyInputSources"
 const BUNDLE_ID_KEY: &str = "Bundle ID";
 const INPUT_SOURCE_KIND_KEY: &str = "InputSourceKind";
 const KEYBOARD_INPUT_METHOD_KIND: &str = "Keyboard Input Method";
+/// mode 条目的 InputSourceKind（菜单里真正可切换的那一条）。
+const INPUT_MODE_KIND: &str = "Input Mode";
+const INPUT_MODE_KEY: &str = "Input Mode";
+/// HIToolbox 偏好文件——**输入法菜单按这里的 AppleEnabledInputSources 渲染**。
+const HITOOLBOX_PLIST: &str = "Library/Preferences/com.apple.HIToolbox.plist";
+const ENABLED_INPUT_SOURCES_KEY: &str = "AppleEnabledInputSources";
 
 // TextInputSources C API（符号在 Carbon.framework；OSStatus = i32）。
 // FFI 签名统一用 *const c_void，配合 core-foundation 类型封装的
@@ -73,6 +79,16 @@ unsafe extern "C" {
     fn CFBooleanGetValue(boolean: *const c_void) -> bool;
 }
 
+/// 判定一条 HIToolbox 条目是否属于 Verba（按 Bundle ID 或 mode ID 匹配）。
+fn is_verba_entry(value: &plist::Value) -> bool {
+    let Some(entry) = value.as_dictionary() else {
+        return false;
+    };
+    let bundle = entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string);
+    let mode = entry.get(INPUT_MODE_KEY).and_then(plist::Value::as_string);
+    bundle == Some(VERBA_SOURCE_ID) || mode == Some(VERBA_MODE_ID)
+}
+
 /// 构造 `com.apple.inputsources` 的 Verba 父源 + Pinyin mode entry。
 fn verba_entries() -> Vec<plist::Value> {
     let mut parent = plist::Dictionary::new();
@@ -91,12 +107,12 @@ fn verba_entries() -> Vec<plist::Value> {
         plist::Value::String(VERBA_SOURCE_ID.to_owned()),
     );
     mode.insert(
-        "Input Mode".to_owned(),
+        INPUT_MODE_KEY.to_owned(),
         plist::Value::String(VERBA_MODE_ID.to_owned()),
     );
     mode.insert(
         INPUT_SOURCE_KIND_KEY.to_owned(),
-        plist::Value::String("Input Mode".to_owned()),
+        plist::Value::String(INPUT_MODE_KIND.to_owned()),
     );
 
     vec![
@@ -177,15 +193,40 @@ fn remove_verba_entries_from_hitoolbox(root: &mut plist::Value) -> Result<bool, 
         let entries = list
             .as_array_mut()
             .ok_or_else(|| format!("{key} 不是 array，拒绝覆盖已有输入源"))?;
-        entries.retain(|value| {
-            let Some(entry) = value.as_dictionary() else {
-                return true;
-            };
-            let bundle = entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string);
-            let mode = entry.get("Input Mode").and_then(plist::Value::as_string);
-            bundle != Some(VERBA_SOURCE_ID) && mode != Some(VERBA_MODE_ID)
-        });
+        entries.retain(|value| !is_verba_entry(value));
     }
+    Ok(*root != original)
+}
+
+/// 往 HIToolbox 的 `AppleEnabledInputSources` **幂等**写入「父源 + mode」两条。
+///
+/// 菜单就是按这份列表渲染的。真机 2026-09-17：只写 `com.apple.inputsources`
+/// 白名单 + 调 `TISEnableInputSource`，返回 noErr 但菜单里始终没有「拾言输入法」；
+/// 手工把同样两条写进 `AppleEnabledInputSources` 后菜单立刻出现。此前本文件只有
+/// 卸载侧会动 HIToolbox，**没有写入侧**——装/卸不对称，这就是根因。
+///
+/// 顺序对齐 macOS 自身写入（真机备份：父源在前、mode 在后）。已存在的 Verba
+/// 条目先全部移除再追加，保证反复调用不产生重复条目（真机上曾因反复注册出现
+/// 过 7 条重复的「拾言输入法」）。
+fn ensure_verba_entries_in_hitoolbox(root: &mut plist::Value) -> Result<bool, String> {
+    let original = root.clone();
+    let root_dict = root
+        .as_dictionary_mut()
+        .ok_or_else(|| "com.apple.HIToolbox 根节点不是 dictionary，拒绝改写".to_owned())?;
+    if !root_dict.contains_key(ENABLED_INPUT_SOURCES_KEY) {
+        root_dict.insert(
+            ENABLED_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(Vec::new()),
+        );
+    }
+    let list = root_dict
+        .get_mut(ENABLED_INPUT_SOURCES_KEY)
+        .ok_or_else(|| format!("{ENABLED_INPUT_SOURCES_KEY} 缺失"))?;
+    let entries = list
+        .as_array_mut()
+        .ok_or_else(|| format!("{ENABLED_INPUT_SOURCES_KEY} 不是 array，拒绝覆盖已有输入源"))?;
+    entries.retain(|value| !is_verba_entry(value));
+    entries.extend(verba_entries());
     Ok(*root != original)
 }
 
@@ -251,6 +292,21 @@ fn write_third_party_input_source_at_home(home: &Path) -> Result<bool, String> {
     Ok(changed)
 }
 
+/// 写入指定用户 home 下的 `com.apple.HIToolbox` 启用列表（菜单来源）。
+fn write_hitoolbox_input_source_at_home(home: &Path) -> Result<bool, String> {
+    let path = home.join(HITOOLBOX_PLIST);
+    let mut root = if path.exists() {
+        plist::Value::from_file(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?
+    } else {
+        plist::Value::Dictionary(plist::Dictionary::new())
+    };
+    let changed = ensure_verba_entries_in_hitoolbox(&mut root)?;
+    if changed {
+        atomic_write_plist(&path, home, &root)?;
+    }
+    Ok(changed)
+}
+
 /// 卸载当前用户输入源条目（app 文件由「卸载.command」删除）。
 fn uninstall_input_source_at_home(home: &Path) -> Result<(), String> {
     let inputsources = home.join(INPUT_SOURCES_PLIST);
@@ -261,7 +317,7 @@ fn uninstall_input_source_at_home(home: &Path) -> Result<(), String> {
             atomic_write_plist(&inputsources, home, &root)?;
         }
     }
-    let hitoolbox = home.join("Library/Preferences/com.apple.HIToolbox.plist");
+    let hitoolbox = home.join(HITOOLBOX_PLIST);
     if hitoolbox.exists() {
         let mut root = plist::Value::from_file(&hitoolbox)
             .map_err(|e| format!("读取 {} 失败: {e}", hitoolbox.display()))?;
@@ -281,12 +337,18 @@ fn refresh_input_source_agents() {
     std::thread::sleep(Duration::from_millis(500));
 }
 
-/// 写入当前用户白名单并刷新 cfprefsd / TextInputMenuAgent。
-fn enable_third_party_input_source() -> Result<bool, String> {
+/// 写入当前用户的**两处**启用清单并刷新 cfprefsd / TextInputMenuAgent。
+///
+/// 两处缺一不可：
+/// - `com.apple.inputsources` → `AppleEnabledThirdPartyInputSources`：第三方白名单；
+/// - `com.apple.HIToolbox` → `AppleEnabledInputSources`：**菜单按这份渲染**。
+fn enable_input_sources() -> Result<bool, String> {
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME 未设置".to_owned())?;
-    let changed = write_third_party_input_source_at_home(Path::new(&home))?;
+    let home = Path::new(&home);
+    let changed = write_third_party_input_source_at_home(home)?;
+    let hitoolbox_changed = write_hitoolbox_input_source_at_home(home)?;
     refresh_input_source_agents();
-    Ok(changed)
+    Ok(changed || hitoolbox_changed)
 }
 
 /// 从 verba-register 自身路径推导 Verba.app 根目录（Contents/MacOS 上两级）。
@@ -499,11 +561,13 @@ fn main() -> ExitCode {
     // HIToolbox，最后重新 enable/select。只调 TISEnableInputSource 在部分真机
     // 返回 noErr 但父源仍 disabled。
     let _ = register_and_enable(&app, false);
-    match enable_third_party_input_source() {
-        Ok(true) => println!("已更新第三方输入源启用列表（com.apple.inputsources）"),
-        Ok(false) => println!("第三方输入源启用列表已是最新"),
+    match enable_input_sources() {
+        Ok(true) => println!(
+            "已写入输入源启用列表（com.apple.inputsources 白名单 + com.apple.HIToolbox 菜单列表）"
+        ),
+        Ok(false) => println!("输入源启用列表已是最新"),
         Err(e) => {
-            eprintln!("错误: 更新第三方输入源启用列表失败: {e}");
+            eprintln!("错误: 写入输入源启用列表失败: {e}");
             return ExitCode::from(1);
         }
     }
@@ -813,5 +877,117 @@ mod tests {
             .and_then(plist::Value::as_array)
             .unwrap()
             .is_empty());
+    }
+
+    /// 回归（2026-09-17 真机）：菜单按 HIToolbox `AppleEnabledInputSources` 渲染，
+    /// 只写第三方白名单 + TISEnableInputSource 时菜单里看不到「拾言输入法」。
+    /// 这里钉住写入侧：父源在前、mode 在后，且不动别人的条目。
+    #[test]
+    fn hitoolbox_enabled_adds_parent_then_mode_and_keeps_others() {
+        let mut hitoolbox = plist::Value::Dictionary(plist::Dictionary::new());
+        let mut abc = plist::Dictionary::new();
+        abc.insert(
+            INPUT_SOURCE_KIND_KEY.to_owned(),
+            plist::Value::String("Keyboard Layout".to_owned()),
+        );
+        abc.insert(
+            "KeyboardLayout Name".to_owned(),
+            plist::Value::String("ABC".to_owned()),
+        );
+        hitoolbox.as_dictionary_mut().unwrap().insert(
+            ENABLED_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(vec![plist::Value::Dictionary(abc)]),
+        );
+
+        assert!(ensure_verba_entries_in_hitoolbox(&mut hitoolbox).unwrap());
+        let entries = hitoolbox
+            .as_dictionary()
+            .and_then(|d| d.get(ENABLED_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .expect("应有启用列表");
+        assert_eq!(entries.len(), 3, "原有 1 条 + Verba 父源 + mode");
+        assert_eq!(
+            entries[0]
+                .as_dictionary()
+                .and_then(|e| e.get("KeyboardLayout Name"))
+                .and_then(plist::Value::as_string),
+            Some("ABC"),
+            "他人条目必须原样保留且顺序不变"
+        );
+        // 顺序：父源在前、mode 在后（与 macOS 自身写入一致）
+        assert_eq!(
+            entries[1]
+                .as_dictionary()
+                .and_then(|e| e.get(INPUT_SOURCE_KIND_KEY))
+                .and_then(plist::Value::as_string),
+            Some(KEYBOARD_INPUT_METHOD_KIND)
+        );
+        assert_eq!(
+            entries[2]
+                .as_dictionary()
+                .and_then(|e| e.get(INPUT_SOURCE_KIND_KEY))
+                .and_then(plist::Value::as_string),
+            Some(INPUT_MODE_KIND)
+        );
+        assert_eq!(
+            entries[2]
+                .as_dictionary()
+                .and_then(|e| e.get(INPUT_MODE_KEY))
+                .and_then(plist::Value::as_string),
+            Some(VERBA_MODE_ID)
+        );
+    }
+
+    /// 幂等：反复注册不得产生重复条目（真机曾因反复注册出现 7 条重复项）。
+    #[test]
+    fn hitoolbox_enabled_is_idempotent() {
+        let mut hitoolbox = plist::Value::Dictionary(plist::Dictionary::new());
+        assert!(ensure_verba_entries_in_hitoolbox(&mut hitoolbox).unwrap());
+        assert!(
+            !ensure_verba_entries_in_hitoolbox(&mut hitoolbox).unwrap(),
+            "第二次调用不应再判定为变更"
+        );
+        let count = hitoolbox
+            .as_dictionary()
+            .and_then(|d| d.get(ENABLED_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array)
+            .map(Vec::len);
+        assert_eq!(count, Some(2), "永远是父源 + mode 两条，不重复");
+
+        // 即便列表里已被塞进重复的 Verba 条目，也会被规范回两条。
+        let mut dirty = plist::Value::Dictionary(plist::Dictionary::new());
+        dirty.as_dictionary_mut().unwrap().insert(
+            ENABLED_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::Array(verba_entries()),
+        );
+        let mut extra = verba_entries();
+        if let Some(list) = dirty
+            .as_dictionary_mut()
+            .and_then(|d| d.get_mut(ENABLED_INPUT_SOURCES_KEY))
+            .and_then(plist::Value::as_array_mut)
+        {
+            list.append(&mut extra);
+        }
+        assert!(ensure_verba_entries_in_hitoolbox(&mut dirty).unwrap());
+        assert_eq!(
+            dirty
+                .as_dictionary()
+                .and_then(|d| d.get(ENABLED_INPUT_SOURCES_KEY))
+                .and_then(plist::Value::as_array)
+                .map(Vec::len),
+            Some(2),
+            "脏列表也要被规范成两条"
+        );
+    }
+
+    /// 列表类型不对时 fail-closed，不覆盖用户数据。
+    #[test]
+    fn hitoolbox_enabled_rejects_wrong_type() {
+        let mut hitoolbox = plist::Value::Dictionary(plist::Dictionary::new());
+        hitoolbox.as_dictionary_mut().unwrap().insert(
+            ENABLED_INPUT_SOURCES_KEY.to_owned(),
+            plist::Value::String("not-an-array".to_owned()),
+        );
+        assert!(ensure_verba_entries_in_hitoolbox(&mut hitoolbox).is_err());
     }
 }
