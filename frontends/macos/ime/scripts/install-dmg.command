@@ -42,7 +42,26 @@ fi
 rm -rf "$BACKUP"
 trap - EXIT
 
-echo "已安装到 ${DEST}，正在注册并启用输入源…"
+echo "已安装到 ${DEST}，正在注册输入源…"
+set +e
 "$DEST/Contents/MacOS/verba-register"
+rc=$?
+set -e
 open "$DEST" 2>/dev/null || true
-echo "完成。无需手动到系统设置添加；在输入法菜单选择「拾言输入法」即可。"
+case "$rc" in
+    0)
+        echo "完成。在输入法菜单选择「拾言输入法」即可。"
+        ;;
+    2)
+        # macOS 26：第三方输入法进菜单必须过一次用户批准（只写偏好会被系统收回，
+        # 真机 2026-09-17 实测）。verba-register 已把 系统设置 → 键盘 打开，
+        # 这里如实说明「已装好、还差一次确认」，不能报成失败。
+        echo "已安装。还差一次确认：在 系统设置 → 键盘 → 输入法 点「＋」添加「拾言输入法」，"
+        echo "并在系统弹出「允许『拾言输入法』启用…」时选择允许（只需一次）。"
+        ;;
+    *)
+        echo "错误：注册输入源失败（verba-register 退出码 $rc）。app 已安装，可重试：" >&2
+        echo "  \"$DEST/Contents/MacOS/verba-register\"" >&2
+        exit 1
+        ;;
+esac

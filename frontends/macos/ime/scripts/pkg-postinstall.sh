@@ -69,13 +69,23 @@ for _ in $(/usr/bin/seq 1 "$POLL_COUNT"); do
     /bin/sleep 0.25
 done
 
-if [ "$STATUS" != "0" ]; then
-    echo "error: Verba 输入源自动启用失败（helper status=${STATUS:-missing}）" >&2
-    if [ -f "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; then
-        /usr/bin/head -c 65536 "$LOG_FILE" 2>/dev/null | /usr/bin/sed 's/^/  /' >&2 || true
-    fi
-    exit 1
-fi
-
-echo "Verba 输入源已在用户会话内注册并启用"
+case "$STATUS" in
+    0)
+        echo "Verba 输入源已在用户会话内注册并启用"
+        ;;
+    2)
+        # macOS 26：第三方输入法进菜单必须过一次用户批准（只写偏好会被系统收回）。
+        # helper 已写偏好并把 系统设置 → 键盘 打开；app 已就位，安装本身是成功的，
+        # 不能判失败——否则 Installer 回滚、用户以为根本没装上。
+        echo "Verba 已安装；还差一次确认：在 系统设置 → 键盘 → 输入法 点「＋」添加「拾言输入法」，"
+        echo "并在系统弹出「允许『拾言输入法』启用…」时选择允许（只需一次）。"
+        ;;
+    *)
+        echo "error: Verba 输入源自动启用失败（helper status=${STATUS:-missing}）" >&2
+        if [ -f "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; then
+            /usr/bin/head -c 65536 "$LOG_FILE" 2>/dev/null | /usr/bin/sed 's/^/  /' >&2 || true
+        fi
+        exit 1
+        ;;
+esac
 exit 0

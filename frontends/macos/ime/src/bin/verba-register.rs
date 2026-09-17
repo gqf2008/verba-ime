@@ -338,6 +338,39 @@ fn uninstall_input_source_at_home(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 安装/启用**三态出口码**（安装脚本据此区分「装好了但要用户确认」与「真失败」）：
+/// - 0：偏好写入成功，且系统已放行（父源与 mode 都 enabled）；
+/// - 2：偏好写入成功，但系统尚未放行——macOS 26 上第三方输入法进菜单必须过
+///   一次用户批准，写偏好会被系统收回（真机 2026-09-17 实测），这一步安装器
+///   代劳不了，只能引导用户去 系统设置 点一次；
+/// - 1：偏好写入失败（真失败）。
+const EXIT_ENABLED: i32 = 0;
+const EXIT_NEEDS_USER: i32 = 2;
+const EXIT_WRITE_FAILED: i32 = 1;
+
+/// 由「写入是否成功 + 系统是否已放行」映射出口码。
+fn exit_code_for(write_ok: bool, enabled: bool) -> i32 {
+    match (write_ok, enabled) {
+        (false, _) => EXIT_WRITE_FAILED,
+        (true, true) => EXIT_ENABLED,
+        (true, false) => EXIT_NEEDS_USER,
+    }
+}
+
+/// 系统未放行时的用户引导：打印步骤并把 系统设置 → 键盘 打开到输入法页。
+///
+/// 这不是失败路径——app 已装、偏好已写，只差用户在系统设置里点一次「＋」并
+/// 允许（macOS 26 的强制确认，安装器无法代点）。
+fn guide_user_to_add_input_source() {
+    println!(
+        "需要在 系统设置 → 键盘 → 输入法 点一次「＋」添加「拾言输入法」，\n\
+         并在系统弹出「允许『拾言输入法』启用…」时选择允许（只需一次）。"
+    );
+    let _ = Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.Keyboard-Settings.extension")
+        .status();
+}
+
 fn refresh_input_source_agents() {
     let _ = Command::new("/usr/bin/killall").arg("cfprefsd").status();
     let _ = Command::new("/usr/bin/killall")
@@ -626,16 +659,16 @@ fn main() -> ExitCode {
     }
     // 有界等待：写入后立刻读可能撞上 cfprefsd/TextInputMenuAgent 重启窗口。
     let (parent_enabled, mode_enabled) = wait_input_sources_enabled();
-    if parent_enabled && mode_enabled {
+    let enabled = parent_enabled && mode_enabled;
+    if enabled {
         println!("已启用「拾言输入法」（父源 + Pinyin mode）");
-        ExitCode::SUCCESS
     } else {
-        eprintln!(
-            "错误: 输入源启用状态未落盘（parent_enabled={parent_enabled}, mode_enabled={mode_enabled}, TISEnableInputSource_rc={enable_rc}）。\n\
-             请重新运行 verba-register；若仍失败，请在 系统设置 → 键盘 → 输入法 检查「拾言输入法」。"
-        );
-        ExitCode::from(1)
+        // 不是失败：app 已装、偏好已写，只差用户点一次确认（macOS 26 强制）。
+        guide_user_to_add_input_source();
     }
+    let code = exit_code_for(true, enabled);
+    let _ = enable_rc;
+    ExitCode::from(code as u8)
 }
 
 #[cfg(test)]
@@ -1100,5 +1133,24 @@ mod tests {
         let id_key =
             unsafe { CFString::wrap_under_get_rule(kTISPropertyInputSourceID as CFStringRef) };
         assert_eq!(id_key.to_string(), "TISPropertyInputSourceID");
+    }
+
+    /// 三态出口码：安装脚本据此把「需用户确认」与「真失败」分开（否则假报错）。
+    #[test]
+    fn exit_code_maps_three_states() {
+        assert_eq!(
+            exit_code_for(false, false),
+            EXIT_WRITE_FAILED,
+            "写失败=真失败"
+        );
+        assert_eq!(exit_code_for(false, true), EXIT_WRITE_FAILED, "写失败优先");
+        assert_eq!(exit_code_for(true, true), EXIT_ENABLED, "写入+放行=成功");
+        assert_eq!(
+            exit_code_for(true, false),
+            EXIT_NEEDS_USER,
+            "写入成功但系统未放行=需用户确认一次，不是失败"
+        );
+        assert_ne!(EXIT_NEEDS_USER, EXIT_WRITE_FAILED);
+        assert_ne!(EXIT_NEEDS_USER, EXIT_ENABLED);
     }
 }
