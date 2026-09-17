@@ -1,0 +1,69 @@
+# Verba · 拾言输入法工作单元看板（walgit D1 collab 层）。
+# 规范见 walgit 仓库 docs/D1_COLLAB_DESIGN.md §8。
+#
+# 卡片只在往线程里追加**签名 status 条目**时才移动；本文件只声明「线程 → 泳道」的
+# 确定性投影：线程进入**第一个**满足谓词的列（first-match-wins），字段留空 = 匹配
+# 任意，未命中任何列的线程不出现在看板上（故保留 other 兜底，避免线程凭空消失）。
+#
+# 状态取值对齐 RULE_开发流程规范 与 walgit SKILL：
+#   open / in-progress / needs-review / blocked / needs-human
+# 终态 card_status 有三种合法值，必须各有列，否则卡片在合并/结项后掉进活跃泳道或消失：
+#   merged —— merge_result {"merged": true}
+#   done   —— status {"status":"done"}（门禁要求 needs-review + 已验签 approve）
+#   closed —— status {"status":"closed"}（结项归档）
+
+version = 1
+
+[sort]
+by = "ts"          # ts(按最后活动，默认) | id(按线程 id)
+direction = "desc" # desc(新在前，默认) | asc
+
+# ── 终态优先 ────────────────────────────────────────────────────────────────
+[[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "done"
+status = "done"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# ── 告警泳道 ────────────────────────────────────────────────────────────────
+# 刻意排在活跃泳道之前：一个「needs-review 但合并规则判为不可合并」的 PR 出现在
+# merge-blocked 比藏在 needs-review 里更可行动；含未验签条目的线程同理。
+[[column]]
+name = "merge-blocked"
+merge = "blocked"
+
+[[column]]
+name = "unverified"
+unverified = true
+
+# ── 活跃泳道 ────────────────────────────────────────────────────────────────
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+# ── 兜底 ────────────────────────────────────────────────────────────────────
+# 状态未知的线程也要能看到，不能凭空消失。
+[[column]]
+name = "other"
