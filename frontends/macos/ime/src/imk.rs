@@ -92,14 +92,23 @@ fn dbg_log(msg: &str) {
 fn catch_void(label: &str, f: impl FnOnce()) {
     // 闭包捕获的 Retained<AnyObject> 非 UnwindSafe，此处仅用于诊断日志记录，
     // 异常路径不改动共享状态，AssertUnwindSafe 可接受。
-    match objc2::exception::catch(std::panic::AssertUnwindSafe(f)) {
-        Ok(()) => {}
-        Err(e) => {
-            let desc = e
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
-            log::warn!("[Verba] OBJC-EXC at {label}: {desc}");
-        }
+    // 再包一层 catch_unwind：objc2 的异常 shim 是 C++ try/catch，Rust panic
+    // 从它里面穿出时会在 __cxa_end_catch 里二次 panic（rust_drop_panic）→ abort。
+    // 输入法的正确取舍是「放弃这一次宿主调用」，而不是「整个进程死掉」。
+    let caught =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || match objc2::exception::catch(std::panic::AssertUnwindSafe(f)) {
+                Ok(()) => {}
+                Err(e) => {
+                    let desc = e
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    log::warn!("[Verba] OBJC-EXC at {label}: {desc}");
+                }
+            },
+        ));
+    if caught.is_err() {
+        log::error!("[Verba] RUST-PANIC swallowed at {label}（否则会穿出 ObjC 异常帧 abort）");
     }
 }
 
@@ -2015,7 +2024,15 @@ impl VerbaIMKController {
             unsafe { c.setAttributes(Some(&dict)) };
             *ui = Some(c);
         }
-        let ui_ref = ui.as_ref().expect("刚创建");
+        // 关键：把面板句柄 clone 出来后**立即释放 RefCell 借用**。下面的
+        // host_call（updateCandidates / show）会**同步泵运行循环**——show 要向
+        // 客户端查 markedRange；泵期间到达的按键会重入 input_text，而它开头就取
+        // `candidates_ui.borrow()`。借用若跨过那次泵，就是
+        // `already mutably borrowed` panic；该 panic 穿出 objc2 的 ObjC 异常
+        // shim 会二次 panic（rust_drop_panic）→ **abort**。真机 2026-09-17 12:22
+        // 的 SIGABRT 正是这个形状：打完第 1 个字母候选窗弹出、第 2 个字母必崩。
+        let ui_ref = ui.as_ref().expect("刚创建").clone();
+        drop(ui);
         // SAFETY: updateCandidates/show 为无前置条件的 UI 方法；候选数据源
         // 由本控制器实现（candidates / candidates:）。
         self.host_call("refresh.updateCandidates", || unsafe {
@@ -2039,7 +2056,9 @@ impl VerbaIMKController {
 
     /// 隐藏候选窗（提交/清空组合/会话切换时调用；无窗则空操作）。
     fn hide_candidate_window(&self) {
-        if let Some(ui) = self.ivars().candidates_ui.borrow().as_ref() {
+        // 同 refresh：先把句柄 clone 出来释放借用，再调会泵运行循环的 hide。
+        let ui = self.ivars().candidates_ui.borrow().clone();
+        if let Some(ui) = ui.as_ref() {
             // SAFETY: hide 为无前置条件的 UI 方法。
             self.host_call("hide", || unsafe { ui.hide() });
             // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（主线程）。
@@ -2632,6 +2651,24 @@ mod tests {
             ph,
             ai_result_display_items("你好", ResultPhase::Streaming),
             "占位条目与首块条目必须不同（否则首块被去重跳过）"
+        );
+    }
+
+    /// 回归（真机 2026-09-17 12:22 SIGABRT 家族）：host_call 闭包里的 Rust panic
+    /// **绝不允许穿出**到 objc2 的 ObjC 异常 shim —— 那会在 `__cxa_end_catch` 里
+    /// 二次 panic（`rust_drop_panic`）并把可恢复的 panic 升级成进程 abort。
+    /// 这里直接钉住 `catch_void` 的吞咽语义。
+    #[test]
+    fn catch_void_swallows_rust_panic() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 静音本次预期 panic 的输出
+        let escaped = std::panic::catch_unwind(|| {
+            catch_void("test.swallow", || panic!("boom"));
+        });
+        std::panic::set_hook(prev);
+        assert!(
+            escaped.is_ok(),
+            "catch_void 必须吞掉 Rust panic，否则真机上会穿出 ObjC 异常帧 abort"
         );
     }
 }
