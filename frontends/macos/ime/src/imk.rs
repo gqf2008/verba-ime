@@ -78,6 +78,30 @@ fn init_file_logger() {
             std::sync::Mutex::new(file),
         ))))
         .init();
+
+    // panic 必须留痕：本进程由 launchd 拉起，stderr 无处可去，panic 的默认输出
+    // 会整个丢失——而 Rust panic 一旦从 CoreFoundation 的 C++ 帧里往上展开，就会
+    // 以 SIGABRT 收场（真机 2026-09-17 两次），那时**唯一**能定位根因的就只剩这条
+    // 日志。默认 hook 照旧保留（stderr 那路丢就丢）。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "?".to_owned());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+        log::error!("[Verba] RUST-PANIC at {loc}: {msg}");
+        log::error!(
+            "[Verba] RUST-PANIC backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        default_hook(info);
+    }));
 }
 
 /// 关键链路调试日志（激活/按键/候选回达/提交），走文件日志 debug 级。
