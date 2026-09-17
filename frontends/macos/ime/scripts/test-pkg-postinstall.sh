@@ -43,6 +43,19 @@ VERBA_PKG_CONSOLE_UID="$(id -u)" \
 VERBA_PKG_LAUNCHCTL="$FAKE_OK" \
     bash "$POSTINSTALL" >/dev/null
 
+# status=2：偏好写入成功但系统未放行（macOS 26 需用户确认一次）——安装成功，不算失败。
+FAKE_NEEDS_USER="$TMP/fake-launchctl-needs-user"
+write_fake_launchctl "$FAKE_NEEDS_USER" "2" "fake helper needs user confirmation"
+VERBA_PKG_APP="$APP" \
+VERBA_PKG_CONSOLE_USER="$(id -un)" \
+VERBA_PKG_CONSOLE_UID="$(id -u)" \
+VERBA_PKG_LAUNCHCTL="$FAKE_NEEDS_USER" \
+    bash "$POSTINSTALL" >"$TMP/needs-user.out" 2>&1
+grep -q '还差一次确认' "$TMP/needs-user.out" \
+    || { echo "error: status=2 时应提示用户去系统设置确认" >&2; exit 1; }
+grep -q '系统设置 → 键盘 → 输入法' "$TMP/needs-user.out" \
+    || { echo "error: status=2 的提示缺方向" >&2; exit 1; }
+
 FAKE_FAIL="$TMP/fake-launchctl-fail"
 write_fake_launchctl "$FAKE_FAIL" "1" "fake helper failed"
 if VERBA_PKG_APP="$APP" \
@@ -83,4 +96,4 @@ if VERBA_PKG_APP="$APP"     VERBA_PKG_CONSOLE_USER="$(id -un)"     VERBA_PKG_CON
 fi
 grep -q 'helper status=missing' "$TMP/no-status.out"
 
-echo "PASS: pkg postinstall helper 成功/失败/无状态路径"
+echo "PASS: pkg postinstall helper 成功/需用户确认/失败/无状态路径"
