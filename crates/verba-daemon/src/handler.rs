@@ -83,6 +83,8 @@ struct SessionEntry {
     turns: VecDeque<(String, String)>,
     /// 单调递增的使用序号：每次 append 更新；超出会话上限时逐出最小值（最久未用）。
     last_used: u64,
+    /// 重置代际：`//重置` 时 +1；in-flight 请求完成时只有代际仍匹配才允许写入。
+    generation: u64,
 }
 
 /// 会话历史存储：窗口级 `session_key` → 该窗口历史。不同窗口的 key 不同，
@@ -125,22 +127,50 @@ fn history_snapshot(
     history
 }
 
-/// 追加一轮 (user, assistant) 到某窗口，按 `context_turns` 截断到上限，并刷新
-/// 其 LRU 序号（`tick` 为单调递增源）。插入后若会话总数超限，逐出最久未用会话。
-fn history_append(
-    store: &mut SessionHistory,
-    session_key: &str,
-    user: String,
-    assistant: String,
-    context_turns: usize,
-    tick: u64,
-) {
+/// 读取窗口当前代际；不存在时按 0 处理（新会话）。
+fn history_generation(store: &SessionHistory, session_key: &str) -> u64 {
+    store.get(session_key).map(|e| e.generation).unwrap_or(0)
+}
+
+/// 重置窗口历史：清空轮次并递增代际。代际递增使重置前已经发出的 in-flight
+/// 请求在完成回写时被丢弃，而不是把旧上下文重新写回来；保留空条目也给
+/// `//会话` 一个稳定的当前槽位。
+fn history_reset(store: &mut SessionHistory, session_key: &str, tick: u64) {
     let entry = store
         .entry(session_key.to_owned())
         .or_insert_with(|| SessionEntry {
             turns: VecDeque::new(),
             last_used: 0,
+            generation: 0,
         });
+    entry.turns.clear();
+    entry.generation = entry.generation.saturating_add(1);
+    entry.last_used = tick;
+}
+
+/// 追加一轮 (user, assistant) 到某窗口，按 `context_turns` 截断到上限，并刷新
+/// 其 LRU 序号（`tick` 为单调递增源）。`generation` 是请求发起时捕获的代际；
+/// 若期间发生过 `//重置`，返回 false 并丢弃本轮，防止旧请求复活已清空的上下文。
+/// 插入后若会话总数超限，逐出最久未用会话。
+fn history_append(
+    store: &mut SessionHistory,
+    session_key: &str,
+    generation: u64,
+    user: String,
+    assistant: String,
+    context_turns: usize,
+    tick: u64,
+) -> bool {
+    let entry = store
+        .entry(session_key.to_owned())
+        .or_insert_with(|| SessionEntry {
+            turns: VecDeque::new(),
+            last_used: 0,
+            generation,
+        });
+    if entry.generation != generation {
+        return false;
+    }
     entry.turns.push_back(("user".to_owned(), user));
     entry.turns.push_back(("assistant".to_owned(), assistant));
     let max = context_turns * 2;
@@ -159,6 +189,7 @@ fn history_append(
             store.remove(&oldest);
         }
     }
+    true
 }
 
 /// 取消注册 RAII 守卫：函数任何退出路径（含 early-return）都移除注册，
@@ -365,8 +396,12 @@ impl DaemonHandler {
         let context_turns = self.config.read().unwrap().ai_context_turns.max(0) as usize;
         let trimmed = user_prompt.trim();
         if trimmed == "重置" || trimmed == "reset" {
-            // 只清当前窗口上下文（多会话隔离）。
-            self.history.lock().unwrap().remove(&session_key);
+            // 只清当前窗口上下文（多会话隔离），并递增代际让在途请求回写失效。
+            history_reset(
+                &mut self.history.lock().unwrap(),
+                &session_key,
+                HISTORY_TICK.fetch_add(1, Ordering::Relaxed),
+            );
             let _ = out
                 .event(&StreamEvent {
                     id,
@@ -457,9 +492,11 @@ impl DaemonHandler {
         }
         let has_image = image.is_some();
         let mut history = Vec::new();
+        let mut request_generation = 0;
         if !has_image && context_turns > 0 {
             let guard = self.history.lock().unwrap();
             history = history_snapshot(&guard, &session_key, context_turns);
+            request_generation = history_generation(&guard, &session_key);
         }
         // vision：请求携带图像时，若配置了独立 vision 模型则切换模型名。
         if image.is_some() {
@@ -545,14 +582,18 @@ impl DaemonHandler {
                     // 按会话分组（多会话隔离，架构审查会话维度）。
                     if !cancelled && !has_image && context_turns > 0 {
                         let mut guard = self.history.lock().unwrap();
-                        history_append(
+                        let appended = history_append(
                             &mut guard,
                             &session_key,
+                            request_generation,
                             user_prompt.clone(),
                             final_text.clone(),
                             context_turns,
                             HISTORY_TICK.fetch_add(1, Ordering::Relaxed),
                         );
+                        if !appended {
+                            log::info!("AI 回合在 //重置 后完成，丢弃历史写入: {session_key}");
+                        }
                     }
                 }
             }
@@ -1394,8 +1435,8 @@ mod tests {
     fn session_history_isolated_per_window_key() {
         // B4b：两个窗口各自累积上下文，互不可见
         let mut store = SessionHistory::new();
-        history_append(&mut store, "window:a", "u1".into(), "a1".into(), 4, 1);
-        history_append(&mut store, "window:b", "u2".into(), "a2".into(), 4, 2);
+        history_append(&mut store, "window:a", 0, "u1".into(), "a1".into(), 4, 1);
+        history_append(&mut store, "window:b", 0, "u2".into(), "a2".into(), 4, 2);
         let s1 = history_snapshot(&store, "window:a", 4);
         let s2 = history_snapshot(&store, "window:b", 4);
         assert_eq!(
@@ -1419,12 +1460,41 @@ mod tests {
     #[test]
     fn session_history_same_window_keeps_context() {
         let mut store = SessionHistory::new();
-        history_append(&mut store, "window:a", "u1".into(), "a1".into(), 4, 1);
-        history_append(&mut store, "window:a", "u2".into(), "a2".into(), 4, 2);
+        history_append(&mut store, "window:a", 0, "u1".into(), "a1".into(), 4, 1);
+        history_append(&mut store, "window:a", 0, "u2".into(), "a2".into(), 4, 2);
         let s = history_snapshot(&store, "window:a", 4);
         assert_eq!(s.len(), 4);
         assert_eq!(s[0], ("user".to_owned(), "u1".to_owned()));
         assert_eq!(s[3], ("assistant".to_owned(), "a2".to_owned()));
+    }
+
+    #[test]
+    fn session_history_reset_only_current_window() {
+        let mut store = SessionHistory::new();
+        history_append(&mut store, "window:a", 0, "u1".into(), "a1".into(), 4, 1);
+        history_append(&mut store, "window:b", 0, "u2".into(), "a2".into(), 4, 2);
+        history_reset(&mut store, "window:a", 3);
+        assert!(history_snapshot(&store, "window:a", 4).is_empty());
+        assert_eq!(history_snapshot(&store, "window:b", 4).len(), 2);
+    }
+
+    #[test]
+    fn session_history_reset_drops_inflight_old_generation() {
+        let mut store = SessionHistory::new();
+        history_append(&mut store, "window:a", 0, "u1".into(), "a1".into(), 4, 1);
+        let old_generation = history_generation(&store, "window:a");
+        history_reset(&mut store, "window:a", 2);
+        let appended = history_append(
+            &mut store,
+            "window:a",
+            old_generation,
+            "u2".into(),
+            "a2".into(),
+            4,
+            3,
+        );
+        assert!(!appended, "reset 前发出的请求不得复活历史");
+        assert!(history_snapshot(&store, "window:a", 4).is_empty());
     }
 
     #[test]
@@ -1435,6 +1505,7 @@ mod tests {
             history_append(
                 &mut store,
                 "window:a",
+                0,
                 format!("u{i}"),
                 format!("a{i}"),
                 2,
@@ -1443,6 +1514,7 @@ mod tests {
             history_append(
                 &mut store,
                 "window:b",
+                0,
                 format!("x{i}"),
                 format!("y{i}"),
                 2,
@@ -1470,6 +1542,7 @@ mod tests {
             history_append(
                 &mut store,
                 &key,
+                0,
                 format!("u{id}"),
                 format!("a{id}"),
                 2,
@@ -1481,6 +1554,7 @@ mod tests {
         history_append(
             &mut store,
             "window:new",
+            0,
             "new".into(),
             "new".into(),
             2,

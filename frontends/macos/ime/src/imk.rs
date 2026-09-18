@@ -11,6 +11,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, Once, OnceLock};
 
+use core_foundation::array::{CFArray, CFArrayRef};
+use core_foundation::base::{CFTypeRef, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryGetValue};
+use core_foundation::number::{CFNumber, CFNumberRef};
+use core_foundation::string::{CFString, CFStringRef};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{
@@ -258,28 +263,20 @@ fn alloc_session_id() -> u64 {
     ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
 }
 
-/// 组合 macOS 窗口级 session_key：优先包含 NSWindow.windowNumber（能拿到时），
-/// 否则退化为 client 对象指针；再加进程盐，避免 IME 重启后继承旧槽。
-fn compose_macos_session_key(
-    controller_id: u64,
-    client_key: usize,
-    window_number: Option<NSInteger>,
-) -> String {
-    match window_number {
-        Some(n) => format!(
-            "macos:{:08x}:{controller_id:x}:{client_key:x}:w{n}",
-            process_salt()
-        ),
-        None => format!(
-            "macos:{:08x}:{controller_id:x}:{client_key:x}",
-            process_salt()
-        ),
-    }
+/// 组合 macOS 窗口级 session_key：PID + CGWindowNumber。
+fn compose_macos_window_key(pid: i32, window_number: u32) -> String {
+    format!("macos:{:08x}:{pid}:w{window_number}", process_salt())
 }
 
-/// IMK client 通常是宿主文本控件/包装器；尽力取 `window.windowNumber` 作为
-/// 窗口身份。目标选择器不存在时返回 None，由 client 指针兜底。
-fn window_number_for_client(client: &AnyObject) -> Option<NSInteger> {
+/// 窗口身份不可得时的 controller 级 fallback：宁可拆分同一窗口的上下文，
+/// 也绝不使用可能复用的 client 指针去跨窗口共享历史。
+fn compose_macos_fallback_key(controller_id: u64) -> String {
+    format!("macos:{:08x}:session:{controller_id:x}", process_salt())
+}
+
+/// IMK client 的 windowNumber 路径（当前 _IPMDServerClientWrapperLegacy 通常
+/// 没有该 selector，保留为兼容快路径）。
+fn client_window_number(client: &AnyObject) -> Option<u32> {
     let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(window)] };
     if !responds.as_bool() {
         return None;
@@ -290,15 +287,100 @@ fn window_number_for_client(client: &AnyObject) -> Option<NSInteger> {
     if !responds_wn.as_bool() {
         return None;
     }
-    Some(unsafe { msg_send![&window, windowNumber] })
+    let n: NSInteger = unsafe { msg_send![&window, windowNumber] };
+    (n > 0).then_some(n as u32)
+}
+
+fn client_process_identifier(client: &AnyObject) -> Option<i32> {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(processIdentifier)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let pid: i32 = unsafe { msg_send![client, processIdentifier] };
+    (pid > 0).then_some(pid)
+}
+
+// CGWindowListCopyWindowInfo 与 key 常量（CoreGraphics）。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    static kCGWindowNumber: CFStringRef;
+    static kCGWindowLayer: CFStringRef;
+    static kCGWindowOwnerPID: CFStringRef;
+}
+
+/// 在无辅助功能权限下，用 CGWindowList 取该进程当前最前面的普通窗口。
+/// CGWindowList 顺序是从前到后；layer=0 排除候选面板/菜单等辅助窗口。
+fn cg_window_number_for_pid(pid: i32) -> Option<u32> {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0) };
+    if raw.is_null() {
+        return None;
+    }
+    let windows: CFArray<CFDictionary> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    let number_key = unsafe { CFString::wrap_under_get_rule(kCGWindowNumber) };
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    for dict in windows.iter() {
+        let raw_layer = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                layer_key.as_concrete_TypeRef() as CFTypeRef,
+            )
+        };
+        if raw_layer.is_null() {
+            continue;
+        }
+        let layer = unsafe { CFNumber::wrap_under_get_rule(raw_layer as CFNumberRef) };
+        if layer.to_i32() != Some(0) {
+            continue;
+        }
+        let raw_owner = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                pid_key.as_concrete_TypeRef() as CFTypeRef,
+            )
+        };
+        if raw_owner.is_null() {
+            continue;
+        }
+        let owner = unsafe { CFNumber::wrap_under_get_rule(raw_owner as CFNumberRef) };
+        if owner.to_i32() != Some(pid) {
+            continue;
+        }
+        let raw_number = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                number_key.as_concrete_TypeRef() as CFTypeRef,
+            )
+        };
+        if raw_number.is_null() {
+            continue;
+        }
+        let number = unsafe { CFNumber::wrap_under_get_rule(raw_number as CFNumberRef) };
+        if let Some(n) = number.to_i32() {
+            if n > 0 {
+                return Some(n as u32);
+            }
+        }
+    }
+    None
+}
+
+fn window_identity_for_client(client: &AnyObject) -> Option<(i32, u32)> {
+    let pid = client_process_identifier(client)?;
+    if let Some(window_number) = client_window_number(client) {
+        return Some((pid, window_number));
+    }
+    cg_window_number_for_pid(pid).map(|window_number| (pid, window_number))
 }
 
 fn session_key_for_client(client: &AnyObject, controller_id: u64) -> String {
-    compose_macos_session_key(
-        controller_id,
-        client as *const AnyObject as usize,
-        window_number_for_client(client),
-    )
+    match window_identity_for_client(client) {
+        Some((pid, window_number)) => compose_macos_window_key(pid, window_number),
+        None => compose_macos_fallback_key(controller_id),
+    }
 }
 
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
@@ -1539,8 +1621,12 @@ impl VerbaIMKController {
             // SAFETY: sender 是 IMK 会话客户端对象，保留以跨回调使用。
             let retained = unsafe { Retained::retain(s as *const AnyObject as *mut AnyObject) }
                 .expect("client 有效");
-            *self.ivars().session_key.borrow_mut() =
-                session_key_for_client(s, self.ivars().session_id.get());
+            let key = session_key_for_client(s, self.ivars().session_id.get());
+            let changed = *self.ivars().session_key.borrow() != key;
+            *self.ivars().session_key.borrow_mut() = key.clone();
+            if changed {
+                log::info!("[VerbaIMK] window session_key={key}");
+            }
             self.ivars().client.borrow_mut().replace(retained);
         }
     }
@@ -2690,19 +2776,17 @@ mod tests {
     }
 
     #[test]
-    fn macos_session_key_separates_clients_and_windows() {
-        let a = compose_macos_session_key(1, 0x1111, Some(1));
-        let b = compose_macos_session_key(1, 0x1111, Some(2));
-        let c = compose_macos_session_key(1, 0x2222, Some(1));
-        let d = compose_macos_session_key(2, 0x1111, Some(1));
-        assert_ne!(a, b, "同 client 不同 window 必须不同 key");
-        assert_ne!(a, c, "同 window 不同 client 必须不同 key");
-        assert_ne!(a, d, "不同 controller 必须不同 key");
+    fn macos_session_key_separates_windows_and_falls_back_per_session() {
+        let a = compose_macos_window_key(123, 1);
+        let b = compose_macos_window_key(123, 2);
+        let c = compose_macos_window_key(456, 1);
+        assert_ne!(a, b, "同进程不同窗口必须不同 key");
+        assert_ne!(a, c, "不同进程窗口必须不同 key");
         assert!(a.starts_with("macos:"));
         assert_ne!(
-            compose_macos_session_key(1, 0x1111, None),
-            compose_macos_session_key(1, 0x2222, None),
-            "无 windowNumber 时 client 指针仍须隔离"
+            compose_macos_fallback_key(1),
+            compose_macos_fallback_key(2),
+            "窗口身份不可得时至少按 controller 拆会话，不跨窗口复用"
         );
     }
 

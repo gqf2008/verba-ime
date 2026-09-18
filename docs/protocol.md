@@ -122,10 +122,13 @@ message Candidates {
   可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` / `eye_mode=vision` 使用。
   多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空当前窗口会话）。
   **`session_key`（field 9）**：窗口级稳定 key，daemon 优先按此分槽隔离；
-  macOS 由 IMK client/NSWindow.windowNumber 生成，Windows 由 TSF 活动视图 HWND 生成，
-  key 中包含宿主进程盐，避免 IME 重启后继承旧槽。空串表示回退到旧字段。
+  macOS 优先用 IMK client 的 PID + CGWindowNumber（无辅助功能权限），Windows 用
+  TSF 活动视图 HWND + context generation；两端的 key 都含宿主进程盐，避免 IME
+  重启后继承旧槽。窗口身份不可得时退化为 input-session/context 级 key，绝不回退到
+  service/controller 级共享槽。空串表示回退到旧字段。
   **`session_id`（field 8，兼容字段）**：旧客户端使用；daemon 在 `session_key` 为空时
-  归一化为 `legacy:{session_id}`，其中 `0` 仍表示旧客户端的共享槽。
+  归一化为 `legacy:{session_id}`，其中 `0` 仍表示旧客户端的共享槽。**旧 daemon 会忽略
+  field 9，只按 `session_id` 做 controller/service 级隔离；混版部署不具备窗口级语义。**
   daemon 侧 `SessionHistory` 按最终 key 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
