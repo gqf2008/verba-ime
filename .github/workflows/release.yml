@@ -94,6 +94,15 @@ jobs:
       - name: 逐二进制签名（hardened runtime + timestamp）
         if: env.IDENTITY != ''
         run: |
+          # 嵌套的设置 .app 必须**作为独立 bundle 先签**，再签外层——否则外层的
+          # 封条不覆盖它、公证会拒（"nested code is not signed"）。
+          SETTINGS_APP="frontends/macos/ime/dist/Verba.app/Contents/Library/Verba Settings.app"
+          if [ -d "$SETTINGS_APP" ]; then
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" \
+              "$SETTINGS_APP/Contents/MacOS/verba-settings"
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$SETTINGS_APP"
+            codesign --verify --strict --verbose=2 "$SETTINGS_APP"
+          fi
           # 公证前 bundle 内每个 Mach-O（含 rime/*.dylib）都必须带时间戳签名
           find frontends/macos/ime/dist/Verba.app/Contents/MacOS -type f \( -perm -111 -o -name "*.dylib" \) \
             -exec codesign --force --options runtime --timestamp --sign "$IDENTITY" {} \;

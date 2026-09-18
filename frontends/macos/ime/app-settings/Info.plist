@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>verba-settings</string>
+    <!-- 设置面板的身份独立于输入法本体：第 2 步把它搬到 /Applications 时
+         这个 id 不变，输入法菜单用 LaunchServices 按路径/此 id 打开同一份 app。 -->
+    <key>CFBundleIdentifier</key>
+    <string>dev.verba.settings</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Verba Settings</string>
+    <key>CFBundleDisplayName</key>
+    <string>拾言输入法 设置</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <!-- 版本由 package.sh 从根 Cargo.toml 注入（与输入法同一版本源）。 -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- 有窗口的普通 app：不设 LSUIElement，才能被 LaunchServices 激活到前台。 -->
+</dict>
+</plist>

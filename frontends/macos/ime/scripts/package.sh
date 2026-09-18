@@ -23,7 +23,6 @@ mkdir -p "$APP/Contents/MacOS"
 
 cp "$IME_ROOT/target/release/verba-mac" "$APP/Contents/MacOS/verba-mac"
 cp "$REPO_ROOT/target/release/verba-daemon" "$APP/Contents/MacOS/verba-daemon"
-cp "$REPO_ROOT/target/release/verba-settings" "$APP/Contents/MacOS/verba-settings"
 # 触发工具（issue #82 跨平台统一）：选区截图/录音/TTS 播放的共享 CLI，
 # `///` 选区 OCR 由 verba-mac spawn 本进程完成；随 bundle 分发、
 # 由 release.yml 的逐二进制签名循环覆盖。
@@ -49,6 +48,19 @@ fi
 PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST"
+
+# 设置面板组装成**真正的 .app**（嵌在 Contents/Library 下）。
+# 为什么不是裸二进制：输入法菜单若直接 spawn 二进制，不走 LaunchServices ——
+# 窗口不起到前台、还会开出多个实例（2026-09-18 真机实测）。包成 .app 后
+# 菜单用 `open` 打开它，即单实例 + 正确激活；第 2 步（搬到 /Applications）
+# 也是同一份 .app 换个位置。
+SETTINGS_APP="$APP/Contents/Library/Verba Settings.app"
+mkdir -p "$SETTINGS_APP/Contents/MacOS"
+cp "$REPO_ROOT/target/release/verba-settings" "$SETTINGS_APP/Contents/MacOS/verba-settings"
+cp "$IME_ROOT/app-settings/Info.plist" "$SETTINGS_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$SETTINGS_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$SETTINGS_APP/Contents/Info.plist"
+echo "已组装设置面板: $SETTINGS_APP (v$VERSION)"
 
 # 可选：捆绑 Rime（librime.dylib + data/），daemon 从 $APP/Contents/MacOS/rime/ 加载。
 # 缺失时 daemon 日志会报 librime 加载失败，可用 VERBA_RIME_DYLIB/SHARED/USER 指向外部。
