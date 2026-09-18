@@ -18,6 +18,7 @@ use verba_core::machine::{
     MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
+use verba_ipc::LlmSession;
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -1573,6 +1574,33 @@ fn start_llm(
     start_llm_with_system(data, &prompt, None, eye_rect, use_vision)
 }
 
+/// 组合 Windows 窗口级 session_key：进程盐隔离不同宿主进程，HWND 隔离同进程
+/// 内不同窗口。thread id 不参与——同一窗口的 TSF 调用可来自不同工作线程，
+/// 参与反而会把同一窗口拆成多份上下文。
+fn compose_windows_session_key(service_id: u64, hwnd_value: usize) -> String {
+    format!(
+        "windows:{:08x}:{service_id:x}:{hwnd_value:x}",
+        process_salt()
+    )
+}
+
+/// 从当前 TSF context 取活动视图 HWND；拿不到时返回 None，由旧 session_id
+/// fallback 保证请求仍能发出。
+fn current_window_session_key(data: &TextServiceData) -> Option<String> {
+    let context = data.context.borrow().as_ref().cloned()?;
+    // SAFETY: context 为当前 TSF 输入上下文；GetActiveView 是标准 COM 调用，失败返回 Err。
+    let view: ITfContextView = unsafe { context.GetActiveView().ok()? };
+    // SAFETY: view 为当前 TSF 活动视图；GetWnd 是标准 COM 调用，失败返回 Err。
+    let hwnd = unsafe { view.GetWnd().ok()? };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    Some(compose_windows_session_key(
+        data.session_id.get(),
+        hwnd.0 as usize,
+    ))
+}
+
 /// start_llm 的系统提示词可注入变体（改写管道用）。
 fn start_llm_with_system(
     data: &Rc<TextServiceData>,
@@ -1586,6 +1614,7 @@ fn start_llm_with_system(
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
     let session_id = data.session_id.get();
+    let session_key = current_window_session_key(data);
     // 新流代际必须在发起线程（spawn 之前）领取：在 worker 内领取时，两个快速
     // 连续的 start_llm 的 epoch 顺序由 OS 线程调度决定，可能新旧颠倒——
     // on_timer 过滤会丢弃当前流、放行已作废流（复审 V6，P2-2 回归）。
@@ -1628,14 +1657,12 @@ fn start_llm_with_system(
         }
 
         let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
-        let id = match client.llm_start(
-            &prompt,
-            system.as_deref(),
-            None,
-            None,
-            image_ref,
-            session_id,
-        ) {
+        let session = match session_key.as_deref() {
+            Some(key) if !key.is_empty() => LlmSession::window(session_id, key),
+            _ => LlmSession::legacy(session_id),
+        };
+        let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref, session)
+        {
             Ok(id) => id,
             Err(e) => {
                 push_chunk(&chunks, epoch, error_event(&format!("LLM 启动失败: {e}")));
@@ -2584,6 +2611,17 @@ mod tests {
         assert_eq!(trigger_kind_for_hotkey_vk(0x4D), None, "M 热键已移除");
         // 其他键不在热键集合
         assert_eq!(trigger_kind_for_hotkey_vk(VK_UP.0 as u32), None);
+    }
+
+    #[test]
+    fn windows_session_key_separates_windows_and_carries_process_salt() {
+        let a = compose_windows_session_key(1, 0x1111);
+        let b = compose_windows_session_key(1, 0x2222);
+        let c = compose_windows_session_key(2, 0x1111);
+        assert_ne!(a, b, "不同 HWND 必须不同 key");
+        assert_ne!(a, c, "不同 TextService 实例必须不同 key");
+        assert!(a.starts_with("windows:"));
+        assert!(a.contains(&format!("{:08x}", process_salt())));
     }
 
     #[test]

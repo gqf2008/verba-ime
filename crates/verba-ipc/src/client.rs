@@ -35,6 +35,24 @@ use crate::name::default_socket_spec;
 #[cfg(unix)]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// LLM 会话标识：`id` 为旧版兼容槽，`key` 为窗口级稳定 key。
+/// `key` 非空时 daemon 优先按它隔离多轮上下文。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LlmSession<'a> {
+    pub id: u64,
+    pub key: Option<&'a str>,
+}
+
+impl<'a> LlmSession<'a> {
+    pub const fn legacy(id: u64) -> Self {
+        Self { id, key: None }
+    }
+
+    pub const fn window(id: u64, key: &'a str) -> Self {
+        Self { id, key: Some(key) }
+    }
+}
+
 /// 连接等待策略。
 ///
 /// 注意：Windows 命名管道对「目标管道不存在」总是立即报错，
@@ -129,8 +147,7 @@ impl VerbaClient {
 
     /// 发起 LLM 流式生成，返回请求 id；服务端以 Ok 确认后开始推送事件。
     ///
-    /// `session_id`：多轮上下文会话标识（每控制器/前端生成唯一值；0 = 旧客户端
-    /// 默认共享槽）。服务端按此分组 AI 历史，实现多会话上下文隔离（架构审查会话维度）。
+    /// `session`：旧版 `id` 与窗口级 `key`；`key` 非空时服务端优先使用它隔离 AI 历史。
     pub fn llm_start(
         &mut self,
         prompt: &str,
@@ -138,7 +155,7 @@ impl VerbaClient {
         temperature: Option<f32>,
         max_tokens: Option<i32>,
         image: Option<(&str, &[u8])>,
-        session_id: u64,
+        session: LlmSession<'_>,
     ) -> Result<u64, IpcError> {
         let id = self.new_id();
         let req = Request {
@@ -151,7 +168,8 @@ impl VerbaClient {
                 stream: true,
                 image: image.map(|(_, data)| data.to_vec()),
                 image_mime: image.map(|(mime, _)| mime.to_owned()),
-                session_id,
+                session_id: session.id,
+                session_key: session.key.unwrap_or_default().to_owned(),
             })),
         };
         self.write_request(&req)?;

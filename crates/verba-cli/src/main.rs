@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use verba_ipc::{IpcError, VerbaClient};
+use verba_ipc::{IpcError, LlmSession, VerbaClient};
 use verba_protos::stream_event;
 
 fn main() {
@@ -143,7 +143,7 @@ fn cmd_ai(args: &[String]) -> i32 {
     }
     let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
     with_client(|c| {
-        let id = c.llm_start(&prompt, None, None, None, image_ref, 0)?;
+        let id = c.llm_start(&prompt, None, None, None, image_ref, LlmSession::legacy(0))?;
         let mut any_chunk = false;
         loop {
             let evt = c.next_event(id)?;

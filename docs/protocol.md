@@ -120,11 +120,13 @@ message Candidates {
 - **OcrImage**：支持 `bytes`（剪贴板 / 截图）或 `file_ref`（临时文件路径，避免大包传输；临时文件由请求方负责清理）。
 - **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）；
   可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` / `eye_mode=vision` 使用。
-  多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空本轮会话）。
-  **`session_id`（field 8）**：多轮上下文按此分组隔离，每控制器/前端生成唯一值
-  （Windows/macOS 均为「进程盐 << 32 | 进程内自增序号」，IME 重启后不撞 daemon 侧残留历史槽）。
-  `0` = 旧客户端/未分配的默认共享槽（向后兼容，行为同隔离前的单一全局历史）。
-  daemon 侧 `SessionHistory` 按 `session_id` 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
+  多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空当前窗口会话）。
+  **`session_key`（field 9）**：窗口级稳定 key，daemon 优先按此分槽隔离；
+  macOS 由 IMK client/NSWindow.windowNumber 生成，Windows 由 TSF 活动视图 HWND 生成，
+  key 中包含宿主进程盐，避免 IME 重启后继承旧槽。空串表示回退到旧字段。
+  **`session_id`（field 8，兼容字段）**：旧客户端使用；daemon 在 `session_key` 为空时
+  归一化为 `legacy:{session_id}`，其中 `0` 仍表示旧客户端的共享槽。
+  daemon 侧 `SessionHistory` 按最终 key 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：前端把拼音/五笔码发到 daemon，daemon 内 librime（单引擎）

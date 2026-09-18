@@ -51,9 +51,12 @@ message LlmGenerate {
   // 多模态图像（vision）：mime 如 image/png，字节内容。
   optional bytes image = 6;
   optional string image_mime = 7;
-  // 会话标识：多轮上下文按此分组隔离（每控制器/前端生成唯一值）。
-  // 0 = 旧客户端/未分配的默认共享槽（向后兼容，行为同修复前的单一全局历史）。
+  // 旧版会话标识（兼容字段）：多轮上下文按此分组隔离。
+  // 0 = 旧客户端/未分配的默认共享槽；新客户端应优先填 session_key。
   uint64 session_id = 8;
+  // 窗口级会话标识：优先于 session_id；空串表示回退到 legacy:{session_id}。
+  // 由前端按“应用 + 窗口”生成稳定 key，daemon 按此隔离多轮上下文。
+  string session_key = 9;
 }
 
 message LlmCancel {}

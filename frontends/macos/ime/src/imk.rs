@@ -36,6 +36,7 @@ use verba_core::machine::{
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
+use verba_ipc::LlmSession;
 use verba_protos::{stream_event, StreamEvent};
 
 use crate::ipc;
@@ -255,6 +256,49 @@ fn process_salt() -> u32 {
 fn alloc_session_id() -> u64 {
     let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
     ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
+}
+
+/// 组合 macOS 窗口级 session_key：优先包含 NSWindow.windowNumber（能拿到时），
+/// 否则退化为 client 对象指针；再加进程盐，避免 IME 重启后继承旧槽。
+fn compose_macos_session_key(
+    controller_id: u64,
+    client_key: usize,
+    window_number: Option<NSInteger>,
+) -> String {
+    match window_number {
+        Some(n) => format!(
+            "macos:{:08x}:{controller_id:x}:{client_key:x}:w{n}",
+            process_salt()
+        ),
+        None => format!(
+            "macos:{:08x}:{controller_id:x}:{client_key:x}",
+            process_salt()
+        ),
+    }
+}
+
+/// IMK client 通常是宿主文本控件/包装器；尽力取 `window.windowNumber` 作为
+/// 窗口身份。目标选择器不存在时返回 None，由 client 指针兜底。
+fn window_number_for_client(client: &AnyObject) -> Option<NSInteger> {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(window)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let window: Option<Retained<AnyObject>> = unsafe { msg_send![client, window] };
+    let window = window?;
+    let responds_wn: Bool = unsafe { msg_send![&window, respondsToSelector: sel!(windowNumber)] };
+    if !responds_wn.as_bool() {
+        return None;
+    }
+    Some(unsafe { msg_send![&window, windowNumber] })
+}
+
+fn session_key_for_client(client: &AnyObject, controller_id: u64) -> String {
+    compose_macos_session_key(
+        controller_id,
+        client as *const AnyObject as usize,
+        window_number_for_client(client),
+    )
 }
 
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
@@ -587,9 +631,11 @@ struct Ivars {
     /// 按此集合在 drain 丢弃，防全局队列无界滞留（复审 V7）。有界
     /// （DEAD_SEQ_MAX = 256 条）：更早的序号其 worker 早已退出、无在途事件。
     dead_seqs: RefCell<VecDeque<u64>>,
-    /// 本控制器的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按此
-    /// 隔离历史：多文本域（多应用）各自独立多轮，互不串上下文（B4b）。
+    /// 本控制器的旧版 AI 会话 id（兼容 fallback；daemon 无 session_key 时使用）。
     session_id: Cell<u64>,
+    /// 当前窗口级 AI 会话 key：set_client 时按 IMK client/NSWindow 刷新。
+    /// daemon 优先按它隔离多轮上下文，窗口切回时复用同一槽。
+    session_key: RefCell<String>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -628,6 +674,7 @@ impl Default for Ivars {
             active_candidates: Cell::new(0),
             dead_seqs: RefCell::new(VecDeque::new()),
             session_id: Cell::new(alloc_session_id()),
+            session_key: RefCell::new(String::new()),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
             candidates_ui: RefCell::new(None),
@@ -1492,6 +1539,8 @@ impl VerbaIMKController {
             // SAFETY: sender 是 IMK 会话客户端对象，保留以跨回调使用。
             let retained = unsafe { Retained::retain(s as *const AnyObject as *mut AnyObject) }
                 .expect("client 有效");
+            *self.ivars().session_key.borrow_mut() =
+                session_key_for_client(s, self.ivars().session_id.get());
             self.ivars().client.borrow_mut().replace(retained);
         }
     }
@@ -2135,6 +2184,7 @@ impl VerbaIMKController {
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
         let session_id = self.ivars().session_id.get();
+        let session_key = self.ivars().session_key.borrow().clone();
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
@@ -2146,15 +2196,19 @@ impl VerbaIMKController {
                     return;
                 }
             };
-            let id =
-                match client.llm_start(&prompt, system.as_deref(), None, None, None, session_id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
-                        cancelled_seqs().lock().unwrap().remove(&seq);
-                        return;
-                    }
-                };
+            let session = if session_key.is_empty() {
+                LlmSession::legacy(session_id)
+            } else {
+                LlmSession::window(session_id, &session_key)
+            };
+            let id = match client.llm_start(&prompt, system.as_deref(), None, None, None, session) {
+                Ok(id) => id,
+                Err(e) => {
+                    push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
+                    cancelled_seqs().lock().unwrap().remove(&seq);
+                    return;
+                }
+            };
             daemon_ids().lock().unwrap().insert(seq, id);
             // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
             // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
@@ -2633,6 +2687,23 @@ mod tests {
         assert!(!is_pasteable_char('\u{3}'));
         assert!(!is_pasteable_char('\u{F702}'));
         assert!(!is_pasteable_char('\u{F8FF}'));
+    }
+
+    #[test]
+    fn macos_session_key_separates_clients_and_windows() {
+        let a = compose_macos_session_key(1, 0x1111, Some(1));
+        let b = compose_macos_session_key(1, 0x1111, Some(2));
+        let c = compose_macos_session_key(1, 0x2222, Some(1));
+        let d = compose_macos_session_key(2, 0x1111, Some(1));
+        assert_ne!(a, b, "同 client 不同 window 必须不同 key");
+        assert_ne!(a, c, "同 window 不同 client 必须不同 key");
+        assert_ne!(a, d, "不同 controller 必须不同 key");
+        assert!(a.starts_with("macos:"));
+        assert_ne!(
+            compose_macos_session_key(1, 0x1111, None),
+            compose_macos_session_key(1, 0x2222, None),
+            "无 windowNumber 时 client 指针仍须隔离"
+        );
     }
 
     #[test]

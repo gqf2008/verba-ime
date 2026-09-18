@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use verba_ipc::server::{serve, Outbound, RequestHandler};
-use verba_ipc::{ConnectWait, VerbaClient};
+use verba_ipc::{ConnectWait, LlmSession, VerbaClient};
 use verba_protos::{
     request, response, stream_event, Chunk, Error as ProtoError, Final, LlmGenerate, Ok as OkMsg,
     Pong, Request, Response, StreamEvent,
@@ -139,7 +139,7 @@ async fn llm_stream_roundtrip() {
 
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let id = client
-        .llm_start("你好", None, None, None, None, 0)
+        .llm_start("你好", None, None, None, None, LlmSession::legacy(0))
         .expect("llm_start");
     let mut parts = Vec::new();
     loop {
@@ -226,7 +226,14 @@ async fn llm_vision_image_roundtrip() {
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let img = b"\x89PNG fake vision bytes".to_vec();
     let id = client
-        .llm_start("看图", None, None, None, Some(("image/png", &img)), 0)
+        .llm_start(
+            "看图",
+            None,
+            None,
+            None,
+            Some(("image/png", &img)),
+            LlmSession::window(0, "window:vision"),
+        )
         .expect("llm_start image");
     loop {
         let evt = client.next_event(id).expect("next_event");
@@ -244,6 +251,7 @@ async fn llm_vision_image_roundtrip() {
         .expect("handler 应收到 LlmGenerate");
     assert_eq!(got.image.as_deref(), Some(img.as_slice()));
     assert_eq!(got.image_mime.as_deref(), Some("image/png"));
+    assert_eq!(got.session_key, "window:vision");
 }
 
 /// 捕获 LlmCancel 请求 id 的 handler：验证取消请求命中原始目标 id。
@@ -303,7 +311,7 @@ async fn llm_cancel_uses_target_request_id() {
 
     let mut client = connect_with_retry(&name, Duration::from_secs(5));
     let target = client
-        .llm_start("你好", None, None, None, None, 0)
+        .llm_start("你好", None, None, None, None, LlmSession::legacy(0))
         .expect("llm_start");
     client.llm_cancel(target).expect("llm_cancel 成功");
 
