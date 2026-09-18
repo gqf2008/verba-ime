@@ -65,7 +65,7 @@
   - [x] **mock**（确定性，2026-08-23：`verba-ocr` crate + IPC `OcrRecognize` + daemon 路由 + `verba-cli ocr`）
   - [x] **Windows.Media.Ocr**（2026-08-23 实机验证：英文识别 OK；中文需装 OCR 语言包，代码优先 zh-Hans-CN 并有回退）
   - [x] **rapid（本地 RapidOCR/PaddleOCR PP-OCRv4）**（2026-08-23：`verba-ocr::rapid`，原生 Rust ONNX（`ort`/`rapidocr-core`，PP-OCRv5 中文 mobile；MSVC 编译，模型自动下载，无 Python），中文实测正确；本机 GNU 工具链无 `ort` 预编译故走子进程；`ocr_provider=rapid` + `ocr_rapid_python`/自动探测 venv）
-  - [x] **多模态 vision（`//看图`）**（2026-08-23：`LlmRequest.image` + IPC `image/image_mime` + daemon 透传 + OpenAI 兼容 `image_url`；`eye_mode=vision` 直接把眼睛区域发图给 LLM）
+  - [x] **多模态 vision（`//看图`）**（2026-08-23：`LlmRequest.image` + IPC `image/image_mime` + daemon 透传 + OpenAI 兼容 `image_url`；`eye_mode=vision` 直接把眼睛区域发图给 LLM）（`eye_mode` / `llm_vision_model` 配置键已于 2026-09-18 移除，见下表本日条目）
   - [x] **眼睛区域按光标智能取屏**（2026-08-23：复用候选窗工作区避让逻辑，默认上方、放不下翻下方/贴边）
 - [ ] 截图链路：权限、选区、预览、OCR 结果上屏
   - [x] **触发能力地基**（2026-08-23：`verba-trigger` 全屏截图→BMP→daemon OCR 端到端实机验证，Windows.Media.Ocr 真识别）
@@ -190,3 +190,4 @@
 | 2026-09-18 | v0.2.20 发布准备：版本号统一 0.2.20（lock 只改自家 crate）。随版内容：**预览槽加固**——`rewrite_previewing()` 收紧为「槽在且 state==ResultReady」（残留槽不得劫持确认键）、`begin_rewrite_preview` 非法/迟到武装一律拒绝并返回 bool（前端仅在成功时写镜像槽/弹对照窗）、`begin_ocr_preview` 接手清对照残留槽、`on_llm_error` 只接管 LLM 界面态不再把 Idle/OCR 抢成 Failed；新增穷举不变量守卫 `tests/preview_state_invariants.rs`（`d1abafc`/`af44fa3`）。 |
 | 2026-09-18 | v0.2.19 已发布（tag 指向 `7141f42`，Build & Release run `35332177684` 四 job 全绿；DMG/PKG/EXE/SHA256SUMS 齐全、SHA256 与 Release digest 一致、DMG staple 有效且 `spctl` = Notarized Developer ID）。本机装后 HID 冒烟通过（`nihao`+空格 → `commit text=你好`）；「启动/首次激活后第一次候选不上屏」的真机确认以用户日常使用为准。 |
 | 2026-09-18 | v0.2.20 已发布（tag 指向 `47738c9`，Build & Release run `35337586936` 四 job 全绿；资产齐全、SHA256 一致、DMG staple 有效且 `spctl` = Notarized Developer ID）。随版为**预览槽加固**（见上一行）。本机已装 v0.2.20（IME + `/Applications/Verba 设置.app`）。该批经**两轮独立审查**：第一轮 needs-changes（指出「归一状态」会把惰性残留槽变成活跃预览）→ 整改为「非法/迟到武装一律拒绝」→ 第二轮 approve。同批完成**窗口级 AI 记忆真机验收**：macOS 由 IPC 探针证明按 `session_key` 分槽、A/B 窗口隔离、`//重置` 只清当前 key，前端日志证明同窗口复用 `w<id>`、不同窗口不同 key、身份不可得走 `ephemeral`；Windows 按用户 2026-09-18 晚口径「输入法没有问题」记一般使用验收通过（双窗口 HWND 隔离、`GetWnd` 失败回退、focus 切换、`//重置` 四条细项未逐条举证）。 |
+| 2026-09-18 | 设置页收敛多模态入口（`ad635b2` + 审查整改 `ed05e02`）：移除「多模态（OCR / Vision）」分组与 `llm_vision_model` / `eye_mode` 配置键；内置 OCR 默认 rapid，普通 `//` 的眼睛区域固定走内置 OCR，仅 `//看图` 走当前 LLM vision（当前 Windows 接入）；旧 `ocr_provider=mock` 启动时迁移为 rapid；图片请求被服务端拒绝时结果浮层显示可执行提示（换视觉模型或改用 `//截图`）。 |

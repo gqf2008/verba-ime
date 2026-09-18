@@ -152,9 +152,9 @@ export component SettingsWindow inherits Window {
                     VerticalBox {
                         padding: 8px;
                         spacing: 4px;
-                        Text { text: "LLM / 在线 OCR 会把文本发送到你配置的远程服务商。"; wrap: word-wrap; }
+                        Text { text: "LLM 与 `//看图` 会把文本/图片发送到你配置的远程服务商。"; wrap: word-wrap; }
                         Text { text: "API Key 存入系统密钥库（keyring），config.toml 不保存明文。"; wrap: word-wrap; }
-                        Text { text: "mock / windows OCR 等本地 provider 不联网。"; wrap: word-wrap; }
+                        Text { text: "内置 OCR 在本地运行，不联网。"; wrap: word-wrap; }
                     }
                 }
             }

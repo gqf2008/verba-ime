@@ -121,6 +121,13 @@ try {
     Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + ocr=rapid + tts/asr=mock + 在线端点清空）"
 }
 finally {
+    # 成功/失败都尽力恢复内置 OCR 默认，避免把 mock 留在用户配置里；
+    # daemon 在跑才能走 IPC，失败时忽略（下次 daemon 启动仍有迁移兜底）。
+    try {
+        if ($daemon -ne $null -and -not $daemon.HasExited) {
+            & $cli config set rime_schema=luna_pinyin_simp tts_provider=mock ocr_provider=rapid asr_provider=mock tts_base_url= tts_voice= asr_base_url= 2>$null | Out-Null
+        }
+    } catch { }
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
     Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
     Get-Process | Where-Object { $_.ProcessName -match 'verba|cargo' } | Stop-Process -Force -ErrorAction SilentlyContinue

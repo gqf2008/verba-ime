@@ -784,13 +784,23 @@ const CAPS_OWE_CLEAR_MARKED: u8 = 1 << 1;
 /// 提交永远取 core 的全文（显示截断、提交取全文）。
 const AI_RESULT_DISPLAY_CHARS: usize = 40;
 
+/// 失败态的正文通常是可执行错误（换模型 / 改用 //截图 + 服务端原始错误），
+/// 40 字会把关键部分截掉；失败态单独放宽，仍只影响显示、不改变提交/重试语义。
+const AI_FAILURE_DISPLAY_CHARS: usize = 200;
+
 /// AI 结果面板条目（纯函数，供单测）：截断结果 + 阶段提示两条；空结果
-/// （失败于首块前）只剩提示一条。
+/// （失败于首块前）只剩提示一条。失败态用更宽的截断上限，保证可执行提示
+/// 与原始错误可见。
 fn ai_result_display_items(text: &str, phase: ResultPhase) -> Vec<String> {
     let mut items: Vec<String> = Vec::new();
     if !text.is_empty() {
-        let mut disp: String = text.chars().take(AI_RESULT_DISPLAY_CHARS).collect();
-        if text.chars().count() > AI_RESULT_DISPLAY_CHARS {
+        let limit = if phase == ResultPhase::Failed {
+            AI_FAILURE_DISPLAY_CHARS
+        } else {
+            AI_RESULT_DISPLAY_CHARS
+        };
+        let mut disp: String = text.chars().take(limit).collect();
+        if text.chars().count() > limit {
             disp.push('…');
         }
         items.push(disp);
@@ -2971,6 +2981,18 @@ mod tests {
     /// #89 结果浮层面板条目：显示截断（上限+省略号）、空结果只剩提示、
     /// 短文本原样。「提交取全文」的一半由 core 的 feed_enter →
     /// CommitResult(全文) 测试钉住——显示截断只属于面板。
+    #[test]
+    fn ai_result_display_items_keep_failure_actionable_hint() {
+        let hint = "当前模型 `deepseek-flash` 拒绝了图片输入（HTTP 400）。若该模型不支持视觉，请在「设置 → LLM」换用支持图片输入的模型，或改用 `//截图` 走内置 OCR。\n服务端返回：HTTP 400: model does not support image input";
+        let items = ai_result_display_items(hint, ResultPhase::Failed);
+        assert!(items[0].contains("//截图"), "失败提示必须保留可执行动作");
+        assert!(
+            items[0].contains("model does not support image input"),
+            "失败提示必须保留服务端原始错误"
+        );
+        assert_eq!(items[1], result_hint(ResultPhase::Failed));
+    }
+
     #[test]
     fn ai_result_display_items_truncate_and_hint() {
         let items = ai_result_display_items(&"字".repeat(60), ResultPhase::Ready);

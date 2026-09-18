@@ -232,15 +232,24 @@ fn parse_sse(data: &str) -> Result<Option<String>, LlmError> {
         let msg = err
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .or_else(|| err.as_str())
-            .unwrap_or("服务端返回未知错误");
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| err.to_string());
         return Err(LlmError::Stream(format!("服务端流式错误: {msg}")));
     }
-    if value.get("choices").is_none() {
-        if let Some(msg) = value.get("message").and_then(serde_json::Value::as_str) {
-            if !msg.is_empty() {
-                return Err(LlmError::Stream(format!("服务端流式错误: {msg}")));
-            }
+    // choices 缺失 / null / 空数组都视为“没有正常增量”；此时若有顶层
+    // message，按流错误处理，避免 {"message":"...","choices":[]} 被吞成空 Final。
+    let choices_empty = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if choices_empty {
+        if let Some(msg) = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.is_empty())
+        {
+            return Err(LlmError::Stream(format!("服务端流式错误: {msg}")));
         }
     }
     let content = value
@@ -454,6 +463,23 @@ mod tests {
         }
         let msg = parse_sse(r#"{"message":"invalid image_url"}"#).unwrap_err();
         assert!(matches!(msg, LlmError::Stream(_)));
+
+        // choices 为 [] / null 时，顶层 message 仍是错误（不能吞成空 Final）。
+        for payload in [
+            r#"{"message":"model does not support image input","choices":[]}"#,
+            r#"{"message":"model does not support image input","choices":null}"#,
+        ] {
+            match parse_sse(payload).unwrap_err() {
+                LlmError::Stream(msg) => assert!(msg.contains("does not support image input")),
+                other => panic!("期望 Stream 错误，得到 {other:?}"),
+            }
+        }
+
+        // error object 没有 message 时，保留完整 error JSON 作为详情。
+        match parse_sse(r#"{"error":{"code":"invalid_image"}}"#).unwrap_err() {
+            LlmError::Stream(msg) => assert!(msg.contains("invalid_image")),
+            other => panic!("期望 Stream 错误，得到 {other:?}"),
+        }
     }
 
     #[test]
