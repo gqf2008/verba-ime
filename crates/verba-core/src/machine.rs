@@ -956,10 +956,11 @@ impl CompositionMachine {
     /// Esc。
     ///
     /// Idle 也走 `clear_composition_state`：预览槽（rewrite/ocr/ai）与主状态
-    /// 解耦，Idle 仍可能残留预览——改写流结果为空时 `begin_rewrite_preview`
-    /// 会在 Idle 上武装对照预览；OCR 预览退出（feed_ocr_preview 的
-    /// Digit2/Other 臂、end_ocr_preview）也把 state 置回 Idle 而**不清**
-    /// rewrite_preview。前端 activate/deactivate 又以本函数作为会话归零
+    /// 解耦，Idle 仍可能残留预览。现有实现已从源头收紧（`begin_rewrite_preview`
+    /// 只在 ResultReady 接受、非法武装一律拒绝；`rewrite_previewing` 也要求
+    /// 状态一致），但归零原语仍必须对**任意来源**的残留负责——历史形态、
+    /// 异常事件序、后续再引入的写点都可能留下它。前端 activate/deactivate
+    /// 以本函数作为会话归零
     /// 原语（reset()），Idle 直接返回会让粘滞预览跨会话存活：下一会话首个
     /// 空格/回车/1/2 被 input_text 的 rewrite_previewing 门误路由到
     /// feed_rewrite_preview，上屏陈旧（本例为空）文本并丢弃刚输入的拼音。
@@ -1283,6 +1284,9 @@ impl CompositionMachine {
         {
             return None;
         }
+        // 预览槽互斥：OCR 预览接手即丢弃对照预览槽。两槽并存时 OCR 退出臂
+        // 只清自己那半边，对照槽会以「主状态已 Idle、槽还在」的形态残留。
+        self.rewrite_preview = None;
         self.state = MachineState::OcrPreviewing;
         self.ocr_preview = Some(text.clone());
         self.ocr_preview_deadline = Some(Instant::now() + OCR_PREVIEW_TTL);
@@ -1349,14 +1353,40 @@ impl CompositionMachine {
 
     /// 改写对照预览：进入（流完成时前端调用）。
     /// 期间 Esc/Enter/空格/数字路由由 feed_rewrite_preview 处理。
-    pub fn begin_rewrite_preview(&mut self, rewritten: String, source: String) {
+    pub fn begin_rewrite_preview(&mut self, rewritten: String, source: String) -> bool {
+        // **只有结果就绪态接受**配对预览，返回是否武装成功。
+        //
+        // 其余状态（Idle/Prompt/OcrPreviewing/…）说明这是一次非法的或迟到的
+        // `RewriteReady`——core 已经从那一步走开了。此时必须**原样丢弃**：
+        // 既不能留槽（残留槽会吞键），也不能把状态强行改成 ResultReady
+        // （那等于把惰性陈旧槽变成活跃预览，继续吞掉下一个 空格/回车/1/2 并
+        // 上屏陈旧文本——正是真机 2026-09-18「启动/首次激活后第一次 nihao
+        // 选候选不上屏」的形态）。前端只在返回 true 时才写自己的镜像槽并刷新
+        // 候选窗。
+        if self.state != MachineState::ResultReady {
+            return false;
+        }
         self.rewrite_preview = Some((rewritten, source));
         // 结果浮层与对照预览互斥：对照预览接管按键路由，浮层态撤销。
         self.ai_preview = None;
+        // 此处 state 必为 ResultReady，OCR 预览不可能在使用中；槽位若有值
+        // 即残留，顺手清掉（不会造出 OcrPreviewing + 空槽的第三种形态）。
+        self.ocr_preview = None;
+        self.ocr_preview_deadline = None;
+        true
     }
 
+    /// 对照预览是否**活跃**。
+    ///
+    /// 必须同时看主状态：`rewrite_preview` 只是武装槽，真正生效的态是
+    /// `ResultReady`（前端拦截门与 Windows 侧注释都按 ResultReady 写）。
+    /// 历史实现只看槽位存在，于是任何残留槽——在非 ResultReady 态被武装、
+    /// 事件序异常、旧版本遗留——都会在 Idle 上继续吞掉下一个 空格/回车/1/2
+    /// 并上屏陈旧文本。真机 2026-09-18「启动/首次激活后第一次 nihao 选候选
+    /// 不上屏」正是此形态（日志：`改写预览键: Space` + `commit text=` 空串）。
+    /// 收紧后残留槽至多是惰性数据，由 clear_composition_state/feed_escape 回收。
     pub fn rewrite_previewing(&self) -> bool {
-        self.rewrite_preview.is_some()
+        self.rewrite_preview.is_some() && self.state == MachineState::ResultReady
     }
 
     /// 对照预览按键：1/Enter/空格=改写结果上屏；2=原文上屏；Esc 全取消；
@@ -1497,15 +1527,38 @@ impl CompositionMachine {
     /// 已被 take，此处无需也不得再清。
     pub fn on_llm_error(&mut self, message: &str) -> Action {
         let was_active = matches!(self.state, MachineState::Streaming | MachineState::Failed);
+        // LLM 结果界面（流中/已就绪/失败）才由错误事件接管状态；Idle/拼音/
+        // 提示词/OCR 预览等无关态不受影响。
+        let in_llm_ui = matches!(
+            self.state,
+            MachineState::Streaming | MachineState::ResultReady | MachineState::Failed
+        );
+        // 失败的改写流不得残留改写标记：否则下一条普通生成完成时
+        // on_llm_done 会 take 到陈旧原文，误弹对照预览窗（原文错配）。
+        // 重试需要时由 last_request.rewrite_source 恢复。
+        //
+        // 预览槽一并清空（含 OCR）：错误事件可能与 OCR 预览并发，只清 rewrite
+        // 会留下「Failed + ocr_preview=Some」的第二种槽/状态解耦形态
+        // （独立审查 F2；预览槽只允许在 ResultReady/OcrPreviewing 存在）。
+        self.rewrite_source = None;
+        self.rewrite_preview = None;
+        if !in_llm_ui {
+            // 非 LLM 界面态收到错误事件（取消流的迟到 Error 等）：不得把与之
+            // 无关的现状态硬拉成 Failed——此前无条件赋值会让一次迟到错误把
+            // Idle/OcrPreviewing 变成 Failed（浮层永驻、OCR 预览被吞）。
+            // 也**不动 OCR 槽**：state=OcrPreviewing 时它正被使用，清掉会让
+            // feed_ocr_preview 的前置条件落空。只回收本次流可能留下的改写标记。
+            return Action::None;
+        }
+        // 至此 state 必为 Streaming/ResultReady/Failed，OCR 预览不可能在使用中，
+        // 槽位若有值就是残留——一并清掉，避免「Failed + ocr_preview=Some」这种
+        // 第二种槽/状态解耦形态（独立审查 F2）。
+        self.ocr_preview = None;
+        self.ocr_preview_deadline = None;
         self.state = MachineState::Failed;
         if let Some(preview) = self.ai_preview.as_mut() {
             preview.phase = ResultPhase::Failed;
         }
-        // 失败的改写流不得残留改写标记：否则下一条普通生成完成时
-        // on_llm_done 会 take 到陈旧原文，误弹对照预览窗（原文错配）。
-        // 重试需要时由 last_request.rewrite_source 恢复。
-        self.rewrite_source = None;
-        self.rewrite_preview = None;
         if was_active {
             Action::LlmFailed {
                 message: message.to_owned(),
@@ -1709,6 +1762,42 @@ mod tests {
             &texts.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
             true,
         );
+    }
+
+    /// 经**合法路径**武装一次改写对照预览：`//<原文>` + Tab 起改写流 →
+    /// chunk → Final（on_llm_done 产出 RewriteReady）→ 前端 apply_action 调
+    /// begin_rewrite_preview。返回时 state=ResultReady 且预览活跃。
+    /// 经合法路径武装并指定改写结果与原文（原文须为大写 ASCII 或非 ASCII——
+    /// 小写字母会进拼音组合，Tab 起不了改写流）。
+    fn armed_rewrite_preview_with(rewritten: &str, source: &str) -> CompositionMachine {
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        for ch in source.chars() {
+            let _ = m.feed_char(ch);
+        }
+        assert!(
+            matches!(m.feed_char('\t'), Action::StartRewrite { content } if content == source),
+            "前奏应起改写流"
+        );
+        let _ = m.on_llm_chunk(rewritten);
+        match m.on_llm_done() {
+            Action::RewriteReady {
+                rewritten: r,
+                source: s,
+            } => {
+                assert_eq!(r, rewritten);
+                assert_eq!(s, source);
+            }
+            other => panic!("应返回 RewriteReady，实际 {other:?}"),
+        }
+        assert!(
+            m.begin_rewrite_preview(rewritten.to_owned(), source.to_owned()),
+            "结果就绪态必须接受对照预览武装"
+        );
+        assert_eq!(m.state(), MachineState::ResultReady);
+        assert!(m.rewrite_previewing());
+        m
     }
 
     /// 多候选（>9）用于分页测试。
@@ -3530,47 +3619,31 @@ mod tests {
     /// 1/Enter/空格=改写上屏，2=原文上屏，Esc 取消，其他键不动预览。
     #[test]
     fn rewrite_ready_preview_keys() {
-        let mut m = CompositionMachine::new();
-        m.feed_char('/');
-        m.feed_char('/');
-        for ch in "明天发烧请假条".chars() {
-            let _ = m.feed_char(ch);
-        }
-        assert!(matches!(
-            m.feed_char('\t'),
-            Action::StartRewrite { content } if content == "明天发烧请假条"
-        ));
-        // 模拟流完成
-        let _ = m.on_llm_chunk("尊敬的经理：");
-        match m.on_llm_done() {
-            Action::RewriteReady { rewritten, source } => {
-                assert_eq!(rewritten, "尊敬的经理：");
-                assert_eq!(source, "明天发烧请假条");
-            }
-            other => panic!("应返回 RewriteReady，实际 {other:?}"),
-        }
-        m.begin_rewrite_preview("尊敬的经理：".into(), "明天发烧请假条".into());
-        assert!(m.rewrite_previewing());
-        // 2 = 原文上屏
+        // 1/Enter/空格 = 改写上屏；2 = 原文上屏；Esc 取消；其他键不动预览。
+        // 每个子用例都经**合法路径**武装（对照预览只在 ResultReady 生效）。
+        let mut m = armed_rewrite_preview_with("尊敬的经理：", "明天发烧请假条");
         assert_eq!(
             m.feed_rewrite_preview(PreviewKey::Digit2),
             Some(Action::CommitImmediate("明天发烧请假条".to_owned()))
         );
         assert!(!m.rewrite_previewing());
-        // 再走一遍：Enter = 改写上屏
-        m.begin_rewrite_preview("改写结果".into(), "原文".into());
+
+        let mut m = armed_rewrite_preview_with("改写结果", "原稿");
         assert_eq!(
             m.feed_rewrite_preview(PreviewKey::Enter),
             Some(Action::CommitImmediate("改写结果".to_owned()))
         );
-        // Esc 取消
-        m.begin_rewrite_preview("a".into(), "b".into());
+        assert!(!m.rewrite_previewing());
+
+        let mut m = armed_rewrite_preview_with("甲", "乙");
         assert_eq!(
             m.feed_rewrite_preview(PreviewKey::Escape),
             Some(Action::Cancel)
         );
+        assert!(!m.rewrite_previewing());
+
         // 其他键：None（预览保持）
-        m.begin_rewrite_preview("a".into(), "b".into());
+        let mut m = armed_rewrite_preview_with("甲", "乙");
         assert_eq!(m.feed_rewrite_preview(PreviewKey::Other), None);
         assert!(m.rewrite_previewing());
     }
@@ -3582,12 +3655,17 @@ mod tests {
     /// 上屏陈旧（该例为空）文本，刚输入的拼音全部丢弃。
     #[test]
     fn escape_clears_rewrite_preview_left_in_idle() {
+        // 白盒构造「Idle + 残留对照槽」：收紧后公开 API 已造不出该形态
+        // （begin_rewrite_preview 只在 ResultReady 接受、非结果态一律拒绝），
+        // 但会话归零原语必须对**任意来源**的残留负责——这是会话边界必须
+        // 成立的契约，也是真机 2026-09-18 那次残留能跨会话存活的直接原因。
         let mut m = CompositionMachine::new();
-        // 复现前提：预览被武装，而主状态停在 Idle（begin_rewrite_preview 不
-        // 动 state；OCR 预览退出路径也会把 state 置回 Idle 而不清它）。
-        m.begin_rewrite_preview(String::new(), "原文".to_owned());
+        m.rewrite_preview = Some((String::new(), "原文".to_owned()));
         assert_eq!(m.state(), MachineState::Idle);
-        assert!(m.rewrite_previewing());
+        assert!(
+            !m.rewrite_previewing(),
+            "Idle 上的残留槽不算预览活跃——不得劫持确认键"
+        );
 
         // 会话边界：前端 reset() → feed_escape。
         assert_eq!(m.feed_escape(), Action::None);
@@ -3595,8 +3673,16 @@ mod tests {
             !m.rewrite_previewing(),
             "Idle 的 feed_escape 必须清掉残留预览，否则跨会话粘滞"
         );
+        // 残留槽被**真正回收**（不只是被判定为不活跃）：回收后连直喂预览键
+        // 都不会再产出陈旧上屏。若 feed_escape 不清槽，这里会拿到
+        // Some(CommitImmediate("原文"))。
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Enter),
+            None,
+            "feed_escape 必须回收 Idle 上的残留预览槽"
+        );
 
-        // 新会话首个空格走正常候选路由，不再被预览分支吃掉。
+        // 新会话首个空格走正常候选路由。
         for ch in "nihao".chars() {
             let _ = m.feed_char(ch);
         }
@@ -3605,6 +3691,127 @@ mod tests {
         assert!(
             matches!(&action, Action::CommitImmediate(t) if t == "你好"),
             "首个空格应提交当前候选，实际 {action:?}"
+        );
+    }
+
+    /// 回归：预览槽**必须与主状态一致**才算活跃。历史实现只看槽位存在，
+    /// 于是 Idle 上的残留槽会让前端 `rewrite_previewing` 门吞掉下一个
+    /// 空格/回车/1/2 并上屏陈旧文本——真机 2026-09-18「启动/首次激活后
+    /// 第一次 nihao 选候选不上屏」（日志 `改写预览键: Space` + `commit text=`
+    /// 空串）即此形态。
+    #[test]
+    fn stale_rewrite_slot_outside_result_ready_never_hijacks_keys() {
+        // (a) 白盒构造 v0.2.18 真机出现过的组合：主状态 Idle、对照槽仍在
+        // （日志：首个空格打的是 `改写预览键: Space`，`commit text=` 为空串）。
+        let mut m = CompositionMachine::new();
+        m.rewrite_preview = Some((String::new(), "原文".to_owned()));
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(
+            !m.rewrite_previewing(),
+            "预览是否活跃必须同时看主状态；只看槽位会让残留槽继续吞键"
+        );
+        // 前端拦截门取 rewrite_previewing() → false，故空格落回正常候选路由。
+        for ch in "nihao".chars() {
+            let _ = m.feed_char(ch);
+        }
+        rime(&mut m, "nihao", &["你好", "妳好", "逆号"]);
+        let action = m.feed_char(' ');
+        assert!(
+            matches!(&action, Action::CommitImmediate(t) if t == "你好"),
+            "残留槽不得劫持确认键，实际 {action:?}"
+        );
+
+        // (b) 迟到的 RewriteReady（core 已离开结果态）必须被**拒绝**：既不能
+        // 留槽（否则吞键），也不能把状态强行改成 ResultReady（那等于把惰性
+        // 陈旧槽变成活跃预览）。三种现场各验一遍，且用户现场原样保留。
+        // b1) Idle
+        let mut m = CompositionMachine::new();
+        assert!(!m.begin_rewrite_preview("陈旧".into(), "原文".into()));
+        assert_eq!(m.state(), MachineState::Idle);
+        assert_eq!(m.feed_rewrite_preview(PreviewKey::Space), None);
+        // b2) Prompt（正在编辑提示词，迟到的结果不得吞掉它）
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        m.feed_char('A');
+        assert_eq!(m.state(), MachineState::Prompt);
+        assert!(!m.begin_rewrite_preview("陈旧".into(), "原文".into()));
+        assert_eq!(m.state(), MachineState::Prompt);
+        assert_eq!(m.preedit(), "//A");
+        // b3) OcrPreviewing（OCR 识别文本不得被清、状态不得被夺）
+        let mut m = CompositionMachine::new();
+        assert!(m.begin_ocr_preview("OCR文本".into()).is_some());
+        assert!(!m.begin_rewrite_preview("陈旧".into(), "原文".into()));
+        assert_eq!(m.state(), MachineState::OcrPreviewing);
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Space),
+            Some(Action::CommitImmediate("OCR文本".to_owned()))
+        );
+
+        // (c) 结果就绪态则相反：接受武装，确认键走对照预览上屏。
+        let mut m = armed_rewrite_preview_with("改写结果", "原稿");
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Space),
+            Some(Action::CommitImmediate("改写结果".to_owned()))
+        );
+    }
+
+    /// 预览槽互斥（独立审查 F2）：两槽并存时各自的退出臂只清半边，会让另一边
+    /// 以「主状态已变、槽还在」的形态残留。进入任一种预览都应清掉另一种。
+    #[test]
+    fn preview_slots_are_mutually_exclusive() {
+        // 对照预览期不得起 OCR 预览（begin_ocr_preview 只接受 Idle/OcrPreviewing）
+        let mut m = armed_rewrite_preview_with("R", "S");
+        assert!(
+            m.begin_ocr_preview("O".into()).is_none(),
+            "对照预览期间不得被 OCR 预览抢占"
+        );
+        assert_eq!(m.state(), MachineState::ResultReady);
+        assert!(m.rewrite_previewing());
+
+        // OCR 预览期收到迟到 RewriteReady：拒绝，OCR 现场原样保留
+        let mut m = CompositionMachine::new();
+        assert!(m.begin_ocr_preview("O".into()).is_some());
+        assert!(!m.begin_rewrite_preview("R".into(), "S".into()));
+        assert_eq!(m.state(), MachineState::OcrPreviewing);
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Space),
+            Some(Action::CommitImmediate("O".to_owned()))
+        );
+
+        // Idle 上的对照残留槽（白盒）→ OCR 接手时清掉，免其复活
+        let mut m = CompositionMachine::new();
+        m.rewrite_preview = Some(("R".to_owned(), "S".to_owned()));
+        assert!(m.begin_ocr_preview("O".into()).is_some());
+        let _ = m.feed_ocr_preview(PreviewKey::Escape);
+        assert_eq!(m.state(), MachineState::Idle);
+        assert_eq!(
+            m.feed_rewrite_preview(PreviewKey::Enter),
+            None,
+            "OCR 接手须清掉对照残留槽"
+        );
+    }
+
+    /// 非 LLM 界面态收到错误事件不得把自己拉成 Failed（取消流的迟到 Error），
+    /// 也不得动正在使用的 OCR 槽（独立审查 F2）。
+    #[test]
+    fn llm_error_outside_llm_ui_keeps_state() {
+        let mut m = CompositionMachine::new();
+        assert_eq!(m.on_llm_error("迟到错误"), Action::None);
+        assert_eq!(m.state(), MachineState::Idle, "Idle 不得被拉成 Failed");
+        assert!(!m.ai_previewing());
+
+        assert!(m.begin_ocr_preview("O".into()).is_some());
+        assert_eq!(m.on_llm_error("迟到错误"), Action::None);
+        assert!(
+            m.ocr_previewing(),
+            "OCR 预览与本次 LLM 错误无关，必须原样保留"
+        );
+        assert_eq!(m.state(), MachineState::OcrPreviewing);
+        // OCR 槽仍在：确认键照常上屏识别文本
+        assert_eq!(
+            m.feed_ocr_preview(PreviewKey::Space),
+            Some(Action::CommitImmediate("O".to_owned()))
         );
     }
 

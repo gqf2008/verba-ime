@@ -1319,9 +1319,19 @@ pub fn apply_action(
             // 失效（审查发现）。组合串此时显示着流式结果（rewritten），
             // 保持不隐藏——预览候选窗叠加显示双候选；用户选定后组合由
             // CommitImmediate/Cancel 清理。
-            data.machine
+            let armed = data
+                .machine
                 .borrow_mut()
                 .begin_rewrite_preview(rewritten.clone(), source.clone());
+            if !armed {
+                // 迟到的 RewriteReady：core 已离开结果就绪态，整条丢弃——
+                // 不弹对照预览窗，否则陈旧预览会重新接管按键路由。
+                log::warn!(
+                    "改写对照预览被拒（core 非 ResultReady），已丢弃 rewritten_len={}",
+                    rewritten.chars().count()
+                );
+                return Ok(());
+            }
             show_rewrite_preview(data, context, &rewritten, &source);
             log::info!(
                 "改写对照预览: rewritten_len={} source_len={}",
