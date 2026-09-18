@@ -1745,8 +1745,8 @@ impl VerbaIMKController {
     fn set_client(&self, sender: Option<&AnyObject>, force_new_fallback: bool) {
         if let Some(s) = sender {
             let client_ptr = s as *const AnyObject as usize;
-            let need_refresh = force_new_fallback
-                || self.ivars().session_key_client.get() != client_ptr;
+            let cached_client = self.ivars().session_key_client.get();
+            let need_refresh = force_new_fallback || cached_client != client_ptr;
             if need_refresh && !self.ivars().session_key_refreshing.get() {
                 struct RefreshGuard<'a>(&'a Cell<bool>);
                 impl Drop for RefreshGuard<'_> {
