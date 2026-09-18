@@ -90,12 +90,15 @@ pub fn vision_error_hint(err: &LlmError, model: &str) -> Option<String> {
     // 其它 400/422（图片过大、格式错误、上下文/参数超限等）只提示图片请求被
     // 拒绝并附原始错误，避免把无关客户端错误误归因给模型能力。
     if mentions_vision(detail) {
+        // 动作前置：macOS 候选面板是单列不换行、只显示前 40 字，必须保证
+        // “换视觉模型 / 改用 //截图”落在安全宽度内；完整原始错误随后附上
+        // （Windows 自绘浮层可完整显示，macOS 详情另见 daemon 日志）。
         Some(format!(
-            "当前模型 `{model}` 拒绝了图片输入（{reason}）。若该模型不支持视觉，请在「设置 → LLM」换用支持图片输入的模型，或改用 `//截图` 走内置 OCR。\n服务端返回：{detail}"
+            "图片未识别：请换支持视觉的模型，或改用 `//截图` 走内置 OCR。当前模型 `{model}` 拒绝了图片输入（{reason}）。\n服务端返回：{detail}"
         ))
     } else {
         Some(format!(
-            "图片请求被服务端拒绝（{reason}，模型 `{model}`）。请检查图片格式/大小或上下文限制，并查看下面的原始错误。\n服务端返回：{detail}"
+            "图片请求失败：请检查图片格式/大小或上下文限制。模型 `{model}` 返回 {reason}。\n服务端返回：{detail}"
         ))
     }
 }
@@ -228,7 +231,7 @@ fn parse_sse(data: &str) -> Result<Option<String>, LlmError> {
     // 部分 OpenAI 兼容端点以 HTTP 200 + SSE error payload 报错（例如模型不接受
     // image_url）。此前只取 choices[0].delta.content，会把这类错误当空流吞掉，
     // 最终发空 Final；这里显式转成流错误，让上层能做能力提示。
-    if let Some(err) = value.get("error") {
+    if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
         let msg = err
             .get("message")
             .and_then(serde_json::Value::as_str)
@@ -410,6 +413,10 @@ mod tests {
         assert!(hint.contains("deepseek-flash"));
         assert!(hint.contains("//截图"));
         assert!(hint.contains("model does not support image input"));
+        assert!(
+            hint.chars().take(40).collect::<String>().contains("//截图"),
+            "动作必须在 macOS 40 字安全宽度内: {hint}"
+        );
     }
 
     #[test]
@@ -419,8 +426,8 @@ mod tests {
             body: "temperature must be between 0 and 2".into(),
         };
         let hint = vision_error_hint(&err, "m").unwrap();
-        assert!(hint.contains("图片请求被服务端拒绝"));
-        assert!(!hint.contains("当前模型 `m` 拒绝了图片输入"));
+        assert!(hint.contains("图片请求失败"));
+        assert!(!hint.contains("图片未识别"));
         assert!(hint.contains("temperature must be between 0 and 2"));
     }
 
@@ -480,6 +487,16 @@ mod tests {
             LlmError::Stream(msg) => assert!(msg.contains("invalid_image")),
             other => panic!("期望 Stream 错误，得到 {other:?}"),
         }
+
+        // 正常 chunk 携带 "error": null 或仅 usage 时不得误判为错误。
+        assert_eq!(
+            parse_sse(r#"{"error":null,"choices":[{"delta":{"content":"你好"}}]}"#).unwrap(),
+            Some("你好".into())
+        );
+        assert_eq!(
+            parse_sse(r#"{"choices":[],"usage":{"total_tokens":1}}"#).unwrap(),
+            None
+        );
     }
 
     #[test]

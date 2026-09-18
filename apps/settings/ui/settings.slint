@@ -154,7 +154,7 @@ export component SettingsWindow inherits Window {
                         spacing: 4px;
                         Text { text: "LLM 与 `//看图` 会把文本/图片发送到你配置的远程服务商。"; wrap: word-wrap; }
                         Text { text: "API Key 存入系统密钥库（keyring），config.toml 不保存明文。"; wrap: word-wrap; }
-                        Text { text: "内置 OCR 在本地运行，不联网。"; wrap: word-wrap; }
+                        Text { text: "内置 OCR 识别在本地完成；安装包未内置模型时，首次使用可能需要联网下载。"; wrap: word-wrap; }
                     }
                 }
             }
