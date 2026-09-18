@@ -12,6 +12,11 @@ use std::collections::HashMap;
 use verba_config::ApiKeyStore;
 use verba_ipc::VerbaClient;
 
+/// daemon 冷启动连接的有界重试（约 5s 上限）：绑 socket + librime 加载 + 预热
+/// 在真机上耗时波动，固定 sleep 会在首次打开时报 Connection refused（v0.2.16 复现）。
+const CONNECT_ATTEMPTS: u32 = 10;
+const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// 最近一次刷新得到的模型列表（UI 下拉数据源，Rust 侧读取避免 ModelRc 存取）。
 static MODELS_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
     std::sync::OnceLock::new();
@@ -347,6 +352,10 @@ fn daemon_candidates() -> Vec<std::path::PathBuf> {
 }
 
 /// 连不上 daemon 时**最多尝试拉起一次**（进程内去重，避免每个操作都 spawn）。
+///
+/// 注意：这里只负责"把进程起起来"，**不等固定时长**。daemon 冷启动要绑 socket +
+/// 加载 librime + 预热，实测 800ms 不够——固定 sleep 会让首次打开设置面板报
+/// `Connection refused`（v0.2.16 真机验收复现）。等待交给下面的 `connect_with_retry`。
 fn ensure_daemon_started() -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
     static TRIED: AtomicBool = AtomicBool::new(false);
@@ -355,12 +364,37 @@ fn ensure_daemon_started() -> bool {
     }
     for candidate in daemon_candidates() {
         if candidate.is_file() && std::process::Command::new(&candidate).spawn().is_ok() {
-            // 给 daemon 一点启动时间（绑 socket + 预热 rime 在真机上是秒级）
-            std::thread::sleep(std::time::Duration::from_millis(800));
             return true;
         }
     }
     false
+}
+
+/// 有界重试连接：`attempts` 次、每次间隔 `delay`。返回最后一次客户端或最后一次错误。
+///
+/// 抽成泛型便于单测（真机 daemon 冷启动耗时随 rime 预热波动，不能靠固定 sleep）。
+fn connect_with_retry<T, C>(
+    mut attempts: u32,
+    delay: std::time::Duration,
+    mut connect: C,
+) -> Result<T, String>
+where
+    C: FnMut() -> Result<T, String>,
+{
+    if attempts == 0 {
+        attempts = 1;
+    }
+    let mut last = String::from("未尝试连接");
+    for i in 0..attempts {
+        match connect() {
+            Ok(c) => return Ok(c),
+            Err(e) => last = e,
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    Err(last)
 }
 
 /// 后台线程：连接 daemon 并执行一次阻塞 IPC 操作。
@@ -373,11 +407,12 @@ fn with_client<T>(
         Ok(c) => c,
         Err(first) => {
             // 独立安装的设置面板可能先于输入法被打开：尝试自己拉起 daemon，
-            // 再重试一次；仍失败才如实报错（含"输入法未安装"的提示）。
+            // 然后**有界重试**连接（冷启动要加载 rime，固定等待不够）。
             if ensure_daemon_started() {
-                VerbaClient::connect_verified().map_err(|e| {
-                    format!("已尝试启动 daemon 但仍连不上: {e}（原始错误: {first}）")
-                })?
+                connect_with_retry(CONNECT_ATTEMPTS, CONNECT_DELAY, || {
+                    VerbaClient::connect_verified().map_err(|e| e.to_string())
+                })
+                .map_err(|e| format!("已启动 daemon 但仍连不上: {e}（首次错误: {first}）"))?
             } else {
                 return Err(format!(
                     "连接 daemon 失败: {first}\n未找到拾言输入法 daemon——请先安装拾言输入法，或设置 VERBA_DAEMON_PATH"

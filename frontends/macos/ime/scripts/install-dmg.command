@@ -50,6 +50,11 @@ SETTINGS_DST="/Applications/Verba 设置.app"
 if [ -d "$SETTINGS_SRC" ]; then
     if rm -rf "$SETTINGS_DST" 2>/dev/null && cp -R "$SETTINGS_SRC" "$SETTINGS_DST" 2>/dev/null; then
         echo "设置面板已安装到 ${SETTINGS_DST}"
+        # 嵌套 app 的公证票据只 staple 在外层 bundle 上；拷出来后补一次，
+        # 让它在离线/首次启动时也能被 Gatekeeper 校验（失败不致命，仅警告）。
+        if ! /usr/bin/xcrun stapler staple "$SETTINGS_DST" >/dev/null 2>&1; then
+            echo "提示：未能为设置面板补离线公证票据（联网时 Gatekeeper 仍可校验）"
+        fi
     else
         FALLBACK="$HOME/Applications/Verba 设置.app"
         mkdir -p "$HOME/Applications"
