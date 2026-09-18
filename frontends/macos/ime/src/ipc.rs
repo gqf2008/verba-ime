@@ -48,9 +48,26 @@ pub fn settings_app_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // 第 2 步：优先用**独立安装**到 /Applications 的那份（用户可单独更新它），
+    // 找不到再回退 ~/Applications，最后才用输入法 bundle 内嵌的那份。
+    for candidate in installed_settings_app_candidates() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let candidate = settings_app_from_exe(&exe)?;
     candidate.exists().then_some(candidate)
+}
+
+/// 独立安装位置的候选（按优先级）：`/Applications` → `~/Applications`。
+/// 与 `安装.command` 的落点保持一致；纯路径拼接，便于单测。
+pub fn installed_settings_app_candidates() -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("/Applications/Verba 设置.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(PathBuf::from(home).join("Applications/Verba 设置.app"));
+    }
+    out
 }
 
 /// 定位设置面板可执行文件：VERBA_SETTINGS_PATH 或本可执行文件同目录 verba-settings。
@@ -117,5 +134,16 @@ mod tests {
         );
         // 非标准布局（裸二进制）也算得出来，但 exists() 会挡住它
         assert!(settings_app_from_exe(Path::new("/tmp/verba-mac")).is_some());
+    }
+
+    #[test]
+    fn installed_candidates_prefer_applications() {
+        let c = installed_settings_app_candidates();
+        assert_eq!(
+            c.first().map(PathBuf::as_path),
+            Some(Path::new("/Applications/Verba 设置.app")),
+            "独立安装位置优先 /Applications"
+        );
+        assert!(c.len() >= 2, "还应包含 ~/Applications 作为回退");
     }
 }

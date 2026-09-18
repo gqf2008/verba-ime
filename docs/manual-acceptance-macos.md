@@ -100,3 +100,20 @@
       仍可用——不留「永远生成中」的僵尸面板
 - [ ] 占位期 Esc → 取消流 + 收面板 + 结束组合，无幽灵面板
 - [ ] 改写管道（`//内容` + Tab）发送即占位，完成后仍走对照预览（1/2 不回归）
+
+---
+
+## 设置面板（独立应用，第 2 步：verba-settings-standalone-app）
+
+> 形态对齐商业输入法：**输入法 bundle** 在 `~/Library/Input Methods`，**设置面板**作为
+> 独立 app 装到 `/Applications`；DMG 里只有 bundle 内那一份（避免 19MB 复制两份），
+> 由「安装.command」拷出去。
+
+- [ ] 双击 DMG 内「安装.command」后：输入法在 `~/Library/Input Methods/Verba.app`，
+      **设置面板在 `/Applications/Verba 设置.app`**
+- [ ] `/Applications` 不可写时回退 `~/Applications/Verba 设置.app`，并给出说明（不静默失败）
+- [ ] 输入法菜单「设置…」打开的是 `/Applications` 那份；只装输入法时回退到 bundle 内那份
+- [ ] 点两次「设置…」只开**一个**窗口，且窗口**直接到前台**（LaunchServices 语义）
+- [ ] daemon 未运行时打开设置面板：能自行拉起 daemon 并显示「已连接 daemon」
+- [ ] 输入法未安装时打开设置面板：状态栏给出明确提示（不是空白/假成功）
+- [ ] `卸载.command` 同时清掉 `~/Library/Input Methods/Verba.app` 与两处设置 app

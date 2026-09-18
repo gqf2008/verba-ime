@@ -27,6 +27,12 @@ scripts\build-msvc.cmd run -p verba-cli -- --help
 
 ## 设置面板（apps/settings，Slint 1.17）
 
+> **打包形态**：`scripts/package.sh` 会把 `verba-settings` 组装成
+> `Verba.app/Contents/Library/Verba Settings.app`（真正的 .app，id `dev.verba.settings`），
+> 输入法菜单经 LaunchServices（`/usr/bin/open`）打开它——单实例且能激活到前台。
+> `scripts/install-dmg.command` 再把这份拷到 `/Applications/Verba 设置.app`
+> （不可写则回退 `~/Applications`）；卸载脚本两处都清。
+
 - Slint 版本线说明：crates.io 无 0.17，用户所说的 `slint-0.17.x` 即 `1.17.x`，固定 `=1.17.1`。
 - 运行：`cargo run -p verba-settings`（需 daemon 在跑：`verba-cli daemon`）。
 - 密钥经 IPC `ApiKeySet` 写系统密钥库（需 keyring 平台后端已启用，见 workspace Cargo.toml）。
