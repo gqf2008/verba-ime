@@ -1956,10 +1956,19 @@ impl VerbaIMKController {
                 // （互斥），旁路直喂的 r/e 从 feed_char 得 None，不再误触
                 // 重试/改提示词（独立复审 P2——此前只写前端槽，core 停在
                 // ResultReady 且浮层态仍武装）。
-                self.ivars()
+                let armed = self
+                    .ivars()
                     .machine
                     .borrow_mut()
                     .begin_rewrite_preview(rewritten.clone(), source.clone());
+                if !armed {
+                    // 迟到的 RewriteReady：core 已离开结果就绪态（Idle/Prompt/
+                    // OCR 预览…），必须整条丢弃——既不写前端镜像槽也不弹对照
+                    // 预览窗。否则陈旧对照预览会重新接管按键，吞掉下一次
+                    // 空格/回车并上屏陈旧文本（真机 2026-09-18 首次候选不上屏）。
+                    dbg_log("apply RewriteReady 被拒（core 非 ResultReady），已丢弃");
+                    return true;
+                }
                 *self.ivars().rewrite_preview.borrow_mut() =
                     Some((rewritten.clone(), source.clone()));
                 *self.ivars().candidates.borrow_mut() = vec![rewritten, source];
