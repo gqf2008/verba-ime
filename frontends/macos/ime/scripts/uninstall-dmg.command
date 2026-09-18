@@ -37,3 +37,14 @@ if [ -d "$DEST" ]; then
 else
     echo "已清理输入源条目；未找到用户级 Verba.app。"
 fi
+
+# 独立安装的设置面板（第 2 步）：/Applications 与 ~/Applications 两处都清。
+for SETTINGS_APP in "/Applications/Verba 设置.app" "$HOME/Applications/Verba 设置.app"; do
+    if [ -d "$SETTINGS_APP" ]; then
+        if rm -rf "$SETTINGS_APP"; then
+            echo "已卸载 $SETTINGS_APP"
+        else
+            echo "警告：未能删除 $SETTINGS_APP（可能需要管理员权限）" >&2
+        fi
+    fi
+done

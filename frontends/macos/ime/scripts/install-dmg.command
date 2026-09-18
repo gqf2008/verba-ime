@@ -42,6 +42,28 @@ fi
 rm -rf "$BACKUP"
 trap - EXIT
 
+# 设置面板作为**独立应用**装到 /Applications（第 2 步/verba-settings-standalone-app）：
+# DMG 里只有 bundle 内那一份（避免 19MB 复制两份），这里拷出去作为顶层 app；
+# /Applications 不可写时回退 ~/Applications 并说明。
+SETTINGS_SRC="$DEST/Contents/Library/Verba Settings.app"
+SETTINGS_DST="/Applications/Verba 设置.app"
+if [ -d "$SETTINGS_SRC" ]; then
+    if rm -rf "$SETTINGS_DST" 2>/dev/null && cp -R "$SETTINGS_SRC" "$SETTINGS_DST" 2>/dev/null; then
+        echo "设置面板已安装到 ${SETTINGS_DST}"
+    else
+        FALLBACK="$HOME/Applications/Verba 设置.app"
+        mkdir -p "$HOME/Applications"
+        rm -rf "$FALLBACK" 2>/dev/null || true
+        if cp -R "$SETTINGS_SRC" "$FALLBACK" 2>/dev/null; then
+            echo "设置面板已安装到 ${FALLBACK}（/Applications 不可写，回退用户级）"
+        else
+            echo "警告：设置面板安装失败；输入法菜单会自动回退到 bundle 内那份，功能不受影响" >&2
+        fi
+    fi
+else
+    echo "警告：bundle 内未找到 Verba Settings.app，跳过独立安装（第 1 步产物缺失？）" >&2
+fi
+
 echo "已安装到 ${DEST}，正在注册输入源…"
 set +e
 "$DEST/Contents/MacOS/verba-register"

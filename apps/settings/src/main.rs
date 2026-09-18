@@ -323,14 +323,68 @@ fn save_fields(values: HashMap<String, String>, new_key: &str) -> String {
     }
 }
 
+/// daemon 可执行文件的候选位置（按优先级）：
+/// `VERBA_DAEMON_PATH` → 用户级/系统级输入法 bundle 内。
+///
+/// 第 2 步（verba-settings-standalone-app）：设置面板装到 /Applications 后是独立
+/// 进程，**不能假设 daemon 已经在跑**（只有输入法被激活时才会拉起它）。这里给出
+/// 它与输入法 bundle 的约定位置。
+fn daemon_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(p) = std::env::var("VERBA_DAEMON_PATH") {
+        out.push(std::path::PathBuf::from(p));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(
+            std::path::PathBuf::from(home)
+                .join("Library/Input Methods/Verba.app/Contents/MacOS/verba-daemon"),
+        );
+    }
+    out.push(std::path::PathBuf::from(
+        "/Library/Input Methods/Verba.app/Contents/MacOS/verba-daemon",
+    ));
+    out
+}
+
+/// 连不上 daemon 时**最多尝试拉起一次**（进程内去重，避免每个操作都 spawn）。
+fn ensure_daemon_started() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    for candidate in daemon_candidates() {
+        if candidate.is_file() && std::process::Command::new(&candidate).spawn().is_ok() {
+            // 给 daemon 一点启动时间（绑 socket + 预热 rime 在真机上是秒级）
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            return true;
+        }
+    }
+    false
+}
+
 /// 后台线程：连接 daemon 并执行一次阻塞 IPC 操作。
 fn with_client<T>(
     f: impl FnOnce(&mut VerbaClient) -> Result<T, verba_ipc::IpcError>,
 ) -> Result<T, String> {
     // connect_verified：验活握手后才信任对端（本面板会发送 API key——
     // 全仓库最敏感的调用方，架构审查 P0-1 不得缺席）。
-    let mut client =
-        VerbaClient::connect_verified().map_err(|e| format!("连接 daemon 失败: {e}"))?;
+    let mut client = match VerbaClient::connect_verified() {
+        Ok(c) => c,
+        Err(first) => {
+            // 独立安装的设置面板可能先于输入法被打开：尝试自己拉起 daemon，
+            // 再重试一次；仍失败才如实报错（含"输入法未安装"的提示）。
+            if ensure_daemon_started() {
+                VerbaClient::connect_verified().map_err(|e| {
+                    format!("已尝试启动 daemon 但仍连不上: {e}（原始错误: {first}）")
+                })?
+            } else {
+                return Err(format!(
+                    "连接 daemon 失败: {first}\n未找到拾言输入法 daemon——请先安装拾言输入法，或设置 VERBA_DAEMON_PATH"
+                ));
+            }
+        }
+    };
     f(&mut client).map_err(|e| e.to_string())
 }
 
