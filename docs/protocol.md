@@ -65,7 +65,7 @@ message TtsSynthesize {
   optional string voice = 2;       // 覆盖 config tts_voice（如 zh-CN-XiaoxiaoNeural）
 }
 
-// OCR 识别：provider 由 config ocr_provider 决定（mock|windows…）。
+// OCR 识别：内置 provider（默认 rapid；windows/mock 仅供 CLI/验收覆盖）。
 message OcrRecognize {
   bytes image = 1;                 // 图像字节（PNG/JPEG/BMP…）
 }
@@ -119,7 +119,7 @@ message Candidates {
 - **SetMode**：模式切换（Normal / Voice / Ocr / Ai）。AI 模式进入后，前端把按键收集为 prompt 文本，直到 Enter 提交 / Esc 退出。
 - **OcrImage**：支持 `bytes`（剪贴板 / 截图）或 `file_ref`（临时文件路径，避免大包传输；临时文件由请求方负责清理）。
 - **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）；
-  可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` / `eye_mode=vision` 使用。
+  可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` 使用。
   多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空当前窗口会话）。
   **`session_key`（field 9）**：窗口级稳定 key，daemon 优先按此分槽隔离；
   macOS 优先用 IMK client 的 PID + CGWindowNumber（无辅助功能权限），Windows 用
@@ -136,8 +136,8 @@ message Candidates {
   查询候选并一次性回 `Candidates`（`done=true`）；`rime_schema` 配置方案。
 - **TtsSynthesize**：`text` 待朗读文本，`voice` 可覆盖 `config tts_voice`（默认 zh-CN-XiaoxiaoNeural）；daemon 按
   `config tts_provider` 选择 provider（`mock` 确定性 WAV / `edge` 微软在线神经音色 MP3），一次性回 `Audio`。
-- **OcrRecognize**：`image` 图像字节；daemon 按 `config ocr_provider` 选择 provider（`mock` 确定性 /
-  `windows` = Windows.Media.Ocr 本地识别 / `rapid` = 本地 RapidOCR（PaddleOCR+ONNXRuntime，经 Python 子进程）），一次性回 `Text`（整段文字，多行以换行拼接）。
+- **OcrRecognize**：`image` 图像字节；OCR 是内置能力，daemon 默认用 `rapid`（本地 RapidOCR，原生 Rust，无需 Python），
+  `windows`（Windows.Media.Ocr）与 `mock`（开发/验收）仅可经 CLI `config set` 覆盖，设置页不暴露；一次性回 `Text`（整段文字，多行以换行拼接）。
 - **AsrTranscribe**：`audio` 音频字节；daemon 按 `config asr_provider` 选择 provider（当前 `mock` 确定性），一次性回 `Text`。
 - **取消**：任何流式请求可 `LlmCancel` 按请求 id 中止；daemon 应尽快释放资源并补发结束事件，保证客户端退出阻塞读。
   取消注册表键为 `(conn_id, req_id)`（请求 id 每连接从 1 自增，跨连接会重复），解析时**精确键优先**；

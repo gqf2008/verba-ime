@@ -25,14 +25,6 @@ fn models_cache() -> &'static std::sync::Mutex<Vec<String>> {
 }
 
 /// provider 显示标签 → 实际配置值（顺序与 settings.slint 的 ComboBox 模型一致）。
-const OCR_PROVIDERS: &[(&str, &str)] = &[
-    ("mock（确定性，开发/验收）", "mock"),
-    ("windows（Windows 本地识别）", "windows"),
-    (
-        "rapid（本地 RapidOCR/PaddleOCR，需 Python rapidocr_onnxruntime）",
-        "rapid",
-    ),
-];
 const ASR_PROVIDERS: &[(&str, &str)] = &[
     ("mock（确定性，开发/验收）", "mock"),
     ("openai（在线转写）", "openai"),
@@ -41,10 +33,6 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
     ("mock（确定性，开发/验收）", "mock"),
     ("edge（微软在线音色）", "edge"),
     ("openai（OpenAI 兼容音色）", "openai"),
-];
-const EYE_MODES: &[(&str, &str)] = &[
-    ("ocr（本地/在线 OCR → 文字）", "ocr"),
-    ("vision（多模态 LLM 直读图像）", "vision"),
 ];
 const THEMES: &[(&str, &str)] = &[("light（浅色）", "light"), ("dark（深色）", "dark")];
 
@@ -288,15 +276,6 @@ fn read_fields(ui: &SettingsWindow) -> HashMap<String, String> {
         ui.get_ai_context_turns().to_string(),
     );
     values.insert(
-        "ocr_provider".into(),
-        pick(OCR_PROVIDERS, ui.get_ocr_provider_index()),
-    );
-    values.insert(
-        "llm_vision_model".into(),
-        ui.get_llm_vision_model().to_string(),
-    );
-    values.insert("eye_mode".into(), pick(EYE_MODES, ui.get_eye_mode_index()));
-    values.insert(
         "asr_provider".into(),
         pick(ASR_PROVIDERS, ui.get_asr_provider_index()),
     );
@@ -472,9 +451,6 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     ui.set_max_tokens(get("max_tokens").into());
     ui.set_ai_system_prompt(get("ai_system_prompt").into());
     ui.set_ai_context_turns(get("ai_context_turns").into());
-    ui.set_ocr_provider_index(index_of(OCR_PROVIDERS, &get("ocr_provider")));
-    ui.set_llm_vision_model(get("llm_vision_model").into());
-    ui.set_eye_mode_index(index_of(EYE_MODES, &get("eye_mode")));
     ui.set_asr_provider_index(index_of(ASR_PROVIDERS, &get("asr_provider")));
     ui.set_asr_base_url(get("asr_base_url").into());
     ui.set_asr_model(get("asr_model").into());
@@ -535,18 +511,16 @@ mod tests {
     #[test]
     fn pick_maps_index_to_value() {
         assert_eq!(pick(TTS_PROVIDERS, 2), "openai");
-        assert_eq!(pick(OCR_PROVIDERS, 1), "windows");
         assert_eq!(pick(THEMES, 99), "light", "越界回退首个");
     }
 
     #[test]
-    fn provider_lists_cover_config_values() {
-        // 与 config 白名单保持一致，防止 UI 漂移
+    fn hidden_provider_lists_cover_config_values() {
+        // 与 config 白名单保持一致，防止隐藏入口的 ASR/TTS 枚举漂移；
+        // OCR provider 已不暴露给用户，由 daemon 内置默认 + CLI/验收覆盖。
         let asr: Vec<&str> = ASR_PROVIDERS.iter().map(|(_, v)| *v).collect();
         assert!(asr.contains(&"mock") && asr.contains(&"openai"));
         let tts: Vec<&str> = TTS_PROVIDERS.iter().map(|(_, v)| *v).collect();
         assert!(tts.contains(&"mock") && tts.contains(&"edge") && tts.contains(&"openai"));
-        let ocr: Vec<&str> = OCR_PROVIDERS.iter().map(|(_, v)| *v).collect();
-        assert!(ocr.contains(&"mock") && ocr.contains(&"windows"));
     }
 }

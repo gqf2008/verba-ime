@@ -1294,11 +1294,10 @@ pub fn apply_action(
                     set_preedit_streaming_status(data, context, clientid);
                     // 发送即占位：同一次按键处理里同步挂上结果浮层（零延迟）。
                     show_result_placeholder(data, context);
+                    // 普通 `//` 的眼睛区域固定走内置 OCR；只有 `//看图` 才显式
+                    // 走 LLM vision。用户不再需要选择 ocr/vision。
                     let eye_rect = eye_rect_for(data, context);
-                    let (eye_enabled, eye_mode) =
-                        load_eye_runtime_cfg().unwrap_or((true, "ocr".to_owned()));
-                    let use_vision = eye_enabled && eye_mode == "vision";
-                    start_llm(data, prompt, eye_rect, use_vision);
+                    start_llm(data, prompt, eye_rect, false);
                 }
             }
             Ok(())
@@ -1713,7 +1712,7 @@ fn start_llm_with_system(
                 return;
             }
         };
-        // 眼睛：指令前捕捉光标上方屏幕。use_vision=true 时（`//看图` / eye_mode=vision）
+        // 眼睛：指令前捕捉光标上方屏幕。use_vision=true 时（仅 `//看图`）
         // 在工作线程内截图→PNG 直接交给 LLM；否则 OCR 转文字注入 system。
         // 改写管道等调用方注入的系统提示词；None 时按用例（眼睛等）再定。
         let mut system: Option<String> = system;
@@ -2278,13 +2277,6 @@ fn eye_vision_image(eye_rect: Option<(i32, i32, i32, i32)>) -> Option<(String, V
     };
     let png = bmp_to_png(&shot.bmp).ok()?;
     Some(("image/png".to_owned(), png))
-}
-
-/// 读取当前眼睛运行配置：是否启用 + 喂给 LLM 的方式（ocr|vision）。
-fn load_eye_runtime_cfg() -> Option<(bool, String)> {
-    let dirs = verba_config::VerbaDirs::locate().ok()?;
-    let cfg = verba_config::ConfigManager::new(dirs).load().ok()?;
-    Some((cfg.eye_enabled, cfg.eye_mode.clone()))
 }
 
 fn eye_rect_for(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32, i32, i32)> {

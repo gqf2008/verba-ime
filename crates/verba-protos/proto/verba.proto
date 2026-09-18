@@ -132,7 +132,7 @@ message Audio {
   bytes data = 2;
 }
 
-// OCR（图片/截图 → 文字）：provider 由 config ocr_provider 决定（mock|windows…）。
+// OCR（图片/截图 → 文字）：内置 provider 默认 rapid（windows/mock 仅供 CLI/验收覆盖）。
 message OcrRecognize {
   bytes image = 1;
 }

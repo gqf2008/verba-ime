@@ -70,6 +70,34 @@ pub enum LlmError {
     Format(String),
 }
 
+/// 图片请求失败时，把「模型/接口不接受图片输入」转成可执行提示。
+///
+/// OpenAI 兼容端点通常不暴露模型模态信息，无法在请求前可靠判断；这里只在
+/// 已经携带图片且服务端返回客户端拒绝（400/422，或带 vision 关键词的 404）
+/// 时兜底，并在提示里保留原始错误，避免把无关的 400 误判成「没有视觉能力」。
+pub fn vision_error_hint(err: &LlmError, model: &str) -> Option<String> {
+    let (reason, detail) = match err {
+        LlmError::Http { status, body } if matches!(status, 400 | 422) => {
+            (format!("HTTP {status}"), body.as_str())
+        }
+        LlmError::Http { status, body } if *status == 404 && mentions_vision(body) => {
+            (format!("HTTP {status}"), body.as_str())
+        }
+        LlmError::Stream(msg) if mentions_vision(msg) => ("流式错误".to_owned(), msg.as_str()),
+        _ => return None,
+    };
+    Some(format!(
+        "当前模型 `{model}` 拒绝了图片输入（{reason}）。若该模型不支持视觉，请在「设置 → LLM」换用支持图片输入的模型，或改用 `//截图` 走内置 OCR。\n服务端返回：{detail}"
+    ))
+}
+
+fn mentions_vision(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["image", "vision", "multimodal", "图片", "视觉", "多模态"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
 /// LLM 客户端。
 #[derive(Debug, Clone)]
 pub struct LlmClient {
@@ -336,6 +364,47 @@ mod tests {
             "应使用指定模型"
         );
     }
+    #[test]
+    fn vision_error_hint_maps_client_rejection() {
+        let err = LlmError::Http {
+            status: 400,
+            body: "model does not support image input".into(),
+        };
+        let hint = vision_error_hint(&err, "deepseek-flash").unwrap();
+        assert!(hint.contains("deepseek-flash"));
+        assert!(hint.contains("//截图"));
+        assert!(hint.contains("model does not support image input"));
+    }
+
+    #[test]
+    fn vision_error_hint_maps_stream_vision_rejection() {
+        let err = LlmError::Stream("unexpected content type image_url".into());
+        let hint = vision_error_hint(&err, "text-only").unwrap();
+        assert!(hint.contains("text-only"));
+        assert!(hint.contains("图片输入"));
+    }
+
+    #[test]
+    fn vision_error_hint_ignores_auth_server_and_generic_errors() {
+        let auth = LlmError::Http {
+            status: 401,
+            body: "invalid api key".into(),
+        };
+        let server = LlmError::Http {
+            status: 500,
+            body: "internal error".into(),
+        };
+        let reset = LlmError::Stream("connection reset".into());
+        let not_found = LlmError::Http {
+            status: 404,
+            body: "model not found".into(),
+        };
+        assert!(vision_error_hint(&auth, "m").is_none());
+        assert!(vision_error_hint(&server, "m").is_none());
+        assert!(vision_error_hint(&reset, "m").is_none());
+        assert!(vision_error_hint(&not_found, "m").is_none());
+    }
+
     #[test]
     fn parse_sse_handles_done_and_junk() {
         assert_eq!(parse_sse("[DONE]").unwrap(), None);

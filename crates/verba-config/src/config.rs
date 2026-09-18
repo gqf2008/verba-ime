@@ -195,9 +195,6 @@ pub struct Config {
     /// 模型名。
     #[serde(default = "default_llm_model")]
     pub llm_model: String,
-    /// 多模态 vision 模型名（在 llm_base_url 上）；为空则复用 llm_model（仅文本）。`//看图`/eye_mode=vision 时使用。
-    #[serde(default)]
-    pub llm_vision_model: String,
     /// 采样温度。
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -222,7 +219,8 @@ pub struct Config {
     /// TTS 语音名（如 edge 的 zh-CN-XiaoxiaoNeural；mock 忽略）。
     #[serde(default)]
     pub tts_voice: String,
-    /// OCR provider：mock（默认，确定性）| windows（Windows.Media.Ocr 本地识别）。
+    /// 内置 OCR 实现：rapid（默认，真实识别）| windows（Windows.Media.Ocr）| mock（开发/验收）。
+    /// 设置页不暴露；仅 CLI `config set` 与验收脚本可覆盖。
     #[serde(default = "default_ocr_provider")]
     pub ocr_provider: String,
 
@@ -253,9 +251,6 @@ pub struct Config {
     /// 眼睛区域距光标组合的偏移（正值=向上）。
     #[serde(default = "default_eye_offset")]
     pub eye_offset_y: i32,
-    /// 眼睛喂给 LLM 的方式：ocr（默认，本地/在线 OCR → 文字）| vision（直接发图给多模态 LLM）。
-    #[serde(default = "default_eye_mode")]
-    pub eye_mode: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -277,7 +272,7 @@ fn default_tts_provider() -> String {
     "mock".to_owned()
 }
 fn default_ocr_provider() -> String {
-    "mock".to_owned()
+    "rapid".to_owned()
 }
 fn default_asr_provider() -> String {
     "mock".to_owned()
@@ -305,16 +300,11 @@ fn default_eye_offset() -> i32 {
 fn default_ai_context_turns() -> i32 {
     0
 }
-fn default_eye_mode() -> String {
-    "ocr".to_owned()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             llm_base_url: default_llm_base_url(),
             llm_model: default_llm_model(),
-            llm_vision_model: String::new(),
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             ai_system_prompt: String::new(),
@@ -333,7 +323,6 @@ impl Default for Config {
             eye_width: default_eye_width(),
             eye_height: default_eye_height(),
             eye_offset_y: default_eye_offset(),
-            eye_mode: default_eye_mode(),
         }
     }
 }
@@ -344,7 +333,6 @@ impl Config {
         let mut map = HashMap::new();
         map.insert("llm_base_url".into(), self.llm_base_url.clone());
         map.insert("llm_model".into(), self.llm_model.clone());
-        map.insert("llm_vision_model".into(), self.llm_vision_model.clone());
         map.insert("temperature".into(), self.temperature.to_string());
         map.insert("max_tokens".into(), self.max_tokens.to_string());
         map.insert("ai_system_prompt".into(), self.ai_system_prompt.clone());
@@ -362,7 +350,6 @@ impl Config {
         map.insert("eye_width".into(), self.eye_width.to_string());
         map.insert("eye_height".into(), self.eye_height.to_string());
         map.insert("eye_offset_y".into(), self.eye_offset_y.to_string());
-        map.insert("eye_mode".into(), self.eye_mode.clone());
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -440,7 +427,6 @@ impl Config {
                         .parse()
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
-                "llm_vision_model" => self.llm_vision_model = v.clone(),
                 "rime_schema" => self.rime_schema = v.clone(),
                 "tts_provider" => {
                     if v != "mock" && v != "edge" && v != "openai" {
@@ -490,14 +476,6 @@ impl Config {
                     self.eye_offset_y = v
                         .parse()
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
-                }
-                "eye_mode" => {
-                    if v != "ocr" && v != "vision" {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "eye_mode 仅支持 ocr|vision: {k}={v}"
-                        )));
-                    }
-                    self.eye_mode = v.clone();
                 }
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
@@ -808,29 +786,44 @@ mod tests {
     }
 
     #[test]
-    fn ai_vision_and_rapid_keys_flow_through_map() {
+    fn ocr_defaults_to_builtin_rapid() {
+        assert_eq!(Config::default().ocr_provider, "rapid");
+    }
+
+    #[test]
+    fn builtin_ocr_and_context_keys_flow_through_map() {
         let mut cfg = Config::default();
-        assert_eq!(cfg.eye_mode, "ocr");
-        assert_eq!(cfg.llm_vision_model, "");
         let mut map = HashMap::new();
-        map.insert("eye_mode".into(), "vision".into());
-        map.insert("llm_vision_model".into(), "qwen2.5-vl".into());
-        map.insert("ocr_provider".into(), "rapid".into());
+        map.insert("ocr_provider".into(), "windows".into());
         map.insert("ai_context_turns".into(), "4".into());
         cfg.apply_map(&map).unwrap();
-        assert_eq!(cfg.eye_mode, "vision");
-        assert_eq!(cfg.llm_vision_model, "qwen2.5-vl");
-        assert_eq!(cfg.ocr_provider, "rapid");
+        assert_eq!(cfg.ocr_provider, "windows");
         assert_eq!(cfg.ai_context_turns, 4);
         let out = cfg.to_map();
-        assert_eq!(out.get("eye_mode").map(String::as_str), Some("vision"));
-        assert_eq!(out.get("ocr_provider").map(String::as_str), Some("rapid"));
-        let mut m = HashMap::new();
-        m.insert("eye_mode".into(), "bogus".into());
-        assert!(matches!(
-            cfg.apply_map(&m),
-            Err(ConfigError::InvalidValue(_))
-        ));
+        assert_eq!(out.get("ocr_provider").map(String::as_str), Some("windows"));
+    }
+
+    #[test]
+    fn legacy_vision_keys_are_ignored_on_load_and_rejected_on_set() {
+        // 旧 config.toml 残留 llm_vision_model / eye_mode 不得让加载失败；
+        // 新写入路径（apply_map / SetConfig）必须拒绝，避免已删配置键继续漂移。
+        let legacy = r#"
+llm_model = "deepseek-flash"
+llm_vision_model = "qwen2.5-vl"
+eye_mode = "vision"
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.llm_model, "deepseek-flash");
+        let out = cfg.to_map();
+        assert!(!out.contains_key("llm_vision_model"));
+        assert!(!out.contains_key("eye_mode"));
+
+        for key in ["llm_vision_model", "eye_mode"] {
+            let mut cfg = Config::default();
+            let mut m = HashMap::new();
+            m.insert(key.into(), "x".into());
+            assert!(matches!(cfg.apply_map(&m), Err(ConfigError::UnknownKey(_))));
+        }
     }
 
     #[test]

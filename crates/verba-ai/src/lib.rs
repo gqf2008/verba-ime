@@ -8,5 +8,5 @@
 pub mod llm;
 pub mod traits;
 
-pub use llm::{LlmClient, LlmConfig, LlmError, LlmRequest};
+pub use llm::{vision_error_hint, LlmClient, LlmConfig, LlmError, LlmRequest};
 pub use traits::{AsrProvider, OcrProvider, TtsAudio, TtsProvider};

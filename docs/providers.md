@@ -59,15 +59,16 @@
 
 | 能力 | 默认 | 备选 | 说明 |
 | --- | --- | --- | --- |
-| OCR | rapid（本地 RapidOCR/PaddleOCR，经 Python `rapidocr_onnxruntime`） | platform 原生（Windows.Media.Ocr）/ vision LLM | 云端仅当用户配置 key |
+| OCR | rapid（本地 RapidOCR/PaddleOCR，原生 Rust，无需 Python） | 内部可经 CLI 覆盖 windows/mock | 设置页不暴露 provider；vision LLM 只用于 `//看图` 理解 |
 | ASR | ❄️ 冻结为实验性，默认关闭 | mock | 入口隐藏，不承诺 |
 | LLM | 无默认服务商，首次引导配置 | DeepSeek / OpenAI 兼容 | 纯远程，必须显式配置 |
 | TTS | ❄️ 冻结为实验性，默认关闭 | mock | 入口隐藏，不承诺 |
 
-## 多模态 vision（`//看图` / 眼睛直读图像）
+## 多模态 vision（`//看图`）
 
-- `//看图` 或 `eye_mode=vision` 时，把「眼睛区域」（光标上方屏幕，见候选窗避让逻辑）直接发给多模态 LLM（OpenAI 兼容 `image_url` 内容块），例如 `gpt-4o-mini` / `qwen2.5-vl` / `GLM-4V`。
-- 配置：`llm_vision_model`（为空则复用 `llm_model`，需模型支持 vision）、`eye_mode=ocr|vision`。
+- `//看图` 把「眼睛区域」（光标上方屏幕，见候选窗避让逻辑）直接发给当前配置的 LLM（OpenAI 兼容 `image_url` 内容块），例如 `gpt-4o-mini` / `qwen2.5-vl` / `GLM-4V`；模型复用 `llm_model` / `llm_base_url` / 同一个 API Key。
+- 设置页不暴露 vision 模型或眼睛模式：普通 `//` 的眼睛区域固定走内置 OCR，只有 `//看图` 显式走 LLM vision。
+- 模型不支持图片时，daemon 把客户端拒绝（HTTP 400/422，或带 vision 关键词的 404/流错误）转成可执行提示：换用支持图片输入的模型，或改用 `//截图` 走内置 OCR；服务端原始错误一并展示。
 - 与 OCR 的区别：vision 由 LLM 直接「理解 + 提取」，擅长版面、表格、图表与上下文；OCR 只做「文字识别」转文本。
 
 ## 降级与失败策略
