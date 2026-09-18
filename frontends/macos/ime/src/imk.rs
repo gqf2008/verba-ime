@@ -1174,12 +1174,25 @@ define_class!(
         /// 打开设置面板（菜单项 action）。
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
+            // 优先经 **LaunchServices** 打开设置 .app：已在运行则激活到前台、不新开
+            // 实例；直接 spawn 裸二进制起不到前台（2026-09-18 真机实测）。
+            if let Some(app) = crate::ipc::settings_app_path() {
+                log::info!("[VerbaIMK] 打开设置面板（LaunchServices）: {}", app.display());
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .arg(&app)
+                    .spawn();
+                return;
+            }
+            // 开发态（仓库里只有裸二进制、没有 .app）：退回 spawn。
+            // 注意此路径窗口可能不在前台——仅开发用，打包形态走上面的分支。
             match crate::ipc::settings_exe_path() {
                 Some(p) => {
-                    log::info!("[VerbaIMK] 打开设置面板: {}", p.display());
+                    log::info!("[VerbaIMK] 打开设置面板（开发态 spawn）: {}", p.display());
                     let _ = std::process::Command::new(&p).spawn();
                 }
-                None => log::warn!("[VerbaIMK] 未找到 verba-settings（VERBA_SETTINGS_PATH 或同目录）"),
+                None => log::warn!(
+                    "[VerbaIMK] 未找到设置面板（VERBA_SETTINGS_APP / VERBA_SETTINGS_PATH 或 bundle 内 Library/Verba Settings.app）"
+                ),
             }
         }
 
