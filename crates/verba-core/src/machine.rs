@@ -954,9 +954,24 @@ impl CompositionMachine {
     }
 
     /// Esc。
+    ///
+    /// Idle 也走 `clear_composition_state`：预览槽（rewrite/ocr/ai）与主状态
+    /// 解耦，Idle 仍可能残留预览——改写流结果为空时 `begin_rewrite_preview`
+    /// 会在 Idle 上武装对照预览；OCR 预览退出（feed_ocr_preview 的
+    /// Digit2/Other 臂、end_ocr_preview）也把 state 置回 Idle 而**不清**
+    /// rewrite_preview。前端 activate/deactivate 又以本函数作为会话归零
+    /// 原语（reset()），Idle 直接返回会让粘滞预览跨会话存活：下一会话首个
+    /// 空格/回车/1/2 被 input_text 的 rewrite_previewing 门误路由到
+    /// feed_rewrite_preview，上屏陈旧（本例为空）文本并丢弃刚输入的拼音。
+    /// 真机 2026-09-18：「启动后第一次 nihao 选候选不上屏」——日志显示首个
+    /// 空格打的是 `改写预览键: Space` 且 `commit text=`（空串）。
+    /// 返回 Action::None：Idle 无现场可取消，仅清残留槽位。
     pub fn feed_escape(&mut self) -> Action {
         match self.state {
-            MachineState::Idle => Action::None,
+            MachineState::Idle => {
+                self.clear_composition_state();
+                Action::None
+            }
             _ => {
                 self.state = MachineState::Idle;
                 self.clear_composition_state();
@@ -3558,6 +3573,39 @@ mod tests {
         m.begin_rewrite_preview("a".into(), "b".into());
         assert_eq!(m.feed_rewrite_preview(PreviewKey::Other), None);
         assert!(m.rewrite_previewing());
+    }
+
+    /// 回归（真机 2026-09-18「启动后第一次 nihao 选候选不上屏」）：对照预览
+    /// 槽与主状态解耦，Idle 也可能残留 rewrite_preview。macOS 前端在
+    /// activate/deactivate 的 reset() 里以 feed_escape 作会话归零原语，它必须
+    /// 在 Idle 也清预览——否则下一会话首个空格被 rewrite_previewing 门吞掉、
+    /// 上屏陈旧（该例为空）文本，刚输入的拼音全部丢弃。
+    #[test]
+    fn escape_clears_rewrite_preview_left_in_idle() {
+        let mut m = CompositionMachine::new();
+        // 复现前提：预览被武装，而主状态停在 Idle（begin_rewrite_preview 不
+        // 动 state；OCR 预览退出路径也会把 state 置回 Idle 而不清它）。
+        m.begin_rewrite_preview(String::new(), "原文".to_owned());
+        assert_eq!(m.state(), MachineState::Idle);
+        assert!(m.rewrite_previewing());
+
+        // 会话边界：前端 reset() → feed_escape。
+        assert_eq!(m.feed_escape(), Action::None);
+        assert!(
+            !m.rewrite_previewing(),
+            "Idle 的 feed_escape 必须清掉残留预览，否则跨会话粘滞"
+        );
+
+        // 新会话首个空格走正常候选路由，不再被预览分支吃掉。
+        for ch in "nihao".chars() {
+            let _ = m.feed_char(ch);
+        }
+        rime(&mut m, "nihao", &["你好", "妳好", "逆号"]);
+        let action = m.feed_char(' ');
+        assert!(
+            matches!(&action, Action::CommitImmediate(t) if t == "你好"),
+            "首个空格应提交当前候选，实际 {action:?}"
+        );
     }
 
     /// `//<内容>` + Tab：提示词内容走改写管道（StartRewrite）；
