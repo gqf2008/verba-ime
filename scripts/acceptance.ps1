@@ -117,8 +117,8 @@ try {
     Remove-Item -LiteralPath $ttsOnline -Force -ErrorAction SilentlyContinue
     Write-Output "tts(openai) -> MP3 OK（$($obytes.Length) bytes）"
 
-    & $cli config set rime_schema=luna_pinyin_simp tts_provider=mock ocr_provider=mock asr_provider=mock tts_base_url= tts_voice= asr_base_url= | Out-Null
-    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + tts/ocr/asr=mock + 在线端点清空）"
+    & $cli config set rime_schema=luna_pinyin_simp tts_provider=mock ocr_provider=rapid asr_provider=mock tts_base_url= tts_voice= asr_base_url= | Out-Null
+    Write-Output "（配置已恢复 engine=rime + luna_pinyin_simp + ocr=rapid + tts/asr=mock + 在线端点清空）"
 }
 finally {
     Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue

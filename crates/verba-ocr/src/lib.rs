@@ -1,7 +1,9 @@
 //! Verba OCR 能力：图片/截图 → 文字。
 //!
-//! provider 由 config `ocr_provider` 选择：mock（确定性，开发/验收）| windows（Windows.Media.Ocr
-//! 本地识别，零下载）。每个 provider 实现 `verba_ai::OcrProvider`，`OcrClient` 按配置分发。
+//! OCR 是内置能力：默认 `rapid`（本地 ONNX/PaddleOCR，原生 Rust，无需 Python）。
+//! `windows`（Windows.Media.Ocr，零下载）与 `mock`（确定性假数据）仅保留为
+//! CLI / 验收的内部覆盖，设置页不暴露。每个 provider 实现 `verba_ai::OcrProvider`，
+//! `OcrClient` 按配置分发。
 
 // 白名单 crate：Cargo.toml 放开 unsafe_code（仅 windows_media.rs 经 SAFETY 注释使用）。
 
@@ -41,7 +43,7 @@ pub enum OcrProviderKind {
     Mock,
     /// Windows.Media.Ocr 本地识别（仅 Windows）。
     WindowsMedia,
-    /// RapidOCR（PaddleOCR + ONNXRuntime，经 Python 子进程）本地识别。
+    /// RapidOCR（PaddleOCR + ONNXRuntime，原生 Rust，无需 Python）本地识别。
     Rapid,
 }
 
@@ -65,7 +67,7 @@ pub struct OcrClient {
 }
 
 impl OcrClient {
-    /// 按配置创建（provider: mock|windows）。
+    /// 按配置创建（provider: mock|windows|rapid；默认内置 rapid）。
     pub fn from_config(provider: &str) -> Result<Self, OcrError> {
         Ok(Self {
             provider: provider.parse()?,

@@ -328,6 +328,18 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 旧版本默认 `ocr_provider = "mock"`（假 OCR）。mock 现在只作为 CLI/验收
+    /// 运行时覆盖保留；加载历史配置时把落盘的默认值升级为内置 `rapid`，避免
+    /// 设置页移除 provider 入口后用户永远停在假识别。返回是否发生迁移。
+    pub fn migrate_legacy_ocr_provider(&mut self) -> bool {
+        if self.ocr_provider == "mock" {
+            self.ocr_provider = "rapid".to_owned();
+            true
+        } else {
+            false
+        }
+    }
+
     /// 转成键值表（用于 IPC `Config` 消息）。
     pub fn to_map(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
@@ -801,6 +813,17 @@ mod tests {
         assert_eq!(cfg.ai_context_turns, 4);
         let out = cfg.to_map();
         assert_eq!(out.get("ocr_provider").map(String::as_str), Some("windows"));
+    }
+
+    #[test]
+    fn legacy_mock_ocr_provider_migrates_to_rapid() {
+        let mut cfg = Config {
+            ocr_provider: "mock".into(),
+            ..Config::default()
+        };
+        assert!(cfg.migrate_legacy_ocr_provider());
+        assert_eq!(cfg.ocr_provider, "rapid");
+        assert!(!cfg.migrate_legacy_ocr_provider(), "迁移必须幂等");
     }
 
     #[test]

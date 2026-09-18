@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use verba_core::machine::{
-    is_fullwidth_mapped_punct, result_hint, Action, CompositionMachine, LlmCandidateRequest,
-    MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
+    failure_overlay_body, is_fullwidth_mapped_punct, result_hint, Action, CompositionMachine,
+    LlmCandidateRequest, MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY,
+    REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::LlmSession;
@@ -1387,9 +1388,11 @@ pub fn apply_action(
                 (m.result().to_owned(), m.result_phase())
             };
             if phase == Some(ResultPhase::Failed) {
-                // body 为已生成的部分结果（失败于首块前则为空——浮层仍有
-                // 状态行的重试提示）。
-                show_result_overlay(data, context, &body, ResultPhase::Failed);
+                // 首块前失败时 result 为空：把 daemon 的可执行错误放进浮层
+                // 正文，否则用户只能看到空的「生成失败」（//看图 不支持图片
+                // 的提示会被吞掉）。已生成部分结果仍优先展示。
+                let display = failure_overlay_body(&body, &message);
+                show_result_overlay(data, context, display, ResultPhase::Failed);
             }
             Ok(())
         }

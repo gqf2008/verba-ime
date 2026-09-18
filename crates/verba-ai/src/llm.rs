@@ -86,9 +86,18 @@ pub fn vision_error_hint(err: &LlmError, model: &str) -> Option<String> {
         LlmError::Stream(msg) if mentions_vision(msg) => ("流式错误".to_owned(), msg.as_str()),
         _ => return None,
     };
-    Some(format!(
-        "当前模型 `{model}` 拒绝了图片输入（{reason}）。若该模型不支持视觉，请在「设置 → LLM」换用支持图片输入的模型，或改用 `//截图` 走内置 OCR。\n服务端返回：{detail}"
-    ))
+    // 只有服务端文本明确提到 image/vision/多模态时才下“模型不支持视觉”的结论；
+    // 其它 400/422（图片过大、格式错误、上下文/参数超限等）只提示图片请求被
+    // 拒绝并附原始错误，避免把无关客户端错误误归因给模型能力。
+    if mentions_vision(detail) {
+        Some(format!(
+            "当前模型 `{model}` 拒绝了图片输入（{reason}）。若该模型不支持视觉，请在「设置 → LLM」换用支持图片输入的模型，或改用 `//截图` 走内置 OCR。\n服务端返回：{detail}"
+        ))
+    } else {
+        Some(format!(
+            "图片请求被服务端拒绝（{reason}，模型 `{model}`）。请检查图片格式/大小或上下文限制，并查看下面的原始错误。\n服务端返回：{detail}"
+        ))
+    }
 }
 
 fn mentions_vision(text: &str) -> bool {
@@ -216,6 +225,24 @@ fn parse_sse(data: &str) -> Result<Option<String>, LlmError> {
     }
     let value: serde_json::Value = serde_json::from_str(trimmed)
         .map_err(|e| LlmError::Format(format!("JSON 解析失败: {e}")))?;
+    // 部分 OpenAI 兼容端点以 HTTP 200 + SSE error payload 报错（例如模型不接受
+    // image_url）。此前只取 choices[0].delta.content，会把这类错误当空流吞掉，
+    // 最终发空 Final；这里显式转成流错误，让上层能做能力提示。
+    if let Some(err) = value.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| err.as_str())
+            .unwrap_or("服务端返回未知错误");
+        return Err(LlmError::Stream(format!("服务端流式错误: {msg}")));
+    }
+    if value.get("choices").is_none() {
+        if let Some(msg) = value.get("message").and_then(serde_json::Value::as_str) {
+            if !msg.is_empty() {
+                return Err(LlmError::Stream(format!("服务端流式错误: {msg}")));
+            }
+        }
+    }
     let content = value
         .pointer("/choices/0/delta/content")
         .and_then(serde_json::Value::as_str)
@@ -377,6 +404,18 @@ mod tests {
     }
 
     #[test]
+    fn vision_error_hint_does_not_misattribute_unrelated_client_errors() {
+        let err = LlmError::Http {
+            status: 422,
+            body: "temperature must be between 0 and 2".into(),
+        };
+        let hint = vision_error_hint(&err, "m").unwrap();
+        assert!(hint.contains("图片请求被服务端拒绝"));
+        assert!(!hint.contains("当前模型 `m` 拒绝了图片输入"));
+        assert!(hint.contains("temperature must be between 0 and 2"));
+    }
+
+    #[test]
     fn vision_error_hint_maps_stream_vision_rejection() {
         let err = LlmError::Stream("unexpected content type image_url".into());
         let hint = vision_error_hint(&err, "text-only").unwrap();
@@ -403,6 +442,18 @@ mod tests {
         assert!(vision_error_hint(&server, "m").is_none());
         assert!(vision_error_hint(&reset, "m").is_none());
         assert!(vision_error_hint(&not_found, "m").is_none());
+    }
+
+    #[test]
+    fn parse_sse_surfaces_error_payload() {
+        let err =
+            parse_sse(r#"{"error":{"message":"model does not support image input"}}"#).unwrap_err();
+        match err {
+            LlmError::Stream(msg) => assert!(msg.contains("does not support image input")),
+            other => panic!("期望 Stream 错误，得到 {other:?}"),
+        }
+        let msg = parse_sse(r#"{"message":"invalid image_url"}"#).unwrap_err();
+        assert!(matches!(msg, LlmError::Stream(_)));
     }
 
     #[test]

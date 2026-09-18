@@ -36,8 +36,8 @@ use objc2_input_method_kit::{
 };
 
 use verba_core::machine::{
-    result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, PreviewKey,
-    ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
+    failure_overlay_body, result_hint, Action, CompositionMachine, LlmCandidateRequest,
+    MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
@@ -2010,7 +2010,9 @@ impl VerbaIMKController {
                     (m.result().to_owned(), m.preedit())
                 };
                 self.set_marked(&preedit);
-                self.show_ai_result(&body, ResultPhase::Failed);
+                // 首块前失败时 result 为空：把 daemon 的可执行错误显示在
+                // 面板上，避免只剩一条空失败提示（与 Windows 共用 core 策略）。
+                self.show_ai_result(failure_overlay_body(&body, &message), ResultPhase::Failed);
                 self.invalidate_timer();
                 true
             }

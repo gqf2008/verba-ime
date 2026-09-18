@@ -58,7 +58,11 @@ pub fn run(socket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         })))
         .init();
     let mgr = ConfigManager::new(dirs);
-    let config = mgr.load()?;
+    let mut config = mgr.load()?;
+    if config.migrate_legacy_ocr_provider() {
+        log::warn!("旧配置 ocr_provider=mock 已迁移为内置 rapid（mock 仅保留 CLI/验收运行时覆盖）");
+        mgr.save(&config)?;
+    }
 
     let api_key = ApiKeyStore::get()?;
     let llm_config = LlmConfig::new(
