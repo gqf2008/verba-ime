@@ -36,8 +36,8 @@ use objc2_input_method_kit::{
 };
 
 use verba_core::machine::{
-    result_hint, Action, CompositionMachine, LlmCandidateRequest, MachineState, PreviewKey,
-    ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
+    failure_overlay_body, result_hint, Action, CompositionMachine, LlmCandidateRequest,
+    MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
@@ -786,6 +786,10 @@ const AI_RESULT_DISPLAY_CHARS: usize = 40;
 
 /// AI 结果面板条目（纯函数，供单测）：截断结果 + 阶段提示两条；空结果
 /// （失败于首块前）只剩提示一条。
+///
+/// 面板是单列、不换行的候选列表，40 字是既有安全宽度；失败提示因此要求
+/// daemon 把“换视觉模型 / 改用 //截图”等动作前置在 40 字内，面板只展示
+/// 前缀，完整错误详情看 daemon 日志。
 fn ai_result_display_items(text: &str, phase: ResultPhase) -> Vec<String> {
     let mut items: Vec<String> = Vec::new();
     if !text.is_empty() {
@@ -2010,7 +2014,9 @@ impl VerbaIMKController {
                     (m.result().to_owned(), m.preedit())
                 };
                 self.set_marked(&preedit);
-                self.show_ai_result(&body, ResultPhase::Failed);
+                // 首块前失败时 result 为空：把 daemon 的可执行错误显示在
+                // 面板上，避免只剩一条空失败提示（与 Windows 共用 core 策略）。
+                self.show_ai_result(failure_overlay_body(&body, &message), ResultPhase::Failed);
                 self.invalidate_timer();
                 true
             }
@@ -2969,6 +2975,15 @@ mod tests {
     /// #89 结果浮层面板条目：显示截断（上限+省略号）、空结果只剩提示、
     /// 短文本原样。「提交取全文」的一半由 core 的 feed_enter →
     /// CommitResult(全文) 测试钉住——显示截断只属于面板。
+    #[test]
+    fn ai_result_display_items_keep_failure_actionable_hint() {
+        // 与 daemon vision_error_hint 同构：动作前置，40 字安全宽度内可见。
+        let hint = "图片未识别：请换支持视觉的模型，或改用 `//截图` 走内置 OCR。当前模型 `deepseek-flash` 拒绝了图片输入（HTTP 400）。\n服务端返回：HTTP 400: model does not support image input";
+        let items = ai_result_display_items(hint, ResultPhase::Failed);
+        assert!(items[0].contains("//截图"), "失败提示必须保留可执行动作");
+        assert_eq!(items[1], result_hint(ResultPhase::Failed));
+    }
+
     #[test]
     fn ai_result_display_items_truncate_and_hint() {
         let items = ai_result_display_items(&"字".repeat(60), ResultPhase::Ready);

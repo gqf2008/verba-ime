@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
-use verba_ai::{LlmClient, LlmConfig, LlmRequest};
+use verba_ai::{vision_error_hint, LlmClient, LlmConfig, LlmRequest};
 use verba_config::{ApiKeyStore, Config, ConfigManager};
 use verba_core::VERSION;
 use verba_ipc::server::{Outbound, RequestHandler};
@@ -403,7 +403,7 @@ impl DaemonHandler {
         })
         .await?;
 
-        let (mut llm_cfg, config_system) = self.llm_snapshot();
+        let (llm_cfg, config_system) = self.llm_snapshot();
         let LlmGenerate {
             prompt,
             system,
@@ -531,18 +531,12 @@ impl DaemonHandler {
             )
             .unwrap_or(0);
         }
-        // vision：请求携带图像时，若配置了独立 vision 模型则切换模型名。
-        if image.is_some() {
-            let vision_model = self.config.read().unwrap().llm_vision_model.clone();
-            if !vision_model.is_empty() {
-                llm_cfg.model = vision_model;
-            }
-        }
         let system = system
             .filter(|s| !s.is_empty())
             .or_else(|| (!config_system.is_empty()).then_some(config_system))
             .or_else(|| Some(DEFAULT_AI_SYSTEM.to_owned()));
 
+        let request_model = llm_cfg.model.clone();
         let req = LlmRequest {
             prompt,
             system,
@@ -582,13 +576,19 @@ impl DaemonHandler {
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!("LLM 流错误: {e}");
+                                    let message = if has_image {
+                                        vision_error_hint(&e, &request_model)
+                                            .unwrap_or_else(|| e.to_string())
+                                    } else {
+                                        e.to_string()
+                                    };
+                                    log::warn!("LLM 流错误: {message}");
                                     let _ = out
                                         .event(&StreamEvent {
                                             id,
                                             kind: Some(stream_event::Kind::Error(ProtoError {
                                                 code: 500,
-                                                message: e.to_string(),
+                                                message,
                                             })),
                                         })
                                         .await;
@@ -632,13 +632,15 @@ impl DaemonHandler {
                 }
             }
             Err(e) => {
+                let message = if has_image {
+                    vision_error_hint(&e, &request_model).unwrap_or_else(|| e.to_string())
+                } else {
+                    e.to_string()
+                };
                 let _ = out
                     .event(&StreamEvent {
                         id,
-                        kind: Some(stream_event::Kind::Error(ProtoError {
-                            code: 502,
-                            message: e.to_string(),
-                        })),
+                        kind: Some(stream_event::Kind::Error(ProtoError { code: 502, message })),
                     })
                     .await;
             }

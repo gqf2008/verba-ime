@@ -110,6 +110,20 @@ pub fn result_hint(phase: ResultPhase) -> &'static str {
     }
 }
 
+/// 失败浮层的显示正文：优先保留已生成的部分结果；首块前失败（result 为空）
+/// 时改用 daemon 的错误信息——否则用户只能看到空的「生成失败」，看不到可
+/// 执行提示（例如 `//看图` 模型不支持图片时的换模型/改用 `//截图` 指引）。
+///
+/// **只影响显示**：Failed 态下 Enter/`r` 是重试、不会提交本串；两端共用，
+/// 避免 Windows 与 macOS 的失败提示再次漂移。
+pub fn failure_overlay_body<'a>(partial: &'a str, message: &'a str) -> &'a str {
+    if partial.trim().is_empty() {
+        message
+    } else {
+        partial
+    }
+}
+
 /// 结果浮层的**占位正文**：`//`（含 `//看图`）与改写管道发送的**同一次按
 /// 键处理**里，结果浮层以本串**同步**出场——发送 → 首个 token 的 1–3s 里
 /// 用户视线正落在候选框上，此前那里什么都没有（用户感知「什么都没发生」）。
@@ -2266,6 +2280,20 @@ mod tests {
             }
         );
         assert_eq!(m.state(), MachineState::Streaming);
+    }
+
+    #[test]
+    fn failure_overlay_body_prefers_partial_result_but_surfaces_error_when_empty() {
+        assert_eq!(
+            failure_overlay_body("部分", "模型不支持图片"),
+            "部分",
+            "有部分结果时不得用错误覆盖"
+        );
+        assert_eq!(
+            failure_overlay_body("  ", "模型不支持图片，请改 //截图"),
+            "模型不支持图片，请改 //截图",
+            "首块前失败必须把可执行错误显示给用户"
+        );
     }
 
     #[test]

@@ -419,13 +419,11 @@ fn cmd_diag(_args: &[String]) -> i32 {
                     for k in [
                         "llm_base_url",
                         "llm_model",
-                        "llm_vision_model",
                         "rime_schema",
                         "ocr_provider",
                         "asr_provider",
                         "tts_provider",
                         "eye_enabled",
-                        "eye_mode",
                     ] {
                         println!("{k} = {}", get(k));
                     }

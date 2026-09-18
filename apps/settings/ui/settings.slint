@@ -21,10 +21,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> api-key-state: "未设置";
     in-out property <string> api-key-input: "";
 
-    // ---------- 多模态 ----------
-    in-out property <int> ocr-provider-index: 0;
-    in-out property <string> llm-vision-model;
-    in-out property <int> eye-mode-index: 0;
+    // ---------- 实验性能力（ASR/TTS，UI 入口隐藏） ----------
     in-out property <int> asr-provider-index: 0;
     in-out property <string> asr-base-url;
     in-out property <string> asr-model;
@@ -99,17 +96,6 @@ export component SettingsWindow inherits Window {
                 }
 
                 GroupBox {
-                    title: "多模态（OCR / Vision）";
-                    VerticalBox {
-                        padding: 8px;
-                        spacing: 6px;
-                        HorizontalBox { spacing: 8px; Text { text: "OCR"; width: 130px; vertical-alignment: center; } ComboBox { model: ["mock（确定性，开发/验收）", "windows（Windows 本地识别）", "rapid（本地 ONNX/PaddleOCR，原生 Rust，无需 Python）"]; current-index <=> root.ocr-provider-index; } }
-                        HorizontalBox { spacing: 8px; Text { text: "Vision 模型"; width: 130px; vertical-alignment: center; } LineEdit { text <=> root.llm-vision-model; placeholder-text: "留空复用 LLM 模型（需 vision 模型）/ gpt-4o-mini"; } }
-                        HorizontalBox { spacing: 8px; Text { text: "眼睛喂给 LLM"; width: 130px; vertical-alignment: center; } ComboBox { model: ["ocr（本地/在线 OCR → 文字）", "vision（多模态 LLM 直读图像）"]; current-index <=> root.eye-mode-index; } }
-                    }
-                }
-
-                GroupBox {
                     title: "候选窗";
                     VerticalBox {
                         padding: 8px;
@@ -166,9 +152,9 @@ export component SettingsWindow inherits Window {
                     VerticalBox {
                         padding: 8px;
                         spacing: 4px;
-                        Text { text: "LLM / 在线 OCR 会把文本发送到你配置的远程服务商。"; wrap: word-wrap; }
+                        Text { text: "LLM 与 `//看图` 会把文本/图片发送到你配置的远程服务商。"; wrap: word-wrap; }
                         Text { text: "API Key 存入系统密钥库（keyring），config.toml 不保存明文。"; wrap: word-wrap; }
-                        Text { text: "mock / windows OCR 等本地 provider 不联网。"; wrap: word-wrap; }
+                        Text { text: "内置 OCR 识别在本地完成；安装包未内置模型时，首次使用可能需要联网下载。"; wrap: word-wrap; }
                     }
                 }
             }
