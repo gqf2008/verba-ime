@@ -99,7 +99,8 @@ fn is_verba_entry(value: &plist::Value) -> bool {
 }
 
 /// 构造 `com.apple.inputsources` 的 Verba 父源 + Pinyin mode entry。
-fn verba_entries() -> Vec<plist::Value> {
+/// Verba **父源**条目（Keyboard Input Method）。白名单只需这一条。
+fn verba_parent_entry() -> plist::Value {
     let mut parent = plist::Dictionary::new();
     parent.insert(
         BUNDLE_ID_KEY.to_owned(),
@@ -109,7 +110,12 @@ fn verba_entries() -> Vec<plist::Value> {
         INPUT_SOURCE_KIND_KEY.to_owned(),
         plist::Value::String(KEYBOARD_INPUT_METHOD_KIND.to_owned()),
     );
+    plist::Value::Dictionary(parent)
+}
 
+/// 父源 + Pinyin mode（HIToolbox 的 `AppleEnabledInputSources` 用这一对，
+/// macOS 自身也是两条：父源 + 可打字的方案）。
+fn verba_entries() -> Vec<plist::Value> {
     let mut mode = plist::Dictionary::new();
     mode.insert(
         BUNDLE_ID_KEY.to_owned(),
@@ -124,10 +130,7 @@ fn verba_entries() -> Vec<plist::Value> {
         plist::Value::String(INPUT_MODE_KIND.to_owned()),
     );
 
-    vec![
-        plist::Value::Dictionary(parent),
-        plist::Value::Dictionary(mode),
-    ]
+    vec![verba_parent_entry(), plist::Value::Dictionary(mode)]
 }
 
 /// 把 `com.apple.inputsources` plist 规范化为「Verba 父源 + Pinyin mode」两条。
@@ -159,7 +162,12 @@ fn ensure_verba_entries(root: &mut plist::Value) -> Result<bool, String> {
             .and_then(plist::Value::as_string)
             != Some(VERBA_SOURCE_ID)
     });
-    entries.extend(verba_entries());
+    // **只写父源**：mode 已由 app bundle 的 ComponentInputModeDict 声明，再往白名单写
+    // 一条会让 TIS 把同一个 mode 注册两次（真机 2026-09-18：Verba.Pinyin 在 TIS 里
+    // 出现 2 次，而 Apple 自家的 SCIM.ITABC 只有 1 次）。清掉 mode 条目后重新注册，
+    // TIS 恢复 2 条（父源 + mode）且 mode 仍 enabled/selectable——v0.2.13 得出"必须
+    // 两条都写"时自检函数正用错 key 恒返回 false，那个结论是假象。
+    entries.push(verba_parent_entry());
     Ok(*root != original)
 }
 
@@ -693,7 +701,12 @@ mod tests {
     }
 
     #[test]
-    fn third_party_input_sources_adds_verba_parent_and_mode() {
+    /// 回归（真机 2026-09-18 输入源重复）：白名单**只能有父源一条**。
+    ///
+    /// mode 再写进白名单会让 TIS 把同一个 mode 注册两次（`Verba.Pinyin` 出现 2 次，
+    /// 而 Apple 自家 `SCIM.ITABC` 只有 1 次）。mode 由 app bundle 的
+    /// ComponentInputModeDict 声明即可，且实验证明仅父源时 mode 仍 enabled/selectable。
+    fn third_party_input_sources_writes_parent_only() {
         let mut root = plist::Value::Dictionary(plist::Dictionary::new());
         assert!(ensure_verba_entries(&mut root).unwrap());
         let entries = root
@@ -701,21 +714,22 @@ mod tests {
             .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
             .and_then(plist::Value::as_array)
             .expect("应有第三方输入源数组");
-        assert_eq!(entries.len(), 2, "父源 + Pinyin mode");
-        assert!(entries.iter().any(|value| {
-            value
-                .as_dictionary()
-                .and_then(|entry| entry.get(INPUT_SOURCE_KIND_KEY))
-                .and_then(plist::Value::as_string)
-                == Some(KEYBOARD_INPUT_METHOD_KIND)
-        }));
-        assert!(entries.iter().any(|value| {
-            let Some(entry) = value.as_dictionary() else {
-                return false;
-            };
-            entry.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string) == Some(VERBA_SOURCE_ID)
-                && entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
-        }));
+        assert_eq!(entries.len(), 1, "白名单只留父源一条");
+        let e = entries[0].as_dictionary().expect("条目应为字典");
+        assert_eq!(
+            e.get(BUNDLE_ID_KEY).and_then(plist::Value::as_string),
+            Some(VERBA_SOURCE_ID)
+        );
+        assert_eq!(
+            e.get(INPUT_SOURCE_KIND_KEY)
+                .and_then(plist::Value::as_string),
+            Some(KEYBOARD_INPUT_METHOD_KIND),
+            "必须是父源（Keyboard Input Method）"
+        );
+        assert!(
+            e.get(INPUT_MODE_KEY).is_none(),
+            "白名单里不得再出现 Input Mode 条目——那会让 mode 在 TIS 里重复注册"
+        );
     }
 
     #[test]
@@ -756,13 +770,26 @@ mod tests {
             .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
             .and_then(plist::Value::as_array)
             .unwrap();
-        assert_eq!(entries.len(), 3, "其他输入源保留，Verba 规范化为父源+mode");
+        assert_eq!(
+            entries.len(),
+            2,
+            "其他输入源保留；Verba 只留父源一条（mode 不再写进白名单）"
+        );
         assert!(entries.iter().any(|v| {
             v.as_dictionary()
                 .and_then(|d| d.get(BUNDLE_ID_KEY))
                 .and_then(plist::Value::as_string)
                 == Some("example.other.inputmethod")
         }));
+        assert!(
+            !entries.iter().any(|v| {
+                v.as_dictionary()
+                    .and_then(|d| d.get(INPUT_MODE_KEY))
+                    .and_then(plist::Value::as_string)
+                    == Some(VERBA_MODE_ID)
+            }),
+            "白名单里不得残留任何 Verba Input Mode 条目"
+        );
     }
     #[test]
     fn third_party_input_sources_fails_closed_on_wrong_root_type() {
@@ -818,20 +845,14 @@ mod tests {
             .and_then(|d| d.get(THIRD_PARTY_INPUT_SOURCES_KEY))
             .and_then(plist::Value::as_array)
             .unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|value| {
-            value
+        assert_eq!(entries.len(), 1, "畸形条目全部重写为唯一一条父源");
+        assert_eq!(
+            entries[0]
                 .as_dictionary()
-                .and_then(|entry| entry.get(INPUT_SOURCE_KIND_KEY))
-                .and_then(plist::Value::as_string)
-                == Some(KEYBOARD_INPUT_METHOD_KIND)
-        }));
-        assert!(entries.iter().any(|value| {
-            let Some(entry) = value.as_dictionary() else {
-                return false;
-            };
-            entry.get("Input Mode").and_then(plist::Value::as_string) == Some(VERBA_MODE_ID)
-        }));
+                .and_then(|e| e.get(INPUT_SOURCE_KIND_KEY))
+                .and_then(plist::Value::as_string),
+            Some(KEYBOARD_INPUT_METHOD_KIND)
+        );
     }
     #[test]
     fn uninstall_preserves_other_input_sources_in_hitoolbox() {
