@@ -334,15 +334,39 @@ fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
 }
 
 // CGWindowListCopyWindowInfo 与 key 常量（CoreGraphics）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPointF {
+    x: f64,
+    y: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSizeF {
+    width: f64,
+    height: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRectF {
+    origin: CGPointF,
+    size: CGSizeF,
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayBounds(display: u32) -> CGRectF;
     static kCGWindowNumber: CFStringRef;
     static kCGWindowLayer: CFStringRef;
     static kCGWindowBounds: CFStringRef;
     static kCGWindowOwnerPID: CFStringRef;
+}
+
+/// Cocoa 屏幕坐标（主屏左下原点）→ CGWindowBounds 坐标（主屏左上原点）。
+fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
+    (point.0, main_display_height - point.1)
 }
 
 fn cf_dict_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
@@ -375,7 +399,7 @@ fn cg_window_number_for_client(client: &AnyObject, pid: i32) -> Option<u32> {
     let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
     let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
     let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
-    let screen_h = unsafe { CGDisplayPixelsHigh(CGMainDisplayID()) } as f64;
+    let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
     let mut candidates = Vec::new();
     for dict in windows.iter() {
         let raw_layer = unsafe {
@@ -440,9 +464,9 @@ fn cg_window_number_for_client(client: &AnyObject, pid: i32) -> Option<u32> {
             candidates.push(window_number as u32);
             continue;
         };
-        if let Some((px, py)) = caret {
-            let flipped = (px, (screen_h - py).max(0.0));
-            if bounds_contains(bounds, (px, py)) || bounds_contains(bounds, flipped) {
+        if let Some(point) = caret {
+            let cg_point = cocoa_to_cg_point(point, screen_h);
+            if bounds_contains(bounds, cg_point) {
                 return Some(window_number as u32);
             }
         }
@@ -812,6 +836,8 @@ struct Ivars {
     session_key_client: Cell<usize>,
     /// 当前 key 是否来自真实窗口身份（false 表示 input-session fallback）。
     session_key_is_window: Cell<bool>,
+    /// session_key 刷新重入保护：firstRect XPC 可能泵 runloop。
+    session_key_refreshing: Cell<bool>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -853,6 +879,7 @@ impl Default for Ivars {
             session_key: RefCell::new(String::new()),
             session_key_client: Cell::new(0),
             session_key_is_window: Cell::new(false),
+            session_key_refreshing: Cell::new(false),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
             candidates_ui: RefCell::new(None),
@@ -1718,9 +1745,17 @@ impl VerbaIMKController {
     fn set_client(&self, sender: Option<&AnyObject>, force_new_fallback: bool) {
         if let Some(s) = sender {
             let client_ptr = s as *const AnyObject as usize;
-            let need_refresh = self.ivars().session_key_client.get() != client_ptr
-                || (force_new_fallback && !self.ivars().session_key_is_window.get());
-            if need_refresh {
+            let need_refresh = force_new_fallback
+                || self.ivars().session_key_client.get() != client_ptr;
+            if need_refresh && !self.ivars().session_key_refreshing.get() {
+                struct RefreshGuard<'a>(&'a Cell<bool>);
+                impl Drop for RefreshGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.set(false);
+                    }
+                }
+                self.ivars().session_key_refreshing.set(true);
+                let _guard = RefreshGuard(&self.ivars().session_key_refreshing);
                 let fallback = compose_macos_fallback_key(alloc_session_token());
                 let slot = Cell::new(None::<(String, bool)>);
                 self.host_call("session_key.refresh", || {
@@ -2901,6 +2936,12 @@ mod tests {
             compose_macos_fallback_key(2),
             "窗口身份不可得时至少按 controller 拆会话，不跨窗口复用"
         );
+    }
+
+    #[test]
+    fn cocoa_to_cg_point_flips_y_around_main_display() {
+        assert_eq!(cocoa_to_cg_point((10.0, 20.0), 900.0), (10.0, 880.0));
+        assert_eq!(cocoa_to_cg_point((0.0, 900.0), 900.0), (0.0, 0.0));
     }
 
     #[test]
