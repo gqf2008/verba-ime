@@ -11,6 +11,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, Once, OnceLock};
 
+use core_foundation::array::{CFArray, CFArrayRef};
+use core_foundation::base::{CFTypeRef, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryGetValue, CFDictionaryRef};
+use core_foundation::number::{CFNumber, CFNumberRef};
+use core_foundation::string::{CFString, CFStringRef};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{
@@ -22,8 +27,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSDictionary, NSInteger,
-    NSNotFound, NSNumber, NSObject, NSObjectProtocol, NSRange, NSRunLoop, NSString, NSTimer,
-    NSUInteger,
+    NSNotFound, NSNumber, NSObject, NSObjectProtocol, NSRange, NSRect, NSRunLoop, NSString,
+    NSTimer, NSUInteger,
 };
 use objc2_input_method_kit::{
     kIMKLocateCandidatesBelowHint, kIMKSingleColumnScrollingCandidatePanel, IMKCandidates,
@@ -36,6 +41,7 @@ use verba_core::machine::{
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
+use verba_ipc::LlmSession;
 use verba_protos::{stream_event, StreamEvent};
 
 use crate::ipc;
@@ -237,6 +243,9 @@ static LLM_SEQ: AtomicU64 = AtomicU64::new(1);
 /// daemon 按 session_id 分组隔离历史（架构审查会话维度 B4b）。
 static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 窗口身份不可得时的一次性会话 token：每次强制刷新分配新值，不与其他窗口共享。
+static SESSION_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// 每进程随机盐（惰性生成一次）：daemon 是按用户单例、按 session_id 分组历史，
 /// 而本 IME 进程可独立于 daemon 重启（崩溃/重装/系统回收）——重启后
 /// SESSION_ID_SEQ 从 1 重排，会撞回 daemon 侧残留的历史槽并**继承**陈旧上下文
@@ -255,6 +264,236 @@ fn process_salt() -> u32 {
 fn alloc_session_id() -> u64 {
     let seq = SESSION_ID_SEQ.fetch_add(1, Ordering::SeqCst);
     ((process_salt() as u64) << 32) | (seq & 0xffff_ffff)
+}
+
+/// 组合 macOS 窗口级 session_key：PID + CGWindowNumber。
+fn compose_macos_window_key(pid: i32, window_number: u32) -> String {
+    format!("macos:{:08x}:{pid}:w{window_number}", process_salt())
+}
+
+/// 窗口身份不可得时的 input-session 级 fallback：每次强制刷新分配新 token，
+/// 宁可丢掉多轮记忆，也绝不跨窗口共享。
+fn compose_macos_fallback_key(token: u64) -> String {
+    format!("macos:{:08x}:ephemeral:{token:x}", process_salt())
+}
+
+fn alloc_session_token() -> u64 {
+    SESSION_TOKEN_SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
+/// IMK client 的 windowNumber 路径（当前 _IPMDServerClientWrapperLegacy 通常
+/// 没有该 selector，保留为兼容快路径）。
+fn client_window_number(client: &AnyObject) -> Option<u32> {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(window)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let window: Option<Retained<AnyObject>> = unsafe { msg_send![client, window] };
+    let window = window?;
+    let responds_wn: Bool = unsafe { msg_send![&window, respondsToSelector: sel!(windowNumber)] };
+    if !responds_wn.as_bool() {
+        return None;
+    }
+    let n: NSInteger = unsafe { msg_send![&window, windowNumber] };
+    (n > 0).then_some(n as u32)
+}
+
+fn client_process_identifier(client: &AnyObject) -> Option<i32> {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(processIdentifier)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let pid: i32 = unsafe { msg_send![client, processIdentifier] };
+    (pid > 0).then_some(pid)
+}
+
+/// 取当前光标/选区的屏幕坐标（Cocoa 底部原点）。该调用会经 XPC 查宿主，
+/// 必须在 host_call 重入保护内执行。
+fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
+    let responds_range: Bool =
+        unsafe { msg_send![client, respondsToSelector: sel!(selectedRange)] };
+    if !responds_range.as_bool() {
+        return None;
+    }
+    let range: NSRange = unsafe { msg_send![client, selectedRange] };
+    let mut actual = NSRange::new(NSNotFound as NSUInteger, 0);
+    let rect: NSRect = unsafe {
+        msg_send![
+            client,
+            firstRectForCharacterRange: range,
+            actualRange: &mut actual as *mut NSRange
+        ]
+    };
+    if rect.size.width < 0.0 || rect.size.height < 0.0 {
+        return None;
+    }
+    Some((
+        rect.origin.x + rect.size.width,
+        rect.origin.y + rect.size.height,
+    ))
+}
+
+// CGWindowListCopyWindowInfo 与 key 常量（CoreGraphics）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPointF {
+    x: f64,
+    y: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSizeF {
+    width: f64,
+    height: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRectF {
+    origin: CGPointF,
+    size: CGSizeF,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> CGRectF;
+    static kCGWindowNumber: CFStringRef;
+    static kCGWindowLayer: CFStringRef;
+    static kCGWindowBounds: CFStringRef;
+    static kCGWindowOwnerPID: CFStringRef;
+}
+
+/// Cocoa 屏幕坐标（主屏左下原点）→ CGWindowBounds 坐标（主屏左上原点）。
+fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
+    (point.0, main_display_height - point.1)
+}
+
+fn cf_dict_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
+    let key = CFString::new(key);
+    let raw = unsafe { CFDictionaryGetValue(dict.as_concrete_TypeRef(), key.as_CFTypeRef()) };
+    if raw.is_null() {
+        return None;
+    }
+    let number = unsafe { CFNumber::wrap_under_get_rule(raw as CFNumberRef) };
+    number.to_f64()
+}
+
+fn bounds_contains(bounds: (f64, f64, f64, f64), point: (f64, f64)) -> bool {
+    let (x, y, w, h) = bounds;
+    point.0 >= x - 2.0 && point.0 <= x + w + 2.0 && point.1 >= y - 2.0 && point.1 <= y + h + 2.0
+}
+
+/// 用 PID + 光标矩形匹配当前窗口；若光标匹配失败但该 PID 只有一个
+/// layer=0 窗口，则接受该唯一窗口。多窗口且无法匹配时返回 None。
+fn cg_window_number_for_client(client: &AnyObject, pid: i32) -> Option<u32> {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    let caret = client_caret_point(client);
+    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0) };
+    if raw.is_null() {
+        return None;
+    }
+    let windows: CFArray<CFDictionary> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    let number_key = unsafe { CFString::wrap_under_get_rule(kCGWindowNumber) };
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
+    let mut candidates = Vec::new();
+    for dict in windows.iter() {
+        let raw_layer = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                layer_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_layer.is_null() {
+            continue;
+        }
+        let layer = unsafe { CFNumber::wrap_under_get_rule(raw_layer as CFNumberRef) };
+        if layer.to_i32() != Some(0) {
+            continue;
+        }
+        let raw_owner = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                pid_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_owner.is_null() {
+            continue;
+        }
+        let owner = unsafe { CFNumber::wrap_under_get_rule(raw_owner as CFNumberRef) };
+        if owner.to_i32() != Some(pid) {
+            continue;
+        }
+        let raw_number = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                number_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_number.is_null() {
+            continue;
+        }
+        let number = unsafe { CFNumber::wrap_under_get_rule(raw_number as CFNumberRef) };
+        let Some(window_number) = number.to_i32().filter(|n| *n > 0) else {
+            continue;
+        };
+        let raw_bounds = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                bounds_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_bounds.is_null() {
+            candidates.push(window_number as u32);
+            continue;
+        }
+        let bounds_dict =
+            unsafe { CFDictionary::wrap_under_get_rule(raw_bounds as CFDictionaryRef) };
+        let Some(bounds) = (|| {
+            Some((
+                cf_dict_f64(&bounds_dict, "X")?,
+                cf_dict_f64(&bounds_dict, "Y")?,
+                cf_dict_f64(&bounds_dict, "Width")?,
+                cf_dict_f64(&bounds_dict, "Height")?,
+            ))
+        })() else {
+            candidates.push(window_number as u32);
+            continue;
+        };
+        if let Some(point) = caret {
+            let cg_point = cocoa_to_cg_point(point, screen_h);
+            if bounds_contains(bounds, cg_point) {
+                return Some(window_number as u32);
+            }
+        }
+        candidates.push(window_number as u32);
+    }
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
+fn window_identity_for_client(client: &AnyObject) -> Option<(i32, u32)> {
+    let pid = client_process_identifier(client)?;
+    if let Some(window_number) = client_window_number(client) {
+        return Some((pid, window_number));
+    }
+    cg_window_number_for_client(client, pid).map(|window_number| (pid, window_number))
+}
+
+/// 返回 (key, is_window_identity)。窗口身份不可得时返回 input-session 级
+/// 一次性 fallback，不与其他窗口共享。
+fn session_key_for_client(client: &AnyObject, fallback: String) -> (String, bool) {
+    match window_identity_for_client(client) {
+        Some((pid, window_number)) => (compose_macos_window_key(pid, window_number), true),
+        None => (fallback, false),
+    }
 }
 
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
@@ -587,9 +826,18 @@ struct Ivars {
     /// 按此集合在 drain 丢弃，防全局队列无界滞留（复审 V7）。有界
     /// （DEAD_SEQ_MAX = 256 条）：更早的序号其 worker 早已退出、无在途事件。
     dead_seqs: RefCell<VecDeque<u64>>,
-    /// 本控制器的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按此
-    /// 隔离历史：多文本域（多应用）各自独立多轮，互不串上下文（B4b）。
+    /// 本控制器的旧版 AI 会话 id（兼容 fallback；daemon 无 session_key 时使用）。
     session_id: Cell<u64>,
+    /// 当前窗口级 AI 会话 key：set_client 时按 IMK client/NSWindow 刷新。
+    /// daemon 优先按它隔离多轮上下文，窗口切回时复用同一槽。
+    session_key: RefCell<String>,
+    /// 上次计算 session_key 的 client 指针：inputText 同 client 直接复用，
+    /// 避免每键枚举 WindowServer 窗口。
+    session_key_client: Cell<usize>,
+    /// 当前 key 是否来自真实窗口身份（false 表示 input-session fallback）。
+    session_key_is_window: Cell<bool>,
+    /// session_key 刷新重入保护：firstRect XPC 可能泵 runloop。
+    session_key_refreshing: Cell<bool>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
@@ -628,6 +876,10 @@ impl Default for Ivars {
             active_candidates: Cell::new(0),
             dead_seqs: RefCell::new(VecDeque::new()),
             session_id: Cell::new(alloc_session_id()),
+            session_key: RefCell::new(String::new()),
+            session_key_client: Cell::new(0),
+            session_key_is_window: Cell::new(false),
+            session_key_refreshing: Cell::new(false),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
             candidates_ui: RefCell::new(None),
@@ -672,7 +924,7 @@ define_class!(
                     Err(e) => log::warn!("[VerbaIMK] daemon 预热失败（按键时重试）: {e}"),
                 });
             }
-            self.set_client(sender);
+            self.set_client(sender, true);
             // 先重置再预置空标记文本：控制器可能跨会话复用，composed 残留
             // 上一会话的拼音——若先 updateComposition 会把残留拼音标记进
             // 新会话（随后被宿主当作普通文本上屏）。
@@ -747,7 +999,7 @@ define_class!(
                 string.map(|x| x.to_string()),
                 key_code
             ));
-            self.set_client(sender);
+            self.set_client(sender, false);
             // 补做 caps 切英文时因重入窗推迟的宿主侧清理（此刻须已出窗；
             // 仍在窗内则继续挂起，下一键再试）。
             if self.ivars().caps_host_cleanup.get() != 0
@@ -1487,8 +1739,39 @@ impl VerbaIMKController {
         Some(NSArray::from_retained_slice(&items))
     }
 
-    fn set_client(&self, sender: Option<&AnyObject>) {
+    /// 更新 IMK client，并在必要时重算窗口级 session_key。
+    /// `force_new_fallback`：activate 边界为 true；若拿不到真实窗口身份，
+    /// 分配新的 input-session token，避免 controller 跨窗口复用时共享历史。
+    fn set_client(&self, sender: Option<&AnyObject>, force_new_fallback: bool) {
         if let Some(s) = sender {
+            let client_ptr = s as *const AnyObject as usize;
+            let need_refresh = force_new_fallback
+                || self.ivars().session_key_client.get() != client_ptr;
+            if need_refresh && !self.ivars().session_key_refreshing.get() {
+                struct RefreshGuard<'a>(&'a Cell<bool>);
+                impl Drop for RefreshGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.set(false);
+                    }
+                }
+                self.ivars().session_key_refreshing.set(true);
+                let _guard = RefreshGuard(&self.ivars().session_key_refreshing);
+                let fallback = compose_macos_fallback_key(alloc_session_token());
+                let slot = Cell::new(None::<(String, bool)>);
+                self.host_call("session_key.refresh", || {
+                    slot.set(Some(session_key_for_client(s, fallback)));
+                });
+                let (key, is_window) = slot
+                    .take()
+                    .unwrap_or_else(|| (compose_macos_fallback_key(alloc_session_token()), false));
+                self.ivars().session_key_client.set(client_ptr);
+                self.ivars().session_key_is_window.set(is_window);
+                let changed = *self.ivars().session_key.borrow() != key;
+                *self.ivars().session_key.borrow_mut() = key.clone();
+                if changed {
+                    log::info!("[VerbaIMK] window session_key={key} (window={is_window})");
+                }
+            }
             // SAFETY: sender 是 IMK 会话客户端对象，保留以跨回调使用。
             let retained = unsafe { Retained::retain(s as *const AnyObject as *mut AnyObject) }
                 .expect("client 有效");
@@ -2135,6 +2418,7 @@ impl VerbaIMKController {
         let seq = LLM_SEQ.fetch_add(1, Ordering::SeqCst);
         self.ivars().active_stream.set(seq);
         let session_id = self.ivars().session_id.get();
+        let session_key = self.ivars().session_key.borrow().clone();
 
         std::thread::spawn(move || {
             let mut client = match ipc::ensure_daemon() {
@@ -2146,15 +2430,19 @@ impl VerbaIMKController {
                     return;
                 }
             };
-            let id =
-                match client.llm_start(&prompt, system.as_deref(), None, None, None, session_id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
-                        cancelled_seqs().lock().unwrap().remove(&seq);
-                        return;
-                    }
-                };
+            let session = if session_key.is_empty() {
+                LlmSession::legacy(session_id)
+            } else {
+                LlmSession::window(session_id, &session_key)
+            };
+            let id = match client.llm_start(&prompt, system.as_deref(), None, None, None, session) {
+                Ok(id) => id,
+                Err(e) => {
+                    push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
+                    cancelled_seqs().lock().unwrap().remove(&seq);
+                    return;
+                }
+            };
             daemon_ids().lock().unwrap().insert(seq, id);
             // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
             // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
@@ -2633,6 +2921,27 @@ mod tests {
         assert!(!is_pasteable_char('\u{3}'));
         assert!(!is_pasteable_char('\u{F702}'));
         assert!(!is_pasteable_char('\u{F8FF}'));
+    }
+
+    #[test]
+    fn macos_session_key_separates_windows_and_falls_back_per_session() {
+        let a = compose_macos_window_key(123, 1);
+        let b = compose_macos_window_key(123, 2);
+        let c = compose_macos_window_key(456, 1);
+        assert_ne!(a, b, "同进程不同窗口必须不同 key");
+        assert_ne!(a, c, "不同进程窗口必须不同 key");
+        assert!(a.starts_with("macos:"));
+        assert_ne!(
+            compose_macos_fallback_key(1),
+            compose_macos_fallback_key(2),
+            "窗口身份不可得时至少按 controller 拆会话，不跨窗口复用"
+        );
+    }
+
+    #[test]
+    fn cocoa_to_cg_point_flips_y_around_main_display() {
+        assert_eq!(cocoa_to_cg_point((10.0, 20.0), 900.0), (10.0, 880.0));
+        assert_eq!(cocoa_to_cg_point((0.0, 900.0), 900.0), (0.0, 0.0));
     }
 
     #[test]

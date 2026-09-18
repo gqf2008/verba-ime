@@ -6,7 +6,7 @@
 //!   `OnKeyDown` 每次带回 `ITfContext`，写入共享状态供组合/定时器使用。
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::windows::process::CommandExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +18,7 @@ use verba_core::machine::{
     MachineState, PreviewKey, ResultPhase, PLACEHOLDER_RESULT_BODY, REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
+use verba_ipc::LlmSession;
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -54,6 +55,8 @@ const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
 const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
 const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 1; // 80ms：击键后短暂停顿即查 Rime（本地快）；过早的 320ms 防抖为远程 LLM 融合设计，单引擎 Rime 下导致候选框滞后于输入（不跟手）
+/// TSF context 身份映射上限：超过时逐出最旧 context→generation 绑定。
+const MAX_CONTEXT_SESSIONS: usize = 256;
 /// 听写 / ASR 热键录音时长（秒）。
 const ASR_RECORD_SECONDS: f32 = 3.0;
 
@@ -153,8 +156,17 @@ pub struct TextServiceData {
     /// 在途候选融合请求 id（0 = 无）。
     pub candidate_request_id: Arc<AtomicU64>,
     /// 本输入上下文的 AI 多轮上下文会话 id（创建时分配，全局唯一）。daemon 按
-    /// session_id 分组隔离历史：多应用文本域各自独立多轮，互不串上下文（B4b）。
+    /// 旧版 session_id：兼容 fallback（新协议 window/context key 优先）。
     pub session_id: Cell<u64>,
+    /// TSF context 身份 → 会话代际：GetWnd 失败时仍按 context 隔离，
+    /// 且 HWND 复用时用新 generation 防止继承旧窗口历史。
+    context_generations: RefCell<HashMap<usize, u64>>,
+    /// 强引用已登记 context，防止 COM 指针在映射项存活期间被复用。
+    context_refs: RefCell<HashMap<usize, ITfContext>>,
+    context_order: RefCell<VecDeque<usize>>,
+    next_context_generation: Cell<u64>,
+    /// context 完全不可用时的一次性会话序号（不继承历史，绝不跨窗口共享）。
+    session_token_seq: Cell<u64>,
     /// 待触发的候选融合请求（防抖中）。
     candidate_req_pending: RefCell<Option<PendingCandidateReq>>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
@@ -194,6 +206,11 @@ impl TextServiceData {
             stream_epoch: Arc::new(AtomicU64::new(0)),
             candidate_request_id: Arc::new(AtomicU64::new(0)),
             session_id: Cell::new(alloc_session_id()),
+            context_generations: RefCell::new(HashMap::new()),
+            context_refs: RefCell::new(HashMap::new()),
+            context_order: RefCell::new(VecDeque::new()),
+            next_context_generation: Cell::new(0),
+            session_token_seq: Cell::new(0),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
@@ -1573,6 +1590,86 @@ fn start_llm(
     start_llm_with_system(data, &prompt, None, eye_rect, use_vision)
 }
 
+/// HWND 路径 key：进程盐 + TextService id + generation + HWND。generation 让
+/// HWND 被系统复用后仍不会继承旧窗口历史。
+fn compose_windows_window_key(service_id: u64, generation: u64, hwnd_value: usize) -> String {
+    format!(
+        "windows:{:08x}:{service_id:x}:{generation:x}:hwnd:{hwnd_value:x}",
+        process_salt()
+    )
+}
+
+/// GetWnd 失败时的 context 路径 key：按 TSF context 身份 + generation 隔离。
+fn compose_windows_context_key(service_id: u64, generation: u64) -> String {
+    format!(
+        "windows:{:08x}:{service_id:x}:{generation:x}:ctx",
+        process_salt()
+    )
+}
+
+/// context 完全不可用时的一次性 key：不使用 legacy service 级 session_id，
+/// 宁可让这一轮不继承历史，也不跨窗口串上下文。
+fn ephemeral_windows_session_key(data: &TextServiceData) -> String {
+    let n = data.session_token_seq.get().saturating_add(1).max(1);
+    data.session_token_seq.set(n);
+    format!("windows:{:08x}:ephemeral:{n:x}", process_salt())
+}
+
+fn context_generation(
+    data: &TextServiceData,
+    context_key: usize,
+    context: Option<&ITfContext>,
+) -> u64 {
+    if let Some(g) = data.context_generations.borrow().get(&context_key) {
+        return *g;
+    }
+    let generation = data.next_context_generation.get().saturating_add(1).max(1);
+    data.next_context_generation.set(generation);
+    data.context_generations
+        .borrow_mut()
+        .insert(context_key, generation);
+    if let Some(context) = context {
+        data.context_refs
+            .borrow_mut()
+            .insert(context_key, context.clone());
+    }
+    data.context_order.borrow_mut().push_back(context_key);
+    while data.context_order.borrow().len() > MAX_CONTEXT_SESSIONS {
+        let oldest = data.context_order.borrow_mut().pop_front();
+        if let Some(oldest) = oldest {
+            data.context_generations.borrow_mut().remove(&oldest);
+            data.context_refs.borrow_mut().remove(&oldest);
+        }
+    }
+    generation
+}
+
+/// 优先取当前 TSF context 的活动视图 HWND；失败时退到 context key。
+/// 只要 context 存在就返回稳定 key；context 也没有时返回 None，由调用方
+/// 分配一次性 key。
+fn current_window_session_key(data: &TextServiceData) -> Option<String> {
+    let context = data.context.borrow().as_ref().cloned()?;
+    let context_key = context.as_raw() as usize;
+    let generation = context_generation(data, context_key, Some(&context));
+    // SAFETY: context 为当前 TSF 输入上下文；GetActiveView 是标准 COM 调用，失败返回 Err。
+    let view = unsafe { context.GetActiveView().ok() };
+    let hwnd = view.and_then(|view| {
+        // SAFETY: view 为当前 TSF 活动视图；GetWnd 是标准 COM 调用，失败返回 Err。
+        unsafe { view.GetWnd().ok() }
+    });
+    match hwnd {
+        Some(hwnd) if !hwnd.is_invalid() => Some(compose_windows_window_key(
+            data.session_id.get(),
+            generation,
+            hwnd.0 as usize,
+        )),
+        _ => Some(compose_windows_context_key(
+            data.session_id.get(),
+            generation,
+        )),
+    }
+}
+
 /// start_llm 的系统提示词可注入变体（改写管道用）。
 fn start_llm_with_system(
     data: &Rc<TextServiceData>,
@@ -1586,6 +1683,10 @@ fn start_llm_with_system(
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
     let session_id = data.session_id.get();
+    let session_key = current_window_session_key(data).unwrap_or_else(|| {
+        log::warn!("TSF context 不可用，AI 会话使用一次性 key（不继承历史）");
+        ephemeral_windows_session_key(data)
+    });
     // 新流代际必须在发起线程（spawn 之前）领取：在 worker 内领取时，两个快速
     // 连续的 start_llm 的 epoch 顺序由 OS 线程调度决定，可能新旧颠倒——
     // on_timer 过滤会丢弃当前流、放行已作废流（复审 V6，P2-2 回归）。
@@ -1628,14 +1729,9 @@ fn start_llm_with_system(
         }
 
         let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
-        let id = match client.llm_start(
-            &prompt,
-            system.as_deref(),
-            None,
-            None,
-            image_ref,
-            session_id,
-        ) {
+        let session = LlmSession::window(session_id, &session_key);
+        let id = match client.llm_start(&prompt, system.as_deref(), None, None, image_ref, session)
+        {
             Ok(id) => id,
             Err(e) => {
                 push_chunk(&chunks, epoch, error_event(&format!("LLM 启动失败: {e}")));
@@ -2584,6 +2680,29 @@ mod tests {
         assert_eq!(trigger_kind_for_hotkey_vk(0x4D), None, "M 热键已移除");
         // 其他键不在热键集合
         assert_eq!(trigger_kind_for_hotkey_vk(VK_UP.0 as u32), None);
+    }
+
+    #[test]
+    fn windows_session_key_separates_windows_contexts_and_generations() {
+        let a = compose_windows_window_key(1, 1, 0x1111);
+        let b = compose_windows_window_key(1, 1, 0x2222);
+        let c = compose_windows_window_key(1, 2, 0x1111);
+        let d = compose_windows_context_key(1, 1);
+        assert_ne!(a, b, "不同 HWND 必须不同 key");
+        assert_ne!(a, c, "HWND 复用但 generation 变化必须不同 key");
+        assert_ne!(a, d, "window 路径与 context fallback 必须不同 key");
+        assert!(a.starts_with("windows:"));
+        assert!(a.contains(&format!("{:08x}", process_salt())));
+    }
+
+    #[test]
+    fn windows_context_generation_is_stable_and_unique() {
+        let data = TextServiceData::new();
+        let a = context_generation(&data, 0x1111, None);
+        let a2 = context_generation(&data, 0x1111, None);
+        let b = context_generation(&data, 0x2222, None);
+        assert_eq!(a, a2, "同一 context 必须复用 generation");
+        assert_ne!(a, b, "不同 context 必须不同 generation");
     }
 
     #[test]

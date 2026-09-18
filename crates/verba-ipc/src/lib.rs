@@ -12,6 +12,6 @@ pub mod error;
 pub mod name;
 pub mod server;
 
-pub use client::{ConnectWait, VerbaClient};
+pub use client::{ConnectWait, LlmSession, VerbaClient};
 pub use error::IpcError;
 pub use name::default_socket_spec;
