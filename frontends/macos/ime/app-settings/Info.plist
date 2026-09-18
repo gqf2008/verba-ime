@@ -18,6 +18,10 @@
     <string>拾言输入法 设置</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Finder/Dock/程序切换器的图标；由 assets/branding/verba-256.png 生成
+         （512/1024 系放大，像素级干净需 ≥1024 源图，见 assets/branding/README）。 -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <!-- 版本由 package.sh 从根 Cargo.toml 注入（与输入法同一版本源）。 -->
     <key>CFBundleShortVersionString</key>
     <string>0.0.0</string>
