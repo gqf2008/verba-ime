@@ -912,7 +912,12 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
 
 /// 预览态按键分类（OCR 预览与改写对照预览共用一份清单，防止两条路由
 /// 各自漂移）。Return/Esc 按虚拟键；数字/空格按成字符。
-fn classify_preview_key(vk: u32, ch: Option<char>) -> Option<PreviewKey> {
+fn classify_preview_key(vk: u32, ch: Option<char>, shift_down: bool) -> Option<PreviewKey> {
+    // Shift+数字键不得当预览数字：某些宿主/TSF 线程的 GetKeyboardState 不反映
+    // Shift，ToUnicodeEx 会把 Shift+1 解成 '1'；若先走成字符分支就会误上屏预览。
+    if shift_down && (0x30..=0x39).contains(&vk) {
+        return None;
+    }
     if vk == VK_RETURN.0 as u32 {
         Some(PreviewKey::Enter)
     } else if ch == Some(' ') {
@@ -1007,7 +1012,14 @@ pub fn handle_key_down(
     // （此刻仍 ResultReady：可打印键已被认领送达，feed_char 返回 None 后
     // 照常吞掉，不会漏进宿主文档——预览期间保护结果）。
     if machine.rewrite_previewing() {
-        let key = classify_preview_key(vk, ch).or(preview_digit_by_vk(vk));
+        let shift_down = shift_held();
+        let key = classify_preview_key(vk, ch, shift_down).or_else(|| {
+            if shift_down {
+                None
+            } else {
+                preview_digit_by_vk(vk)
+            }
+        });
         if let Some(k) = key {
             if let Some(action) = machine.feed_rewrite_preview(k) {
                 log::info!("改写预览: {action:?}");
@@ -1032,8 +1044,9 @@ pub fn handle_key_down(
     if machine.ocr_previewing() {
         // 数字 VK 兜底对齐改写预览（AZERTY 等未按 Shift 时 '1' 键解不出
         // 数字，只按成字符会把「1 上屏」的预览直接销毁）。
-        let key =
-            classify_preview_key(vk, ch).or_else(|| ocr_preview_digit_fallback(shift_held(), vk));
+        let shift_down = shift_held();
+        let key = classify_preview_key(vk, ch, shift_down)
+            .or_else(|| ocr_preview_digit_fallback(shift_down, vk));
         match key {
             // 2 在 OCR 预览无语义（仅识别文本一项）：按未命中处理——退出
             // 预览，该键落回下方正常路由。
@@ -2717,6 +2730,27 @@ mod tests {
     }
 
     #[test]
+    fn tsf_modifier_detection_uses_global_async_state() {
+        // 源码级守卫：把 modifier_down 回退成线程局部 GetKeyState 时红，
+        // 防止 Ctrl+V 再次被解成 'v' 认领（纯决策核测试覆盖不到这个来源）。
+        let src = include_str!("text_service.rs");
+        let start = src
+            .find("fn modifier_down")
+            .expect("modifier_down 必须存在");
+        let tail = &src[start..];
+        let end = tail.find("\n}\n").map(|i| i + 2).unwrap_or(tail.len());
+        let body = &tail[..end];
+        assert!(
+            body.contains("GetAsyncKeyState"),
+            "TSF 修饰键必须用 GetAsyncKeyState: {body}"
+        );
+        assert!(
+            !body.contains("GetKeyState("),
+            "禁止回退线程局部 GetKeyState: {body}"
+        );
+    }
+
+    #[test]
     fn hotkey_trigger_resets_stale_ocr_anchor() {
         let data = Rc::new(TextServiceData::new());
         // 命令路径 stash 后未被消费的陈旧残留（取消选区/空结果/非 Idle 直上屏）。
@@ -2729,7 +2763,7 @@ mod tests {
 
     #[test]
     fn trigger_kind_requires_modifier_but_maps_vk() {
-        // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
+        // 无修饰键（测试环境修饰键状态为 0）时不应认作热键。
         assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
         // Ctrl+Alt+M（听写）随 ASR 冻结移除（#78）；S = 打开设置。
         assert_eq!(trigger_kind_for_vk(0x4D), None);
