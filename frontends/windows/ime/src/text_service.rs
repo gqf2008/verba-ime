@@ -1721,11 +1721,20 @@ fn start_llm_with_system(
         let mut system: Option<String> = system;
         let mut image: Option<(String, Vec<u8>)> = None;
         if use_vision {
-            if let Some(img) = eye_vision_image(eye_rect) {
-                log::info!("眼睛区域 vision 捕捉成功, bytes={}", img.1.len());
-                image = Some(img);
-            } else {
-                log::warn!("眼睛区域 vision 捕捉失败");
+            match eye_vision_image(eye_rect) {
+                Ok(img) => {
+                    log::info!("眼睛区域 vision 捕捉成功, bytes={}", img.1.len());
+                    image = Some(img);
+                }
+                Err(e) => {
+                    // 截图失败不能静默降级成无图文本请求：否则用户以为图已被分析。
+                    push_chunk(
+                        &chunks,
+                        epoch,
+                        error_event(&format!("//看图 截屏失败: {e}")),
+                    );
+                    return;
+                }
             }
         } else if let Some((rx, ry, rw, rh)) = eye_rect {
             match run_region_ocr_rect(rx, ry, rw, rh) {
@@ -2266,14 +2275,16 @@ fn run_region_ocr_rect(
 /// 捕捉眼睛区域（或全屏回退）为 PNG 图像，供多模态 LLM。
 /// `eye_rect` 为 None 时回退到主屏全屏；截图→PNG 走 verba-trigger 共享实现，
 /// 与 macOS/Linux 前端同源。
-fn eye_vision_image(eye_rect: Option<(i32, i32, i32, i32)>) -> Option<(String, Vec<u8>)> {
+fn eye_vision_image(
+    eye_rect: Option<(i32, i32, i32, i32)>,
+) -> std::result::Result<(String, Vec<u8>), String> {
     let png = match eye_rect {
-        Some((rx, ry, rw, rh)) => {
-            verba_trigger::capture::capture_region_png(rx, ry, rw, rh).ok()?
-        }
-        None => verba_trigger::capture::capture_primary_screen_png().ok()?,
+        Some((rx, ry, rw, rh)) => verba_trigger::capture::capture_region_png(rx, ry, rw, rh)
+            .map_err(|e| format!("选区截屏失败: {e}"))?,
+        None => verba_trigger::capture::capture_primary_screen_png()
+            .map_err(|e| format!("全屏截屏失败: {e}"))?,
     };
-    Some(("image/png".to_owned(), png))
+    Ok(("image/png".to_owned(), png))
 }
 
 fn eye_rect_for(data: &Rc<TextServiceData>, context: &ITfContext) -> Option<(i32, i32, i32, i32)> {

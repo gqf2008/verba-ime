@@ -358,7 +358,17 @@ fn cmd_region_shot(args: &[String]) -> i32 {
 
 /// `vision-shot [--rect x,y,w,h]`：截图 → PNG 字节写 stdout，供多模态 LLM
 /// 的 image_url 输入。截图与编码复用 verba-trigger 共享实现；前端不重复。
+fn vision_shot_help_requested(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help")
+}
+
 fn cmd_vision_shot(args: &[String]) -> i32 {
+    if vision_shot_help_requested(args) {
+        println!(
+            "用法: verba-trigger vision-shot [--rect x,y,w,h]\n  截屏 → PNG 写 stdout（多模态 LLM 输入）"
+        );
+        return 0;
+    }
     let rect_given = args.iter().any(|a| a == "--rect");
     let png = match parse_rect(args) {
         Some((x, y, w, h)) => capture_region_png(x, y, w, h),
@@ -420,5 +430,31 @@ fn cmd_region_ocr(args: &[String]) -> i32 {
             eprintln!("OCR 失败: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rect_accepts_and_rejects() {
+        let ok = vec!["vision-shot".into(), "--rect".into(), "1,2,3,4".into()];
+        assert_eq!(parse_rect(&ok), Some((1, 2, 3, 4)));
+        let bad = vec!["vision-shot".into(), "--rect".into(), "bad".into()];
+        assert!(parse_rect(&bad).is_none());
+    }
+
+    #[test]
+    fn vision_shot_help_is_detected() {
+        assert!(vision_shot_help_requested(&[
+            "vision-shot".into(),
+            "--help".into()
+        ]));
+        assert!(vision_shot_help_requested(&[
+            "vision-shot".into(),
+            "-h".into()
+        ]));
+        assert!(!vision_shot_help_requested(&["vision-shot".into()]));
     }
 }

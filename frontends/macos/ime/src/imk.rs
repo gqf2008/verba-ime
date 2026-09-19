@@ -309,6 +309,16 @@ fn client_process_identifier(client: &AnyObject) -> Option<i32> {
 
 /// 取当前光标/选区的屏幕坐标（Cocoa 底部原点）。该调用会经 XPC 查宿主，
 /// 必须在 host_call 重入保护内执行。
+/// 校验 firstRectForCharacterRange 的结果：actualRange 必须有效、宽高为正。
+/// 零矩形/NSNotFound 必须回退全屏，而不是把 (0,0) 当成光标。
+fn valid_caret_rect(actual_location: NSUInteger, width: f64, height: f64) -> Option<(f64, f64)> {
+    if actual_location == NSNotFound as NSUInteger || width <= 0.0 || height <= 0.0 {
+        None
+    } else {
+        Some((width, height))
+    }
+}
+
 fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
     let responds_range: Bool =
         unsafe { msg_send![client, respondsToSelector: sel!(selectedRange)] };
@@ -324,13 +334,8 @@ fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
             actualRange: &mut actual as *mut NSRange
         ]
     };
-    if rect.size.width < 0.0 || rect.size.height < 0.0 {
-        return None;
-    }
-    Some((
-        rect.origin.x + rect.size.width,
-        rect.origin.y + rect.size.height,
-    ))
+    let (w, h) = valid_caret_rect(actual.location, rect.size.width, rect.size.height)?;
+    Some((rect.origin.x + w, rect.origin.y + h))
 }
 
 // CGWindowListCopyWindowInfo 与 key 常量（CoreGraphics）。
@@ -356,6 +361,11 @@ struct CGRectF {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRectF;
     static kCGWindowNumber: CFStringRef;
@@ -369,23 +379,59 @@ fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) 
     (point.0, main_display_height - point.1)
 }
 
-/// 由 CG 顶左坐标的光标点计算「光标上方」截屏矩形（主屏内 clamp）。
-/// 与 Windows eye 区域同语义：宽高取配置，y 在光标上方 offset；取不到
-/// 光标时上层回退主屏全屏。
-fn vision_rect_above_caret(
-    caret_x: f64,
-    caret_y: f64,
-    screen_w: f64,
-    screen_h: f64,
+/// 由 CG 顶左坐标的光标点与所在显示器工作区计算 vision 截屏矩形。
+/// 与 Windows `fit_eye_rect` 同语义：优先光标上方（留 offset 间隙），上方
+/// 放不下翻到下方，再不行贴空间更大的一侧；水平 clamp 到工作区。
+fn vision_rect_from_caret(
+    caret_x: i32,
+    caret_y: i32,
+    work: (i32, i32, i32, i32),
     width: i32,
     height: i32,
     offset_y: i32,
 ) -> (i32, i32, i32, i32) {
-    let w = width.max(64) as f64;
-    let h = height.max(64) as f64;
-    let x = (caret_x - w / 2.0).clamp(0.0, (screen_w - w).max(0.0));
-    let y = (caret_y - h - offset_y.max(0) as f64).clamp(0.0, (screen_h - h).max(0.0));
-    (x.round() as i32, y.round() as i32, w as i32, h as i32)
+    let (work_left, work_top, work_right, work_bottom) = work;
+    let w = width.max(64);
+    let h = height.max(64);
+    let px = caret_x.clamp(work_left, (work_right - w).max(work_left));
+    let off = offset_y.max(0);
+    let above_space = caret_y - off - work_top;
+    let below_space = work_bottom - caret_y;
+    let py = if h <= above_space {
+        caret_y - off - h
+    } else if h <= below_space {
+        caret_y
+    } else if above_space >= below_space {
+        work_top
+    } else {
+        (work_bottom - h).max(work_top)
+    };
+    (px, py, w, h)
+}
+
+/// 找到包含该 CG 顶左坐标点的活动显示器 bounds；找不到返回 None。
+fn display_bounds_containing(point: (f64, f64)) -> Option<CGRectF> {
+    let mut count: u32 = 0;
+    let status = unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) };
+    if status != 0 || count == 0 {
+        return None;
+    }
+    let mut ids = vec![0u32; count as usize];
+    let status = unsafe { CGGetActiveDisplayList(count, ids.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        return None;
+    }
+    for id in ids {
+        let b = unsafe { CGDisplayBounds(id) };
+        if point.0 >= b.origin.x
+            && point.0 <= b.origin.x + b.size.width
+            && point.1 >= b.origin.y
+            && point.1 <= b.origin.y + b.size.height
+        {
+            return Some(b);
+        }
+    }
+    None
 }
 
 fn cf_dict_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
@@ -2461,21 +2507,28 @@ impl VerbaIMKController {
         if !cfg.eye_enabled {
             return None;
         }
-        let client = self.ivars().client.borrow();
-        let client = client.as_ref()?;
-        let client: &AnyObject = client;
+        // 先把 Retained 从 RefCell clone 出来再进 host_call：client_caret_point
+        // 会同步 XPC 并可能泵 runloop，重入 set_client 的 borrow_mut 不能与
+        // 这里未释放的 borrow() 冲突（同 commit() 的既有模式）。
+        let client = self.ivars().client.borrow().clone()?;
         let mut caret = None;
         self.host_call("vision.eye_rect", || {
-            caret = client_caret_point(client);
+            caret = client_caret_point(&client);
         });
         let (cx, cy) = caret?;
-        let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-        let (cx, cy) = cocoa_to_cg_point((cx, cy), bounds.size.height);
-        Some(vision_rect_above_caret(
-            cx,
-            cy,
-            bounds.size.width,
-            bounds.size.height,
+        let main_bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let (cx, cy) = cocoa_to_cg_point((cx, cy), main_bounds.size.height);
+        let bounds = display_bounds_containing((cx, cy)).unwrap_or(main_bounds);
+        let work = (
+            bounds.origin.x.round() as i32,
+            bounds.origin.y.round() as i32,
+            (bounds.origin.x + bounds.size.width).round() as i32,
+            (bounds.origin.y + bounds.size.height).round() as i32,
+        );
+        Some(vision_rect_from_caret(
+            cx.round() as i32,
+            cy.round() as i32,
+            work,
             cfg.eye_width,
             cfg.eye_height,
             cfg.eye_offset_y,
@@ -2535,8 +2588,11 @@ impl VerbaIMKController {
                 match spawn_vision_shot(vision_rect) {
                     Ok(png) => Some(("image/png".to_owned(), png)),
                     Err(e) => {
-                        log::warn!("[VerbaIMK] //看图 vision 截屏失败: {e}");
-                        None
+                        // 截图失败必须是错误，不能静默降级成无图文本请求——
+                        // 否则用户以为图已被分析。
+                        push_llm(seq, error_event(&format!("//看图 截屏失败: {e}")));
+                        cancelled_seqs().lock().unwrap().remove(&seq);
+                        return;
                     }
                 }
             } else {
@@ -3042,19 +3098,40 @@ mod tests {
     }
 
     #[test]
-    fn vision_rect_above_caret_clamps_to_primary_screen() {
+    fn vision_rect_from_caret_matches_windows_fit_semantics() {
+        let main = (0, 0, 1440, 900);
         assert_eq!(
-            vision_rect_above_caret(500.0, 500.0, 1440.0, 900.0, 640, 480, 0),
-            (180, 20, 640, 480)
+            vision_rect_from_caret(500, 500, main, 640, 480, 0),
+            (500, 20, 640, 480)
         );
+        // 上方放不下 → 翻到光标下方。
         assert_eq!(
-            vision_rect_above_caret(100.0, 100.0, 1440.0, 900.0, 640, 480, 0),
-            (0, 0, 640, 480)
+            vision_rect_from_caret(100, 100, main, 640, 480, 0),
+            (100, 100, 640, 480)
         );
+        // 上方空间更大 → 贴工作区顶部。
         assert_eq!(
-            vision_rect_above_caret(500.0, 500.0, 1440.0, 900.0, 640, 480, 40),
-            (180, 0, 640, 480)
+            vision_rect_from_caret(500, 500, main, 640, 480, 40),
+            (500, 0, 640, 480)
         );
+        // 副屏（右侧）按光标所在屏 clamp。
+        assert_eq!(
+            vision_rect_from_caret(2200, 500, (1440, 0, 2880, 900), 640, 480, 0),
+            (2200, 20, 640, 480)
+        );
+        // 副屏（左侧，负坐标）同样成立。
+        assert_eq!(
+            vision_rect_from_caret(-1000, 500, (-1920, 0, 0, 1080), 640, 480, 0),
+            (-1000, 20, 640, 480)
+        );
+    }
+
+    #[test]
+    fn valid_caret_rect_rejects_not_found_and_zero_size() {
+        assert_eq!(valid_caret_rect(0, 10.0, 10.0), Some((10.0, 10.0)));
+        assert_eq!(valid_caret_rect(NSNotFound as NSUInteger, 10.0, 10.0), None);
+        assert_eq!(valid_caret_rect(0, 0.0, 10.0), None);
+        assert_eq!(valid_caret_rect(0, 10.0, 0.0), None);
     }
 
     #[test]

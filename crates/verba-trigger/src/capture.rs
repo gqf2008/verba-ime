@@ -296,9 +296,14 @@ mod tests {
     }
 
     #[test]
-    fn bmp_to_png_encodes_png_signature() {
-        let bmp = crate::bmp::encode_bmp(1, 1, &[0, 0, 0, 255]);
+    fn bmp_to_png_preserves_dimensions_and_channels() {
+        // encode_bmp 输入 BGRA；纯红 = B0 G0 R255 A255。
+        let bmp = crate::bmp::encode_bmp(2, 1, &[0, 0, 255, 255, 0, 0, 255, 255]);
         let png = bmp_to_png(&bmp).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [255, 0, 0, 255]);
     }
 }
