@@ -26,8 +26,8 @@ use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
+    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL,
+    VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
 };
 
 use verba_trigger::capture::capture_primary_screen;
@@ -425,20 +425,39 @@ impl KeyEventSink {
 ///   直插字面量。
 /// - 修饰键/导航键/功能键（无字符）一律不认领，保持应用正常导航。
 pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lparam: u32) -> bool {
-    // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+M 录音 ASR）一律认领。
-    if matches!(state, MachineState::Idle | MachineState::OcrPreviewing) && is_trigger_hotkey(vk) {
+    should_claim_key_with_mods(
+        state,
+        ocr_previewing,
+        vk,
+        lparam,
+        ctrl_or_alt_held(),
+        is_trigger_hotkey(vk),
+    )
+}
+
+/// 纯决策内核（修饰键状态由调用方注入，供单测钉住；生产调用见
+/// `should_claim_key`）。
+fn should_claim_key_with_mods(
+    state: MachineState,
+    ocr_previewing: bool,
+    vk: u32,
+    lparam: u32,
+    ctrl_alt_held: bool,
+    trigger_hotkey: bool,
+) -> bool {
+    // 空闲态触发热键（Ctrl+Alt+O 截图 OCR / Ctrl+Alt+S 设置）一律认领。
+    if matches!(state, MachineState::Idle | MachineState::OcrPreviewing) && trigger_hotkey {
         return true;
+    }
+    // Ctrl/Alt 下除已注册热键外一律不认领：必须在任何字符/VK 判定之前，
+    // 否则某些宿主/TSF 线程拿不到修饰键状态时，Ctrl+V 会被 ToUnicodeEx 解成
+    // 'v' 并按拼音字母认领，粘贴失效。
+    if ctrl_alt_held {
+        return false;
     }
     let is_control = vk == VK_RETURN.0 as u32 || vk == VK_BACK.0 as u32 || vk == VK_ESCAPE.0 as u32;
     let is_page = vk == VK_PRIOR.0 as u32 || vk == VK_NEXT.0 as u32;
     let is_arrow = vk == VK_UP.0 as u32 || vk == VK_DOWN.0 as u32;
-    // Ctrl/Alt 按下时不做字符认领：字母键在 Ctrl 下 ToUnicodeEx 返回控制字符
-    // 本就不命中认领，但 OEM 标点（. , 等）仍返回普通字符——Idle/Pinyin 新
-    // 认领的标点会把应用快捷键吞掉（如 VS Code 的 Ctrl+. 快速修复）。热键与
-    // 控制/翻页键分支不受影响（沿用既有语义；实机验收项在 issue #44）。
-    if ctrl_or_alt_held() {
-        return false;
-    }
     // OCR 预览态（begin_ocr_preview 将 state 置为 OcrPreviewing）：
     // Enter/Esc/空格/1/2 与其它可打印键都必须认领，否则 OnTestKeyDown 返回
     // FALSE → OnKeyDown 永不回调，预览分支成死代码，OCR 结果无法上屏/取消
@@ -487,17 +506,24 @@ pub fn should_claim_key(state: MachineState, ocr_previewing: bool, vk: u32, lpar
     }
 }
 
-/// Ctrl 或 Alt 当前按下（GetKeyState 高位；与既有热键判定同一套位约定）。
+/// 修饰键当前按下（`GetAsyncKeyState` 会话级全局状态）。
+///
+/// 不能用 `GetKeyState`：它是调用线程消息队列的局部状态，TSF 的
+/// OnTestKeyDown/OnKeyDown 在部分宿主上由没有该消息队列状态的 TSF 线程执行，
+/// Ctrl/Alt 读不到就会把 Ctrl+V 的 'v' 当普通字母认领进拼音组合（真机：
+/// Ctrl+V 不能粘贴）。GetAsyncKeyState 高位的按下语义与 GetKeyState 一致。
+fn modifier_down(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// Ctrl 或 Alt 当前按下。
 fn ctrl_or_alt_held() -> bool {
-    unsafe {
-        (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
-            || (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
-    }
+    modifier_down(VK_CONTROL.0 as i32) || modifier_down(VK_MENU.0 as i32)
 }
 
 /// Shift 当前按下（同一位约定；供预览数字 VK 兜底避让组合键用）。
 fn shift_held() -> bool {
-    unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 }
+    modifier_down(VK_SHIFT.0 as i32)
 }
 
 /// Idle 态认领的字符判定（VK 解耦，单测直测；调用点见 `should_claim_key`）。
@@ -886,7 +912,12 @@ fn toggle_ime(data: &Rc<TextServiceData>) {
 
 /// 预览态按键分类（OCR 预览与改写对照预览共用一份清单，防止两条路由
 /// 各自漂移）。Return/Esc 按虚拟键；数字/空格按成字符。
-fn classify_preview_key(vk: u32, ch: Option<char>) -> Option<PreviewKey> {
+fn classify_preview_key(vk: u32, ch: Option<char>, shift_down: bool) -> Option<PreviewKey> {
+    // Shift+数字键不得当预览数字：某些宿主/TSF 线程的 GetKeyboardState 不反映
+    // Shift，ToUnicodeEx 会把 Shift+1 解成 '1'；若先走成字符分支就会误上屏预览。
+    if shift_down && (0x30..=0x39).contains(&vk) {
+        return None;
+    }
     if vk == VK_RETURN.0 as u32 {
         Some(PreviewKey::Enter)
     } else if ch == Some(' ') {
@@ -981,7 +1012,14 @@ pub fn handle_key_down(
     // （此刻仍 ResultReady：可打印键已被认领送达，feed_char 返回 None 后
     // 照常吞掉，不会漏进宿主文档——预览期间保护结果）。
     if machine.rewrite_previewing() {
-        let key = classify_preview_key(vk, ch).or(preview_digit_by_vk(vk));
+        let shift_down = shift_held();
+        let key = classify_preview_key(vk, ch, shift_down).or_else(|| {
+            if shift_down {
+                None
+            } else {
+                preview_digit_by_vk(vk)
+            }
+        });
         if let Some(k) = key {
             if let Some(action) = machine.feed_rewrite_preview(k) {
                 log::info!("改写预览: {action:?}");
@@ -1006,8 +1044,9 @@ pub fn handle_key_down(
     if machine.ocr_previewing() {
         // 数字 VK 兜底对齐改写预览（AZERTY 等未按 Shift 时 '1' 键解不出
         // 数字，只按成字符会把「1 上屏」的预览直接销毁）。
-        let key =
-            classify_preview_key(vk, ch).or_else(|| ocr_preview_digit_fallback(shift_held(), vk));
+        let shift_down = shift_held();
+        let key = classify_preview_key(vk, ch, shift_down)
+            .or_else(|| ocr_preview_digit_fallback(shift_down, vk));
         match key {
             // 2 在 OCR 预览无语义（仅识别文本一项）：按未命中处理——退出
             // 预览，该键落回下方正常路由。
@@ -2066,10 +2105,7 @@ fn is_trigger_hotkey(vk: u32) -> bool {
     if vk != VK_O.0 as u32 && vk != VK_S.0 as u32 {
         return false;
     }
-    unsafe {
-        (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
-            && (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
-    }
+    modifier_down(VK_CONTROL.0 as i32) && modifier_down(VK_MENU.0 as i32)
 }
 
 /// 触发热键 → 任务类型。
@@ -2652,6 +2688,88 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_alt_shortcuts_are_never_claimed() {
+        // Ctrl+V/C/X/A/Z 在任何状态下都必须透传宿主；这钉住「修饰键状态
+        // 读不到 → Ctrl+V 被当 'v' 认领」的 Windows 粘贴回归。
+        let states = [
+            MachineState::Idle,
+            MachineState::Pinyin,
+            MachineState::PendingSlash,
+            MachineState::Prompt,
+            MachineState::Streaming,
+            MachineState::ResultReady,
+            MachineState::Failed,
+            MachineState::OcrPreviewing,
+        ];
+        for state in states {
+            let previewing = state == MachineState::OcrPreviewing;
+            for vk in [0x41, 0x43, 0x56, 0x58, 0x5A] {
+                assert!(
+                    !should_claim_key_with_mods(state, previewing, vk, 0x1E << 16, true, false),
+                    "Ctrl/Alt+{vk:#x} 在 {state:?} 必须透传宿主"
+                );
+            }
+        }
+        // 已注册热键例外：Ctrl+Alt+O / Ctrl+Alt+S 仍须认领。
+        assert!(should_claim_key_with_mods(
+            MachineState::Idle,
+            false,
+            VK_O.0 as u32,
+            0,
+            true,
+            true
+        ));
+        assert!(should_claim_key_with_mods(
+            MachineState::Idle,
+            false,
+            VK_S.0 as u32,
+            0,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn shift_digit_is_not_preview_digit() {
+        assert_eq!(classify_preview_key(0x31, Some('1'), true), None);
+        assert_eq!(
+            classify_preview_key(0x31, Some('1'), false),
+            Some(PreviewKey::Digit1)
+        );
+        assert_eq!(classify_preview_key(0x32, Some('2'), true), None);
+        assert_eq!(
+            classify_preview_key(0x32, Some('2'), false),
+            Some(PreviewKey::Digit2)
+        );
+    }
+
+    #[test]
+    fn tsf_modifier_detection_uses_global_async_state() {
+        // 源码级守卫：把 modifier_down 回退成线程局部 GetKeyState 时红，
+        // 防止 Ctrl+V 再次被解成 'v' 认领（纯决策核测试覆盖不到这个来源）。
+        // windows-latest 常以 CRLF 检出；先规范化行尾，否则 find("\n}\n")
+        // 返回 None 会把 body 扩成全文、扫到断言自身的字面量而假红。
+        let src = include_str!("text_service.rs").replace("\r\n", "\n");
+        let start = src
+            .find("fn modifier_down")
+            .expect("modifier_down 必须存在");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n}\n")
+            .expect("modifier_down body must terminate")
+            + 2;
+        let body = &tail[..end];
+        assert!(
+            body.contains("GetAsyncKeyState"),
+            "TSF 修饰键必须用 GetAsyncKeyState: {body}"
+        );
+        assert!(
+            !body.contains("GetKeyState("),
+            "禁止回退线程局部 GetKeyState: {body}"
+        );
+    }
+
+    #[test]
     fn hotkey_trigger_resets_stale_ocr_anchor() {
         let data = Rc::new(TextServiceData::new());
         // 命令路径 stash 后未被消费的陈旧残留（取消选区/空结果/非 Idle 直上屏）。
@@ -2664,7 +2782,7 @@ mod tests {
 
     #[test]
     fn trigger_kind_requires_modifier_but_maps_vk() {
-        // 无修饰键（测试环境 GetKeyState 为 0）时不应认作热键。
+        // 无修饰键（测试环境修饰键状态为 0）时不应认作热键。
         assert_eq!(trigger_kind_for_vk(VK_O.0 as u32), None);
         // Ctrl+Alt+M（听写）随 ASR 冻结移除（#78）；S = 打开设置。
         assert_eq!(trigger_kind_for_vk(0x4D), None);
