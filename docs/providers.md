@@ -66,7 +66,7 @@
 
 ## 多模态 vision（`//看图`）
 
-- `//看图` 把「眼睛区域」（光标上方屏幕，见候选窗避让逻辑）直接发给当前配置的 LLM（OpenAI 兼容 `image_url` 内容块），例如 `gpt-4o-mini` / `qwen2.5-vl` / `GLM-4V`；模型复用 `llm_model` / `llm_base_url` / 同一个 API Key。**当前仅 Windows 前端接入；macOS 的 `//看图` 仍回退普通文本生成**。
+- `//看图` 把「眼睛区域」（光标上方屏幕，见候选窗避让逻辑）直接发给当前配置的 LLM（OpenAI 兼容 `image_url` 内容块），例如 `gpt-4o-mini` / `qwen2.5-vl` / `GLM-4V`；模型复用 `llm_model` / `llm_base_url` / 同一个 API Key。**Windows / macOS 前端均已接入；Linux 前端尚未开始，共享 `verba-trigger` 截图/PNG API 已平台中立，前端落地后直接接线**。
 - 设置页不暴露 vision 模型或眼睛模式：普通 `//` 的眼睛区域固定走内置 OCR，只有 `//看图` 显式走 LLM vision。
 - 模型不支持图片时，daemon 把客户端拒绝（HTTP 400/422，或带 vision 关键词的 404/流错误）转成可执行提示：换用支持图片输入的模型，或改用 `//截图` 走内置 OCR；服务端原始错误一并展示。
 - 与 OCR 的区别：vision 由 LLM 直接「理解 + 提取」，擅长版面、表格、图表与上下文；OCR 只做「文字识别」转文本。

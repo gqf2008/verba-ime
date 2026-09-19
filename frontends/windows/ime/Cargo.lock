@@ -4287,6 +4287,7 @@ version = "0.2.21"
 dependencies = [
  "cpal",
  "env_logger",
+ "image",
  "log",
  "rodio",
  "softbuffer",

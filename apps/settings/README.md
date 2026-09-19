@@ -3,7 +3,7 @@
 - 技术：**Slint 1.17**（Rust 原生跨平台桌面 UI，替代原 Tauri 方案；crates.io 无 0.17 版本线，`0.17` 即 `1.17.x`，固定 `=1.17.1`）。
 - 职责：
   - LLM 服务商（base_url / model / temperature / max_tokens / 系统提示词）与 **API Key**（经 IPC `ApiKeySet` 写系统密钥库并热更新 daemon，无需重启）
-  - 多模态：**OCR 为内置能力（默认 rapid，设置页不暴露 provider）**；`//看图` 自动走当前 LLM 的视觉能力（当前仅 Windows 前端接入），模型不支持图片时给出可执行提示。ASR/TTS 为隐藏的实验性能力（入口隐藏，API 走「联网」：OpenAI 兼容 `audio/transcriptions` / `audio/speech`；edge-tts 在线音色）
+  - 多模态：**OCR 为内置能力（默认 rapid，设置页不暴露 provider）**；`//看图` 自动走当前 LLM 的视觉能力（Windows / macOS 已接入；Linux 前端未开始），模型不支持图片时给出可执行提示。ASR/TTS 为隐藏的实验性能力（入口隐藏，API 走「联网」：OpenAI 兼容 `audio/transcriptions` / `audio/speech`；edge-tts 在线音色）
   - 候选窗：Rime 方案（单引擎，librime）与候选窗主题
   - 快捷键速览（当前内置：Ctrl+Alt+O 选区 OCR / Ctrl+Alt+M 录音 ASR / `//朗读` `//截图` `//听写`）
   - 隐私说明（远程数据出境提示、密钥存储位置）

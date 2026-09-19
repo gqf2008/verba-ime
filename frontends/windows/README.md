@@ -16,6 +16,7 @@
 - `verba-trigger shot [输出.bmp]`：截取主屏全屏（BitBlt → 32bpp top-down BMP，零依赖编码）。
 - `verba-trigger region-shot [--rect x,y,w,h] [输出.bmp]`：选区截图（半透明遮罩拖选；Esc/右键取消；`--rect` 脚本化）。
 - `verba-trigger region-ocr [--rect x,y,w,h] [输出.txt]`：选区 → daemon OCR。
+- `verba-trigger vision-shot [--rect x,y,w,h]`：截屏 → PNG 写 stdout（多模态 LLM 输入，Windows/macOS/Linux 同源）。
 - `verba-trigger ocr [输出.txt]`：截图 → daemon 内置 OCR（默认 rapid；`config ocr_provider` 仅 CLI/验收可覆盖 mock / windows）。
 - `verba-trigger mic [秒=3] [输出.wav]`：麦克风录音（cpal → 16bit PCM WAV）。
 - `verba-trigger asr [秒=3]`：录音 → daemon ASR（`config asr_provider`）。

@@ -12,7 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use verba_ipc::VerbaClient;
-use verba_trigger::capture::{capture_primary_screen, capture_region};
+use verba_trigger::capture::{
+    capture_primary_screen, capture_primary_screen_png, capture_region, capture_region_png,
+};
 use verba_trigger::play::play_audio;
 use verba_trigger::record::record_seconds;
 use verba_trigger::selection::select_region;
@@ -37,6 +39,7 @@ fn main() {
         Some("shot") => cmd_shot(&args),
         Some("region-shot") => cmd_region_shot(&args),
         Some("region-ocr") => cmd_region_ocr(&args),
+        Some("vision-shot") => cmd_vision_shot(&args),
         Some("ocr") => cmd_ocr(&args),
         Some("mic") => cmd_mic(&args),
         Some("asr") => cmd_asr(&args),
@@ -57,6 +60,7 @@ fn print_help() {
          verba-trigger shot [输出.bmp]        截取主屏全屏为 BMP\n  \
          verba-trigger region-shot [--rect x,y,w,h] [输出.bmp]  选区截图（交互拖选；--rect 脚本化）\n  \
          verba-trigger region-ocr [--rect x,y,w,h] [输出.txt]   选区 → daemon OCR\n  \
+         verba-trigger vision-shot [--rect x,y,w,h] 截屏 → PNG 写 stdout（多模态 LLM 输入）\n  \
          verba-trigger ocr [输出.txt]         截图 → daemon OCR → 打印/写文件\n  \
          verba-trigger mic [秒=3] [输出.wav]   录制麦克风为 WAV\n  \
          verba-trigger asr [秒=3]             录音 → daemon ASR → 打印\n  \
@@ -347,6 +351,34 @@ fn cmd_region_shot(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("截图失败: {e}");
+            1
+        }
+    }
+}
+
+/// `vision-shot [--rect x,y,w,h]`：截图 → PNG 字节写 stdout，供多模态 LLM
+/// 的 image_url 输入。截图与编码复用 verba-trigger 共享实现；前端不重复。
+fn cmd_vision_shot(args: &[String]) -> i32 {
+    let rect_given = args.iter().any(|a| a == "--rect");
+    let png = match parse_rect(args) {
+        Some((x, y, w, h)) => capture_region_png(x, y, w, h),
+        None if rect_given => {
+            eprintln!("--rect 参数非法（应为 x,y,w,h 四个整数）");
+            return 1;
+        }
+        None => capture_primary_screen_png(),
+    };
+    match png {
+        Ok(bytes) => {
+            use std::io::Write;
+            if let Err(e) = std::io::stdout().write_all(&bytes) {
+                eprintln!("写 stdout 失败: {e}");
+                return 1;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("vision 截图失败: {e}");
             1
         }
     }

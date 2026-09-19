@@ -22,6 +22,8 @@ winit = "0.30"
 softbuffer = "0.4"
 # 截屏：xcap（内部封装 Win32 GDI / macOS CoreGraphics / Linux X11）
 xcap = "0.9"
+# 多模态 LLM 的 image_url 输入：BMP 截屏 → PNG（跨平台共享，前端不再各写一份）
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 [[bin]]
 name = "verba-trigger"

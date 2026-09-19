@@ -14,6 +14,11 @@ Verba · 拾言输入法：开源跨平台多模态 AI 输入法（OCR / ASR / L
 ## 通用规则
 遵循 `~/.agents/rules/` 下的通用规则（开发流程、开发规范、提交规范、合并规范、经验沉淀等）；本文件为仓库级规则，冲突时以本文件为准。
 
+## 跨平台默认
+- 用户提出的所有功能默认在 **Windows / macOS / Linux 全平台**实现；未明确说明平台限定时，不得只在一个平台收口，也不得把单平台实现当作完成。
+- 某平台前端尚未就绪（如 Linux 前端未开始）时，共享 core / daemon / verba-trigger 必须先落下平台中立实现；前端就绪后直接接线，禁止在共享层写死单平台或把缺口留到前端。
+- 交付时必须显式列出各平台状态；任何平台缺口都要说明原因与补齐计划，不能静默略过或用「当前仅 X 接入」包装成已完成。
+
 ## 构建与验证
 - 构建（Windows 须 MSVC target）：`scripts\build-msvc.cmd build --workspace --target x86_64-pc-windows-msvc`
 - 测试：`scripts\build-msvc.cmd test --workspace --target x86_64-pc-windows-msvc`

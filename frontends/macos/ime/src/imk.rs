@@ -369,6 +369,25 @@ fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) 
     (point.0, main_display_height - point.1)
 }
 
+/// 由 CG 顶左坐标的光标点计算「光标上方」截屏矩形（主屏内 clamp）。
+/// 与 Windows eye 区域同语义：宽高取配置，y 在光标上方 offset；取不到
+/// 光标时上层回退主屏全屏。
+fn vision_rect_above_caret(
+    caret_x: f64,
+    caret_y: f64,
+    screen_w: f64,
+    screen_h: f64,
+    width: i32,
+    height: i32,
+    offset_y: i32,
+) -> (i32, i32, i32, i32) {
+    let w = width.max(64) as f64;
+    let h = height.max(64) as f64;
+    let x = (caret_x - w / 2.0).clamp(0.0, (screen_w - w).max(0.0));
+    let y = (caret_y - h - offset_y.max(0) as f64).clamp(0.0, (screen_h - h).max(0.0));
+    (x.round() as i32, y.round() as i32, w as i32, h as i32)
+}
+
 fn cf_dict_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
     let key = CFString::new(key);
     let raw = unsafe { CFDictionaryGetValue(dict.as_concrete_TypeRef(), key.as_CFTypeRef()) };
@@ -541,6 +560,32 @@ fn trigger_exe_path() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// `//看图` 截屏：spawn 同目录 verba-trigger vision-shot，PNG 经 stdout
+/// 回传；IMK 进程不链接 xcap/image，截图与 PNG 编码复用 verba-trigger
+/// 共享实现（与 Windows/Linux 前端同源）。
+fn spawn_vision_shot(rect: Option<(i32, i32, i32, i32)>) -> Result<Vec<u8>, String> {
+    let exe = trigger_exe_path().ok_or_else(|| "未找到 verba-trigger".to_owned())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("vision-shot");
+    if let Some((x, y, w, h)) = rect {
+        cmd.arg("--rect").arg(format!("{x},{y},{w},{h}"));
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 verba-trigger vision-shot 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "verba-trigger vision-shot 退出码 {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if out.stdout.is_empty() {
+        return Err("verba-trigger vision-shot 未输出 PNG".to_owned());
+    }
+    Ok(out.stdout)
 }
 
 /// `///` 触发选区截图 OCR：spawn 同目录 verba-trigger region-ocr（选区 UI 的
@@ -1883,7 +1928,7 @@ impl VerbaIMKController {
                             true
                         }
                         None => {
-                            self.start_llm(prompt, system);
+                            self.start_llm(prompt, system, false, None);
                             true
                         }
                     },
@@ -1901,17 +1946,17 @@ impl VerbaIMKController {
                         spawn_trigger_capture(sub);
                         true
                     }
-                    // `//看图` 一期回退普通生成（macOS 前端尚无 vision 捕捉
-                    // 基础设施；列为 #89 后续，见 PR 注）。
+                    // `//看图`：与 Windows 对齐——抓光标上方区域（取不到
+                    // 光标回退主屏全屏）→ PNG 交给当前 LLM 做 vision。
                     AiCommand::Vision => {
-                        log::warn!("[VerbaIMK] //看图 vision 一期未接入，回退普通生成");
-                        self.start_llm(prompt, system);
+                        let vision_rect = self.vision_rect_for_client();
+                        self.start_llm(prompt, system, true, vision_rect);
                         true
                     }
                     // 普通生成与 daemon 命令（`//重置`/`//会话`——前端不得
                     // 拦截，原样送 daemon）。
                     AiCommand::Llm => {
-                        self.start_llm(prompt, system);
+                        self.start_llm(prompt, system, false, None);
                         true
                     }
                 }
@@ -1924,7 +1969,7 @@ impl VerbaIMKController {
                 // `//<内容>` + Tab：改写管道（与 Windows 同一套固定系统提示词，
                 // 常量收口在 verba-core）。流式结果沿用 Streaming/ResultReady
                 // 通道（Enter 上屏）。
-                self.start_llm(content, Some(REWRITE_SYSTEM_PROMPT.to_owned()));
+                self.start_llm(content, Some(REWRITE_SYSTEM_PROMPT.to_owned()), false, None);
                 true
             }
             Action::OcrPreview { text } => {
@@ -2407,7 +2452,43 @@ impl VerbaIMKController {
 
     // ---- LLM 流式 ----
 
-    fn start_llm(&self, prompt: String, system: Option<String>) {
+    /// `//看图` 的截屏区域：优先光标上方（与 Windows eye 语义一致）；
+    /// 取不到光标或 eye_enabled=false 时返回 None，worker 回退主屏全屏。
+    fn vision_rect_for_client(&self) -> Option<(i32, i32, i32, i32)> {
+        let cfg = verba_config::ConfigManager::new(verba_config::VerbaDirs::locate().ok()?)
+            .load()
+            .ok()?;
+        if !cfg.eye_enabled {
+            return None;
+        }
+        let client = self.ivars().client.borrow();
+        let client = client.as_ref()?;
+        let client: &AnyObject = client;
+        let mut caret = None;
+        self.host_call("vision.eye_rect", || {
+            caret = client_caret_point(client);
+        });
+        let (cx, cy) = caret?;
+        let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let (cx, cy) = cocoa_to_cg_point((cx, cy), bounds.size.height);
+        Some(vision_rect_above_caret(
+            cx,
+            cy,
+            bounds.size.width,
+            bounds.size.height,
+            cfg.eye_width,
+            cfg.eye_height,
+            cfg.eye_offset_y,
+        ))
+    }
+
+    fn start_llm(
+        &self,
+        prompt: String,
+        system: Option<String>,
+        vision: bool,
+        vision_rect: Option<(i32, i32, i32, i32)>,
+    ) {
         // 发送即反馈：标记文本立刻换成机器的短状态串（Streaming 态 =
         // 「✨ 生成中…」）——发送 → 首块的首 token 延迟内此前完全无反馈，
         // 用户以为没发出而习惯性再敲 Enter，空提交把提示词一并抹掉
@@ -2450,7 +2531,26 @@ impl VerbaIMKController {
             } else {
                 LlmSession::window(session_id, &session_key)
             };
-            let id = match client.llm_start(&prompt, system.as_deref(), None, None, None, session) {
+            let image = if vision {
+                match spawn_vision_shot(vision_rect) {
+                    Ok(png) => Some(("image/png".to_owned(), png)),
+                    Err(e) => {
+                        log::warn!("[VerbaIMK] //看图 vision 截屏失败: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let image_ref = image.as_ref().map(|(m, d)| (m.as_str(), d.as_slice()));
+            let id = match client.llm_start(
+                &prompt,
+                system.as_deref(),
+                None,
+                None,
+                image_ref,
+                session,
+            ) {
                 Ok(id) => id,
                 Err(e) => {
                     push_llm(seq, error_event(&format!("LLM 启动失败: {e}")));
@@ -2458,6 +2558,9 @@ impl VerbaIMKController {
                     return;
                 }
             };
+            // 图已交给 daemon（llm_start 返回）：及时释放 PNG，避免整个
+            // 流式生成期驻留数 MB 截图缓冲。
+            drop(image);
             daemon_ids().lock().unwrap().insert(seq, id);
             // 启动期间已被取消（cancel_stream 在 llm_start 返回前执行，daemon id
             // 尚不可知）：检查取消登记，立即取消并退出，避免空转。
@@ -2936,6 +3039,22 @@ mod tests {
         assert!(!is_pasteable_char('\u{3}'));
         assert!(!is_pasteable_char('\u{F702}'));
         assert!(!is_pasteable_char('\u{F8FF}'));
+    }
+
+    #[test]
+    fn vision_rect_above_caret_clamps_to_primary_screen() {
+        assert_eq!(
+            vision_rect_above_caret(500.0, 500.0, 1440.0, 900.0, 640, 480, 0),
+            (180, 20, 640, 480)
+        );
+        assert_eq!(
+            vision_rect_above_caret(100.0, 100.0, 1440.0, 900.0, 640, 480, 0),
+            (0, 0, 640, 480)
+        );
+        assert_eq!(
+            vision_rect_above_caret(500.0, 500.0, 1440.0, 900.0, 640, 480, 40),
+            (180, 0, 640, 480)
+        );
     }
 
     #[test]

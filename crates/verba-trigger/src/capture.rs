@@ -173,6 +173,35 @@ pub fn capture_region(x: i32, y: i32, width: i32, height: i32) -> Result<ScreenS
     })
 }
 
+/// 截取主屏全屏并编码为 PNG（多模态 LLM 的 image_url 输入）。
+///
+/// 与 `capture_primary_screen` 同一跨平台实现；Windows / macOS / Linux
+/// 前端共用，避免各端各自做 BMP→PNG 转换。
+pub fn capture_primary_screen_png() -> Result<Vec<u8>, TriggerError> {
+    bmp_to_png(&capture_primary_screen()?.bmp)
+}
+
+/// 截取屏幕矩形并编码为 PNG（多模态 LLM 的 image_url 输入）。
+pub fn capture_region_png(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, TriggerError> {
+    bmp_to_png(&capture_region(x, y, width, height)?.bmp)
+}
+
+/// 32bpp top-down BMP → PNG。供截屏后的多模态请求使用；跨平台同源，
+/// 不在各前端重复实现（verba-ocr 的 BMP 解码仍走自己的路径）。
+pub fn bmp_to_png(bmp: &[u8]) -> Result<Vec<u8>, TriggerError> {
+    let img = image::load_from_memory(bmp)
+        .map_err(|e| TriggerError::Capture(format!("图像解码失败: {e}")))?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| TriggerError::Capture(format!("PNG 编码失败: {e}")))?;
+    Ok(out)
+}
+
 /// 截取主屏全屏（主显示器）。
 pub fn capture_primary_screen() -> Result<ScreenShot, TriggerError> {
     let list = monitors()?;
@@ -264,5 +293,12 @@ mod tests {
         let mut px = vec![1u8, 2, 3, 255, 4, 5, 6, 255];
         rgba_to_bgra(&mut px);
         assert_eq!(px, vec![3u8, 2, 1, 255, 6, 5, 4, 255]);
+    }
+
+    #[test]
+    fn bmp_to_png_encodes_png_signature() {
+        let bmp = crate::bmp::encode_bmp(1, 1, &[0, 0, 0, 255]);
+        let png = bmp_to_png(&bmp).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 }

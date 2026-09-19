@@ -2263,22 +2263,16 @@ fn run_region_ocr_rect(
 
 /// 眼睛区域：`//` 指令时自动捕捉「光标上方」矩形（可配 eye.*），供 LLM 上下文。
 /// BMP（32bpp top-down，capture 产物）→ PNG 字节，用于多模态 LLM vision。
-fn bmp_to_png(bmp: &[u8]) -> std::result::Result<Vec<u8>, String> {
-    let img = image::load_from_memory(bmp).map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
 /// 捕捉眼睛区域（或全屏回退）为 PNG 图像，供多模态 LLM。
-/// `eye_rect` 为 None 时回退到主屏全屏。
+/// `eye_rect` 为 None 时回退到主屏全屏；截图→PNG 走 verba-trigger 共享实现，
+/// 与 macOS/Linux 前端同源。
 fn eye_vision_image(eye_rect: Option<(i32, i32, i32, i32)>) -> Option<(String, Vec<u8>)> {
-    let shot = match eye_rect {
-        Some((rx, ry, rw, rh)) => verba_trigger::capture::capture_region(rx, ry, rw, rh).ok()?,
-        None => verba_trigger::capture::capture_primary_screen().ok()?,
+    let png = match eye_rect {
+        Some((rx, ry, rw, rh)) => {
+            verba_trigger::capture::capture_region_png(rx, ry, rw, rh).ok()?
+        }
+        None => verba_trigger::capture::capture_primary_screen_png().ok()?,
     };
-    let png = bmp_to_png(&shot.bmp).ok()?;
     Some(("image/png".to_owned(), png))
 }
 
