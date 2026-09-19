@@ -24,6 +24,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSMenu, NSMenuItem,
+    NSScreen,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSDictionary, NSInteger,
@@ -307,19 +308,38 @@ fn client_process_identifier(client: &AnyObject) -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
-/// 取当前光标/选区的屏幕坐标（Cocoa 底部原点）。该调用会经 XPC 查宿主，
-/// 必须在 host_call 重入保护内执行。
-/// 校验 firstRectForCharacterRange 的结果：actualRange 必须有效、宽高为正。
-/// 零矩形/NSNotFound 必须回退全屏，而不是把 (0,0) 当成光标。
-fn valid_caret_rect(actual_location: NSUInteger, width: f64, height: f64) -> Option<(f64, f64)> {
-    if actual_location == NSNotFound as NSUInteger || width <= 0.0 || height <= 0.0 {
-        None
-    } else {
-        Some((width, height))
+/// 由 firstRectForCharacterRange 的原始矩形得到插入点（Cocoa 底左坐标）。
+///
+/// 零长度 range 返回 width=0 的矩形是 NSTextView 的正常行为，必须接受；
+/// width<0 表示 range 向左延伸，插入点仍取 origin.x。只拒绝 NSNotFound、
+/// 非有限坐标与 <=0 的行高。
+fn caret_point_from_rect(
+    actual_location: NSUInteger,
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
+) -> Option<(f64, f64)> {
+    if actual_location == NSNotFound as NSUInteger
+        || !origin_x.is_finite()
+        || !origin_y.is_finite()
+        || !height.is_finite()
+        || height <= 0.0
+    {
+        return None;
     }
+    let dx = if width.is_finite() {
+        width.max(0.0)
+    } else {
+        0.0
+    };
+    Some((origin_x + dx, origin_y + height))
 }
 
-fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
+/// 原始光标矩形（Cocoa 底左坐标 x/y/w/h）；有效性校验与 caret_point_from_rect
+/// 一致，额外保留 width 供 vision 取上/下边界。该调用会经 XPC 查宿主，必须在
+/// host_call 重入保护内执行。
+fn client_caret_rect(client: &AnyObject) -> Option<(f64, f64, f64, f64)> {
     let responds_range: Bool =
         unsafe { msg_send![client, respondsToSelector: sel!(selectedRange)] };
     if !responds_range.as_bool() {
@@ -334,8 +354,24 @@ fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
             actualRange: &mut actual as *mut NSRange
         ]
     };
-    let (w, h) = valid_caret_rect(actual.location, rect.size.width, rect.size.height)?;
-    Some((rect.origin.x + w, rect.origin.y + h))
+    let _ = caret_point_from_rect(
+        actual.location,
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )?;
+    Some((
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    ))
+}
+
+fn client_caret_point(client: &AnyObject) -> Option<(f64, f64)> {
+    let (x, y, w, h) = client_caret_rect(client)?;
+    caret_point_from_rect(0, x, y, w, h)
 }
 
 // CGWindowListCopyWindowInfo 与 key 常量（CoreGraphics）。
@@ -361,11 +397,6 @@ struct CGRectF {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
-    fn CGGetActiveDisplayList(
-        max_displays: u32,
-        displays: *mut u32,
-        display_count: *mut u32,
-    ) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRectF;
     static kCGWindowNumber: CFStringRef;
@@ -379,12 +410,13 @@ fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) 
     (point.0, main_display_height - point.1)
 }
 
-/// 由 CG 顶左坐标的光标点与所在显示器工作区计算 vision 截屏矩形。
-/// 与 Windows `fit_eye_rect` 同语义：优先光标上方（留 offset 间隙），上方
-/// 放不下翻到下方，再不行贴空间更大的一侧；水平 clamp 到工作区。
+/// 由 CG 顶左坐标的光标行（top/bottom）与所在显示器工作区计算 vision
+/// 截屏矩形。逐行镜像 Windows `fit_eye_rect`：优先光标上方（留 offset 间隙），
+/// 上方放不下翻到下方，再不行贴空间更大的一侧；水平 clamp 到工作区。
 fn vision_rect_from_caret(
     caret_x: i32,
-    caret_y: i32,
+    caret_top: i32,
+    caret_bottom: i32,
     work: (i32, i32, i32, i32),
     width: i32,
     height: i32,
@@ -395,12 +427,12 @@ fn vision_rect_from_caret(
     let h = height.max(64);
     let px = caret_x.clamp(work_left, (work_right - w).max(work_left));
     let off = offset_y.max(0);
-    let above_space = caret_y - off - work_top;
-    let below_space = work_bottom - caret_y;
+    let above_space = caret_top - off - work_top;
+    let below_space = work_bottom - caret_bottom;
     let py = if h <= above_space {
-        caret_y - off - h
+        caret_top - off - h
     } else if h <= below_space {
-        caret_y
+        caret_bottom
     } else if above_space >= below_space {
         work_top
     } else {
@@ -409,29 +441,44 @@ fn vision_rect_from_caret(
     (px, py, w, h)
 }
 
-/// 找到包含该 CG 顶左坐标点的活动显示器 bounds；找不到返回 None。
-fn display_bounds_containing(point: (f64, f64)) -> Option<CGRectF> {
-    let mut count: u32 = 0;
-    let status = unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) };
-    if status != 0 || count == 0 {
-        return None;
-    }
-    let mut ids = vec![0u32; count as usize];
-    let status = unsafe { CGGetActiveDisplayList(count, ids.as_mut_ptr(), &mut count) };
-    if status != 0 {
-        return None;
-    }
-    for id in ids {
-        let b = unsafe { CGDisplayBounds(id) };
-        if point.0 >= b.origin.x
-            && point.0 <= b.origin.x + b.size.width
-            && point.1 >= b.origin.y
-            && point.1 <= b.origin.y + b.size.height
-        {
-            return Some(b);
+/// 光标所在显示器的真实工作区（NSScreen.visibleFrame，排除菜单栏/Dock），
+/// 转成 CG 顶左坐标 (left, top, right, bottom)。
+fn display_work_area_containing(
+    cg_point: (f64, f64),
+    main_height: f64,
+) -> Option<(i32, i32, i32, i32)> {
+    // SAFETY: IMK 回调在主线程执行（NSScreen 为 MainThreadOnly）。
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let screens = NSScreen::screens(mtm);
+    for screen in screens.iter() {
+        let frame = screen.frame();
+        let left = frame.origin.x;
+        let right = frame.origin.x + frame.size.width;
+        let top = main_height - (frame.origin.y + frame.size.height);
+        let bottom = main_height - frame.origin.y;
+        if cg_point.0 >= left && cg_point.0 <= right && cg_point.1 >= top && cg_point.1 <= bottom {
+            let visible = screen.visibleFrame();
+            let v_top = main_height - (visible.origin.y + visible.size.height);
+            let v_bottom = main_height - visible.origin.y;
+            return Some((
+                visible.origin.x.round() as i32,
+                v_top.round() as i32,
+                (visible.origin.x + visible.size.width).round() as i32,
+                v_bottom.round() as i32,
+            ));
         }
     }
     None
+}
+
+/// CGDisplayBounds → 工作区兜底（NSScreen 查询失败时；含菜单栏/Dock 的粗略值）。
+fn cg_bounds_work(b: CGRectF) -> (i32, i32, i32, i32) {
+    (
+        b.origin.x.round() as i32,
+        b.origin.y.round() as i32,
+        (b.origin.x + b.size.width).round() as i32,
+        (b.origin.y + b.size.height).round() as i32,
+    )
 }
 
 fn cf_dict_f64(dict: &CFDictionary, key: &str) -> Option<f64> {
@@ -2513,21 +2560,22 @@ impl VerbaIMKController {
         let client = self.ivars().client.borrow().clone()?;
         let mut caret = None;
         self.host_call("vision.eye_rect", || {
-            caret = client_caret_point(&client);
+            caret = client_caret_rect(&client);
         });
-        let (cx, cy) = caret?;
+        let (x, y, w, h) = caret?;
+        let dx = if w.is_finite() { w.max(0.0) } else { 0.0 };
         let main_bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-        let (cx, cy) = cocoa_to_cg_point((cx, cy), main_bounds.size.height);
-        let bounds = display_bounds_containing((cx, cy)).unwrap_or(main_bounds);
-        let work = (
-            bounds.origin.x.round() as i32,
-            bounds.origin.y.round() as i32,
-            (bounds.origin.x + bounds.size.width).round() as i32,
-            (bounds.origin.y + bounds.size.height).round() as i32,
-        );
+        let main_h = main_bounds.size.height;
+        // Cocoa 底左 → CG 顶左：x 不变，y 取 top/bottom 两条边。
+        let caret_x = x + dx;
+        let caret_top = main_h - (y + h);
+        let caret_bottom = main_h - y;
+        let work = display_work_area_containing((caret_x, caret_top), main_h)
+            .unwrap_or_else(|| cg_bounds_work(main_bounds));
         Some(vision_rect_from_caret(
-            cx.round() as i32,
-            cy.round() as i32,
+            caret_x.round() as i32,
+            caret_top.round() as i32,
+            caret_bottom.round() as i32,
             work,
             cfg.eye_width,
             cfg.eye_height,
@@ -3100,38 +3148,55 @@ mod tests {
     #[test]
     fn vision_rect_from_caret_matches_windows_fit_semantics() {
         let main = (0, 0, 1440, 900);
+        // caret line: top=490, bottom=510（高度 20）；上方 490 足够放 480。
         assert_eq!(
-            vision_rect_from_caret(500, 500, main, 640, 480, 0),
-            (500, 20, 640, 480)
+            vision_rect_from_caret(500, 490, 510, main, 640, 480, 0),
+            (500, 10, 640, 480)
         );
-        // 上方放不下 → 翻到光标下方。
+        // 上方放不下 → 翻到光标行下方（bottom=120）。
         assert_eq!(
-            vision_rect_from_caret(100, 100, main, 640, 480, 0),
-            (100, 100, 640, 480)
+            vision_rect_from_caret(100, 100, 120, main, 640, 480, 0),
+            (100, 120, 640, 480)
         );
-        // 上方空间更大 → 贴工作区顶部。
+        // 上下都放不下且上方空间更大 → 贴工作区顶部。
         assert_eq!(
-            vision_rect_from_caret(500, 500, main, 640, 480, 40),
+            vision_rect_from_caret(500, 490, 510, main, 640, 480, 40),
             (500, 0, 640, 480)
         );
         // 副屏（右侧）按光标所在屏 clamp。
         assert_eq!(
-            vision_rect_from_caret(2200, 500, (1440, 0, 2880, 900), 640, 480, 0),
-            (2200, 20, 640, 480)
+            vision_rect_from_caret(2200, 490, 510, (1440, 0, 2880, 900), 640, 480, 0),
+            (2200, 10, 640, 480)
         );
         // 副屏（左侧，负坐标）同样成立。
         assert_eq!(
-            vision_rect_from_caret(-1000, 500, (-1920, 0, 0, 1080), 640, 480, 0),
-            (-1000, 20, 640, 480)
+            vision_rect_from_caret(-1000, 490, 510, (-1920, 0, 0, 1080), 640, 480, 0),
+            (-1000, 10, 640, 480)
         );
     }
 
     #[test]
-    fn valid_caret_rect_rejects_not_found_and_zero_size() {
-        assert_eq!(valid_caret_rect(0, 10.0, 10.0), Some((10.0, 10.0)));
-        assert_eq!(valid_caret_rect(NSNotFound as NSUInteger, 10.0, 10.0), None);
-        assert_eq!(valid_caret_rect(0, 0.0, 10.0), None);
-        assert_eq!(valid_caret_rect(0, 10.0, 0.0), None);
+    fn caret_point_accepts_zero_width_and_rejects_invalid() {
+        // NSTextView 零长度插入点：width=0 是正常的，x 取 origin.x。
+        assert_eq!(
+            caret_point_from_rect(2, 10.0, 20.0, 0.0, 14.0),
+            Some((10.0, 34.0))
+        );
+        // 负 width（range 向左延伸）插入点取 origin.x，不拒绝。
+        assert_eq!(
+            caret_point_from_rect(2, 10.0, 20.0, -3.0, 14.0),
+            Some((10.0, 34.0))
+        );
+        // 正 width：插入点在 range 末端。
+        assert_eq!(
+            caret_point_from_rect(2, 10.0, 20.0, 3.0, 14.0),
+            Some((13.0, 34.0))
+        );
+        assert_eq!(
+            caret_point_from_rect(NSNotFound as NSUInteger, 10.0, 20.0, 0.0, 14.0),
+            None
+        );
+        assert_eq!(caret_point_from_rect(2, 10.0, 20.0, 0.0, 0.0), None);
     }
 
     #[test]
