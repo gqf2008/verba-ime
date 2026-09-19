@@ -2730,15 +2730,34 @@ mod tests {
     }
 
     #[test]
+    fn shift_digit_is_not_preview_digit() {
+        assert_eq!(classify_preview_key(0x31, Some('1'), true), None);
+        assert_eq!(
+            classify_preview_key(0x31, Some('1'), false),
+            Some(PreviewKey::Digit1)
+        );
+        assert_eq!(classify_preview_key(0x32, Some('2'), true), None);
+        assert_eq!(
+            classify_preview_key(0x32, Some('2'), false),
+            Some(PreviewKey::Digit2)
+        );
+    }
+
+    #[test]
     fn tsf_modifier_detection_uses_global_async_state() {
         // 源码级守卫：把 modifier_down 回退成线程局部 GetKeyState 时红，
         // 防止 Ctrl+V 再次被解成 'v' 认领（纯决策核测试覆盖不到这个来源）。
-        let src = include_str!("text_service.rs");
+        // windows-latest 常以 CRLF 检出；先规范化行尾，否则 find("\n}\n")
+        // 返回 None 会把 body 扩成全文、扫到断言自身的字面量而假红。
+        let src = include_str!("text_service.rs").replace("\r\n", "\n");
         let start = src
             .find("fn modifier_down")
             .expect("modifier_down 必须存在");
         let tail = &src[start..];
-        let end = tail.find("\n}\n").map(|i| i + 2).unwrap_or(tail.len());
+        let end = tail
+            .find("\n}\n")
+            .expect("modifier_down body must terminate")
+            + 2;
         let body = &tail[..end];
         assert!(
             body.contains("GetAsyncKeyState"),
