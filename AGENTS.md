@@ -27,5 +27,13 @@ Verba · 拾言输入法：开源跨平台多模态 AI 输入法（OCR / ASR / L
 - 平台前端改动需在对应平台验证（TSF / IMK / Fcitx5 无法在纯 CI 完整跑通，至少保证 `cargo check` 门禁）
 - 关键决策（架构、协议、provider）先更新对应文档再写代码，契约不漂移
 
+## 协作与记账（walgit 协同层）
+本仓库 origin 为本机 walgit（`http://127.0.0.1:8081/gqf2008/verba-ime.git`）。开发协作的 issue / PR / 评审 / 合并 / 收尾一律走 walgit 的 D1 协同层（`refs/collab/*` 追加式签名条目），**不使用 GitHub / `gh`**：
+
+- 开线程 `issue`（`--parent ""`）→ 认领 `comment`（owner/worktree/branch）+ `status: in-progress` → 交补丁 `patch --base refs/heads/main --head refs/heads/<branch>` → 评审 `review`（decision/agent/note）→ 合并 `merge_result` → 收尾 `status: closed`。
+- `--parent` 必须取上一条命令返回的 oid；`--key` 传路径不传内容；**不得用别人的 key 代签**。
+- 查重/看板用 `walgit collab board` / `collab thread <id>`，不用 `gh issue list`。
+- 命令形态与 principal/key 约定见 `~/.agents/rules/RULE_walgit协同记账.md`。
+
 ## 提交
 按通用规则：单职责提交、禁止临时文件/密钥/构建产物、提交前自跑最小验证。
