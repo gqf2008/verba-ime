@@ -1,6 +1,6 @@
 # 构建与打包
 
-> 更新：2026-08-22 · 适用于 M0 骨架与后续各平台前端。
+> 更新：2026-09-21 · 适用于 M0 骨架与后续各平台前端。
 
 ## 环境要求
 
@@ -24,6 +24,43 @@ cargo fmt --all -- --check
 scripts\build-msvc.cmd clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 scripts\build-msvc.cmd run -p verba-cli -- --help
 ```
+
+## ONNX Runtime（ort）预编译 dist 自愈
+
+本地 OCR（`verba-ocr::rapid`）经 `rapidocr-core` 依赖 `ort`，构建期由 `ort-sys` 从 pyke CDN 拉取
+**预编译 onnxruntime**（按 target + feature set 哈希缓存到 `~/Library/Caches/ort.pyke.io/dfbin/<target>/<hash>/`，
+Linux 为 `${XDG_CACHE_HOME:-~/.cache}`）。两个已知坑都会**伪装成代码问题**：
+
+- **缓存目录存在但为空**：`ort-sys` 把它当有效缓存 → 链接期 `could not find native static library onnxruntime`
+  （`cargo check` 全绿，因为它不链接；`cargo test`/二进制才暴露）。
+- **拿旧库凑合**：把 `ORT_LIB_LOCATION` 指向本机别的旧哈希目录，链接能过，但二进制一跑就 panic
+  `The requested API version [...] is not available`——旧目录里是更早版本的 ORT，而 `ort` 默认按最新 API 版本编译。
+
+自愈脚本（只读 Cargo.lock / ort-sys 源码；除下载缓存外不写仓库，不删除任何数据）：
+
+```bash
+# 只检查：0=无需自愈，1=需要（并打印原因与下一步）
+bash scripts/ensure-ort-dist.sh --check
+
+# 让 ort-sys 重新下载：把该 target 的空/坏缓存目录**可逆移开**成 .broken-<ts>（不是删除）
+bash scripts/ensure-ort-dist.sh --fix-cache
+
+# 弱网/离线：脚本按 dist.tsv 自行下载并按 sha256 校验，解压后导出 ORT_LIB_LOCATION
+eval "$(bash scripts/ensure-ort-dist.sh)"
+bash scripts/ensure-ort-dist.sh -- cargo test --workspace   # 或带环境直接跑任意命令
+
+# 无网络自检（用临时目录，不碰真实 ort 缓存）：11 项覆盖各分支
+bash scripts/test-ensure-ort-dist.sh
+```
+
+- 选行规则与 `ort-sys` 一致：无 EP feature 时取该 target 在 `dist.tsv` 里的第一行；启用 cuda/coreml/directml 等
+  EP 时先 `--list` 看清单，再 `ORT_DIST_HASH=<sha256>` 指定（该 target 有多种 feature set 组合时脚本会提示）。
+- 本地 dist 缓存默认落在数据卷 `/Volumes/DataExt/tmp/verba-ort-dist`（可用 `ORT_DIST_CACHE` 覆盖）。
+- ort 缓存根与 `ort-sys` 同优先级：`ORT_CACHE_DIR` > 平台默认（macOS `~/Library/Caches/ort.pyke.io`、
+  Linux `$XDG_CACHE_HOME` 或 `~/.cache/ort.pyke.io`、Windows `%LOCALAPPDATA%\ort.pyke.io`）。
+- 判据：`--check` 绿只代表缓存就绪；**确认要跑一次链接 + 实际推理**（`cargo test`，不是 `cargo check`）。
+- 脚本用 `bash` 跑（macOS 上是 3.2）：空数组展开、`$VAR` 紧跟中文等坑都在自检里钉住，改动后请跑一次
+  `scripts/test-ensure-ort-dist.sh`。
 
 ## 设置面板（apps/settings，Slint 1.17）
 
