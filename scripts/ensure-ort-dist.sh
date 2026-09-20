@@ -213,7 +213,13 @@ main() {
             check) return 0 ;;
             fix)   log "ort 缓存已就绪（${libdir}），无需修复"; return 0 ;;
             path)  echo "$libdir"; return 0 ;;
-            *)     log "ort 缓存已就绪：$libdir"; return 0 ;;
+            *)
+                log "ort 缓存已就绪：$libdir"
+                # 给了命令就必须执行：曾漏这一步 → 缓存就绪的机器上 `-- cargo test` 静默不跑任何东西却 exit 0
+                # （自己绿、别人红，最难查的一类）。emit 形态仍不打 export：缓存就绪时确实不需要设环境变量。
+                [ "${#REMAINING[@]}" -eq 0 ] || report_and_run "$libdir" "${REMAINING[@]}"
+                return 0
+                ;;
         esac
     fi
 

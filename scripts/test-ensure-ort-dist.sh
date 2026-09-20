@@ -145,5 +145,22 @@ else
     fail "--print-path 未取 ort 缓存目录（实际：${GOT:-空}）"
 fi
 
+# 10) ort 自己的缓存命中时，`-- <cmd>` 也必须真的执行命令。
+#     与 6) 的区别：6) 走的是「本地 dist 缓存命中」，10) 走的是「ort 缓存命中」——
+#     后者曾漏掉命令执行（只 log 一行就 return 0），于是缓存本已就绪的机器上
+#     `bash scripts/ensure-ort-dist.sh -- cargo test` 什么都不跑却报成功，最难查的一类假绿。
+if GOT="$(run -- sh -c 'printf %s ORT-CACHE-HIT-RAN' 2>/dev/null)" && [ "$GOT" = "ORT-CACHE-HIT-RAN" ]; then
+    pass "ort 缓存命中时 -- <cmd> 仍然执行命令"
+else
+    fail "ort 缓存命中时 -- <cmd> 没有执行命令（实际：${GOT:-空}）"
+fi
+
+# 11) 同理钉住 emit 形态的契约：缓存就绪时 stdout 保持为空（不需要 export 环境变量），且退出 0
+if OUT="$(run 2>/dev/null)" && [ -z "$OUT" ]; then
+    pass "ort 缓存就绪时 emit 形态 stdout 为空（无需 export）"
+else
+    fail "ort 缓存就绪时 emit 形态输出异常（实际：${OUT:-空}）"
+fi
+
 echo "# 通过 $passed 项，失败 $failed 项"
 [ "$failed" -eq 0 ]
