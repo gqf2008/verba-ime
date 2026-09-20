@@ -12,7 +12,7 @@
 #   eval "$(bash scripts/ensure-ort-dist.sh)"  # 当前 shell 生效，之后直接 cargo build/test
 #   bash scripts/ensure-ort-dist.sh -- cargo test --workspace   # 带着 ORT_LIB_LOCATION 跑命令
 #   bash scripts/ensure-ort-dist.sh --check    # 只检查：0=无需自愈，1=需要自愈（附原因）
-#   bash scripts/ensure-ort-dist.sh --fix-cache# 把该 dist 的空/损坏缓存目录可逆移开（.broken-<ts>）
+#   bash scripts/ensure-ort-dist.sh --fix-cache # 把该 dist 的空/损坏缓存目录可逆移开（.broken-<ts>）
 #   bash scripts/ensure-ort-dist.sh --list     # 列出该 target 的所有 dist 行（含 sha256）
 # 环境变量：
 #   ORT_DIST_CACHE   本地 dist 缓存根（默认 /Volumes/DataExt/tmp/verba-ort-dist；该卷不存在时用 ~/.cache/verba-ort-dist）
@@ -28,7 +28,10 @@ ORT_CACHE_KIND="ort.pyke.io/dfbin"
 log() { echo "ensure-ort-dist: $*" >&2; }
 die() { log "错误：$*"; exit 1; }
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+# 用法块 = 文件头注释块（shebang 之后连续的行首 `#` 行）。不写死行号：改注释不会让 --help 漂移/截断。
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
 
 # `--` 之后的命令。**全局**而非 main 的 local：bash 3.2（macOS /bin/bash）在 `set -u` 下
 # 展开空数组的 `"${REMAINING[@]}"` 会报 `REMAINING[@]: unbound variable` 并中断，
