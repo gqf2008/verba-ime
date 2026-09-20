@@ -18,6 +18,7 @@
 #   ORT_DIST_CACHE   本地 dist 缓存根（默认 /Volumes/DataExt/tmp/verba-ort-dist；该卷不存在时用 ~/.cache/verba-ort-dist）
 #   ORT_DIST_TARGET  覆盖 target triple（默认取 `rustc -vV` 的 host）
 #   ORT_DIST_HASH    覆盖 dist 选择（dist.tsv 第四列；启用 cuda/coreml/directml 等 EP feature 时用 --list 选）
+#   ORT_CACHE_DIR    ort-sys 自己的缓存根（与 ort-sys 同优先级；设置后 --check/--fix-cache 认它）
 # 说明：本脚本只读 Cargo.lock / ort-sys 源码；除下载缓存外不写仓库，不删除任何数据（--fix-cache 是移动）。
 set -euo pipefail
 
@@ -27,7 +28,12 @@ ORT_CACHE_KIND="ort.pyke.io/dfbin"
 log() { echo "ensure-ort-dist: $*" >&2; }
 die() { log "错误：$*"; exit 1; }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# `--` 之后的命令。**全局**而非 main 的 local：bash 3.2（macOS /bin/bash）在 `set -u` 下
+# 展开空数组的 `"${REMAINING[@]}"` 会报 `REMAINING[@]: unbound variable` 并中断，
+# 文档里的 `eval "$(bash scripts/ensure-ort-dist.sh)"` 会因此拿不到输出，故必须按长度分支。
+REMAINING=()
 
 # ── dist.tsv：ort-sys 声明该 target 有哪些预编译 dist（feature_set / url / sha256）────────
 find_dist_tsv() {
@@ -51,9 +57,16 @@ sha256_of() {
 }
 
 onnx_cache_root() {
+    # 与 ort-sys 的 internal::dirs::cache_dir 优先级一致：ORT_CACHE_DIR 优先，其次按平台
+    # （macOS: ~/Library/Caches · Linux: $XDG_CACHE_HOME 或 ~/.cache · Windows: %LOCALAPPDATA%）
+    if [ -n "${ORT_CACHE_DIR:-}" ]; then
+        echo "${ORT_CACHE_DIR%/}/dfbin"
+        return 0
+    fi
     case "$(uname -s)" in
-        Darwin) echo "$HOME/Library/Caches/$ORT_CACHE_KIND" ;;
-        *)      echo "${XDG_CACHE_HOME:-$HOME/.cache}/$ORT_CACHE_KIND" ;;
+        Darwin)               echo "$HOME/Library/Caches/$ORT_CACHE_KIND" ;;
+        MINGW*|MSYS*|CYGWIN*) echo "${LOCALAPPDATA:-$HOME/AppData/Local}/$ORT_CACHE_KIND" ;;
+        *)                    echo "${XDG_CACHE_HOME:-$HOME/.cache}/$ORT_CACHE_KIND" ;;
     esac
 }
 
@@ -108,8 +121,18 @@ report_and_run() {
     fi
 }
 
+# 统一收尾：给了命令就带着 ORT_LIB_LOCATION 执行，否则只打印 export 供 eval
+finish_() {
+    local libdir="$1"
+    if [ "${#REMAINING[@]}" -gt 0 ]; then
+        report_and_run "$libdir" "${REMAINING[@]}"
+    else
+        report_and_run "$libdir"
+    fi
+}
+
 main() {
-    local mode="emit" cmd=()
+    local mode="emit"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --check)     mode="check" ;;
@@ -117,7 +140,7 @@ main() {
             --list)      mode="list" ;;
             --fix-cache) mode="fix" ;;
             --offline)   offline=1 ;;
-            --)          shift; cmd=("$@"); break ;;
+            --)          shift; REMAINING=("$@"); break ;;
             -h|--help)   usage; return 0 ;;
             *)           die "未知参数：$1（--help 看用法）" ;;
         esac
@@ -141,16 +164,27 @@ main() {
         return 0
     fi
 
+    local auto_pick=0
     if [ -n "${ORT_DIST_HASH:-}" ]; then
         row="$(printf '%s\n' "$rows" | awk -F'\t' -v h="$ORT_DIST_HASH" '$3==h {print; exit}')"
         [ -n "$row" ] || die "ORT_DIST_HASH=$ORT_DIST_HASH 不在该 target 的 dist 列表里（--list 查看）"
     else
         # 与 ort-sys resolve_dist 的取向一致：无 EP feature 时选该 target 的第一行
         row="$(printf '%s\n' "$rows" | head -1)"
+        auto_pick=1
     fi
     feature="$(printf '%s' "$row" | cut -f1)"
     url="$(printf '%s' "$row" | cut -f2)"
     hash="$(printf '%s' "$row" | cut -f3)"
+
+    if [ "$auto_pick" = "1" ]; then
+        local variants
+        variants="$(printf '%s\n' "$rows" | awk -F'\t' '{print $1}' | sort -u | wc -l | tr -d ' ')"
+        if [ "$variants" -gt 1 ]; then
+            log "注意：target $target 有 $variants 种 feature set 组合，默认按无 EP feature 取第一行（feature_set=${feature}）；"
+            log "      若本次构建启用了 cuda/coreml/directml 等 EP feature：--list 看清单 → ORT_DIST_HASH=<sha256> 指定"
+        fi
+    fi
 
     local cache_dir store_dir
     cache_dir="$(onnx_cache_root)/$target/$hash"
@@ -162,7 +196,7 @@ main() {
             case "$mode" in
                 check) return 0 ;;
                 path)  echo "$ORT_LIB_LOCATION"; return 0 ;;
-                *)     report_and_run "$ORT_LIB_LOCATION" "${cmd[@]}"; return 0 ;;
+                *)     finish_ "$ORT_LIB_LOCATION"; return 0 ;;
             esac
         fi
         log "注意：环境里的 ORT_LIB_LOCATION=$ORT_LIB_LOCATION 里没有 onnxruntime 库，忽略它"
@@ -207,7 +241,7 @@ main() {
     if [ -n "$libdir" ]; then
         case "$mode" in
             path) echo "$libdir" ;;
-            *)    report_and_run "$libdir" "${cmd[@]}" ;;
+            *)    finish_ "$libdir" ;;
         esac
         return 0
     fi
@@ -232,7 +266,7 @@ main() {
     log "dist 已就绪：$libdir"
     case "$mode" in
         path) echo "$libdir" ;;
-        *)    report_and_run "$libdir" "${cmd[@]}" ;;
+        *)    finish_ "$libdir" ;;
     esac
 }
 

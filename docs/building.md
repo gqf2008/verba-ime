@@ -48,12 +48,19 @@ bash scripts/ensure-ort-dist.sh --fix-cache
 # 弱网/离线：脚本按 dist.tsv 自行下载并按 sha256 校验，解压后导出 ORT_LIB_LOCATION
 eval "$(bash scripts/ensure-ort-dist.sh)"
 bash scripts/ensure-ort-dist.sh -- cargo test --workspace   # 或带环境直接跑任意命令
+
+# 无网络自检（用临时目录，不碰真实 ort 缓存）：11 项覆盖各分支
+bash scripts/test-ensure-ort-dist.sh
 ```
 
 - 选行规则与 `ort-sys` 一致：无 EP feature 时取该 target 在 `dist.tsv` 里的第一行；启用 cuda/coreml/directml 等
-  EP 时先 `--list` 看清单，再 `ORT_DIST_HASH=<sha256>` 指定。
+  EP 时先 `--list` 看清单，再 `ORT_DIST_HASH=<sha256>` 指定（该 target 有多种 feature set 组合时脚本会提示）。
 - 本地 dist 缓存默认落在数据卷 `/Volumes/DataExt/tmp/verba-ort-dist`（可用 `ORT_DIST_CACHE` 覆盖）。
+- ort 缓存根与 `ort-sys` 同优先级：`ORT_CACHE_DIR` > 平台默认（macOS `~/Library/Caches/ort.pyke.io`、
+  Linux `$XDG_CACHE_HOME` 或 `~/.cache/ort.pyke.io`、Windows `%LOCALAPPDATA%\ort.pyke.io`）。
 - 判据：`--check` 绿只代表缓存就绪；**确认要跑一次链接 + 实际推理**（`cargo test`，不是 `cargo check`）。
+- 脚本用 `bash` 跑（macOS 上是 3.2）：空数组展开、`$VAR` 紧跟中文等坑都在自检里钉住，改动后请跑一次
+  `scripts/test-ensure-ort-dist.sh`。
 
 ## 设置面板（apps/settings，Slint 1.17）
 
