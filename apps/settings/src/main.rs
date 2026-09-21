@@ -24,12 +24,6 @@ fn models_cache() -> &'static std::sync::Mutex<Vec<String>> {
     MODELS_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// 配置里是否已有可用的 API Key（决定「打开面板时是否值得自动拉模型列表」：
-/// daemon 侧没 key 会直接返回 400，没必要发这趟请求）。
-fn api_key_configured() -> bool {
-    matches!(ApiKeyStore::get(), Ok(Some(k)) if !k.is_empty())
-}
-
 /// 合并「服务商返回的模型列表」与「当前配置的模型名」：
 /// - 去空、去重，保持服务商返回的顺序；
 /// - 当前模型不在列表里（自定义模型名 / 服务商没列出来）时插到**首位**，
@@ -80,16 +74,9 @@ fn spawn_fetch_models(ui: &SettingsWindow, auto: bool) {
     }
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        if auto && !api_key_configured() {
-            // 没配 key：保持"打开时那个状态"（下拉已由 populate() 播种为当前模型），不发无谓请求。
-            let weak2 = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = weak2.upgrade() {
-                    ui.set_status_text("未配置 API Key，模型列表未加载（可点『刷新模型』）".into());
-                }
-            });
-            return;
-        }
+        // 不做本地 key 预检：key 的权威在 daemon（启动时读密钥库/环境，之后由 SetApiKey 热更新），
+        // 面板进程本地读到的值可能与之不同（如 daemon 带 VERBA_API_KEY 而面板没有）——
+        // 预检会误报"未配置"但其实能拉到。直接请求，按 daemon 返回归类文案（一次本地 IPC，代价≈0）。
         let result = with_client(|c| c.llm_list_models());
         let weak2 = weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -111,8 +98,11 @@ fn spawn_fetch_models(ui: &SettingsWindow, auto: bool) {
                     );
                 }
                 Err(e) => {
+                    let missing_key = e.to_string().contains("未配置 API Key");
                     ui.set_status_text(
-                        if auto {
+                        if missing_key {
+                            "未配置 API Key，模型列表未加载（可点『刷新模型』）".to_owned()
+                        } else if auto {
                             format!("模型列表未加载：{e}（可点『刷新模型』重试）")
                         } else {
                             format!("刷新模型失败: {e}")
@@ -164,12 +154,14 @@ fn wire_callbacks(ui: &SettingsWindow) {
             let key_state = api_key_state_text();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak2.upgrade() {
-                    ui.set_status_text(status.into());
                     ui.set_api_key_input(slint::SharedString::default());
                     ui.set_api_key_state(key_state.into());
                     if key_just_set {
+                        // 先触发拉取（它会写"正在获取模型列表…"），再把"已保存"盖上，
+                        // 避免保存成功的提示被 in-flight 文案瞬即顶掉（审查 F1）。
                         spawn_fetch_models(&ui, true);
                     }
+                    ui.set_status_text(status.into());
                 }
             });
         });
