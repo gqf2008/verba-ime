@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 手动跑矩阵：`gh workflow run ci.yml --ref <branch>`（分支上的改动也能在 Windows/macOS/Linux
+  # 三个真实 runner 上验一遍，用于「脚本只在某平台纸面推断」这类收口）
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +41,26 @@ jobs:
       - name: 校验 ort 预编译 dist 自愈脚本
         shell: bash
         run: bash scripts/test-ensure-ort-dist.sh
+      # Windows 上的**真实落盘**校验（自检是离线 + 假 uname 的模拟，证明不了 ort-sys 真把 dist
+      # 下到了脚本以为的地方）：前面的 `cargo test --workspace` 已经让 ort-sys 在
+      # %LOCALAPPDATA%\ort.pyke.io\dfbin 下好并解压了本 target 的 dist，这里断言脚本能认出同一份：
+      #   1) --print-cache-root 解析到 %LOCALAPPDATA%\ort.pyke.io\dfbin；
+      #   2) --check 返回 0（含版本闸门：目录名 == dist.tsv 的归档 sha256）。
+      # 两者任一不成立即为真缺陷（脚本的 Windows 分支与 ort-sys 的实际落盘不一致）。
+      - name: 校验 Windows 上 ort 真实缓存（%LOCALAPPDATA%）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(bash scripts/ensure-ort-dist.sh --print-cache-root)"
+          echo "cache root = $root"
+          case "$root" in
+            *AppData*Local*ort.pyke.io*dfbin*) ;;
+            *) echo "::error::缓存根不是 %LOCALAPPDATA%\\ort.pyke.io\\dfbin：$root"; exit 1 ;;
+          esac
+          ls -la "$root" || true
+          bash scripts/ensure-ort-dist.sh --check
+          echo "OK：ort 真实缓存被脚本认出（版本闸门亦通过）"
 
   frontend-macos:
     runs-on: macos-latest
