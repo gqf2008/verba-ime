@@ -49,7 +49,7 @@ bash scripts/ensure-ort-dist.sh --fix-cache
 eval "$(bash scripts/ensure-ort-dist.sh)"
 bash scripts/ensure-ort-dist.sh -- cargo test --workspace   # 或带环境直接跑任意命令
 
-# 无网络自检（用临时目录，不碰真实 ort 缓存）：17 项覆盖各分支
+# 无网络自检（用临时目录，不碰真实 ort 缓存）：覆盖各分支（数量以脚本末行输出为准，当前 18 项）
 bash scripts/test-ensure-ort-dist.sh
 
 # 排障：本平台解析出的 ort 缓存根（macOS ~/Library/Caches/ort.pyke.io/dfbin、
@@ -62,14 +62,20 @@ bash scripts/ensure-ort-dist.sh --print-cache-root
 - 本地 dist 缓存默认落在数据卷 `/Volumes/DataExt/tmp/verba-ort-dist`（可用 `ORT_DIST_CACHE` 覆盖）。
 - ort 缓存根与 `ort-sys` 同优先级：`ORT_CACHE_DIR` > 平台默认（macOS `~/Library/Caches/ort.pyke.io`、
   Linux `$XDG_CACHE_HOME` 或 `~/.cache/ort.pyke.io`、Windows `%LOCALAPPDATA%\ort.pyke.io`）。
-- **`--check` 会校验库里 onnxruntime 的版本**（不只是"文件存在"）：目录名 == 该 target 的 dist sha256
-  （强证据），或库文件里能找到 dist URL 声明的 ORT 版本号（如 `1.28.0`）。两者都不满足 → 判红并给出
-  下一步——因为"拿旧库凑合、链接能过、运行期 panic"正是这条路。系统装的 onnxruntime 这类确实无法
-  确认版本时，用 `ORT_DIST_ALLOW_UNVERIFIED=1` 显式放行。
+- **`--check` 会校验库里 onnxruntime 的版本**（不只是"文件存在"），两级证据强度不同：
+  · 强证据（provenance，非内容校验）：库所在目录名 == 该 target 的 dist **归档 sha256**——
+    ort 缓存与本脚本的 dist 缓存都是这种布局；
+  · 弱证据（内容启发式）：库文件里能 grep 到 dist URL 声明的 ORT 版本号（如 `1.28.0`）——
+    名字里带同款版本串的无关文件也能蒙过，所以**最终判据仍是跑一次真实 link + 推理**（`cargo test`，
+    不是 `cargo check`）。
+  两者都不满足 → 判红并给出下一步，因为"拿旧库凑合、链接能过、运行期 panic"正是这条路；
+  系统装的 onnxruntime 这类确实无法确认版本时（例如 Homebrew 的 1.29.0，比期望的 1.28.0 还新，
+  闸门同样 fail-closed），用 `ORT_DIST_ALLOW_UNVERIFIED=1` 显式放行。
 - 判据：`--check` 绿只代表缓存就绪；**确认要跑一次链接 + 实际推理**（`cargo test`，不是 `cargo check`）。
-- **平台状态**：macOS aarch64 已实测；`test-ensure-ort-dist.sh` 已在 CI 的 macOS / Linux / **Windows（Git Bash）**
-  三个 runner 上跑（无网络、不碰真实缓存）。**Windows 真机尚未验证**「ort-sys 实际下载/解压到
-  `%LOCALAPPDATA%`」这一段，真机上跑两条即可补上：
+- **平台状态**：macOS aarch64 已实测；`test-ensure-ort-dist.sh` 已接进 CI 的 macOS / Linux / **Windows（Git Bash）**
+  三个 runner：macOS/Linux 长期在跑，**Windows 随本批接入（合并后首次推送才生效，尚未实跑）**；自检离线、
+  不碰真实缓存。**Windows 真机尚未验证**「ort-sys 实际下载/解压到 `%LOCALAPPDATA%`」这一段，
+  真机上跑两条即可补上：
   `bash scripts/ensure-ort-dist.sh --print-cache-root`（应指向 `%LOCALAPPDATA%\ort.pyke.io\dfbin`）、
   `bash scripts/ensure-ort-dist.sh --check`（已有构建缓存时应返回 0）。
 - 脚本用 `bash` 跑（macOS 上是 3.2）：空数组展开、`$VAR` 紧跟中文等坑都在自检里钉住，改动后请跑一次

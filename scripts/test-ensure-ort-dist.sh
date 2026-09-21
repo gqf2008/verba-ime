@@ -67,7 +67,9 @@ if printf '%s' "$HASH" | grep -Eq '^[0-9a-f]{64}$'; then
     pass "--list 给出 sha256（${HASH:0:12}…）"
 else
     fail "--list 未给出 sha256（输出：${LIST:-空}）"
-    echo "# 后续用例需要 dist 行，提前退出" >&2
+    # 早退也要打统计行：否则阴性对照（拿旧脚本跑本自检）会在半途静默结束，
+    # 既看不出跑了几项、也不知道是失败还是崩了。
+    echo "# 通过 $passed 项，失败 $failed 项（后续用例需要 dist 行，提前结束）"
     exit 1
 fi
 
@@ -163,8 +165,10 @@ else
 fi
 
 # 12) --print-cache-root：平台默认缓存根可被断言（Windows 的 %LOCALAPPDATA% 分支原先从未被跑过）
-ROOT_DEFAULT="$(env -u ORT_CACHE_DIR "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
-ROOT_OVERRIDE="$(env ORT_CACHE_DIR=/tmp/fake-ort-cache-root "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
+# `|| true` 是为了做「修前脚本」的阴性对照时不被 set -e 打断：旧脚本不认识 --print-cache-root，
+# 直接失败会让整个自检在半途静默退出（既不打 FAIL 也没有统计行），最难查的那种。
+ROOT_DEFAULT="$(env -u ORT_CACHE_DIR "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null || true)"
+ROOT_OVERRIDE="$(env ORT_CACHE_DIR=/tmp/fake-ort-cache-root "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null || true)"
 case "$ROOT_DEFAULT" in
     *"ort.pyke.io/dfbin")
         if [ "$ROOT_OVERRIDE" = "/tmp/fake-ort-cache-root/dfbin" ]; then
@@ -216,7 +220,7 @@ mkdir -p "$SHIM"
 printf '#!/bin/sh\necho MINGW64_NT-10.0\n' >"$SHIM/uname"
 chmod +x "$SHIM/uname"
 WIN_ROOT="$(env -u ORT_CACHE_DIR PATH="$SHIM:$PATH" LOCALAPPDATA='C:\Users\tester\AppData\Local' \
-    "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
+    "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null || true)"
 # 分隔符不做要求：Windows 上拼出来会是 `C:\Users\...\AppData\Local/ort.pyke.io/dfbin`（混合分隔符）
 case "$WIN_ROOT" in
     *AppData*Local*ort.pyke.io*dfbin*)
