@@ -34,6 +34,20 @@
 
 **再评估条件（本批保留）**：若要做**本地视觉能力**（本地 VLM 看图 / 元素定位 / 去背等），usls 是 Rust 生态覆盖面较广的选择，值得单独 spike；前提是 ①ort 对齐到 rc.13（走 main 或等 0.2.x 发布）、②权重来源可镜像或随包内置；且以**新增能力**形态引入，不走替换 OCR 的路径。
 
+### 本地视觉/VLM spike：`usls`(vlm) + SmolVLM2-256M（2026-09-21 实测，**暂不采用**）
+
+承接上一条：OCR 不换 usls，但「本地 VLM 能否兜住 `//看图`」单独做了 spike（动机：`//看图` 走云端 LLM，模型不支持图片时只能提示换模型/改用 `//截图`）。
+
+- **探针**：`usls` main（`0.2.0-alpha.4`，rev `c15ad77`，`ort = "=2.0.0-rc.13"`）+ `usls::vlm::SmolVLM`，`Config::smolvlm2_256m()`，CPU（macOS aarch64，release）。**可共图已实测**：临时 crate 同时依赖 `usls`(vlm) 与本仓 `rapidocr-core 0.2.2`，解析到**同一个** `ort v2.0.0-rc.13`，`cargo check` 通过——但 usls 默认 `ort-api-28`（api-NN 特征是累积式）会把 ORT **运行时**要求抬到 ≥1.28（本机缓存已是 1.28.0）。
+- **模型体积**：SmolVLM2-256M fp32 = vision-encoder 374MB + embed-tokens 114MB + decoder(merged) 541MB ≈ **1.03GB**（`jamjamjon/assets` release tag `smolvlm2`；GitHub API 提供每个资产的 sha256 digest，下载后可校验）。
+- **获取耗时**：直连 GitHub 实测 0.14–0.46 MB/s（其中一次直接停住），换镜像 1.78 MB/s → 总体 ≈16min（直连）/ ≈6min（镜像）。**国内分发必须镜像或随包内置**，且 `usls` 版本间缓存布局不同（0.1.11 是 `<cache>/usls/<owner>/<repo>/<tag>/<file>`，main 是 `<cache>/usls/<tag>/<file>`），预热/离线包要按版本对齐。
+- **运行开销**（缓存已热；机器空闲时更快）：启动+建会话 1.1–2.7s；单次问答 3.0–10.2s（64–96 tokens，≈10–20 tok/s；短问答可低到 ≈1.9s）；**峰值 RSS 2.0–2.9GB**（1GB 权重 + fp32 激活/arena）。
+- **输出质量**（真实截图：1440×900 中文设置页）：英文问「What application is shown」→ "a screenshot of a webpage … titled \"Verba\""（部分正确，把桌面设置页判成网页）；中文提示会退化成复读/幻觉（"我们可以看到OCR的词汇，如『哪些词汇』…"）；大字号图能抓到个别整行文本（"OCR latency budget < 2s (screenshot)"）。**对中文密集 UI 截图不可用**。
+- **结论**：**暂不做本地 VLM 兜底 `//看图`**。中文密集截图恰是 256M 档最弱的场景，而这类图的"语义"用**已有的本地 OCR 文本 + LLM 文本提示**就能覆盖（`//` 眼睛区域当前已是该路径）；真正需要视觉理解的是照片/图表，也正是小模型最弱处。
+- **若将来再做**：门槛是「更大模型（SmolVLM2-500M / Moondream2 2–4.6GB，RSS 预计 4–8GB）+ 独立进程（不能塞进 IME daemon）+ 可选装（1GB 权重不随包分发）」，并先回答"比云端 vision 好在哪"（离线/隐私 vs 质量与延迟）。
+- **复现**：探针 `/Volumes/DataExt/tmp/usls-eval/probe-vlm`（`cargo build --release` 后 `probe-vlm <img> <prompt>`），资产校验下载脚本 `/Volumes/DataExt/tmp/usls-eval/fetch-smolvlm2.py`，夹具 `/Volumes/DataExt/tmp/usls-eval/fixtures/screen-zh.png`。
+- **平台状态**：macOS aarch64 已实测；Windows/Linux 未验证（同样走 `ort` 预编译，理论上可用，但内存/延迟未测）。
+
 ## ASR（语音 → 文字）—— **❄️ 已冻结为实验性（2026-08-29：代码保留、默认关闭、入口隐藏，不承诺）**
 
 | 方案 | 类型 | 说明 | Rust 接入 | 评价 |
