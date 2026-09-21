@@ -162,5 +162,70 @@ else
     fail "ort 缓存就绪时 emit 形态输出异常（实际：${OUT:-空}）"
 fi
 
+# 12) --print-cache-root：平台默认缓存根可被断言（Windows 的 %LOCALAPPDATA% 分支原先从未被跑过）
+ROOT_DEFAULT="$(env -u ORT_CACHE_DIR "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
+ROOT_OVERRIDE="$(env ORT_CACHE_DIR=/tmp/fake-ort-cache-root "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
+case "$ROOT_DEFAULT" in
+    *"ort.pyke.io/dfbin")
+        if [ "$ROOT_OVERRIDE" = "/tmp/fake-ort-cache-root/dfbin" ]; then
+            pass "--print-cache-root 给出平台默认根且受 ORT_CACHE_DIR 覆盖（${ROOT_DEFAULT}）"
+        else
+            fail "ORT_CACHE_DIR 覆盖未生效（实际：${ROOT_OVERRIDE}）"
+        fi
+        ;;
+    *)
+        fail "--print-cache-root 输出不符合预期（实际：${ROOT_DEFAULT:-空}）"
+        ;;
+esac
+
+# 13~16) 库版本闸门：旧库（目录名不含 dist 哈希、库里也没有期望版本串）必须判红，
+#         否则就是 LESSON 里「链接能过、运行期 panic requested API version」的老路。
+WANT_VER="$(run --list 2>/dev/null | sed -n 's#.*ms@\([0-9][0-9.]*\)/.*#\1#p' | head -1)"
+if [ -z "$WANT_VER" ]; then
+    fail "无法从 --list 里解析出期望的 ORT 版本（后续版本闸门用例跳过）"
+else
+    OLD_LIB="$TMP/oldlib"
+    NEW_LIB="$TMP/newlib"
+    mkdir -p "$OLD_LIB" "$NEW_LIB"
+    printf 'onnxruntime 1.23.2 %s\n' "$$" >"$OLD_LIB/libonnxruntime.a"
+    printf 'onnxruntime %s\n' "$WANT_VER" >"$NEW_LIB/libonnxruntime.a"
+
+    if env -u ORT_DIST_ALLOW_UNVERIFIED ORT_LIB_LOCATION="$OLD_LIB" "$SHELL_BIN" "$SCRIPT" --check >/dev/null 2>&1; then
+        fail "旧版本库（1.23.2）时 --check 应判红（期望 ${WANT_VER}）"
+    else
+        pass "--check 对旧版本库判红（库里没有 ${WANT_VER}）"
+    fi
+
+    if env ORT_DIST_ALLOW_UNVERIFIED=1 ORT_LIB_LOCATION="$OLD_LIB" "$SHELL_BIN" "$SCRIPT" --check >/dev/null 2>&1; then
+        pass "ORT_DIST_ALLOW_UNVERIFIED=1 可显式放行无法确认版本的库"
+    else
+        fail "ORT_DIST_ALLOW_UNVERIFIED=1 未放行（系统库场景会卡住）"
+    fi
+
+    if env -u ORT_DIST_ALLOW_UNVERIFIED ORT_LIB_LOCATION="$NEW_LIB" "$SHELL_BIN" "$SCRIPT" --check >/dev/null 2>&1; then
+        pass "非哈希目录但库里含期望版本（${WANT_VER}）时的 --check 绿"
+    else
+        fail "含期望版本串的库仍被判红（版本证据未生效）"
+    fi
+fi
+
+# 17) Windows 缓存根分支（%LOCALAPPDATA%）——本机通常不是 Windows，用假 uname(MINGW*) 在任何平台上
+#     把这条分支跑一遍；Windows runner 上则同时覆盖 Git Bash 的真实行为。
+SHIM="$TMP/shim"
+mkdir -p "$SHIM"
+printf '#!/bin/sh\necho MINGW64_NT-10.0\n' >"$SHIM/uname"
+chmod +x "$SHIM/uname"
+WIN_ROOT="$(env -u ORT_CACHE_DIR PATH="$SHIM:$PATH" LOCALAPPDATA='C:\Users\tester\AppData\Local' \
+    "$SHELL_BIN" "$SCRIPT" --print-cache-root 2>/dev/null)"
+# 分隔符不做要求：Windows 上拼出来会是 `C:\Users\...\AppData\Local/ort.pyke.io/dfbin`（混合分隔符）
+case "$WIN_ROOT" in
+    *AppData*Local*ort.pyke.io*dfbin*)
+        pass "Windows 分支走 %LOCALAPPDATA%（${WIN_ROOT}）"
+        ;;
+    *)
+        fail "Windows 缓存根分支不对（实际：${WIN_ROOT:-空}）"
+        ;;
+esac
+
 echo "# 通过 $passed 项，失败 $failed 项"
 [ "$failed" -eq 0 ]

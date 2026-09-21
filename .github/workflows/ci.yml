@@ -31,11 +31,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
       # ort 预编译 dist 自愈脚本（scripts/ensure-ort-dist.sh）的自检：无网络，用 ORT_CACHE_DIR/
-      # ORT_DIST_CACHE 指到临时目录，不碰 runner 上的真实缓存。回归的是「bash 3.2 + set -u 展开空数组
-      # 报 unbound variable」——macOS runner 的 /bin/bash 正是 3.2；Windows 上是 Git Bash 5.x 重现不了，
-      # 且 Windows 缓存根分支（%LOCALAPPDATA%）尚未真机验证，故不在 Windows 上冒烟。
+      # ORT_DIST_CACHE 指到临时目录，不碰 runner 上的真实缓存。覆盖：bash 3.2（macOS runner 的
+      # /bin/bash 正是 3.2）下 set -u 展开空数组、就绪分支漏跑 `-- <cmd>`、库版本闸门、以及平台
+      # 缓存根解析（--print-cache-root，Windows 走 Git Bash 的 %LOCALAPPDATA% 分支）。
+      # 仍未覆盖：Windows 真机上 ort-sys 的实际下载/解压（真机命令见 docs/building.md）。
       - name: 校验 ort 预编译 dist 自愈脚本
-        if: runner.os != 'Windows'
         shell: bash
         run: bash scripts/test-ensure-ort-dist.sh
 

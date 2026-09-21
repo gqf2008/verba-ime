@@ -14,10 +14,12 @@
 #   bash scripts/ensure-ort-dist.sh --check    # 只检查：0=无需自愈，1=需要自愈（附原因）
 #   bash scripts/ensure-ort-dist.sh --fix-cache # 把该 dist 的空/损坏缓存目录可逆移开（.broken-<ts>）
 #   bash scripts/ensure-ort-dist.sh --list     # 列出该 target 的所有 dist 行（含 sha256）
+#   bash scripts/ensure-ort-dist.sh --print-cache-root  # 打印本平台解析出的 ort 缓存根（供测试/排障）
 # 环境变量：
 #   ORT_DIST_CACHE   本地 dist 缓存根（默认 /Volumes/DataExt/tmp/verba-ort-dist；该卷不存在时用 ~/.cache/verba-ort-dist）
 #   ORT_DIST_TARGET  覆盖 target triple（默认取 `rustc -vV` 的 host）
 #   ORT_DIST_HASH    覆盖 dist 选择（dist.tsv 第四列；启用 cuda/coreml/directml 等 EP feature 时用 --list 选）
+#   ORT_DIST_ALLOW_UNVERIFIED=1  允许「无法确认 ORT 版本」的库（系统装的 onnxruntime 等），否则 --check 判红
 #   ORT_CACHE_DIR    ort-sys 自己的缓存根（与 ort-sys 同优先级；设置后 --check/--fix-cache 认它）
 # 说明：本脚本只读 Cargo.lock / ort-sys 源码；除下载缓存外不写仓库，不删除任何数据（--fix-cache 是移动）。
 set -euo pipefail
@@ -90,6 +92,44 @@ lib_dir_in() {
     dirname "$hit"
 }
 
+# 从 dist URL 里取 ORT 版本号：.../ms@1.28.0/<target>+coreml.tar.lzma2 → 1.28.0
+dist_version_from_url() {
+    printf '%s' "$1" | sed -n 's#.*ms@\([0-9][0-9.]*\)/.*#\1#p'
+}
+
+# 判定「这个库是不是本 target 该用的那个 ORT」：
+#   1) 目录名 == dist 的 sha256（强证据，ort 缓存与本脚本的 dist 缓存都是这种布局）；
+#   2) 否则退化为在库文件里找 dist URL 声明的 ORT 版本号（grep -a，跨平台可用）。
+# 两种都过不了 → 无法确认（很可能就是 LESSON 里那种「旧库骗过链接器、运行期 panic」的场景）。
+verify_lib() {
+    local libdir="$1" want_hash="$2" want_ver="$3" libf=""
+    case "/${libdir}/" in
+        *"/${want_hash}/"*) return 0 ;;
+    esac
+    [ -n "$want_ver" ] || return 1
+    libf="$(find "$libdir" -maxdepth 2 \( -name 'libonnxruntime*' -o -name 'onnxruntime.dll' -o -name 'onnxruntime.lib' \) -print -quit 2>/dev/null || true)"
+    [ -n "$libf" ] || return 1
+    grep -a -q -m1 -F "$want_ver" "$libf" 2>/dev/null
+}
+
+# 版本确认闸门：确认不过时，--check 判红；其它模式只告警（系统库场景仍可用）。
+require_verified() {
+    local libdir="$1" want_hash="$2" want_ver="$3" mode="$4"
+    if verify_lib "$libdir" "$want_hash" "$want_ver"; then
+        return 0
+    fi
+    log "警告：$libdir 既不在 dist 哈希目录下，也没在里面找到期望的 onnxruntime 版本 $want_ver"
+    log "      → 若它是更旧的 onnxruntime：链接能过，但二进制一跑就 panic「requested API version ... is not available」"
+    log "      确认无误（如系统装的 onnxruntime）可设 ORT_DIST_ALLOW_UNVERIFIED=1 放行"
+    if [ "${ORT_DIST_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ "$mode" = "check" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # 解 ort 的 dist 包：*.tar.lzma2 是无容器头的 **raw LZMA2**（xz/alone/tar 都解不开）
 extract_dist() {
     local archive="$1" dest="$2"
@@ -140,6 +180,7 @@ main() {
         case "$1" in
             --check)     mode="check" ;;
             --print-path) mode="path" ;;
+            --print-cache-root) mode="cache-root" ;;
             --list)      mode="list" ;;
             --fix-cache) mode="fix" ;;
             --offline)   offline=1 ;;
@@ -151,19 +192,25 @@ main() {
     done
     local offline="${offline:-0}"
 
+    if [ "$mode" = "cache-root" ]; then
+        onnx_cache_root
+        return 0
+    fi
+
     local ver tsv target
     ver="$(ort_sys_version)" || true
     [ -n "${ver:-}" ] || die "Cargo.lock 里没有 ort-sys（本仓库 OCR 路径经 rapidocr-core 依赖它）"
     tsv="$(find_dist_tsv "$ver")" || die "找不到 ort-sys $ver 的 dist.tsv（先跑一次 cargo fetch 或 cargo check 把依赖拉下来）"
     target="${ORT_DIST_TARGET:-$(host_target)}"
 
-    local rows row feature url hash
+    local rows row feature url hash want_ver
     rows="$(awk -F'\t' -v t="$target" '$1==t {print $2"\t"$3"\t"$4}' "$tsv")"
     [ -n "$rows" ] || die "dist.tsv 里没有 target $target 的预编译 dist（ort-sys $ver 未覆盖该平台）"
 
     if [ "$mode" = "list" ]; then
         echo "# ort-sys $ver · target ${target}（每行的 feature_set 对应一个 dist）"
         printf '%s\n' "$rows" | awk -F'\t' '{printf "  %-28s %s\n    %s\n", $1, $3, $2}'
+        log "（--check 会校验：目录名==sha256，或库里能找到 URL 里的 ORT 版本号）"
         return 0
     fi
 
@@ -179,6 +226,7 @@ main() {
     feature="$(printf '%s' "$row" | cut -f1)"
     url="$(printf '%s' "$row" | cut -f2)"
     hash="$(printf '%s' "$row" | cut -f3)"
+    want_ver="$(dist_version_from_url "$url")"
 
     if [ "$auto_pick" = "1" ]; then
         local variants
@@ -196,6 +244,7 @@ main() {
     # 0) 已经显式指过且有效 → 直接用
     if [ -n "${ORT_LIB_LOCATION:-}" ]; then
         if lib_dir_in "${ORT_LIB_LOCATION}" >/dev/null; then
+            require_verified "${ORT_LIB_LOCATION}" "$hash" "$want_ver" "$mode" || return 1
             case "$mode" in
                 check) return 0 ;;
                 path)  echo "$ORT_LIB_LOCATION"; return 0 ;;
@@ -209,6 +258,7 @@ main() {
     local libdir=""
     libdir="$(lib_dir_in "$cache_dir" || true)"
     if [ -n "$libdir" ]; then
+        require_verified "$libdir" "$hash" "$want_ver" "$mode" || return 1
         case "$mode" in
             check) return 0 ;;
             fix)   log "ort 缓存已就绪（${libdir}），无需修复"; return 0 ;;
@@ -248,6 +298,7 @@ main() {
     # 4) 本地 dist 缓存命中？
     libdir="$(lib_dir_in "$store_dir" || true)"
     if [ -n "$libdir" ]; then
+        require_verified "$libdir" "$hash" "$want_ver" "$mode" || return 1
         case "$mode" in
             path) echo "$libdir" ;;
             *)    finish_ "$libdir" ;;
@@ -273,6 +324,7 @@ main() {
     libdir="$(lib_dir_in "$store_dir" || true)"
     [ -n "$libdir" ] || die "解压后没找到 onnxruntime 库（${store_dir}）"
     log "dist 已就绪：$libdir"
+    require_verified "$libdir" "$hash" "$want_ver" "$mode" || return 1
     case "$mode" in
         path) echo "$libdir" ;;
         *)    finish_ "$libdir" ;;
