@@ -58,9 +58,28 @@ jobs:
             *AppData*Local*ort.pyke.io*dfbin*) ;;
             *) echo "::error::缓存根不是 %LOCALAPPDATA%\\ort.pyke.io\\dfbin：$root"; exit 1 ;;
           esac
-          ls -la "$root" || true
+          echo "--- dist.tsv 里本 target 的各行（第一行=无 EP 默认） ---"
+          bash scripts/ensure-ort-dist.sh --list
+          echo "--- 真实缓存里的叶子目录（应为 dist 归档 sha256） ---"
+          find "$root" -maxdepth 3 -mindepth 1 -type d | sed 's#'"$root"'/##' | sort
+          # 强证据断言：缓存里的 dist 目录名 == 脚本选中的那行 dist 归档 sha256。
+          # 只断言「--check 绿」是不够的：版本闸门在哈希目录不匹配时会退化成「库文件里能找到
+          # 版本串」这条弱证据，而弱证据**分不出同版本的不同 EP 变体**——那正是本批要堵的洞。
+          expected="$(bash scripts/ensure-ort-dist.sh --list | awk 'NF==2 && $2 ~ /^[0-9a-f]{64}$/ {print $2; exit}')"
+          echo "expected dist sha256 = $expected"
+          found=0
+          for d in "$root"/*/*; do
+            [ -d "$d" ] || continue
+            case "$(basename "$d")" in
+              "$expected") found=1; echo "match: $d" ;;
+            esac
+          done
+          if [ "$found" != 1 ]; then
+            echo "::error::真实缓存里没有以期望 sha256（${expected}）命名的 dist 目录：脚本选的行与 ort-sys 实际落盘不一致"
+            exit 1
+          fi
           bash scripts/ensure-ort-dist.sh --check
-          echo "OK：ort 真实缓存被脚本认出（版本闸门亦通过）"
+          echo "OK：Windows 真实缓存的 dist 目录名 == dist.tsv 归档 sha256（强证据），--check 亦通过"
 
   frontend-macos:
     runs-on: macos-latest
