@@ -24,6 +24,97 @@ fn models_cache() -> &'static std::sync::Mutex<Vec<String>> {
     MODELS_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// 合并「服务商返回的模型列表」与「当前配置的模型名」：
+/// - 去空、去重，保持服务商返回的顺序；
+/// - 当前模型不在列表里（自定义模型名 / 服务商没列出来）时插到**首位**，
+///   这样下拉永远能显示并选中真正在用的模型，而不是一片空白；
+/// - 返回 `(列表, 当前模型下标)`；当前模型为空时下标 `-1`。
+///
+/// 之所以独立成纯函数：UI 打开时的"播种"与刷新后的"回填"必须走同一套合并语义，
+/// 否则两处实现必然漂移（见 LESSON「同一语义两处实现必然漂移」）。
+fn merge_current_model(fetched: Vec<String>, current: &str) -> (Vec<String>, i32) {
+    let current = current.trim();
+    let mut list: Vec<String> = Vec::with_capacity(fetched.len() + 1);
+    for m in fetched {
+        let m = m.trim();
+        if m.is_empty() || list.iter().any(|x| x == m) {
+            continue;
+        }
+        list.push(m.to_owned());
+    }
+    if current.is_empty() {
+        return (list, -1);
+    }
+    if let Some(i) = list.iter().position(|m| m == current) {
+        return (list, i as i32);
+    }
+    list.insert(0, current.to_owned());
+    (list, 0)
+}
+
+/// 把模型列表写进 UI 与 Rust 侧缓存（两者的下标↔取值必须同源）。
+fn apply_models(ui: &SettingsWindow, list: Vec<String>, index: i32) {
+    *models_cache().lock().unwrap() = list.clone();
+    let ui_models: Vec<slint::SharedString> =
+        list.into_iter().map(slint::SharedString::from).collect();
+    ui.set_llm_models(slint::ModelRc::new(std::rc::Rc::new(
+        slint::VecModel::from(ui_models),
+    )));
+    ui.set_llm_model_index(index);
+}
+
+/// 拉取模型列表并回填下拉：**按钮与「打开即加载」共用同一实现**。
+/// `auto = true`：无 key 直接跳过、失败只写状态栏（不打断使用）；
+/// `auto = false`：用户显式点击，文案区分。
+fn spawn_fetch_models(ui: &SettingsWindow, auto: bool) {
+    // 当前模型必须在 UI 线程读（Slint 类型不能跨线程）。
+    let current = ui.get_llm_model().to_string();
+    if auto {
+        ui.set_status_text("正在获取模型列表…".into());
+    }
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        // 不做本地 key 预检：key 的权威在 daemon（启动时读密钥库/环境，之后由 SetApiKey 热更新），
+        // 面板进程本地读到的值可能与之不同（如 daemon 带 VERBA_API_KEY 而面板没有）——
+        // 预检会误报"未配置"但其实能拉到。直接请求，按 daemon 返回归类文案（一次本地 IPC，代价≈0）。
+        let result = with_client(|c| c.llm_list_models());
+        let weak2 = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak2.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(models) => {
+                    let (list, idx) = merge_current_model(models, &current);
+                    let n = list.len();
+                    apply_models(&ui, list, idx);
+                    ui.set_status_text(
+                        if auto {
+                            format!("模型列表已加载（{n} 个）")
+                        } else {
+                            format!("模型列表已刷新（{n} 个）")
+                        }
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    let missing_key = e.to_string().contains("未配置 API Key");
+                    ui.set_status_text(
+                        if missing_key {
+                            "未配置 API Key，模型列表未加载（可点『刷新模型』）".to_owned()
+                        } else if auto {
+                            format!("模型列表未加载：{e}（可点『刷新模型』重试）")
+                        } else {
+                            format!("刷新模型失败: {e}")
+                        }
+                        .into(),
+                    );
+                }
+            }
+        });
+    });
+}
+
 /// provider 显示标签 → 实际配置值（顺序与 settings.slint 的 ComboBox 模型一致）。
 const ASR_PROVIDERS: &[(&str, &str)] = &[
     ("mock（确定性，开发/验收）", "mock"),
@@ -54,15 +145,23 @@ fn wire_callbacks(ui: &SettingsWindow) {
         };
         let values = read_fields(&ui);
         let new_key = ui.get_api_key_input().to_string();
+        // 这次保存是否刚填了新密钥：是的话保存成功后顺手拉一次模型列表
+        // （刚配好 key 的用户下一步就是想看到真实模型列表，不该再逼他找刷新按钮）。
+        let key_just_set = !new_key.trim().is_empty();
         let weak2 = weak.clone();
         std::thread::spawn(move || {
             let status = save_fields(values, &new_key);
             let key_state = api_key_state_text();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak2.upgrade() {
-                    ui.set_status_text(status.into());
                     ui.set_api_key_input(slint::SharedString::default());
                     ui.set_api_key_state(key_state.into());
+                    if key_just_set {
+                        // 先触发拉取（它会写"正在获取模型列表…"），再把"已保存"盖上，
+                        // 避免保存成功的提示被 in-flight 文案瞬即顶掉（审查 F1）。
+                        spawn_fetch_models(&ui, true);
+                    }
+                    ui.set_status_text(status.into());
                 }
             });
         });
@@ -121,50 +220,12 @@ fn wire_callbacks(ui: &SettingsWindow) {
         });
     });
 
-    // 刷新模型列表（DeepSeek 官方 API，需已配置 API Key）
+    // 刷新模型列表（服务商官方 API，需已配置 API Key）——与"打开即加载"共用同一实现
     let weak = ui.as_weak();
     ui.on_refresh_models(move || {
-        let weak2 = weak.clone();
-        std::thread::spawn(move || {
-            let result = with_client(|c| c.llm_list_models());
-            match result {
-                Ok(models) => {
-                    *models_cache().lock().unwrap() = models.clone();
-                    let ui_models: Vec<slint::SharedString> = models
-                        .iter()
-                        .map(|m| slint::SharedString::from(m.clone()))
-                        .collect();
-                    let weak3 = weak2.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak3.upgrade() {
-                            ui.set_llm_models(slint::ModelRc::new(std::rc::Rc::new(
-                                slint::VecModel::from(ui_models),
-                            )));
-                            let cur = ui.get_llm_model().to_string();
-                            let cache = models_cache().lock().unwrap();
-                            let idx = cache
-                                .iter()
-                                .position(|m| *m == cur)
-                                .map(|i| i as i32)
-                                .unwrap_or(-1);
-                            drop(cache);
-                            ui.set_llm_model_index(idx);
-                            ui.set_status_text(
-                                format!("模型列表已刷新（{} 个）", models.len()).into(),
-                            );
-                        }
-                    });
-                }
-                Err(e) => {
-                    let weak3 = weak2.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak3.upgrade() {
-                            ui.set_status_text(format!("刷新模型失败: {e}").into());
-                        }
-                    });
-                }
-            }
-        });
+        if let Some(ui) = weak.upgrade() {
+            spawn_fetch_models(&ui, false);
+        }
     });
 
     let weak = ui.as_weak();
@@ -418,7 +479,9 @@ fn load_into_ui(ui: &SettingsWindow) {
                     Ok((cfg, version)) => {
                         populate(&ui, &cfg);
                         ui.set_version_text(format!("v{version}").into());
-                        ui.set_status_text("已连接 daemon".into());
+                        // 打开即加载模型列表（无 key 时函数内部会跳过并给出提示），
+                        // 不再要求用户先点一次「刷新模型」才知道有哪些模型。
+                        spawn_fetch_models(&ui, true);
                     }
                     Err(e) => {
                         ui.set_status_text(format!("{e}（可先运行 verba-cli daemon）").into());
@@ -436,16 +499,11 @@ fn populate(ui: &SettingsWindow, cfg: &HashMap<String, String>) {
     ui.set_llm_base_url(get("llm_base_url").into());
     ui.set_llm_model(get("llm_model").into());
     {
-        // 默认列表里匹配当前模型（未刷新时也选中正确项）
+        // 播种：把当前配置的模型立即放进下拉并选中——不依赖"刷新"，
+        // 这样空列表、自定义模型名都不会显示成空白（观感=没配置）。
         let cur = ui.get_llm_model().to_string();
-        let cache = models_cache().lock().unwrap();
-        let idx = cache
-            .iter()
-            .position(|m| *m == cur)
-            .map(|i| i as i32)
-            .unwrap_or(-1);
-        drop(cache);
-        ui.set_llm_model_index(idx);
+        let (list, idx) = merge_current_model(Vec::new(), &cur);
+        apply_models(ui, list, idx);
     }
     ui.set_temperature(get("temperature").into());
     ui.set_max_tokens(get("max_tokens").into());
@@ -522,5 +580,54 @@ mod tests {
         assert!(asr.contains(&"mock") && asr.contains(&"openai"));
         let tts: Vec<&str> = TTS_PROVIDERS.iter().map(|(_, v)| *v).collect();
         assert!(tts.contains(&"mock") && tts.contains(&"edge") && tts.contains(&"openai"));
+    }
+
+    #[test]
+    fn merge_current_model_seeds_configured_model_when_list_empty() {
+        // 打开面板不刷新时：下拉里必须有当前配置的模型（旧行为是空列表 + 下标 -1 = 观感空白）
+        let (list, idx) = merge_current_model(Vec::new(), "deepseek-flash");
+        assert_eq!(list, vec!["deepseek-flash"]);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn merge_current_model_selects_hit_in_fetched_list() {
+        let fetched = vec![
+            "deepseek-v4-flash".to_string(),
+            "deepseek-v4-pro".to_string(),
+        ];
+        let (list, idx) = merge_current_model(fetched.clone(), "deepseek-v4-pro");
+        assert_eq!(list, fetched, "命中时保持服务商返回的顺序");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn merge_current_model_keeps_custom_model_visible() {
+        // 自定义模型名（服务商列表里没有）不能被"吃掉"：插首位并选中
+        let (list, idx) = merge_current_model(vec!["deepseek-v4-flash".to_string()], "gpt-4o");
+        assert_eq!(list, vec!["gpt-4o", "deepseek-v4-flash"]);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn merge_current_model_empty_current_keeps_list_and_no_index() {
+        let (list, idx) = merge_current_model(vec!["a".to_string()], "   ");
+        assert_eq!(list, vec!["a"]);
+        assert_eq!(idx, -1, "当前模型为空时不应强行选中");
+    }
+
+    #[test]
+    fn merge_current_model_dedups_and_trims() {
+        let (list, idx) = merge_current_model(
+            vec![
+                " a ".to_string(),
+                "a".to_string(),
+                "".to_string(),
+                "b".to_string(),
+            ],
+            "a",
+        );
+        assert_eq!(list, vec!["a", "b"]);
+        assert_eq!(idx, 0);
     }
 }
