@@ -37,7 +37,7 @@ jobs:
       # ORT_DIST_CACHE 指到临时目录，不碰 runner 上的真实缓存。覆盖：bash 3.2（macOS runner 的
       # /bin/bash 正是 3.2）下 set -u 展开空数组、就绪分支漏跑 `-- <cmd>`、库版本闸门、以及平台
       # 缓存根解析（--print-cache-root，Windows 走 Git Bash 的 %LOCALAPPDATA% 分支）。
-      # 仍未覆盖：Windows 真机上 ort-sys 的实际下载/解压（真机命令见 docs/building.md）。
+      # 真实的 Windows 落盘（ort-sys 下载/解压 + 脚本认不认）由下面那步断言，不再只是文档里的待办。
       - name: 校验 ort 预编译 dist 自愈脚本
         shell: bash
         run: bash scripts/test-ensure-ort-dist.sh
