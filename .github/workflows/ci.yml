@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 手动跑矩阵：`gh workflow run ci.yml --ref <branch>`（分支上的改动也能在 Windows/macOS/Linux
+  # 三个真实 runner 上验一遍，用于「脚本只在某平台纸面推断」这类收口）
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,10 +37,49 @@ jobs:
       # ORT_DIST_CACHE 指到临时目录，不碰 runner 上的真实缓存。覆盖：bash 3.2（macOS runner 的
       # /bin/bash 正是 3.2）下 set -u 展开空数组、就绪分支漏跑 `-- <cmd>`、库版本闸门、以及平台
       # 缓存根解析（--print-cache-root，Windows 走 Git Bash 的 %LOCALAPPDATA% 分支）。
-      # 仍未覆盖：Windows 真机上 ort-sys 的实际下载/解压（真机命令见 docs/building.md）。
+      # 真实的 Windows 落盘（ort-sys 下载/解压 + 脚本认不认）由下面那步断言，不再只是文档里的待办。
       - name: 校验 ort 预编译 dist 自愈脚本
         shell: bash
         run: bash scripts/test-ensure-ort-dist.sh
+      # Windows 上的**真实落盘**校验（自检是离线 + 假 uname 的模拟，证明不了 ort-sys 真把 dist
+      # 下到了脚本以为的地方）：前面的 `cargo test --workspace` 已经让 ort-sys 在
+      # %LOCALAPPDATA%\ort.pyke.io\dfbin 下好并解压了本 target 的 dist，这里断言脚本能认出同一份：
+      #   1) --print-cache-root 解析到 %LOCALAPPDATA%\ort.pyke.io\dfbin；
+      #   2) --check 返回 0（含版本闸门：目录名 == dist.tsv 的归档 sha256）。
+      # 两者任一不成立即为真缺陷（脚本的 Windows 分支与 ort-sys 的实际落盘不一致）。
+      - name: 校验 Windows 上 ort 真实缓存（%LOCALAPPDATA%）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(bash scripts/ensure-ort-dist.sh --print-cache-root)"
+          echo "cache root = $root"
+          case "$root" in
+            *AppData*Local*ort.pyke.io*dfbin*) ;;
+            *) echo "::error::缓存根不是 %LOCALAPPDATA%\\ort.pyke.io\\dfbin：$root"; exit 1 ;;
+          esac
+          echo "--- dist.tsv 里本 target 的各行（第一行=无 EP 默认） ---"
+          bash scripts/ensure-ort-dist.sh --list
+          echo "--- 真实缓存里的叶子目录（应为 dist 归档 sha256） ---"
+          find "$root" -maxdepth 3 -mindepth 1 -type d | sed 's#'"$root"'/##' | sort
+          # 强证据断言：缓存里的 dist 目录名 == 脚本选中的那行 dist 归档 sha256。
+          # 只断言「--check 绿」是不够的：版本闸门在哈希目录不匹配时会退化成「库文件里能找到
+          # 版本串」这条弱证据，而弱证据**分不出同版本的不同 EP 变体**——那正是本批要堵的洞。
+          expected="$(bash scripts/ensure-ort-dist.sh --list | awk 'NF==2 && $2 ~ /^[0-9a-f]{64}$/ {print $2; exit}')"
+          echo "expected dist sha256 = $expected"
+          found=0
+          for d in "$root"/*/*; do
+            [ -d "$d" ] || continue
+            case "$(basename "$d")" in
+              "$expected") found=1; echo "match: $d" ;;
+            esac
+          done
+          if [ "$found" != 1 ]; then
+            echo "::error::真实缓存里没有以期望 sha256（${expected}）命名的 dist 目录：脚本选的行与 ort-sys 实际落盘不一致"
+            exit 1
+          fi
+          bash scripts/ensure-ort-dist.sh --check
+          echo "OK：Windows 真实缓存的 dist 目录名 == dist.tsv 归档 sha256（强证据），--check 亦通过"
 
   frontend-macos:
     runs-on: macos-latest

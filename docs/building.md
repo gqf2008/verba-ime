@@ -72,12 +72,24 @@ bash scripts/ensure-ort-dist.sh --print-cache-root
   系统装的 onnxruntime 这类确实无法确认版本时（例如 Homebrew 的 1.29.0，比期望的 1.28.0 还新，
   闸门同样 fail-closed），用 `ORT_DIST_ALLOW_UNVERIFIED=1` 显式放行。
 - 判据：`--check` 绿只代表缓存就绪；**确认要跑一次链接 + 实际推理**（`cargo test`，不是 `cargo check`）。
-- **平台状态**：macOS aarch64 已实测；`test-ensure-ort-dist.sh` 已接进 CI 的 macOS / Linux / **Windows（Git Bash）**
-  三个 runner：macOS/Linux 长期在跑，**Windows 随本批接入（合并后首次推送才生效，尚未实跑）**；自检离线、
-  不碰真实缓存。**Windows 真机尚未验证**「ort-sys 实际下载/解压到 `%LOCALAPPDATA%`」这一段，
-  真机上跑两条即可补上：
-  `bash scripts/ensure-ort-dist.sh --print-cache-root`（应指向 `%LOCALAPPDATA%\ort.pyke.io\dfbin`）、
-  `bash scripts/ensure-ort-dist.sh --check`（已有构建缓存时应返回 0）。
+- **平台状态**：macOS aarch64 本机实测；**Windows 已在真实 Windows 上实测**——GitHub Actions
+  windows-latest（MSVC + Git Bash `C:\Program Files\Git\bin\bash.EXE` + 真实 ort-sys 下载/解压），
+  run [35564683274](https://github.com/gqf2008/verba-ime/actions/runs/35564683274)（该 run 跑在分支
+  `chore/ort-dist-win-verify` 的 commit `d43245e` 上；随后的 docs/注释提交不改脚本行为）三个 check
+  job 全绿，其中 Windows job 的证据链：
+  · `cargo test --workspace` 在 `%LOCALAPPDATA%\ort.pyke.io\dfbin\x86_64-pc-windows-msvc\` 下出本
+    target 的 dist（该缓存不在 GitHub 的 rust-cache 里，即**当场真实下载 + 解压**）；
+  · `--print-cache-root` → `C:\Users\runneradmin\AppData\Local/ort.pyke.io/dfbin`（与 ort-sys 用
+    Known Folder API 的落盘一致；混合分隔符不影响 `find` / `[ -d ]`）；
+  · 缓存叶子目录名 == `dist.tsv` 第一行（`x86_64-pc-windows-msvc` 的 `directml` 行，
+    `f7c654b3…`）的归档 sha256 → **走的是强证据**，同时证实「无 EP 取第一行」的选行规则与
+    ort-sys 在 Windows 上的实际选择一致；`--check` 返回 0；
+  · 18 项离线自检在 Git Bash 上全绿，含版本闸门三个用例（旧库判红 / 放行开关 / 版本串弱证据）。
+  自检本身离线、不碰真实缓存；CI 还带 `workflow_dispatch`，任意分支可按需在三个 runner 上重跑矩阵。
+- **仍未覆盖**（需真机/别环境补）：Linux 真机；用户 Windows 机器上「装包后首次构建」的公司代理、
+  杀软、企业证书路径；以及 Windows 上「缓存被破坏 → `--fix-cache` → 重下」的端到端（CI runner 是
+  干净联网 VM，且该路径的逻辑由离线自检覆盖）。受限网络下先手动跑一次
+  `bash scripts/ensure-ort-dist.sh`（必要时 `ORT_DIST_CACHE=<镜像目录>`）再 `cargo test`。
 - 脚本用 `bash` 跑（macOS 上是 3.2）：空数组展开、`$VAR` 紧跟中文等坑都在自检里钉住，改动后请跑一次
   `scripts/test-ensure-ort-dist.sh`。
 
