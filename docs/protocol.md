@@ -37,6 +37,10 @@ message Request {
     OcrRecognize ocr_recognize = 25;    // OCR 识别（config ocr_provider）
     AsrTranscribe asr_transcribe = 26;   // ASR 转写（config asr_provider）
     ApiKeySet api_key_set = 27;          // 设置/清除 API Key（写系统密钥库 + 热更新）
+    RimeInstallExtra rime_install_extra = 28; // 安装生僻字扩展（Rime custom_phrase）
+    ListModels list_models = 29;         // 列出可用模型
+    LlmAppendContext llm_append_context = 30; // 上屏文本入窗口级 AI 上下文会话
+    LlmSessionEnd llm_session_end = 31;      // 窗口会话结束：删除该窗口历史与代际
   }
 }
 
@@ -120,7 +124,14 @@ message Candidates {
 - **OcrImage**：支持 `bytes`（剪贴板 / 截图）或 `file_ref`（临时文件路径，避免大包传输；临时文件由请求方负责清理）。
 - **LlmGenerate**：字段含 `provider`（空 = 默认）、`prompt`、`system`、`temperature`、`max_tokens`、`stream`（默认 true）；
   可选 `image`（图像字节）+ `image_mime`（如 `image/png`）组成多模态 vision 请求（OpenAI 兼容 `image_url` 内容块），`//看图` 使用。
-  多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//重置`/`reset` 清空当前窗口会话）。
+  多轮上下文由 daemon 侧 `ai_context_turns` 维护（文本请求自动附带最近 N 轮历史，`history` 字段不进 IPC；`//new` 清空当前窗口会话）。
+  **上屏上下文（LlmAppendContext，kind 30）**：前端把用户上屏的文本（拼音候选/标点/英文/OCR 结果等）
+  经独立后台线程逐条投递到 daemon（`session_id`/`session_key` 与 LlmGenerate 同源），daemon 合并相邻
+  上屏文本为单条消息（上限 500 字）、以 `[上屏] ` 前缀、user 角色混入同一滑动窗口（总上限
+  `context_turns*2` 条消息）；`//` 请求时随历史一起发给 LLM。`ai_context_turns=0` 时 daemon 直接丢弃，
+  不保留任何上屏内容。AI 回复回写（CommitResult）不重复投递。**敏感字段检测（尽力而为）**：
+  Windows 按 TSF GUID_PROP_INPUTSCOPE 判 IS_PASSWORD；macOS 探测客户端 `secureTextEntry`。
+  检测到的密码类字段不上屏外发（任何一步探测失败按普通字段处理，宁漏勿误杀）。
   **`session_key`（field 9）**：窗口级稳定 key，daemon 优先按此分槽隔离；
   macOS 优先用 IMK client 的 PID + CGWindowNumber（无辅助功能权限），Windows 用
   TSF 活动视图 HWND + context generation；两端的 key 都含宿主进程盐，避免 IME
@@ -130,6 +141,10 @@ message Candidates {
   归一化为 `legacy:{session_id}`，其中 `0` 仍表示旧客户端的共享槽。**旧 daemon 会忽略
   field 9，只按 `session_id` 做 controller/service 级隔离；混版部署不具备窗口级语义。**
   daemon 侧 `SessionHistory` 按最终 key 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
+  **会话生命周期（LlmSessionEnd，kind 31）**：前端检测到窗口已关闭（macOS：CGWindowList
+  查旧窗口身份消失；Windows：IsWindow(旧 HWND) 为假）后经后台投递通道通知 daemon 删除该窗口
+  的历史与代际。删除后代际表无此 key，旧 in-flight 请求回写被拒；窗口号被系统复用重建的
+  新窗口拿到全新会话，不继承旧上下文。`//new` 为会话清空命令（同代际拦截）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：前端把拼音/五笔码发到 daemon，daemon 内 librime（单引擎）

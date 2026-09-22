@@ -235,4 +235,4 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 3. macOS appex 常驻限制下的 daemon 启动 / 生命周期策略。
 4. 截图实现：Windows Graphics Capture vs GDI；macOS ScreenCaptureKit vs CGWindowList。
 5. imekit 是否作为 Linux / Wayland 基座（评估后决定依赖 or fork，Apache/MIT 双许可）。
-6. LLM 多轮上下文与隐私边界的默认策略（默认单轮，可配置）。
+6. LLM 多轮上下文与隐私边界的默认策略（默认 50 轮，0=关闭，可配置；上屏文本默认并入窗口级上下文会话，见 docs/privacy.md）。
