@@ -298,7 +298,8 @@ fn default_eye_offset() -> i32 {
 }
 
 fn default_ai_context_turns() -> i32 {
-    0
+    // 默认开多轮：50 轮（100 条消息）；0=关闭（单轮），`//重置` 清空。
+    50
 }
 impl Default for Config {
     fn default() -> Self {
