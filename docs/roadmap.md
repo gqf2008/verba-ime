@@ -93,7 +93,7 @@
 - [ ] 性能与内存预算达标（**范围 = LLM 核心输入链路 + OCR**，见 architecture §8；2026-08-29 缩减）
 - [x] AI 模式多轮上下文（2026-08-23：`ai_context_turns` + LlmRequest.history + daemon 会话历史 + `//重置` 清空 + 设置面板可配；端到端验证第2轮携带历史；2026-09-22：默认轮数 0 → 50）
 - [x] 上屏文本入 LLM 上下文会话（2026-09-22：LlmAppendContext 协议 + daemon 消息流（Prompt/Commit/Reply）+ CommitForwarder 后台投递 + macOS/Windows 前端接线 + `//会话` 显示上屏段数；上屏文本以 `[上屏] ` 标注随历史发送）
-- [x] 上下文隐私缓解（2026-09-22：①窗口关闭=会话销毁（LlmSessionEnd，macOS CGWindowList / Windows IsWindow 检测，窗口号复用不继承旧上下文）；②敏感字段检测（Windows TSF IS_PASSWORD / macOS secureTextEntry，密码类字段不上屏外发）；③`//new` 会话清空命令）
+- [x] 上下文隐私缓解（2026-09-22：①窗口关闭=会话销毁（LlmSessionEnd，macOS CGWindowList / Windows IsWindow 检测；已知边界：关闭未被检测到时旧上下文可能残留/被复用窗口继承，LRU/重启兑底）；②敏感字段检测（Windows TSF IS_PASSWORD / macOS secureTextEntry，密码类字段不上屏外发，尽力而为）；③`//new` 会话清空命令。平台状态：macOS/Windows 前端已接线；Linux 前端未就绪（共享层平台中立，前端落地时同接 CommitImmediate 投递））
 - [x] 诊断与日志（2026-08-23：daemon 写 `data/logs/verba-daemon.log`；`verba-cli diag` 输出健康/关键配置/日志尾/相关进程/rapid 就绪状态）
 - [ ] 日志脱敏与崩溃上报（本地）
 

@@ -20,7 +20,7 @@ pub enum AiCommand {
     FullScreenOcr,
     /// `//听写` → 录音 ASR（结束组合 + 重置状态机 + 异步触发）。
     Asr,
-    /// 普通文本生成。daemon 侧命令（`//重置`/`//reset`/`//会话`，见
+    /// 普通文本生成。daemon 侧命令（`//new`/`//会话`，见
     /// verba-daemon handler）也落此类——**前端不得拦截**，原样送 daemon。
     Llm,
 }
@@ -93,9 +93,9 @@ mod tests {
 
     #[test]
     fn daemon_commands_stay_llm() {
-        // `//重置`/`//会话` 由 daemon 处理，前端不得拦截——解析保持 Llm。
-        assert_eq!(parse_ai_command("重置"), AiCommand::Llm);
-        assert_eq!(parse_ai_command("reset"), AiCommand::Llm);
+        // `//new`/`//会话` 由 daemon 处理，前端不得拦截——解析保持 Llm。
+        assert_eq!(parse_ai_command("new"), AiCommand::Llm);
+        assert_eq!(parse_ai_command("会话"), AiCommand::Llm);
         assert_eq!(parse_ai_command("会话"), AiCommand::Llm);
     }
 

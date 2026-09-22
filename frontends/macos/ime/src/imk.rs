@@ -601,10 +601,11 @@ fn window_identity_for_client(client: &AnyObject) -> Option<(i32, u32)> {
 
 /// 窗口是否仍存在（CGWindowList 按 owner PID + window number 查）。
 /// 用于窗口关闭检测：旧会话的窗口身份已不在窗口列表 = 窗口已关闭。
+/// 注意：**不能用 ON_SCREEN_ONLY**——最小化/切到其它 Space 的窗口不在屏，
+/// 会被误判为已关闭而销毁会话（评审 a2bb79cb 抓出）。只排除桌面壁纸。
 fn cg_window_exists(pid: i32, window_number: u32) -> bool {
-    const ON_SCREEN_ONLY: u32 = 1 << 0;
     const EXCLUDE_DESKTOP: u32 = 1 << 4;
-    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0) };
+    let raw = unsafe { CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0) };
     if raw.is_null() {
         return false;
     }

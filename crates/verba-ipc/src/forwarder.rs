@@ -25,6 +25,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use crate::client::{LlmSession, VerbaClient};
+use crate::error::IpcError;
 
 /// 一条待投递的项：上屏文本，或窗口会话结束通知。
 /// 单通道 FIFO 保证顺序：窗口结束通知一定排在该窗口已入队的上屏文本之后，
@@ -62,6 +63,16 @@ impl CommitItem {
 
 /// daemon 不可达时的重试间隔。
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// 积压队列上限：超过时丢弃最旧条目并告警。防 daemon 长期不可达时用户键入
+/// 内容在前端进程无界累积（评审 a2bb79cb）。
+const MAX_PENDING: usize = 512;
+
+/// 永久性错误判定：服务端 4xx 表示请求本身不可接受（如旧 daemon 不识别
+/// kind 30/31），重试无意义——丢弃该条并告警，不队头阻塞后续条目。
+/// 连接/IO/超时类错误可重试。
+fn is_permanent_error(e: &IpcError) -> bool {
+    matches!(e, IpcError::Server { code, .. } if (400..500).contains(code))
+}
 
 /// 上屏文本后台投递器（Clone 共享；内部一个常驻 worker 线程）。
 #[derive(Clone)]
@@ -109,6 +120,7 @@ impl CommitForwarder {
 }
 
 /// 尝试把积压条目全部投递；连接失败或中途断连时保留剩余条目待下轮重试。
+/// 服务端 4xx（永久错误）条目直接丢弃并告警，防止队头阻塞整个队列。
 fn flush(pending: &mut VecDeque<CommitItem>) {
     match VerbaClient::connect_verified() {
         Ok(mut client) => {
@@ -120,6 +132,10 @@ fn flush(pending: &mut VecDeque<CommitItem>) {
                 };
                 match result {
                     Ok(()) => {
+                        pending.pop_front();
+                    }
+                    Err(e) if is_permanent_error(&e) => {
+                        log::warn!("上屏上下文被服务端拒绝（永久错误），丢弃本条: {e}");
                         pending.pop_front();
                     }
                     Err(e) => {
@@ -157,6 +173,36 @@ fn worker(rx: Receiver<CommitItem>) {
         while let Ok(item) = rx.try_recv() {
             pending.push_back(item);
         }
+        // 积压上限：丢弃最旧条目（含会话结束通知）并告警，防无界累积。
+        while pending.len() > MAX_PENDING {
+            pending.pop_front();
+            log::warn!("上屏上下文积压超限（>{MAX_PENDING}），丢弃最旧条目");
+        }
         flush(&mut pending);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permanent_errors_are_4xx_only() {
+        assert!(is_permanent_error(&IpcError::Server {
+            code: 400,
+            message: "空请求".into(),
+        }));
+        assert!(is_permanent_error(&IpcError::Server {
+            code: 422,
+            message: "x".into(),
+        }));
+        assert!(!is_permanent_error(&IpcError::Server {
+            code: 500,
+            message: "x".into(),
+        }));
+        assert!(!is_permanent_error(&IpcError::Server {
+            code: 502,
+            message: "x".into(),
+        }));
     }
 }

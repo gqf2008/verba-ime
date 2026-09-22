@@ -39,8 +39,8 @@ use windows::Win32::UI::TextServices::{
     ITfDisplayAttributeProvider_Impl, ITfInputScope, ITfKeyEventSink, ITfKeyEventSink_Impl,
     ITfKeystrokeMgr, ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
     ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE,
-    GUID_PROP_INPUTSCOPE, IS_PASSWORD, TF_CONVERSIONMODE_ALPHANUMERIC,
-    TF_CONVERSIONMODE_NATIVE, TF_INVALID_COOKIE,
+    GUID_PROP_INPUTSCOPE, IS_PASSWORD, TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
+    TF_INVALID_COOKIE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, KillTimer,
@@ -1775,8 +1775,7 @@ fn session_key_for_use(data: &TextServiceData) -> String {
     if old_hwnd != 0 && old_hwnd != new_hwnd {
         // SAFETY: old_hwnd 来自上次 GetWnd 返回的活动视图句柄，仅用于
         // IsWindow 存在性检查（不向它发消息）。
-        let alive =
-            unsafe { IsWindow(Some(HWND(old_hwnd as *mut core::ffi::c_void))) }.as_bool();
+        let alive = unsafe { IsWindow(Some(HWND(old_hwnd as *mut core::ffi::c_void))) }.as_bool();
         if !alive {
             if let Some(old_key) = data.last_session_key.borrow_mut().take() {
                 let session_id = data.session_id.get();
@@ -1793,35 +1792,48 @@ fn session_key_for_use(data: &TextServiceData) -> String {
 /// 焦点字段是否密码类输入（TSF 输入范围 IS_PASSWORD）。
 /// 尽力而为：app property 读取任何一步失败都按「非密码」处理——宁可漏掉
 /// 个别未标准声明的密码框，也不误伤普通输入的上下文。
+/// 焦点字段是否密码类输入（TSF 输入范围 IS_PASSWORD）。
+/// 尽力而为：app property 读取任何一步失败都按「非密码」处理（fail-open）——
+/// 宁可漏掉个别未标准声明的密码框，也不误伤普通输入的上下文。失败时告警一次
+/// （限频），便于真机发现「探测路径整个不可用」的空转场景。
+///
+/// 已知不确定性（评审 a2bb79cb）：`TF_INVALID_COOKIE` 在 MSDN 上标注为
+/// 「Not used」，`GetStart`/`GetValue` 均可能回 `TF_E_NOLOCK`。若真机证实
+/// 被拒，需改为申请只读 edit session 后再读；在真机验证前保留此实现。
 fn focused_field_is_password(context: &ITfContext) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let fail = |why: &str| {
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!("密码字段探测失败（按非密码处理，仅告警一次）: {why}");
+        }
+        false
+    };
     unsafe {
         // SAFETY: GUID_PROP_INPUTSCOPE / GetStart / GetValue / GetInputScopes
-        // 均为 msctf 标准接口调用；TF_INVALID_COOKIE 对 app property 合法
-        // （msctf：app property 的读取不要求 edit cookie）。
+        // 均为 msctf 标准接口调用。
         let Ok(prop) = context.GetAppProperty(&GUID_PROP_INPUTSCOPE) else {
-            return false;
+            return fail("GetAppProperty(GUID_PROP_INPUTSCOPE)");
         };
         let Ok(range) = context.GetStart(TF_INVALID_COOKIE) else {
-            return false;
+            return fail("GetStart(TF_INVALID_COOKIE)");
         };
         let Ok(var) = prop.GetValue(TF_INVALID_COOKIE, &range) else {
-            return false;
+            return fail("GetValue(TF_INVALID_COOKIE)");
         };
         if var.Anonymous.Anonymous.vt != windows::Win32::System::Variant::VT_UNKNOWN {
             return false;
         }
         let punk = &var.Anonymous.Anonymous.Anonymous.punkVal;
         let Some(unknown) = punk.as_ref() else {
-            return false;
+            return fail("variant 无 IUnknown");
         };
         let Ok(input_scope) = unknown.cast::<ITfInputScope>() else {
-            return false;
+            return fail("cast ITfInputScope");
         };
-        let mut scopes: *mut windows::Win32::UI::TextServices::InputScope =
-            std::ptr::null_mut();
+        let mut scopes: *mut windows::Win32::UI::TextServices::InputScope = std::ptr::null_mut();
         let mut count: u32 = 0;
         if input_scope.GetInputScopes(&mut scopes, &mut count).is_err() || scopes.is_null() {
-            return false;
+            return fail("GetInputScopes");
         }
         let found = (0..count).any(|i| *scopes.add(i as usize) == IS_PASSWORD);
         windows::Win32::System::Com::CoTaskMemFree(Some(scopes as *const _));

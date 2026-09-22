@@ -204,7 +204,7 @@ pub struct Config {
     /// AI 模式系统提示词（可覆盖默认）。
     #[serde(default)]
     pub ai_system_prompt: String,
-    /// AI 多轮上下文轮数（0=关闭）：记忆最近 N 轮对话，`//重置` 清空。
+    /// AI 多轮上下文轮数（0=关闭）：记忆最近 N 轮对话，`//new` 清空。
     #[serde(default = "default_ai_context_turns")]
     pub ai_context_turns: i32,
     /// 候选窗主题。
@@ -298,7 +298,7 @@ fn default_eye_offset() -> i32 {
 }
 
 fn default_ai_context_turns() -> i32 {
-    // 默认开多轮：50 轮（100 条消息）；0=关闭（单轮），`//重置` 清空。
+    // 默认开多轮：50 轮（100 条消息）；0=关闭（单轮），`//new` 清空。
     50
 }
 impl Default for Config {

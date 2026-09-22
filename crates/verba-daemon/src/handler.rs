@@ -114,6 +114,23 @@ const COMMIT_PREFIX: &str = "[上屏] ";
 /// 相邻上屏文本合并为单条消息的长度上限（字符数）：输入法按词/标点逐段
 /// 上屏，合并避免碎片消息；超限则新开一条，防单条无限膨胀。
 const MAX_COMMIT_MERGE_CHARS: usize = 500;
+/// 单次上屏文本本身的长度上限（字符数）：全屏 OCR 等场景一次上屏可达
+/// 数千字，截断后整条入历史（评审 a2bb79cb）。截断只丢超出部分，
+/// 保前 MAX_SINGLE_COMMIT_CHARS 字。
+const MAX_SINGLE_COMMIT_CHARS: usize = 2000;
+
+/// LRU 逐出：会话数超限时移除最久未用者（刚插入的本会话 tick 最大，不会被逐）。
+fn evict_lru_if_needed(store: &mut SessionHistory) {
+    if store.len() > MAX_AI_SESSIONS {
+        let oldest = store
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            store.remove(&oldest);
+        }
+    }
+}
 
 /// 会话历史存储：窗口级 `session_key` → 该窗口历史。不同窗口的 key 不同，
 /// 互不串上下文（架构审查会话维度 B4b）。
@@ -246,16 +263,7 @@ fn history_append(
     }
     entry.last_used = tick;
 
-    // LRU 逐出：会话数超限时移除最久未用者（不含刚插入的本会话——其 tick 最大）。
-    if store.len() > MAX_AI_SESSIONS {
-        let oldest = store
-            .iter()
-            .min_by_key(|(_, e)| e.last_used)
-            .map(|(id, _)| id.clone());
-        if let Some(oldest) = oldest {
-            store.remove(&oldest);
-        }
-    }
+    evict_lru_if_needed(store);
     true
 }
 
@@ -263,7 +271,8 @@ fn history_append(
 /// 上屏文本是即时行为（无 in-flight 旧响应问题），不受 reset 代际约束——
 /// `//new` 后用户新打的上屏文本属于新世代，应正常入历史。
 /// 相邻上屏文本合并为单条消息（单条上限 `MAX_COMMIT_MERGE_CHARS`），
-/// 避免输入法按词/标点逐段上屏产生碎片消息。
+/// 避免输入法按词/标点逐段上屏产生碎片消息；单次超长上屏（全屏 OCR）
+/// 按 `MAX_SINGLE_COMMIT_CHARS` 截断。
 fn history_append_context(
     store: &mut SessionHistory,
     session_key: &str,
@@ -271,6 +280,10 @@ fn history_append_context(
     context_turns: usize,
     tick: u64,
 ) {
+    let mut text = text;
+    if text.chars().count() > MAX_SINGLE_COMMIT_CHARS {
+        text = text.chars().take(MAX_SINGLE_COMMIT_CHARS).collect();
+    }
     if text.is_empty() {
         return;
     }
@@ -299,15 +312,7 @@ fn history_append_context(
     }
     entry.last_used = tick;
 
-    if store.len() > MAX_AI_SESSIONS {
-        let oldest = store
-            .iter()
-            .min_by_key(|(_, e)| e.last_used)
-            .map(|(id, _)| id.clone());
-        if let Some(oldest) = oldest {
-            store.remove(&oldest);
-        }
-    }
+    evict_lru_if_needed(store);
 }
 
 /// 窗口会话结束：删除该窗口的历史与代际。旧 in-flight 请求的回写因
@@ -2113,7 +2118,36 @@ mod tests {
             2,
             "超长上屏应在超限后新开一条，而非无限拼接"
         );
-        assert!(entry.msgs[0].content.chars().count() <= MAX_COMMIT_MERGE_CHARS);
+        // 断言落在**新插入的**消息上（评审 a2bb79cb：此前断言 msgs[0] 等于没验证）。
+        assert_eq!(entry.msgs[0].content.chars().count(), 6);
+        assert_eq!(
+            entry.msgs[1].content.chars().count(),
+            MAX_COMMIT_MERGE_CHARS + 10,
+            "单段 510 字应原样入新消息（低于单条截断上限 2000）"
+        );
+    }
+
+    #[test]
+    fn commit_context_truncates_single_oversized_commit() {
+        // 全屏 OCR 等一次上屏数千字：单条截断到 MAX_SINGLE_COMMIT_CHARS，
+        // 超出部分丢弃，不进 LLM 历史。
+        let mut store = SessionHistory::new();
+        let huge: String = "字".repeat(MAX_SINGLE_COMMIT_CHARS + 3000);
+        history_append_context(&mut store, "window:a", huge, 4, 1);
+        {
+            let entry = store.get("window:a").unwrap();
+            assert_eq!(entry.msgs.len(), 1);
+            assert_eq!(
+                entry.msgs[0].content.chars().count(),
+                MAX_SINGLE_COMMIT_CHARS
+            );
+        }
+        // 截断后的 2000 字消息已超 500 字合并上限：后续上屏新开一条，
+        // 不再合并（防单条无限膨胀）。
+        history_append_context(&mut store, "window:a", "续".into(), 4, 2);
+        let entry = store.get("window:a").unwrap();
+        assert_eq!(entry.msgs.len(), 2);
+        assert_eq!(entry.msgs[1].content, "续");
     }
 
     #[test]

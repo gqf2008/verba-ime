@@ -143,8 +143,9 @@ message Candidates {
   daemon 侧 `SessionHistory` 按最终 key 分槽（LRU，上限 `MAX_AI_SESSIONS=256`）。
   **会话生命周期（LlmSessionEnd，kind 31）**：前端检测到窗口已关闭（macOS：CGWindowList
   查旧窗口身份消失；Windows：IsWindow(旧 HWND) 为假）后经后台投递通道通知 daemon 删除该窗口
-  的历史与代际。删除后代际表无此 key，旧 in-flight 请求回写被拒；窗口号被系统复用重建的
-  新窗口拿到全新会话，不继承旧上下文。`//new` 为会话清空命令（同代际拦截）。
+  的历史与代际。删除后代际表无此 key，旧 in-flight 请求回写被拒。已知边界：关闭未被
+  检测到时（焦点未切换、窗口身份被系统复用且未触发检测）旧上下文可能残留或被新窗口
+  继承，由 LRU/重启兑底；`//new` 为会话清空命令（同代际拦截）。
 - **LlmCandidates（候选融合）**：拼音态输入停顿后由前端发起，daemon 按行解析 LLM 输出为候选，
   增量推 `Candidates` 事件（去重 / 去编号），结束（含取消）补发 `done=true`。
 - **RimeCandidates**：前端把拼音/五笔码发到 daemon，daemon 内 librime（单引擎）
