@@ -149,36 +149,36 @@ fn flush(pending: &mut VecDeque<CommitItem>) {
     }
 }
 
+/// 排空通道并把积压裁剪到上限。**每轮必跑**（含投递失败后的重试轮）——
+/// 若只在正常投递路径裁剪，daemon 长期不可达时 worker 在
+/// sleep→retry 打转，上限永不触发、积压无界（评审 2eb03997）。
+fn drain_and_cap(rx: &Receiver<CommitItem>, pending: &mut VecDeque<CommitItem>) {
+    while let Ok(item) = rx.try_recv() {
+        pending.push_back(item);
+    }
+    while pending.len() > MAX_PENDING {
+        pending.pop_front();
+        log::warn!("上屏上下文积压超限（>{MAX_PENDING}），丢弃最旧条目");
+    }
+}
+
 fn worker(rx: Receiver<CommitItem>) {
     let mut pending: VecDeque<CommitItem> = VecDeque::new();
     loop {
-        // 先消化存量积压（失败则退避后重试，不无限热循环）。
-        if !pending.is_empty() {
-            flush(&mut pending);
-            if !pending.is_empty() {
-                std::thread::sleep(RETRY_INTERVAL);
-                continue;
+        // 每轮先排空通道并施加上限：不管上一轮投递成败，积压都有界。
+        drain_and_cap(&rx, &mut pending);
+        if pending.is_empty() {
+            // 空闲：阻塞等新条目；所有发送端关闭时退出。
+            match rx.recv() {
+                Ok(item) => pending.push_back(item),
+                Err(_) => return,
             }
-        }
-        // 阻塞等新条目；所有发送端关闭时投完剩余即退出。
-        let first = match rx.recv() {
-            Ok(item) => item,
-            Err(_) => {
-                flush(&mut pending);
-                return;
-            }
-        };
-        pending.push_back(first);
-        // 吸干此刻在途积压，批量投递（减少连接与握手次数）。
-        while let Ok(item) = rx.try_recv() {
-            pending.push_back(item);
-        }
-        // 积压上限：丢弃最旧条目（含会话结束通知）并告警，防无界累积。
-        while pending.len() > MAX_PENDING {
-            pending.pop_front();
-            log::warn!("上屏上下文积压超限（>{MAX_PENDING}），丢弃最旧条目");
         }
         flush(&mut pending);
+        if !pending.is_empty() {
+            // 投递失败：退避后重试（下轮顶部会再次排空+裁剪）。
+            std::thread::sleep(RETRY_INTERVAL);
+        }
     }
 }
 
@@ -204,5 +204,30 @@ mod tests {
             code: 502,
             message: "x".into(),
         }));
+    }
+
+    #[test]
+    fn drain_and_cap_bounds_pending_even_when_not_flushing() {
+        // 评审 2eb03997 抓出的缺陷：daemon 不可达时上限路径不可达。
+        // 排空+裁剪独立于投递，每轮必跑——此处直接测该函数本身。
+        let (tx, rx) = mpsc::channel();
+        let mut pending = VecDeque::new();
+        let total = MAX_PENDING + 5;
+        for i in 0..total {
+            tx.send(CommitItem::SessionEnd {
+                session_id: 0,
+                session_key: Some(format!("k{i}")),
+            })
+            .unwrap();
+        }
+        drain_and_cap(&rx, &mut pending);
+        assert_eq!(pending.len(), MAX_PENDING, "超限后按上限保留最新条目");
+        let front = pending.front().unwrap();
+        match front {
+            CommitItem::SessionEnd { session_key, .. } => {
+                assert_eq!(session_key.as_deref(), Some("k5"), "最旧 5 条应被丢弃");
+            }
+            CommitItem::Commit { .. } => panic!("unexpected item kind"),
+        }
     }
 }
