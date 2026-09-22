@@ -6,8 +6,8 @@ use std::time::Duration;
 use verba_ipc::server::{serve, Outbound, RequestHandler};
 use verba_ipc::{ConnectWait, LlmSession, VerbaClient};
 use verba_protos::{
-    request, response, stream_event, Chunk, Error as ProtoError, Final, LlmGenerate, Ok as OkMsg,
-    Pong, Request, Response, StreamEvent,
+    request, response, stream_event, Chunk, Error as ProtoError, Final, LlmAppendContext,
+    LlmGenerate, LlmSessionEnd, Ok as OkMsg, Pong, Request, Response, StreamEvent,
 };
 
 fn unique_name(tag: &str) -> String {
@@ -252,6 +252,133 @@ async fn llm_vision_image_roundtrip() {
     assert_eq!(got.image.as_deref(), Some(img.as_slice()));
     assert_eq!(got.image_mime.as_deref(), Some("image/png"));
     assert_eq!(got.session_key, "window:vision");
+}
+
+/// 捕获 LlmSessionEnd 的 handler：验证窗口会话结束通知原样到达服务端。
+struct SessionEndHandler {
+    captured: std::sync::Arc<std::sync::Mutex<Option<LlmSessionEnd>>>,
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for SessionEndHandler {
+    async fn handle(&self, _conn_id: u64, req: Request, out: Outbound) {
+        match req.kind {
+            Some(request::Kind::LlmSessionEnd(g)) => {
+                *self.captured.lock().unwrap() = Some(g.clone());
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+            }
+            _ => {
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 1,
+                            message: "not implemented".into(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_session_end_roundtrip() {
+    let name = unique_name("sessionend");
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<LlmSessionEnd>));
+    let handler = Arc::new(SessionEndHandler {
+        captured: captured.clone(),
+    });
+    let server_name = name.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(&server_name, handler).await;
+    });
+
+    let mut client = connect_with_retry(&name, Duration::from_secs(5));
+    client
+        .llm_session_end(LlmSession::window(7, "window:end"))
+        .expect("llm_session_end");
+    server.abort();
+    let _ = server.await;
+
+    let got = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler 应收到 LlmSessionEnd");
+    assert_eq!(got.session_id, 7);
+    assert_eq!(got.session_key, "window:end");
+}
+
+/// 捕获 LlmAppendContext 的 handler：验证上屏文本与会话标识原样到达服务端。
+struct AppendContextHandler {
+    captured: std::sync::Arc<std::sync::Mutex<Option<LlmAppendContext>>>,
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for AppendContextHandler {
+    async fn handle(&self, _conn_id: u64, req: Request, out: Outbound) {
+        match req.kind {
+            Some(request::Kind::LlmAppendContext(g)) => {
+                *self.captured.lock().unwrap() = Some(g.clone());
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Ok(OkMsg {})),
+                    })
+                    .await;
+            }
+            _ => {
+                let _ = out
+                    .response(&Response {
+                        id: req.id,
+                        kind: Some(response::Kind::Error(ProtoError {
+                            code: 1,
+                            message: "not implemented".into(),
+                        })),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_append_context_roundtrip() {
+    let name = unique_name("appendctx");
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<LlmAppendContext>));
+    let handler = Arc::new(AppendContextHandler {
+        captured: captured.clone(),
+    });
+    let server_name = name.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(&server_name, handler).await;
+    });
+
+    let mut client = connect_with_retry(&name, Duration::from_secs(5));
+    client
+        .llm_append_context("今天天气不错", LlmSession::window(7, "window:ctx"))
+        .expect("llm_append_context");
+    // legacy 会话：key 空 → 服务端按 session_id 回退。
+    client
+        .llm_append_context("。", LlmSession::legacy(7))
+        .expect("llm_append_context legacy");
+    server.abort();
+    let _ = server.await;
+
+    let got = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler 应收到 LlmAppendContext");
+    assert_eq!(got.text, "。");
+    assert_eq!(got.session_id, 7);
+    assert_eq!(got.session_key, "");
 }
 
 /// 捕获 LlmCancel 请求 id 的 handler：验证取消请求命中原始目标 id。

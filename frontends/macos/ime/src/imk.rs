@@ -42,7 +42,7 @@ use verba_core::machine::{
 };
 use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::name::local_entropy_u64;
-use verba_ipc::LlmSession;
+use verba_ipc::{CommitForwarder, LlmSession};
 use verba_protos::{stream_event, StreamEvent};
 
 use crate::ipc;
@@ -599,13 +599,58 @@ fn window_identity_for_client(client: &AnyObject) -> Option<(i32, u32)> {
     cg_window_number_for_client(client, pid).map(|window_number| (pid, window_number))
 }
 
-/// 返回 (key, is_window_identity)。窗口身份不可得时返回 input-session 级
-/// 一次性 fallback，不与其他窗口共享。
-fn session_key_for_client(client: &AnyObject, fallback: String) -> (String, bool) {
-    match window_identity_for_client(client) {
-        Some((pid, window_number)) => (compose_macos_window_key(pid, window_number), true),
-        None => (fallback, false),
+/// 窗口是否仍存在（CGWindowList 按 owner PID + window number 查）。
+/// 用于窗口关闭检测：旧会话的窗口身份已不在窗口列表 = 窗口已关闭。
+fn cg_window_exists(pid: i32, window_number: u32) -> bool {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0) };
+    if raw.is_null() {
+        return false;
     }
+    let windows: CFArray<CFDictionary> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    let number_key = unsafe { CFString::wrap_under_get_rule(kCGWindowNumber) };
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    for dict in windows.iter() {
+        let raw_owner = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                pid_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_owner.is_null() {
+            continue;
+        }
+        let owner = unsafe { CFNumber::wrap_under_get_rule(raw_owner as CFNumberRef) };
+        if owner.to_i32() != Some(pid) {
+            continue;
+        }
+        let raw_number = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                number_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_number.is_null() {
+            continue;
+        }
+        let number = unsafe { CFNumber::wrap_under_get_rule(raw_number as CFNumberRef) };
+        if number.to_i32() == Some(window_number as i32) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 当前输入字段是否安全输入（NSSecureTextField 等实现 `secureTextEntry` 的
+/// 客户端）。尽力而为：仅覆盖原生 AppKit 安全字段，探不到一律按普通字段处理。
+fn client_is_secure(client: &AnyObject) -> bool {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(secureTextEntry)] };
+    if !responds.as_bool() {
+        return false;
+    }
+    let secure: Bool = unsafe { msg_send![client, secureTextEntry] };
+    secure.as_bool()
 }
 
 /// seq → daemon 侧请求 id（取消用）。seq 全局唯一，映射查询安全；工作线程
@@ -978,6 +1023,8 @@ struct Ivars {
     session_key_client: Cell<usize>,
     /// 当前 key 是否来自真实窗口身份（false 表示 input-session fallback）。
     session_key_is_window: Cell<bool>,
+    /// 上次会话的窗口身份（PID, CGWindowNumber）：窗口关闭检测用。
+    session_identity: RefCell<Option<(i32, u32)>>,
     /// session_key 刷新重入保护：firstRect XPC 可能泵 runloop。
     session_key_refreshing: Cell<bool>,
     /// Rime 方案（单引擎，缓存；配置变更时热更新）。
@@ -1021,6 +1068,7 @@ impl Default for Ivars {
             session_key: RefCell::new(String::new()),
             session_key_client: Cell::new(0),
             session_key_is_window: Cell::new(false),
+            session_identity: RefCell::new(None),
             session_key_refreshing: Cell::new(false),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
@@ -1535,6 +1583,8 @@ define_class!(
             };
             if !text.is_empty() {
                 self.commit(&text);
+                // 宿主要求结束组合时提交的原文同样是上屏内容，入上下文会话。
+                self.forward_commit_to_context(text);
             }
             self.cancel_stream();
             self.invalidate_timer();
@@ -1864,7 +1914,38 @@ fn pending_preview_key(pk: &PendingKey) -> Option<PreviewKey> {
     }
 }
 
+/// 上屏文本后台投递器（进程级单例）：把用户上屏的文本异步投递到 daemon
+/// 的窗口级 AI 上下文会话，不阻塞输入线程。
+fn commit_forwarder() -> &'static CommitForwarder {
+    static FWD: OnceLock<CommitForwarder> = OnceLock::new();
+    FWD.get_or_init(CommitForwarder::start)
+}
+
 impl VerbaIMKController {
+    /// 把上屏文本推入当前窗口的 AI 上下文会话（异步，失败静默重试）。
+    fn forward_commit_to_context(&self, text: String) {
+        // 敏感字段（密码框等）不上屏外发：检测到安全输入即跳过。
+        let is_secure = self
+            .ivars()
+            .client
+            .borrow()
+            .as_ref()
+            .map(|c| client_is_secure(c))
+            .unwrap_or(false);
+        if is_secure {
+            log::info!("[VerbaIMK] 安全输入字段，跳过上屏上下文投递");
+            return;
+        }
+        let session_id = self.ivars().session_id.get();
+        let session_key = self.ivars().session_key.borrow().clone();
+        let session = if session_key.is_empty() {
+            LlmSession::legacy(session_id)
+        } else {
+            LlmSession::window(session_id, &session_key)
+        };
+        commit_forwarder().push(session, text);
+    }
+
     /// 当前页候选（candidates / candidates: 共用）。
     fn current_candidates(&self) -> Option<Retained<NSArray<NSString>>> {
         let ivars = self.ivars();
@@ -1899,16 +1980,30 @@ impl VerbaIMKController {
                 self.ivars().session_key_refreshing.set(true);
                 let _guard = RefreshGuard(&self.ivars().session_key_refreshing);
                 let fallback = compose_macos_fallback_key(alloc_session_token());
-                let slot = Cell::new(None::<(String, bool)>);
+                let slot = Cell::new(None::<Option<(i32, u32)>>);
                 self.host_call("session_key.refresh", || {
-                    slot.set(Some(session_key_for_client(s, fallback)));
+                    slot.set(Some(window_identity_for_client(s)));
                 });
-                let (key, is_window) = slot
-                    .take()
-                    .unwrap_or_else(|| (compose_macos_fallback_key(alloc_session_token()), false));
+                let identity = slot.take().unwrap_or(None);
+                let (key, is_window) = match identity {
+                    Some((pid, w)) => (compose_macos_window_key(pid, w), true),
+                    None => (fallback, false),
+                };
                 self.ivars().session_key_client.set(client_ptr);
                 self.ivars().session_key_is_window.set(is_window);
-                let changed = *self.ivars().session_key.borrow() != key;
+                // 窗口关闭检测：旧会话的窗口身份已不在窗口列表 = 窗口已关闭，
+                // 结束并删除该会话（隐私边界：窗口关闭 = 上下文销毁）。
+                let old_identity = *self.ivars().session_identity.borrow();
+                let old_key = self.ivars().session_key.borrow().clone();
+                if let Some((old_pid, old_w)) = old_identity {
+                    if old_key != key && !cg_window_exists(old_pid, old_w) {
+                        let sid = self.ivars().session_id.get();
+                        commit_forwarder().push_end(LlmSession::window(sid, &old_key));
+                        log::info!("[VerbaIMK] 旧窗口已关闭，结束会话: {old_key}");
+                    }
+                }
+                *self.ivars().session_identity.borrow_mut() = identity;
+                let changed = old_key != key;
                 *self.ivars().session_key.borrow_mut() = key.clone();
                 if changed {
                     log::info!("[VerbaIMK] window session_key={key} (window={is_window})");
@@ -1927,6 +2022,9 @@ impl VerbaIMKController {
             Action::None => true,
             Action::CommitImmediate(text) => {
                 self.commit(&text);
+                // 上屏文本进窗口级 AI 上下文会话（AI 结果上屏走 CommitResult，
+                // 已作为 assistant 轮入历史，此处不重复投递）。
+                self.forward_commit_to_context(text);
                 true
             }
             Action::CommitResult { text } => {
@@ -2046,7 +2144,7 @@ impl VerbaIMKController {
                         self.start_llm(prompt, system, true, vision_rect);
                         true
                     }
-                    // 普通生成与 daemon 命令（`//重置`/`//会话`——前端不得
+                    // 普通生成与 daemon 命令（`//new`/`//会话`——前端不得
                     // 拦截，原样送 daemon）。
                     AiCommand::Llm => {
                         self.start_llm(prompt, system, false, None);

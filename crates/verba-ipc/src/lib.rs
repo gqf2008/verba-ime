@@ -9,9 +9,11 @@
 pub mod client;
 pub mod codec;
 pub mod error;
+pub mod forwarder;
 pub mod name;
 pub mod server;
 
 pub use client::{ConnectWait, LlmSession, VerbaClient};
 pub use error::IpcError;
+pub use forwarder::CommitForwarder;
 pub use name::default_socket_spec;

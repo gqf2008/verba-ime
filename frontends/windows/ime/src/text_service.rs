@@ -19,7 +19,7 @@ use verba_core::machine::{
     REWRITE_SYSTEM_PROMPT,
 };
 use verba_core::{parse_ai_command, AiCommand};
-use verba_ipc::LlmSession;
+use verba_ipc::{CommitForwarder, LlmSession};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
@@ -36,15 +36,16 @@ use verba_trigger::record::record_seconds;
 use windows::Win32::UI::TextServices::{
     IEnumTfDisplayAttributeInfo, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl,
     ITfContext, ITfContextView, ITfDisplayAttributeInfo, ITfDisplayAttributeProvider,
-    ITfDisplayAttributeProvider_Impl, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfDisplayAttributeProvider_Impl, ITfInputScope, ITfKeyEventSink, ITfKeyEventSink_Impl,
+    ITfKeystrokeMgr, ITfTextInputProcessor, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
     ITfTextInputProcessor_Impl, ITfThreadMgr, GUID_COMPARTMENT_KEYBOARD_INPUTMODE,
-    TF_CONVERSIONMODE_ALPHANUMERIC, TF_CONVERSIONMODE_NATIVE,
+    GUID_PROP_INPUTSCOPE, IS_PASSWORD, TF_CONVERSIONMODE_ALPHANUMERIC,
+    TF_CONVERSIONMODE_NATIVE, TF_INVALID_COOKIE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, KillTimer, PostMessageW,
-    RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, KillTimer,
+    PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
 };
 
 use crate::dll;
@@ -168,6 +169,10 @@ pub struct TextServiceData {
     next_context_generation: Cell<u64>,
     /// context 完全不可用时的一次性会话序号（不继承历史，绝不跨窗口共享）。
     session_token_seq: Cell<u64>,
+    /// 上次投递会话对应的 HWND（0 = 无）：窗口关闭检测用。
+    last_session_hwnd: Cell<isize>,
+    /// 上次投递的会话 key：窗口已销毁时通知 daemon 删除该会话。
+    last_session_key: RefCell<Option<String>>,
     /// 待触发的候选融合请求（防抖中）。
     candidate_req_pending: RefCell<Option<PendingCandidateReq>>,
     stream_thread: RefCell<Option<JoinHandle<()>>>,
@@ -212,6 +217,8 @@ impl TextServiceData {
             context_order: RefCell::new(VecDeque::new()),
             next_context_generation: Cell::new(0),
             session_token_seq: Cell::new(0),
+            last_session_hwnd: Cell::new(0),
+            last_session_key: RefCell::new(None),
             candidate_req_pending: RefCell::new(None),
             stream_thread: RefCell::new(None),
             candidate_thread: RefCell::new(None),
@@ -694,6 +701,23 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
 }
 
 // ---- 按键处理 ----
+
+/// 上屏文本后台投递器（进程级单例）：把用户上屏的文本异步投递到 daemon
+/// 的窗口级 AI 上下文会话，不阻塞输入线程。
+fn commit_forwarder() -> &'static CommitForwarder {
+    static FWD: OnceLock<CommitForwarder> = OnceLock::new();
+    FWD.get_or_init(CommitForwarder::start)
+}
+
+/// 把上屏文本推入当前窗口的 AI 上下文会话（异步，失败静默重试）。
+/// 会话 key 与 AI 请求同源（`session_key_for_use`），保证上屏文本与
+/// `//` 对话落在同一会话槽。
+fn forward_commit_to_context(data: &TextServiceData, text: String) {
+    let session_id = data.session_id.get();
+    let session_key = session_key_for_use(data);
+    let session = LlmSession::window(session_id, &session_key);
+    commit_forwarder().push(session, text);
+}
 
 /// 构建覆盖层候选窗并按给定锚点显示。OCR 预览 / 改写对照预览 / OCR/改写/AI 结果卡
 /// 共用这套「主题克隆 → 控制器 → 显示 → 锚点」管线——三处各抄一份时兜底
@@ -1201,11 +1225,21 @@ pub fn apply_action(
             cancel_candidate_request(data);
             // 先取走组合引用并释放 borrow，避免分支内 borrow_mut 冲突。
             let existing = data.composition.borrow_mut().take();
-            if let Some(comp) = existing {
+            let result = if let Some(comp) = existing {
                 edit_session::end_composition(context, clientid, &comp, &text)
             } else {
                 edit_session::commit_text(context, clientid, &text)
+            };
+            // 上屏成功才入上下文（AI 结果上屏走 CommitResult，已作为
+            // assistant 轮入历史，此处不重复投递）；密码类字段不上屏外发。
+            if result.is_ok() {
+                if focused_field_is_password(context) {
+                    log::info!("密码类输入字段，跳过上屏上下文投递");
+                } else {
+                    forward_commit_to_context(data, text);
+                }
             }
+            result
         }
         Action::EnterPrompt { preedit } | Action::UpdatePrompt { preedit } => {
             // 离开结果浮层回提示词编辑（e/退格）或 // 进入提示词模式时收起
@@ -1268,7 +1302,7 @@ pub fn apply_action(
         Action::StartLlm { prompt, system: _ } => {
             // 多模态命令路由统一走 core commands::parse_ai_command（判定次序
             // 与措辞两端一致；结果浮层的重试 feed_ai_preview 也经此还原命令
-            // 语义——重试 `//看图` 会重走 vision 截屏）。`//重置`/`//会话` 等
+            // 语义——重试 `//看图` 会重走 vision 截屏）。`//new`/`//会话` 等
             // daemon 命令解析为 Llm 原样透传，前端不得拦截。
             // 进入生成前先收掉可能残留的拼音候选窗（提示词内拼音组合的候选）。
             hide_candidate_window(data);
@@ -1323,7 +1357,7 @@ pub fn apply_action(
                     trigger_async(data, kind);
                 }
                 // `//短语 名称` 未命中（已查表）与普通生成同路；daemon 命令
-                // （`//重置` 等）解析为 Llm 原样透传。
+                // （`//new` 等）解析为 Llm 原样透传。
                 AiCommand::Phrase { .. } | AiCommand::Llm => {
                     // 发送即反馈：组合文本立刻换成「✨ 生成中…」——发送 → 首块
                     // 的 1-3s 此前完全无反馈（旧实现刻意不碰 preedit），用户
@@ -1695,6 +1729,17 @@ fn context_generation(
     generation
 }
 
+/// 取当前 TSF context 的活动视图 HWND；失败返回 None。
+fn active_view_hwnd(data: &TextServiceData) -> Option<HWND> {
+    let context = data.context.borrow().as_ref().cloned()?;
+    // SAFETY: context 为当前 TSF 输入上下文；GetActiveView 是标准 COM 调用，失败返回 Err。
+    let view = unsafe { context.GetActiveView().ok() };
+    view.and_then(|view| {
+        // SAFETY: view 为当前 TSF 活动视图；GetWnd 是标准 COM 调用，失败返回 Err。
+        unsafe { view.GetWnd().ok() }
+    })
+}
+
 /// 优先取当前 TSF context 的活动视图 HWND；失败时退到 context key。
 /// 只要 context 存在就返回稳定 key；context 也没有时返回 None，由调用方
 /// 分配一次性 key。
@@ -1702,13 +1747,7 @@ fn current_window_session_key(data: &TextServiceData) -> Option<String> {
     let context = data.context.borrow().as_ref().cloned()?;
     let context_key = context.as_raw() as usize;
     let generation = context_generation(data, context_key, Some(&context));
-    // SAFETY: context 为当前 TSF 输入上下文；GetActiveView 是标准 COM 调用，失败返回 Err。
-    let view = unsafe { context.GetActiveView().ok() };
-    let hwnd = view.and_then(|view| {
-        // SAFETY: view 为当前 TSF 活动视图；GetWnd 是标准 COM 调用，失败返回 Err。
-        unsafe { view.GetWnd().ok() }
-    });
-    match hwnd {
+    match active_view_hwnd(data) {
         Some(hwnd) if !hwnd.is_invalid() => Some(compose_windows_window_key(
             data.session_id.get(),
             generation,
@@ -1718,6 +1757,75 @@ fn current_window_session_key(data: &TextServiceData) -> Option<String> {
             data.session_id.get(),
             generation,
         )),
+    }
+}
+
+/// 取当前会话 key 供投递使用，并在窗口已销毁时通知 daemon 删除旧会话。
+/// 隐私边界：窗口关闭 = 上下文销毁；窗口 HWND 被系统复用后，新的
+/// 上下文 generation 保证新窗口拿到全新会话，不继承旧窗口历史。
+/// 旧窗口仍在（仅焦点切换）时保留会话；context 不可用时不动缓存，
+/// 由调用方用一次性 key 兜底。
+fn session_key_for_use(data: &TextServiceData) -> String {
+    let Some(key) = current_window_session_key(data) else {
+        log::warn!("TSF context 不可用，AI 会话使用一次性 key（不继承历史）");
+        return ephemeral_windows_session_key(data);
+    };
+    let old_hwnd = data.last_session_hwnd.get();
+    let new_hwnd = active_view_hwnd(data).map(|h| h.0 as isize).unwrap_or(0);
+    if old_hwnd != 0 && old_hwnd != new_hwnd {
+        // SAFETY: old_hwnd 来自上次 GetWnd 返回的活动视图句柄，仅用于
+        // IsWindow 存在性检查（不向它发消息）。
+        let alive =
+            unsafe { IsWindow(Some(HWND(old_hwnd as *mut core::ffi::c_void))) }.as_bool();
+        if !alive {
+            if let Some(old_key) = data.last_session_key.borrow_mut().take() {
+                let session_id = data.session_id.get();
+                commit_forwarder().push_end(LlmSession::window(session_id, &old_key));
+                log::info!("旧窗口已销毁，结束会话: {old_key}");
+            }
+        }
+    }
+    data.last_session_hwnd.set(new_hwnd);
+    *data.last_session_key.borrow_mut() = Some(key.clone());
+    key
+}
+
+/// 焦点字段是否密码类输入（TSF 输入范围 IS_PASSWORD）。
+/// 尽力而为：app property 读取任何一步失败都按「非密码」处理——宁可漏掉
+/// 个别未标准声明的密码框，也不误伤普通输入的上下文。
+fn focused_field_is_password(context: &ITfContext) -> bool {
+    unsafe {
+        // SAFETY: GUID_PROP_INPUTSCOPE / GetStart / GetValue / GetInputScopes
+        // 均为 msctf 标准接口调用；TF_INVALID_COOKIE 对 app property 合法
+        // （msctf：app property 的读取不要求 edit cookie）。
+        let Ok(prop) = context.GetAppProperty(&GUID_PROP_INPUTSCOPE) else {
+            return false;
+        };
+        let Ok(range) = context.GetStart(TF_INVALID_COOKIE) else {
+            return false;
+        };
+        let Ok(var) = prop.GetValue(TF_INVALID_COOKIE, &range) else {
+            return false;
+        };
+        if var.Anonymous.Anonymous.vt != windows::Win32::System::Variant::VT_UNKNOWN {
+            return false;
+        }
+        let punk = &var.Anonymous.Anonymous.Anonymous.punkVal;
+        let Some(unknown) = punk.as_ref() else {
+            return false;
+        };
+        let Ok(input_scope) = unknown.cast::<ITfInputScope>() else {
+            return false;
+        };
+        let mut scopes: *mut windows::Win32::UI::TextServices::InputScope =
+            std::ptr::null_mut();
+        let mut count: u32 = 0;
+        if input_scope.GetInputScopes(&mut scopes, &mut count).is_err() || scopes.is_null() {
+            return false;
+        }
+        let found = (0..count).any(|i| *scopes.add(i as usize) == IS_PASSWORD);
+        windows::Win32::System::Com::CoTaskMemFree(Some(scopes as *const _));
+        found
     }
 }
 
@@ -1734,10 +1842,7 @@ fn start_llm_with_system(
     let request_id = Arc::clone(&data.stream_request_id);
     let stream_epoch = Arc::clone(&data.stream_epoch);
     let session_id = data.session_id.get();
-    let session_key = current_window_session_key(data).unwrap_or_else(|| {
-        log::warn!("TSF context 不可用，AI 会话使用一次性 key（不继承历史）");
-        ephemeral_windows_session_key(data)
-    });
+    let session_key = session_key_for_use(data);
     // 新流代际必须在发起线程（spawn 之前）领取：在 worker 内领取时，两个快速
     // 连续的 start_llm 的 epoch 顺序由 OS 线程调度决定，可能新旧颠倒——
     // on_timer 过滤会丢弃当前流、放行已作废流（复审 V6，P2-2 回归）。

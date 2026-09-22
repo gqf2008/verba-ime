@@ -21,8 +21,9 @@ use interprocess::local_socket::{ConnectOptions, GenericFilePath, Stream as Loca
 use interprocess::ConnectWaitMode;
 use prost::Message as _;
 use verba_protos::{
-    request, response, stream_event, ApiKeySet, AsrTranscribe, LlmCancel, LlmCandidates,
-    LlmGenerate, OcrRecognize, Ping, Request, Response, RimeCandidates, StreamEvent, TtsSynthesize,
+    request, response, stream_event, ApiKeySet, AsrTranscribe, LlmAppendContext, LlmCancel,
+    LlmCandidates, LlmGenerate, LlmSessionEnd, OcrRecognize, Ping, Request, Response,
+    RimeCandidates, StreamEvent, TtsSynthesize,
 };
 
 use crate::codec::{encode_frame, read_frame};
@@ -328,6 +329,81 @@ impl VerbaClient {
                     }
                     _ => return Err(IpcError::Protocol("期望 Ok 响应".into())),
                 }
+            }
+            return Err(IpcError::Protocol("无法解码响应".into()));
+        }
+    }
+
+    /// 把用户上屏文本追加进 daemon 的窗口级 AI 上下文会话（同步阻塞，仅供
+    /// 后台投递线程使用；UI 路径请经 `CommitForwarder`）。
+    pub fn llm_append_context(
+        &mut self,
+        text: &str,
+        session: LlmSession<'_>,
+    ) -> Result<(), IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::LlmAppendContext(LlmAppendContext {
+                text: text.to_owned(),
+                session_id: session.id,
+                session_key: session.key.unwrap_or_default().to_owned(),
+            })),
+        };
+        self.write_request(&req)?;
+        loop {
+            let frame = self.read_frame_blocking()?;
+            if let Ok(resp) = Response::decode(frame.as_slice()) {
+                if resp.id != id {
+                    return Err(IpcError::Protocol("响应 id 不匹配".into()));
+                }
+                return match resp.kind {
+                    Some(response::Kind::Ok(_)) => Ok(()),
+                    Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                        code: e.code,
+                        message: e.message,
+                    }),
+                    _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
+                };
+            }
+            if let Ok(evt) = StreamEvent::decode(frame.as_slice()) {
+                // 防御：本连接出现流事件（不该发生）先缓存，避免丢失。
+                self.pending_events.push_back(evt);
+                continue;
+            }
+            return Err(IpcError::Protocol("无法解码响应".into()));
+        }
+    }
+
+    /// 通知 daemon 窗口会话已结束（窗口关闭）：删除该窗口的历史与代际。
+    pub fn llm_session_end(&mut self, session: LlmSession<'_>) -> Result<(), IpcError> {
+        let id = self.new_id();
+        let req = Request {
+            id,
+            kind: Some(request::Kind::LlmSessionEnd(LlmSessionEnd {
+                session_id: session.id,
+                session_key: session.key.unwrap_or_default().to_owned(),
+            })),
+        };
+        self.write_request(&req)?;
+        loop {
+            let frame = self.read_frame_blocking()?;
+            if let Ok(resp) = Response::decode(frame.as_slice()) {
+                if resp.id != id {
+                    return Err(IpcError::Protocol("响应 id 不匹配".into()));
+                }
+                return match resp.kind {
+                    Some(response::Kind::Ok(_)) => Ok(()),
+                    Some(response::Kind::Error(e)) => Err(IpcError::Server {
+                        code: e.code,
+                        message: e.message,
+                    }),
+                    _ => Err(IpcError::Protocol("期望 Ok 响应".into())),
+                };
+            }
+            if let Ok(evt) = StreamEvent::decode(frame.as_slice()) {
+                self.pending_events.push_back(evt);
+                continue;
             }
             return Err(IpcError::Protocol("无法解码响应".into()));
         }

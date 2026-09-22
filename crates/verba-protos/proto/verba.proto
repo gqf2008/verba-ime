@@ -26,6 +26,8 @@ message Request {
     ApiKeySet api_key_set = 27;
     RimeInstallExtra rime_install_extra = 28;
     ListModels list_models = 29;
+    LlmAppendContext llm_append_context = 30;
+    LlmSessionEnd llm_session_end = 31;
   }
 }
 
@@ -57,6 +59,23 @@ message LlmGenerate {
   // 窗口级会话标识：优先于 session_id；空串表示回退到 legacy:{session_id}。
   // 由前端按“应用 + 窗口”生成稳定 key，daemon 按此隔离多轮上下文。
   string session_key = 9;
+}
+
+// 上屏上下文追加：前端把用户提交上屏的文本（拼音候选/标点/英文/OCR 结果等）
+// 追加进窗口级 AI 会话上下文；`//` 请求时随历史一起发给 LLM。
+// 投递走独立后台线程（不阻塞输入）；daemon 合并相邻上屏文本、滑动窗口裁剪。
+message LlmAppendContext {
+  uint64 session_id = 1;
+  string session_key = 2;
+  string text = 3;
+}
+
+// 窗口会话结束：前端检测到窗口已关闭时通知 daemon 删除该窗口的会话历史
+// 与重置代际（隐私边界：窗口关闭 = 上下文销毁；窗口号被系统复用重建的
+// 新窗口得到全新会话，不继承旧上下文）。
+message LlmSessionEnd {
+  uint64 session_id = 1;
+  string session_key = 2;
 }
 
 message LlmCancel {}
