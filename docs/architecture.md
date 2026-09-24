@@ -131,6 +131,18 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 2. 图片 → daemon → OCR provider（本地 PaddleOCR 优先）→ 文本。
 3. 前端上屏，可先出候选再确认。
 
+**悬浮 AI 回复按钮（float-button，2026-09-24，issue verba-float-button）**
+1. 输入法 session 激活且 `float_button_enable = true`（默认关；密码类安全输入字段不弹）→ 前端取锚点（macOS 光标点 / Windows 活动视图左上）→ spawn `verba-trigger float-button --at x,y --session-id N --session-key S`。helper 进程持有 winit 非激活小窗（macOS `NonactivatingPanel` + Accessory 激活策略 / Windows `WS_EX_NOACTIVATE` / X11 `override_redirect`，点击不抢编辑器焦点；IME 进程不承载 UI，同 /// 选区的 issue #82 既定模式）。
+2. 点击 → `capture_active_window()`（xcap `Window::all()` 已按 z 序排序 + `is_focused()` 三平台真实现找前台窗口，截其屏幕可见区域）→ daemon `OcrRecognize` → 按 `float_button_prompt` 模板（`{ocr}` 占位，缺占位即报错拒绝）拼 prompt → `LlmGenerate`（流式取 Final，一次性结果）→ 回复文本写 stdout。
+3. 前端读 stdout → 进 OCR 预览 → 用户确认上屏（与 /// 同一「后台产、主线程消」管线，无新通道）。session 失活 kill helper（会话边界 = 按钮生命周期，30 分钟 TTL 兜底防前端崩溃残留）。
+4. 会话透传前端 `session_id`/`session_key`，与 `//` 共用窗口级 AI 上下文——按钮生成的回复可继续 `//` 追问。
+
+已知限制（v1）：
+- 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素（CGWindowListCreateImage 一类后续打磨）。
+- 按钮为方形小窗；圆角图标观感需平台 window shaping（color-key / transparent NSWindow），后续打磨。
+- Wayland 焦点豁免以合成器为准（X11 已 override_redirect）。
+- Linux Fcitx5 前端未就绪：共享层（capture_active_window / float-button 子命令）已平台中立落地，Fcitx5 前端就绪后按「spawn helper + 读 stdout + 预览上屏」同模式接线（AGENTS.md 跨平台默认）。
+
 **LLM 流式**
 1. AI 模式触发（`//` 前缀或快捷键）→ 前端收集 prompt → daemon → LLM provider。
 2. SSE 流 → `StreamEvent` 增量 → 前端 preedit 实时刷新 → Enter 上屏 / Esc 取消。

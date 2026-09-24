@@ -183,6 +183,10 @@ pub struct TextServiceData {
     /// daemon 是否已在本进程预拉起（激活时预热，避免首次输入冷启动延迟）。
     daemon_prewarmed: AtomicBool,
     control: RefCell<Option<verba_ipc::VerbaClient>>,
+    /// 悬浮 AI 回复按钮 helper（verba-trigger float-button 子进程）：
+    /// 生命周期 = 本 TSF 激活期，Deactivate 时 kill。DLL 进程不承载
+    /// 按钮 UI（winit 事件循环在 helper 进程，issue #82 既定模式）。
+    float_child: RefCell<Option<std::process::Child>>,
 }
 
 impl TextServiceData {
@@ -225,6 +229,9 @@ impl TextServiceData {
             candidate_request_busy: Arc::new(AtomicBool::new(false)),
             daemon_prewarmed: AtomicBool::new(false),
             control: RefCell::new(None),
+            // 悬浮 AI 回复按钮 helper（float-button 子命令；生命周期 = 本
+            // TSF 激活期，Deactivate 时 kill）。
+            float_child: RefCell::new(None),
         }
     }
 }
@@ -347,6 +354,8 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     }
     // 预拉起 daemon（daemon 启动即预热 Rime），避免首次输入等冷启动。
     prewarm_daemon(data);
+    // 悬浮 AI 回复按钮（默认关）：锚定活动视图，回复走 OCR 预览上屏管线。
+    spawn_float_button(data);
     // 注册显示属性提供者（组合下划线；幂等，失败仅告警）。
     crate::display_attribute::register_provider();
     // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
@@ -371,6 +380,9 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
     unsafe {
         log::info!("Verba TSF 停用, tid={}", GetCurrentThreadId());
     }
+    // 悬浮按钮生命周期 = 本激活期：先杀 helper（其 stdout 管道随之 EOF，
+    // 读线程自然退出，不会在停用后向 trigger_results 投递）。
+    kill_float_button(data);
     if let Some(hwnd) = data.timer_hwnd.take() {
         unsafe {
             let _ = DestroyWindow(hwnd);
@@ -2293,6 +2305,104 @@ fn open_settings() {
         }
     }
     log::warn!("未找到 verba-settings.exe（候选: {candidates:?}）");
+}
+
+/// 读悬浮按钮开关（config 文件；默认关 = 隐私默认最小出网）。
+fn float_button_enabled() -> bool {
+    let Ok(dirs) = verba_config::VerbaDirs::locate() else {
+        return false;
+    };
+    verba_config::ConfigManager::new(dirs)
+        .load()
+        .map(|c| c.float_button_enable)
+        .unwrap_or(false)
+}
+
+/// 定位 verba-trigger.exe（DLL 同目录，安装布局与 daemon 一致）。
+fn trigger_exe_path() -> Option<std::path::PathBuf> {
+    let p = crate::reg::dll_path().ok()?;
+    let candidate = p.with_file_name("verba-trigger.exe");
+    candidate.exists().then_some(candidate)
+}
+
+/// 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable，默认关）：
+/// helper 进程持有 winit 非激活小窗（点击不抢编辑器焦点）；锚点取活动视图
+/// 屏幕矩形左上（激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
+/// 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落到
+/// trigger_results → OCR 预览上屏（与 /// 选区同一管线，无新通道）。
+/// 生命周期 = 本 TSF 激活期：Deactivate 时 kill。
+/// 密码类输入字段不弹按钮（屏幕内容出网链路与 // 同一收口标准）。
+fn spawn_float_button(data: &Rc<TextServiceData>) {
+    if !float_button_enabled() {
+        return;
+    }
+    let context = match data.context.borrow().as_ref().cloned() {
+        Some(ctx) => ctx,
+        None => {
+            log::warn!("float-button: 无 context，跳过");
+            return;
+        }
+    };
+    if focused_field_is_password(&context) {
+        log::info!("float-button: 密码字段，跳过");
+        return;
+    }
+    let Some(anchor) = view_screen_pos(&context) else {
+        log::warn!("float-button: 无活动视图锚点，跳过");
+        return;
+    };
+    let Some(exe) = trigger_exe_path() else {
+        log::warn!("float-button: 未找到 verba-trigger.exe");
+        return;
+    };
+    // 单实例守卫：换激活期先杀旧的（防按钮叠加）。
+    if let Some(mut old) = data.float_child.borrow_mut().take() {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    let session_id = data.session_id.get();
+    let session_key = session_key_for_use(data);
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("float-button")
+        .arg("--at")
+        .arg(format!("{},{}", anchor.0, anchor.1))
+        .arg("--session-id")
+        .arg(session_id.to_string())
+        .arg("--session-key")
+        .arg(&session_key)
+        // CREATE_NO_WINDOW：隐藏控制台窗口，按钮 GUI 照常显示。
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            log::info!("float-button: spawn at=({},{})", anchor.0, anchor.1);
+            let results = Arc::clone(&data.trigger_results);
+            let stdout = child.stdout.take();
+            *data.float_child.borrow_mut() = Some(child);
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut s) = stdout {
+                    use std::io::Read as _;
+                    let _ = s.read_to_string(&mut text);
+                }
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return; // 取消/无结果
+                }
+                results.lock().unwrap().push_back(TriggerResult::Text(text));
+            });
+        }
+        Err(e) => log::warn!("float-button: 启动 verba-trigger 失败: {e}"),
+    }
+}
+
+/// 失活时 kill 悬浮按钮 helper（会话边界 = 按钮生命周期）。
+fn kill_float_button(data: &Rc<TextServiceData>) {
+    if let Some(mut child) = data.float_child.borrow_mut().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// 后台执行触发任务（采集 + daemon 识别），结果入队由定时器上屏。

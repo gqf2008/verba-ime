@@ -7,11 +7,20 @@ rust-version.workspace = true
 description = "Verba 跨平台触发工具：选区截图/截屏、录音、播放（Windows/macOS/Linux 同源实现）"
 
 [lints]
-workspace = true
+# 白名单 crate（开发规范第 10 条）：不继承 workspace 的
+# `unsafe_code = "forbid"`——平台修饰（float/chrome.rs）需要 unsafe。
+# 防护改靠：unsafe 收敛在 chrome.rs 单一模块、每块带 SAFETY 注释、
+# 其余 workspace crate 仍 forbid 兜底。clippy 与 workspace 对齐。
+rust.unsafe_code = "allow"
+clippy.all = { level = "warn", priority = -1 }
 
 [dependencies]
 verba-core = { path = "../verba-core" }
 verba-ipc = { path = "../verba-ipc" }
+verba-protos = { path = "../verba-protos" }
+# 旧 daemon 无 float_button_prompt 键时的兜底默认值（单一权威在 verba-config，
+# 不在此重复字面量——避免两处语义漂移）。
+verba-config = { path = "../verba-config" }
 log.workspace = true
 env_logger.workspace = true
 # 录音/播放：cpal + rodio（跨平台，自 frontends/windows/ime 原样迁入）
@@ -24,6 +33,19 @@ softbuffer = "0.4"
 xcap = "0.9"
 # 多模态 LLM 的 image_url 输入：BMP 截屏 → PNG（跨平台共享，前端不再各写一份）
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+
+# 悬浮按钮非激活窗修饰（macOS NonactivatingPanel / Windows WS_EX_NOACTIVATE）。
+# 平台差异只允许出现在本 crate 的「库内部后端」（issue #82 约束）；
+# windows 全 crate 与 frontends/windows、xcap 同源，不新增锁内版本。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [[bin]]
 name = "verba-trigger"
