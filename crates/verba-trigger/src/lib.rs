@@ -8,6 +8,8 @@
 
 pub mod bmp;
 pub mod capture;
+pub mod daemon;
+pub mod float;
 pub mod play;
 pub mod record;
 pub mod selection;
@@ -19,6 +21,7 @@ pub enum TriggerError {
     Record(String),
     Play(String),
     Daemon(String),
+    Config(String),
 }
 
 impl std::fmt::Display for TriggerError {
@@ -28,6 +31,7 @@ impl std::fmt::Display for TriggerError {
             TriggerError::Record(m) => write!(f, "录音错误: {m}"),
             TriggerError::Play(m) => write!(f, "播放错误: {m}"),
             TriggerError::Daemon(m) => write!(f, "daemon 错误: {m}"),
+            TriggerError::Config(m) => write!(f, "配置错误: {m}"),
         }
     }
 }

@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, Once, OnceLock};
 
@@ -838,6 +839,125 @@ fn lookup_phrase(name: &str) -> Option<String> {
     verba_config::phrases::get(&dirs, name).ok().flatten()
 }
 
+/// 悬浮按钮 helper 进程全局槽：同一宿主进程内单实例（换 session 先杀旧的，
+/// 防多按钮叠加——同 /// 选区单实例守卫的真机踩坑）。
+fn float_button_child() -> &'static Mutex<Option<std::process::Child>> {
+    static S: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// 悬浮按钮世代计数：deactivate kill / 重新 spawn 都会推进；读线程投递
+/// OCR 结果前校验——kill 瞬间回复已在管道里的迟到结果不会落入下一个
+/// 输入 session（自审 stale-push 竞态，随评审 F2 一并修复）。
+fn float_button_epoch() -> &'static std::sync::atomic::AtomicU64 {
+    static E: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &E
+}
+
+/// 读悬浮按钮开关（config 文件；默认关 = 隐私默认最小出网）。
+fn float_button_enabled() -> bool {
+    let Ok(dirs) = verba_config::VerbaDirs::locate() else {
+        return false;
+    };
+    verba_config::ConfigManager::new(dirs)
+        .load()
+        .map(|c| c.float_button_enable)
+        .unwrap_or(false)
+}
+
+/// session 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable）：
+/// 同目录 verba-trigger float-button（winit 事件循环在 helper 进程，IME
+/// 进程不承载 UI，同 /// 选区模式）；锚点为光标点，调用侧已按 vision 同
+/// 口径转成 CG 顶左全局单位（xcap 单位=点）。
+/// 点击后 helper 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落
+/// 到 ocr_result_slot → OCR 预览 → 用户确认上屏（与 /// 同一管线，无新通道）；
+/// 管线失败原因经 stderr 捕获记日志。世代守卫：失活/重 spawn 后旧读线程的
+/// 迟到结果丢弃，不会落进下一个输入 session。
+/// 生命周期 = 输入 session：deactivateServer 侧 kill。
+fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
+    // 杀旧实例并推进世代（旧读线程的迟到投递就此作废）。
+    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut slot) = float_button_child().lock() {
+        if let Some(mut old) = slot.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+    }
+    let Some(exe) = trigger_exe_path() else {
+        dbg_log("float-button: 未找到 verba-trigger");
+        return;
+    };
+    dbg_log(&format!("float-button: spawn at={at:?} sid={session_id}"));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("float-button")
+        .arg("--at")
+        .arg(format!("{},{}", at.0, at.1))
+        .arg("--session-id")
+        .arg(session_id.to_string());
+    if !session_key.is_empty() {
+        cmd.arg("--session-key").arg(session_key);
+    }
+    // stderr 捕获（评审 F2）：管线失败原因（首跑缺屏幕录制权限、OCR/
+    // LLM 错误、模板缺占位）由 bin 写 stderr，此处读空记日志，不再丢空。
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let epoch = float_button_epoch().load(std::sync::atomic::Ordering::SeqCst);
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            if let Ok(mut slot) = float_button_child().lock() {
+                *slot = Some(child);
+            }
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut s) = stdout {
+                    let _ = s.read_to_string(&mut text);
+                }
+                // stdout EOF 即进程已退出，stderr 同步 EOF，可直接读空。
+                let mut err_text = String::new();
+                if let Some(mut e) = stderr {
+                    let _ = e.read_to_string(&mut err_text);
+                }
+                let err_text = err_text.trim();
+                if !err_text.is_empty() {
+                    dbg_log(&format!("float-button: helper stderr: {err_text}"));
+                }
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return; // 取消/无结果
+                }
+                // 世代校验 + 投递在同一 child 锁内进行：校验通过 ⇒ 本次
+                // kill/spawn 的世代推进尚未发生，投递属于当前 session。
+                if let Ok(slot) = float_button_child().lock() {
+                    if float_button_epoch().load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                        dbg_log("float-button: 失活后迟到结果，丢弃");
+                        return;
+                    }
+                    dbg_log(&format!("float-button: 回复 {} 字", text.chars().count()));
+                    if let Ok(mut ocr) = ocr_result_slot().lock() {
+                        *ocr = Some(text);
+                    }
+                    drop(slot);
+                }
+            });
+        }
+        Err(e) => dbg_log(&format!("float-button: 启动 verba-trigger 失败: {e}")),
+    }
+}
+
+/// session 失活：kill 悬浮按钮 helper（会话边界 = 按钮生命周期）。
+fn kill_float_button() {
+    // 推进世代：kill 瞬间回复已在管道里的迟到投递就此作废。
+    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut slot) = float_button_child().lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// OCR 识别文本写剪贴板（静默失败）。与 Windows 行为对齐：识别文本随手可粘贴。
 fn set_clipboard_text_quiet(text: &str) {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
@@ -1133,6 +1253,42 @@ define_class!(
                 // self 即 IMK 控制器对象。
                 let _: () = msg_send![self, updateComposition];
             });
+            // 悬浮 AI 回复按钮（默认关）：锚定光标，回复走 OCR 预览槽。
+            // 密码类安全输入不弹按钮（屏幕内容出网链路与 // 同一收口标准）。
+            if float_button_enabled() {
+                let secure = self
+                    .ivars()
+                    .client
+                    .borrow()
+                    .as_deref()
+                    .map(client_is_secure)
+                    .unwrap_or(false);
+                if secure {
+                    dbg_log("float-button: 安全输入字段，跳过");
+                } else {
+                    // 锚点坐标系：client_caret_point 是 Cocoa 底左原点，
+                    // helper（xcap/CGDisplayBounds）是顶左原点——必须经
+                    // cocoa_to_cg_point 转换（与 vision 路径 imk.rs:581
+                    // 同口径；评审 F1：直传会把按钮 Y 镜像到屏幕另一侧）。
+                    let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
+                    let anchor = self
+                        .ivars()
+                        .client
+                        .borrow()
+                        .as_deref()
+                        .and_then(client_caret_point)
+                        .map(|p| cocoa_to_cg_point(p, screen_h))
+                        .map(|(x, y)| (x.round() as i32, y.round() as i32));
+                    match anchor {
+                        Some(at) => spawn_float_button(
+                            at,
+                            self.ivars().session_id.get(),
+                            &self.ivars().session_key.borrow(),
+                        ),
+                        None => dbg_log("float-button: 无光标锚点，跳过"),
+                    }
+                }
+            }
             log::info!("[VerbaIMK] activateServer");
         }
 
@@ -1141,6 +1297,8 @@ define_class!(
             dbg_log("deactivateServer");
             self.cancel_stream();
             self.invalidate_timer();
+            // 悬浮按钮生命周期 = 输入 session：失活即 kill helper。
+            kill_float_button();
             // 重入窗内积压的键属于本会话：换会话（应用/输入位置）后语义已失效
             // （原目标文本域可能已滚动/失焦），丢弃而非带入新会话。
             self.ivars().pending_keys.borrow_mut().clear();

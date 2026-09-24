@@ -7,7 +7,7 @@
 //! 替换原 Windows BitBlt 实现（frontends/windows/ime/src/capture.rs），
 //! 对外行为不变：返回 32bpp top-down BMP（daemon OCR 原生输入）。
 
-use xcap::Monitor;
+use xcap::{Monitor, Window};
 
 use crate::bmp::{encode_bmp, ScreenShot};
 use crate::TriggerError;
@@ -189,6 +189,55 @@ pub fn capture_region_png(
     height: i32,
 ) -> Result<Vec<u8>, TriggerError> {
     bmp_to_png(&capture_region(x, y, width, height)?.bmp)
+}
+
+/// 前台（聚焦）窗口在屏幕上的矩形（xcap 全局坐标单位：macOS 点 /
+/// Windows·Linux 物理像素）。
+///
+/// 跨平台单实现：`Window::all()` 已按 z 序（前→后）排序，`is_focused()`
+/// 在三个平台均为真实现（Win32 `GetForegroundWindow` / macOS
+/// `NSWorkspace` 活动应用 pid / X11 `_NET_ACTIVE_WINDOW`），取最靠前
+/// 的聚焦窗口即可。零尺寸窗口跳过（聚焦在桌面/过渡态时兜底报错）。
+pub fn active_window_rect() -> Result<ScreenRect, TriggerError> {
+    let windows = Window::all().map_err(|e| TriggerError::Capture(format!("枚举窗口失败: {e}")))?;
+    for w in &windows {
+        let focused = w.is_focused().unwrap_or(false);
+        if !focused {
+            continue;
+        }
+        let (width, height) = (
+            w.width()
+                .map_err(|e| TriggerError::Capture(e.to_string()))? as i32,
+            w.height()
+                .map_err(|e| TriggerError::Capture(e.to_string()))? as i32,
+        );
+        if width <= 0 || height <= 0 {
+            continue;
+        }
+        return Ok(ScreenRect {
+            x: w.x().map_err(|e| TriggerError::Capture(e.to_string()))?,
+            y: w.y().map_err(|e| TriggerError::Capture(e.to_string()))?,
+            width,
+            height,
+        });
+    }
+    Err(TriggerError::Capture(
+        "未找到聚焦窗口（前台应用可能未暴露窗口）".into(),
+    ))
+}
+
+/// 截取前台窗口在屏幕上的区域（与截屏同一坐标口径，复合虚拟屏幕裁剪）。
+///
+/// 语义说明：截的是「窗口在屏幕上的可见区域」，被其它窗口遮挡的部分
+/// 会带遮挡内容；不追求离屏窗口像素（v1 取舍，docs/architecture.md）。
+pub fn capture_active_window() -> Result<ScreenShot, TriggerError> {
+    let r = active_window_rect()?;
+    capture_region(r.x, r.y, r.width, r.height)
+}
+
+/// 截取前台窗口并编码为 PNG（多模态 LLM 的 image_url 输入）。
+pub fn capture_active_window_png() -> Result<Vec<u8>, TriggerError> {
+    bmp_to_png(&capture_active_window()?.bmp)
 }
 
 /// 32bpp top-down BMP → PNG。供截屏后的多模态请求使用；跨平台同源，

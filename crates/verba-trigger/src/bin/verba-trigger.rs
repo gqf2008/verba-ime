@@ -8,13 +8,11 @@
 //! 一致：{app} 目录 / Verba.app/Contents/MacOS），Windows 加 CREATE_NO_WINDOW
 //! 防控制台闪窗，随后退避重连。
 
-use std::process::Command;
-use std::time::Duration;
-
-use verba_ipc::VerbaClient;
 use verba_trigger::capture::{
     capture_primary_screen, capture_primary_screen_png, capture_region, capture_region_png,
 };
+use verba_trigger::daemon::connect_daemon;
+use verba_trigger::float::{run_float_button, FloatArgs, FloatOutcome};
 use verba_trigger::play::play_audio;
 use verba_trigger::record::record_seconds;
 use verba_trigger::selection::select_region;
@@ -45,6 +43,7 @@ fn main() {
         Some("asr") => cmd_asr(&args),
         Some("tts") => cmd_tts(&args),
         Some("speak") => cmd_speak(&args),
+        Some("float-button") => cmd_float_button(&args),
         Some(other) => {
             eprintln!("未知命令: {other}（--help 查看用法）");
             1
@@ -66,53 +65,10 @@ fn print_help() {
          verba-trigger asr [秒=3]             录音 → daemon ASR → 打印\n  \
          verba-trigger tts <文本> [输出.mp3] [语音]  TTS 合成存文件\n  \
          verba-trigger speak <文本> [语音]      TTS 合成并播放\n  \
+         verba-trigger float-button --at x,y [--session-id N] [--session-key S]\n  \
+         \x20 悬浮 AI 回复按钮（点击后截前台窗口→OCR→LLM 生成回复，文本写 stdout）\n  \
          verba-trigger --version              版本\n"
     );
-}
-
-/// 连接 daemon；不在运行则拉起同目录 verba-daemon 并退避重连。
-/// （替代原 verba_ime_windows::ipc::ensure_daemon 的跨平台版。）
-fn connect_daemon() -> Result<VerbaClient, TriggerError> {
-    if let Ok(c) = VerbaClient::connect_verified() {
-        return Ok(c);
-    }
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_owned()))
-        .ok_or_else(|| TriggerError::Daemon("无法定位自身目录".into()))?;
-    let daemon = exe_dir.join(if cfg!(windows) {
-        "verba-daemon.exe"
-    } else {
-        "verba-daemon"
-    });
-    if !daemon.is_file() {
-        return Err(TriggerError::Daemon(format!(
-            "未找到 daemon（{}），无法自动拉起",
-            daemon.display()
-        )));
-    }
-    let mut cmd = Command::new(&daemon);
-    // stdio 全部落 null：daemon 常驻不退出，若继承本进程 stdout 管道写端，
-    // 调用方的 .output() 将永不 EOF（独立审查 NOTE——结果静默丢失根因）。
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：daemon 为控制台子系统构建（debug），防闪窗
-        cmd.creation_flags(0x08000000);
-    }
-    cmd.spawn()
-        .map_err(|e| TriggerError::Daemon(format!("拉起 daemon 失败: {e}")))?;
-    // 退避重连：daemon 启动 + 首次部署预热期间 socket 就绪需要时间
-    for attempt in 0..20 {
-        std::thread::sleep(Duration::from_millis(if attempt < 10 { 150 } else { 400 }));
-        if let Ok(c) = VerbaClient::connect_verified() {
-            return Ok(c);
-        }
-    }
-    Err(TriggerError::Daemon("daemon 拉起后连接失败".into()))
 }
 
 fn cmd_shot(args: &[String]) -> i32 {
@@ -283,6 +239,70 @@ fn cmd_speak(args: &[String]) -> i32 {
     }
 }
 
+/// `float-button --at x,y [--session-id N] [--session-key S]`：悬浮 AI 回复
+/// 按钮（winit 非激活小窗，等点击）；点击后截前台窗口 → OCR → LLM 生成
+/// 回复写 stdout、退出 0。取消（右键/失活被 kill）→ stdout 空、退出 0；
+/// 管线失败/空回复（`FloatOutcome::Failed`）→ stderr 带原因 + 退出 1
+/// （前端捕获 stderr 记日志，首跑缺屏幕录制权限不再无声消失）；超时 →
+/// 退出 3。前端按「stdout 非空 = 有结果」消费（与 region-ocr 同一契约）。
+fn cmd_float_button(args: &[String]) -> i32 {
+    let Some(at) = parse_pair(args, "--at") else {
+        eprintln!("用法: verba-trigger float-button --at x,y [--session-id N] [--session-key S]");
+        return 1;
+    };
+    let session_id = args
+        .iter()
+        .position(|a| a == "--session-id")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let session_key = args
+        .iter()
+        .position(|a| a == "--session-key")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    match run_float_button(FloatArgs {
+        at,
+        session_id,
+        session_key,
+    }) {
+        Ok(FloatOutcome::Reply(text)) => {
+            println!("{text}");
+            0
+        }
+        Ok(FloatOutcome::Cancelled) => 0,
+        Ok(FloatOutcome::Failed(msg)) => {
+            eprintln!("悬浮按钮管线失败: {msg}");
+            1
+        }
+        Ok(FloatOutcome::Expired) => {
+            eprintln!("悬浮按钮超时（等待点击或管线执行超过上限）");
+            3
+        }
+        Err(e) => {
+            eprintln!("悬浮按钮失败: {e}");
+            1
+        }
+    }
+}
+
+/// 解析 `--at x,y`（两个整数），未提供或非法返回 None。
+fn parse_pair(args: &[String], flag: &str) -> Option<(i32, i32)> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == flag {
+            if let Some(s) = it.next() {
+                let parts: Vec<i32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                if parts.len() == 2 {
+                    return Some((parts[0], parts[1]));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 解析 --rect x,y,w,h（全局坐标），未提供返回 None。
 fn parse_rect(args: &[String]) -> Option<(i32, i32, i32, i32)> {
     let mut it = args.iter().skip(1);
@@ -443,6 +463,16 @@ mod tests {
         assert_eq!(parse_rect(&ok), Some((1, 2, 3, 4)));
         let bad = vec!["vision-shot".into(), "--rect".into(), "bad".into()];
         assert!(parse_rect(&bad).is_none());
+    }
+
+    #[test]
+    fn parse_at_accepts_and_rejects() {
+        let ok = vec!["float-button".into(), "--at".into(), "10,-20".into()];
+        assert_eq!(parse_pair(&ok, "--at"), Some((10, -20)));
+        let bad = vec!["float-button".into(), "--at".into(), "1,2,3".into()];
+        assert!(parse_pair(&bad, "--at").is_none());
+        let missing = vec!["float-button".into()];
+        assert!(parse_pair(&missing, "--at").is_none());
     }
 
     #[test]

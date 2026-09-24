@@ -251,6 +251,14 @@ pub struct Config {
     /// 眼睛区域距光标组合的偏移（正值=向上）。
     #[serde(default = "default_eye_offset")]
     pub eye_offset_y: i32,
+    /// 悬浮 AI 回复按钮：输入法 session 激活时在光标旁弹出气泡按钮，
+    /// 点击后截前台窗口 → OCR → LLM 生成回复上屏。默认关闭（隐私默认最小出网）。
+    #[serde(default)]
+    pub float_button_enable: bool,
+    /// 回复生成模板：`{ocr}` 占位符会被前台窗口的 OCR 文本替换。
+    /// 模板必须含 `{ocr}`，否则 helper 启动即报错（拒绝静默丢上下文）。
+    #[serde(default = "default_float_button_prompt")]
+    pub float_button_prompt: String,
 }
 
 fn default_llm_base_url() -> String {
@@ -297,6 +305,14 @@ fn default_eye_offset() -> i32 {
     0
 }
 
+/// 悬浮按钮默认回复模板：`{ocr}` 为前台窗口 OCR 文本占位（helper 侧校验必含）。
+fn default_float_button_prompt() -> String {
+    "以下是用户当前窗口的屏幕文字（本地 OCR 识别结果）：\n{ocr}\n\n\
+     请阅读以上内容，替用户起草一段可以直接发送的回复。只输出回复正文，\
+     不要解释、不要引用原文、不要使用 Markdown 标记。"
+        .to_owned()
+}
+
 fn default_ai_context_turns() -> i32 {
     // 默认开多轮：50 轮（100 条消息）；0=关闭（单轮），`//new` 清空。
     50
@@ -324,6 +340,8 @@ impl Default for Config {
             eye_width: default_eye_width(),
             eye_height: default_eye_height(),
             eye_offset_y: default_eye_offset(),
+            float_button_enable: false,
+            float_button_prompt: default_float_button_prompt(),
         }
     }
 }
@@ -363,6 +381,14 @@ impl Config {
         map.insert("eye_width".into(), self.eye_width.to_string());
         map.insert("eye_height".into(), self.eye_height.to_string());
         map.insert("eye_offset_y".into(), self.eye_offset_y.to_string());
+        map.insert(
+            "float_button_enable".into(),
+            self.float_button_enable.to_string(),
+        );
+        map.insert(
+            "float_button_prompt".into(),
+            self.float_button_prompt.clone(),
+        );
         map.insert("theme.preset".into(), self.theme.preset.clone());
         if let Some(v) = &self.theme.background {
             map.insert("theme.background".into(), v.clone());
@@ -490,6 +516,12 @@ impl Config {
                         .parse()
                         .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
                 }
+                "float_button_enable" => {
+                    self.float_button_enable = v
+                        .parse()
+                        .map_err(|_| ConfigError::InvalidValue(format!("{k}={v}")))?;
+                }
+                "float_button_prompt" => self.float_button_prompt = v.clone(),
                 "theme.preset" => self.theme.preset = v.clone(),
                 "theme.background" => self.theme.background = Some(v.clone()),
                 "theme.text_color" => self.theme.text_color = Some(v.clone()),
@@ -801,6 +833,29 @@ mod tests {
     #[test]
     fn ocr_defaults_to_builtin_rapid() {
         assert_eq!(Config::default().ocr_provider, "rapid");
+    }
+
+    #[test]
+    fn float_button_keys_flow_through_map() {
+        let mut cfg = Config::default();
+        // 默认关闭（隐私默认最小出网），模板必含 {ocr} 占位。
+        assert!(!cfg.float_button_enable);
+        assert!(cfg.float_button_prompt.contains("{ocr}"));
+        let mut map = HashMap::new();
+        map.insert("float_button_enable".into(), "true".into());
+        map.insert("float_button_prompt".into(), "根据：{ocr}\n写回复".into());
+        cfg.apply_map(&map).unwrap();
+        assert!(cfg.float_button_enable);
+        assert_eq!(cfg.float_button_prompt, "根据：{ocr}\n写回复");
+        let out = cfg.to_map();
+        assert_eq!(
+            out.get("float_button_enable").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            out.get("float_button_prompt").map(String::as_str),
+            Some("根据：{ocr}\n写回复")
+        );
     }
 
     #[test]
