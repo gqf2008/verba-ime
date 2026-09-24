@@ -8,7 +8,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, Once, OnceLock};
 
@@ -113,7 +112,8 @@ fn init_file_logger() {
 }
 
 /// 关键链路调试日志（激活/按键/候选回达/提交），走文件日志 debug 级。
-fn dbg_log(msg: &str) {
+/// crate 级可见：float_panel 的点击回调（ObjC 方法）也走同一管道。
+pub(crate) fn dbg_log(msg: &str) {
     log::debug!("{msg}");
 }
 
@@ -400,11 +400,6 @@ extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRectF;
-    fn CGGetActiveDisplayList(
-        max_displays: u32,
-        displays: *mut u32,
-        display_count: *mut u32,
-    ) -> i32;
     static kCGWindowNumber: CFStringRef;
     static kCGWindowLayer: CFStringRef;
     static kCGWindowBounds: CFStringRef;
@@ -414,46 +409,6 @@ extern "C" {
 /// Cocoa 屏幕坐标（主屏左下原点）→ CGWindowBounds 坐标（主屏左上原点）。
 fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
     (point.0, main_display_height - point.1)
-}
-
-/// 在线显示器边界列表（CG 顶左全局坐标，points）。
-fn active_display_bounds() -> Vec<(f64, f64, f64, f64)> {
-    const MAX_DISPLAYS: u32 = 16;
-    let mut ids = [0u32; MAX_DISPLAYS as usize];
-    let mut count: u32 = 0;
-    let status = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &mut count) };
-    if status != 0 || count == 0 {
-        // 查询失败兜底主屏：守卫宁可放行主屏内锚点，也不误杀正常气泡。
-        let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-        return vec![(b.origin.x, b.origin.y, b.size.width, b.size.height)];
-    }
-    ids[..count as usize]
-        .iter()
-        .map(|&id| {
-            let b = unsafe { CGDisplayBounds(id) };
-            (b.origin.x, b.origin.y, b.size.width, b.size.height)
-        })
-        .collect()
-}
-
-/// 锚点合理性守卫（真机验收缺陷 D1，2026-09-24）：IME 激活瞬间
-/// `firstRectForCharacterRange` 可能返回有限但荒谬的瞬时矩形（真机实测
-/// Cocoa y≈2.6e6 → 转换后 CG y≈-2.6e6，气泡被画到屏幕角落闪一下即消失），
-/// 现有有限性校验挡不住「有限但离屏」的值。要求锚点落在某台在线显示器
-/// 边界内（外扩 tolerance 容忍菜单栏上方/屏幕边缘的轻微越界），越界即
-/// 放弃本次 spawn。多显示器逐台检查，副屏上的光标不误杀。
-fn anchor_on_any_display(
-    x: f64,
-    y: f64,
-    displays: &[(f64, f64, f64, f64)],
-    tolerance: f64,
-) -> bool {
-    displays.iter().any(|&(dx, dy, dw, dh)| {
-        x >= dx - tolerance
-            && x <= dx + dw + tolerance
-            && y >= dy - tolerance
-            && y <= dy + dh + tolerance
-    })
 }
 
 /// 由 CG 顶左坐标的光标行（top/bottom）与所在显示器工作区计算 vision
@@ -645,6 +600,100 @@ fn window_identity_for_client(client: &AnyObject) -> Option<(i32, u32)> {
     cg_window_number_for_client(client, pid).map(|window_number| (pid, window_number))
 }
 
+/// 客户端应用前台窗口的屏幕 bounds（CG 顶左全局点）——v2 气泡锚定的
+/// 「激活窗口」参照系：光标坐标收进该 bounds，光标无效退窗口右上。
+///
+/// 选取：光标点落在某窗口 bounds 内 → 该窗口；否则 pid 的首个 layer-0
+/// 窗口（CGWindowList 按 z 序前→后，首个即最前）。与
+/// `cg_window_number_for_client` 的枚举逻辑刻意不共用：那边以「窗口
+/// number + 光标匹配」服务 vision 截屏的身份辨认，这边要的是 bounds
+/// 本身，选择口径不同，拆开各保持单一职责。
+fn client_window_bounds(client: &AnyObject) -> Option<(i32, i32, i32, i32)> {
+    let pid = client_process_identifier(client)?;
+    let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
+    let caret = client_caret_point(client).map(|p| cocoa_to_cg_point(p, screen_h));
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0) };
+    if raw.is_null() {
+        return None;
+    }
+    let windows: CFArray<CFDictionary> = unsafe { TCFType::wrap_under_create_rule(raw) };
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    let mut frontmost: Option<(f64, f64, f64, f64)> = None;
+    for dict in windows.iter() {
+        let layer = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                layer_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if layer.is_null()
+            || unsafe { CFNumber::wrap_under_get_rule(layer as CFNumberRef) }.to_i32() != Some(0)
+        {
+            continue;
+        }
+        let owner = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                pid_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if owner.is_null()
+            || unsafe { CFNumber::wrap_under_get_rule(owner as CFNumberRef) }.to_i32() != Some(pid)
+        {
+            continue;
+        }
+        let raw_bounds = unsafe {
+            CFDictionaryGetValue(
+                dict.as_concrete_TypeRef(),
+                bounds_key.as_CFTypeRef() as CFTypeRef,
+            )
+        };
+        if raw_bounds.is_null() {
+            continue;
+        }
+        let bounds_dict =
+            unsafe { CFDictionary::wrap_under_get_rule(raw_bounds as CFDictionaryRef) };
+        let Some(bounds @ (bx, by, bw, bh)) = (|| {
+            Some((
+                cf_dict_f64(&bounds_dict, "X")?,
+                cf_dict_f64(&bounds_dict, "Y")?,
+                cf_dict_f64(&bounds_dict, "Width")?,
+                cf_dict_f64(&bounds_dict, "Height")?,
+            ))
+        })() else {
+            continue;
+        };
+        if bw <= 0.0 || bh <= 0.0 {
+            continue;
+        }
+        if let Some(point) = caret {
+            if bounds_contains(bounds, point) {
+                return Some((
+                    bx.round() as i32,
+                    by.round() as i32,
+                    bw.round() as i32,
+                    bh.round() as i32,
+                ));
+            }
+        }
+        if frontmost.is_none() {
+            frontmost = Some(bounds);
+        }
+    }
+    frontmost.map(|(bx, by, bw, bh)| {
+        (
+            bx.round() as i32,
+            by.round() as i32,
+            bw.round() as i32,
+            bh.round() as i32,
+        )
+    })
+}
+
 /// 窗口是否仍存在（CGWindowList 按 owner PID + window number 查）。
 /// 用于窗口关闭检测：旧会话的窗口身份已不在窗口列表 = 窗口已关闭。
 /// 注意：**不能用 ON_SCREEN_ONLY**——最小化/切到其它 Space 的窗口不在屏，
@@ -773,55 +822,6 @@ fn spawn_vision_shot(rect: Option<(i32, i32, i32, i32)>) -> Result<Vec<u8>, Stri
     Ok(out.stdout)
 }
 
-/// `///` 触发选区截图 OCR：spawn 同目录 verba-trigger region-ocr（选区 UI 的
-/// winit 事件循环在子进程，不阻塞 IMK 主线程与宿主应用），文本经 stdout
-/// 回传后落入结果槽位，由 drain 定时器在主线程消费。取消 → stdout 空。
-fn trigger_region_ocr_async() {
-    // 单实例守卫：选区框在途时忽略再次 ///（否则叠加多个遮罩窗，
-    // 真机踩坑：连按三次出现三个覆盖层）。
-    static OCR_SPAWN_IN_FLIGHT: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if OCR_SPAWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        dbg_log("OCR: 选区已在途，忽略本次 ///");
-        return;
-    }
-    std::thread::spawn(move || {
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                OCR_SPAWN_IN_FLIGHT.store(false, Ordering::SeqCst);
-            }
-        }
-        let _guard = Guard;
-        let Some(exe) = trigger_exe_path() else {
-            dbg_log("OCR: 未找到 verba-trigger");
-            return;
-        };
-        dbg_log("OCR: spawn verba-trigger region-ocr");
-        match std::process::Command::new(exe).arg("region-ocr").output() {
-            Ok(out) => {
-                dbg_log(&format!(
-                    "OCR: region-ocr 退出 {:?} stdout_len={} stderr={:?}",
-                    out.status.code(),
-                    out.stdout.len(),
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-                if !out.status.success() {
-                    return;
-                }
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if text.is_empty() {
-                    return; // 用户取消或无文字
-                }
-                if let Ok(mut slot) = ocr_result_slot().lock() {
-                    *slot = Some(text);
-                }
-            }
-            Err(e) => dbg_log(&format!("OCR: 启动 verba-trigger 失败: {e}")),
-        }
-    });
-}
-
 /// spawn verba-trigger 采集子命令（`ocr` 全屏截图 OCR / `asr` 录音转写）：
 /// stdout 文本经 ocr_result_slot 进 OCR 预览——与 `///`（region-ocr）同一
 /// 「后台产、主线程 drain 消费」管线，无新通道。
@@ -884,23 +884,8 @@ fn lookup_phrase(name: &str) -> Option<String> {
     verba_config::phrases::get(&dirs, name).ok().flatten()
 }
 
-/// 悬浮按钮 helper 进程全局槽：同一宿主进程内单实例（换 session 先杀旧的，
-/// 防多按钮叠加——同 /// 选区单实例守卫的真机踩坑）。
-fn float_button_child() -> &'static Mutex<Option<std::process::Child>> {
-    static S: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(None))
-}
-
-/// 悬浮按钮世代计数：deactivate kill / 重新 spawn 都会推进；读线程投递
-/// OCR 结果前校验——kill 瞬间回复已在管道里的迟到结果不会落入下一个
-/// 输入 session（自审 stale-push 竞态，随评审 F2 一并修复）。
-fn float_button_epoch() -> &'static std::sync::atomic::AtomicU64 {
-    static E: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    &E
-}
-
 /// 读悬浮按钮开关（config 文件；默认关 = 隐私默认最小出网）。
-fn float_button_enabled() -> bool {
+pub(crate) fn float_button_enabled() -> bool {
     let Ok(dirs) = verba_config::VerbaDirs::locate() else {
         return false;
     };
@@ -910,97 +895,66 @@ fn float_button_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// session 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable）：
-/// 同目录 verba-trigger float-button（winit 事件循环在 helper 进程，IME
-/// 进程不承载 UI，同 /// 选区模式）；锚点为光标点，调用侧已按 vision 同
-/// 口径转成 CG 顶左全局单位（xcap 单位=点）。
-/// 点击后 helper 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落
-/// 到 ocr_result_slot → OCR 预览 → 用户确认上屏（与 /// 同一管线，无新通道）；
-/// 管线失败原因经 stderr 捕获记日志。世代守卫：失活/重 spawn 后旧读线程的
-/// 迟到结果丢弃，不会落进下一个输入 session。
-/// 生命周期 = 输入 session：deactivateServer 侧 kill。
-fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
-    // 杀旧实例并推进世代（旧读线程的迟到投递就此作废）。
-    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut slot) = float_button_child().lock() {
-        if let Some(mut old) = slot.take() {
-            let _ = old.kill();
-            let _ = old.wait();
-        }
-    }
-    let Some(exe) = trigger_exe_path() else {
-        dbg_log("float-button: 未找到 verba-trigger");
-        return;
-    };
-    dbg_log(&format!("float-button: spawn at={at:?} sid={session_id}"));
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("float-button")
-        .arg("--at")
-        .arg(format!("{},{}", at.0, at.1))
-        .arg("--session-id")
-        .arg(session_id.to_string());
-    if !session_key.is_empty() {
-        cmd.arg("--session-key").arg(session_key);
-    }
-    // stderr 捕获（评审 F2）：管线失败原因（首跑缺屏幕录制权限、OCR/
-    // LLM 错误、模板缺占位）由 bin 写 stderr，此处读空记日志，不再丢空。
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let epoch = float_button_epoch().load(std::sync::atomic::Ordering::SeqCst);
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            if let Ok(mut slot) = float_button_child().lock() {
-                *slot = Some(child);
-            }
-            std::thread::spawn(move || {
-                let mut text = String::new();
-                if let Some(mut s) = stdout {
-                    let _ = s.read_to_string(&mut text);
-                }
-                // stdout EOF 即进程已退出，stderr 同步 EOF，可直接读空。
-                let mut err_text = String::new();
-                if let Some(mut e) = stderr {
-                    let _ = e.read_to_string(&mut err_text);
-                }
-                let err_text = err_text.trim();
-                if !err_text.is_empty() {
-                    dbg_log(&format!("float-button: helper stderr: {err_text}"));
-                }
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return; // 取消/无结果
-                }
-                // 世代校验 + 投递在同一 child 锁内进行：校验通过 ⇒ 本次
-                // kill/spawn 的世代推进尚未发生，投递属于当前 session。
-                if let Ok(slot) = float_button_child().lock() {
-                    if float_button_epoch().load(std::sync::atomic::Ordering::SeqCst) != epoch {
-                        dbg_log("float-button: 失活后迟到结果，丢弃");
-                        return;
-                    }
-                    dbg_log(&format!("float-button: 回复 {} 字", text.chars().count()));
-                    if let Ok(mut ocr) = ocr_result_slot().lock() {
-                        *ocr = Some(text);
-                    }
-                    drop(slot);
-                }
-            });
-        }
-        Err(e) => dbg_log(&format!("float-button: 启动 verba-trigger 失败: {e}")),
-    }
+/// 读悬浮按钮回复模板（config 文件；单一权威 = verba-config 内置默认，
+/// helper 不在此重复字面量）。
+pub(crate) fn float_button_prompt_template() -> Option<String> {
+    let dirs = verba_config::VerbaDirs::locate().ok()?;
+    verba_config::ConfigManager::new(dirs)
+        .load()
+        .ok()
+        .map(|c| c.float_button_prompt)
 }
 
-/// session 失活：kill 悬浮按钮 helper（会话边界 = 按钮生命周期）。
-fn kill_float_button() {
-    // 推进世代：kill 瞬间回复已在管道里的迟到投递就此作废。
-    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut slot) = float_button_child().lock() {
-        if let Some(mut child) = slot.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+/// 气泡管道（v2）的 OCR 文本槽：`float-run` 子进程后台线程写入，
+/// drain_stream 主线程取走 → 拼 float_button_prompt 模板 → start_llm
+/// 流式预览（与改写同通道，无新 UI 管线）。
+fn float_ocr_slot() -> &'static Mutex<Option<String>> {
+    static S: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// v2 触发（气泡点击 / `//`+TAB 共用入口）：后台 spawn `verba-trigger
+/// float-run`（截前台窗口 → daemon OCR → stdout），识别文本落
+/// float_ocr_slot。点击频率级 spawn（同 /// 选区模式），**不在激活频率级**
+/// ——v1 的 per-activation spawn 在飞书/终端类客户端引发 IME 会话自激
+/// 抖动（D2，verba-float-button-d2-session-churn）。
+pub(crate) fn trigger_float_run_async() {
+    std::thread::spawn(move || {
+        let Some(exe) = trigger_exe_path() else {
+            dbg_log("float(v2): 未找到 verba-trigger");
+            crate::float_panel::clear_busy();
+            return;
+        };
+        dbg_log("float(v2): spawn verba-trigger float-run");
+        match std::process::Command::new(exe).arg("float-run").output() {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                dbg_log(&format!(
+                    "float(v2): float-run 退出 {:?} stdout_len={} stderr={:?}",
+                    out.status.code(),
+                    out.stdout.len(),
+                    stderr.trim()
+                ));
+                if !out.status.success() {
+                    // 失败原因已完整记日志（首跑缺屏幕录制权限等）。
+                    crate::float_panel::clear_busy();
+                    return;
+                }
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if text.is_empty() {
+                    crate::float_panel::clear_busy();
+                    return;
+                }
+                if let Ok(mut slot) = float_ocr_slot().lock() {
+                    *slot = Some(text);
+                }
+            }
+            Err(e) => {
+                dbg_log(&format!("float(v2): 启动 verba-trigger 失败: {e}"));
+                crate::float_panel::clear_busy();
+            }
         }
-    }
+    });
 }
 
 /// OCR 识别文本写剪贴板（静默失败）。与 Windows 行为对齐：识别文本随手可粘贴。
@@ -1298,8 +1252,8 @@ define_class!(
                 // self 即 IMK 控制器对象。
                 let _: () = msg_send![self, updateComposition];
             });
-            // 悬浮 AI 回复按钮（默认关）：锚定光标，回复走 OCR 预览槽。
-            // 密码类安全输入不弹按钮（屏幕内容出网链路与 // 同一收口标准）。
+            // 悬浮 AI 回复气泡（v2，默认关）：进程内 Panel，激活显、失活隐。
+            // 密码类安全输入不弹（屏幕内容出网链路与 // 同一收口标准）。
             if float_button_enabled() {
                 let secure = self
                     .ivars()
@@ -1309,36 +1263,41 @@ define_class!(
                     .map(client_is_secure)
                     .unwrap_or(false);
                 if secure {
-                    dbg_log("float-button: 安全输入字段，跳过");
+                    dbg_log("float(v2): 安全输入字段，跳过");
+                    crate::float_panel::hide_bubble();
                 } else {
-                    // 锚点坐标系：client_caret_point 是 Cocoa 底左原点，
-                    // helper（xcap/CGDisplayBounds）是顶左原点——必须经
-                    // cocoa_to_cg_point 转换（与 vision 路径 imk.rs:581
-                    // 同口径；评审 F1：直传会把按钮 Y 镜像到屏幕另一侧）。
+                    // 锚点：光标右下收进前台窗口 bounds（CG 顶左全局点）；
+                    // 光标矩形无效（终端类客户端的瞬时垃圾矩形）退窗口右上。
+                    // D1 的几何守卫由「收进窗口」语义接管：垃圾坐标最多
+                    // 退化为角落定位，不再可能画到屏幕外闪一下。
                     let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
-                    let anchor = self
+                    let caret = self
                         .ivars()
                         .client
                         .borrow()
                         .as_deref()
                         .and_then(client_caret_point)
                         .map(|p| cocoa_to_cg_point(p, screen_h))
-                        .map(|(x, y)| (x.round() as i32, y.round() as i32))
-                        // 守卫 D1：激活瞬间的瞬时垃圾矩形（有限但离屏）会
-                        // 把气泡画到屏幕角落闪一下——越界即放弃本次 spawn，
-                        // 等锚点正常的下一次激活再弹。
-                        .filter(|&(x, y)| {
-                            anchor_on_any_display(x as f64, y as f64, &active_display_bounds(), 64.0)
-                        });
-                    match anchor {
-                        Some(at) => spawn_float_button(
-                            at,
-                            self.ivars().session_id.get(),
-                            &self.ivars().session_key.borrow(),
-                        ),
-                        None => dbg_log("float-button: 锚点不可用（无光标或越界），跳过"),
+                        .map(|(x, y)| (x.round() as i32, y.round() as i32));
+                    let win = self
+                        .ivars()
+                        .client
+                        .borrow()
+                        .as_deref()
+                        .and_then(client_window_bounds);
+                    match win {
+                        Some(bounds) => {
+                            let at = crate::float_panel::bubble_anchor(caret, bounds);
+                            crate::float_panel::show_bubble(at);
+                        }
+                        None => {
+                            dbg_log("float(v2): 无前台窗口 bounds，跳过");
+                            crate::float_panel::hide_bubble();
+                        }
                     }
                 }
+            } else {
+                crate::float_panel::hide_bubble();
             }
             log::info!("[VerbaIMK] activateServer");
         }
@@ -1348,8 +1307,9 @@ define_class!(
             dbg_log("deactivateServer");
             self.cancel_stream();
             self.invalidate_timer();
-            // 悬浮按钮生命周期 = 输入 session：失活即 kill helper。
-            kill_float_button();
+            // 气泡生命周期 = 输入 session：失活即隐藏（v2 进程内 Panel，
+            // 无跨进程 kill；v1 的 helper kill 随 per-activation spawn 一并移除）。
+            crate::float_panel::hide_bubble();
             // 重入窗内积压的键属于本会话：换会话（应用/输入位置）后语义已失效
             // （原目标文本域可能已滚动/失焦），丢弃而非带入新会话。
             self.ivars().pending_keys.borrow_mut().clear();
@@ -1878,6 +1838,32 @@ define_class!(
                 dbg_log("replay pending key");
                 self.replay_pending(pk);
             }
+            // 气泡管道 OCR 结果（v2）：float-run 的识别文本 → 拼
+            // float_button_prompt 模板（含 {ocr} 占位校验，缺占位即配置错误，
+            // 记日志拒绝静默丢 OCR 上下文）→ start_llm 流式预览（与改写同
+            // 通道：候选面板 ✨ 生成中 → 结果 Enter 上屏）。
+            if let Some(ocr_text) = float_ocr_slot().lock().ok().and_then(|mut s| s.take()) {
+                crate::float_panel::clear_busy();
+                // 模板/占位校验失败：记日志丢弃本次 OCR 文本（配置错误不
+                // 静默吞上下文），不 return——下方 ocr_result_slot 等消费
+                // 方同 tick 仍要跑。
+                const PLACEHOLDER: &str = "{ocr}";
+                let prompt = float_button_prompt_template()
+                    .filter(|t| t.contains(PLACEHOLDER))
+                    .map(|t| t.replace(PLACEHOLDER, &ocr_text));
+                match prompt {
+                    Some(prompt) => {
+                        dbg_log(&format!(
+                            "float(v2): OCR {} 字 → start_llm",
+                            ocr_text.chars().count()
+                        ));
+                        self.start_llm(prompt, None, false, None);
+                    }
+                    None => {
+                        dbg_log("float(v2): float_button_prompt 模板缺失或缺 {ocr} 占位符");
+                    }
+                }
+            }
             // 选区 OCR 结果槽位（issue #82）：与 LLM 事件同管线消费。
             // 与 Windows 对齐：剪贴板照常；上屏走 OCR 预览（候选窗单候选，
             // Enter/空格/1 上屏，Esc 取消）；非 Idle（组合中触发等罕见场景）
@@ -2293,12 +2279,16 @@ impl VerbaIMKController {
                 self.refresh_candidate_window();
                 true
             }
-            Action::TriggerOcr => {
-                // `///` 触发选区截图 OCR（issue #82 跨平台统一）：结束组合 +
-                // 后台 spawn verba-trigger region-ocr，结果经槽位回主线程进预览。
-                dbg_log("TriggerOcr fired");
+            Action::StartCapture => {
+                // 裸 `//` + Tab：与点击悬浮气泡同一入口（v2，用户裁定
+                // 「双斜杠+tab 触发 llm 调用」）——结束组合后经
+                // float_panel::on_bubble_click 走 float-run（截前台窗口 →
+                // OCR → drain 侧拼 float_button_prompt 模板 → start_llm
+                // 流式预览）。`///` 选区 OCR 绑定随 v2 下线。
+                dbg_log("StartCapture fired");
                 self.set_marked("");
-                trigger_region_ocr_async();
+                self.reset();
+                crate::float_panel::on_bubble_click();
                 true
             }
             Action::StartLlm { prompt, system } => {
@@ -3526,28 +3516,6 @@ mod tests {
     fn cocoa_to_cg_point_flips_y_around_main_display() {
         assert_eq!(cocoa_to_cg_point((10.0, 20.0), 900.0), (10.0, 880.0));
         assert_eq!(cocoa_to_cg_point((0.0, 900.0), 900.0), (0.0, 0.0));
-    }
-
-    #[test]
-    fn anchor_guard_rejects_transient_garbage_rect() {
-        // 真机 D1：激活瞬间 cocoa y≈2.6e6 → CG y≈-2.6e6，必须拒绝。
-        let displays = vec![(0.0, 0.0, 1470.0, 956.0)];
-        assert!(!anchor_on_any_display(0.0, -2_598_917.0, &displays, 64.0));
-        assert!(!anchor_on_any_display(151.0, 9_600_000.0, &displays, 64.0));
-    }
-
-    #[test]
-    fn anchor_guard_accepts_onscreen_marginal_and_secondary_display() {
-        let displays = vec![(0.0, 0.0, 1470.0, 956.0)];
-        // 正常锚点（真机 TextEdit 实测值）。
-        assert!(anchor_on_any_display(151.0, 157.0, &displays, 64.0));
-        // 菜单栏上方轻微越界在容差内放行。
-        assert!(anchor_on_any_display(100.0, -10.0, &displays, 64.0));
-        // 副屏（左侧二屏常见排布）上的光标不误杀。
-        let dual = vec![(0.0, 0.0, 1470.0, 956.0), (-1920.0, 0.0, 1920.0, 1080.0)];
-        assert!(anchor_on_any_display(-500.0, 500.0, &dual, 64.0));
-        // 副屏远侧之外的垃圾值仍拒绝。
-        assert!(!anchor_on_any_display(-500.0, 50_000.0, &dual, 64.0));
     }
 
     #[test]

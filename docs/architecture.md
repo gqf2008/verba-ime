@@ -131,19 +131,19 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 2. 图片 → daemon → OCR provider（本地 PaddleOCR 优先）→ 文本。
 3. 前端上屏，可先出候选再确认。
 
-**悬浮 AI 回复按钮（float-button，2026-09-24，issue verba-float-button）**
-1. 输入法 session 激活且 `float_button_enable = true`（默认关；密码类安全输入字段不弹）→ 前端取锚点（macOS 光标点，调用侧已按 vision 同口径转 CG 顶左全局坐标 / Windows 活动视图左上）→ spawn `verba-trigger float-button --at x,y --session-id N --session-key S`。helper 进程持有 winit 非激活小窗（macOS `NonactivatingPanel` + Accessory 激活策略 / Windows `WS_EX_NOACTIVATE` / X11 `override_redirect`，点击不抢编辑器焦点；IME 进程不承载 UI，同 /// 选区的 issue #82 既定模式）。
-2. 点击 → `capture_active_window()`（xcap `Window::all()` 已按 z 序排序 + `is_focused()` 三平台真实现找前台窗口，截其屏幕可见区域）→ daemon `OcrRecognize` → 按 `float_button_prompt` 模板（`{ocr}` 占位，缺占位即报错拒绝）拼 prompt → `LlmGenerate`（流式取 Final，一次性结果）→ 回复文本写 stdout。
-3. 前端读 stdout → 进 OCR 预览 → 用户确认上屏（与 /// 同一「后台产、主线程消」管线，无新通道）。管线失败/空回复 → helper stderr + 退出 1，前端捕获 stderr 记日志（首跑缺屏幕录制权限不再无声消失）；取消（右键/失活被 kill）→ stdout 空、退出 0。session 失活 kill helper 并推进世代（读线程迟到投递作废，防 stale push 进下一 session；30 分钟 TTL 兜底防前端崩溃残留）。
-4. 会话透传前端 `session_id`/`session_key`，与 `//` 共用窗口级 AI 上下文——按钮生成的回复可继续 `//` 追问。
+**悬浮 AI 回复气泡（float-button v2，2026-09-24，issue verba-float-button-v2，用户裁定）**
 
-已知限制（v1）：
-- **2026-09-24 真机验收不通过（阻塞级）**：per-activation spawn helper 的机制在飞书/终端等客户端引发 IME 会话高频自激抖动（activate/spawn/deactivate ≥10Hz 刷屏，无法输入、气泡不可见）；macOS 保持 `float_button_enable` 默认关。v2 重构方向（用户裁定）：气泡锚进当前激活窗口内（进程内 Panel，与候选窗同址生命周期）、`//`+TAB 触发 LLM 调用、`///` 下线；见 walgit 线程 `verba-float-button-d2-session-churn`。重构前本节其余条目视为待重新验收。
-- 屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非输入法宿主 App）：macOS 首跑需在「系统设置 → 隐私与安全性 → 屏幕录制」勾选 verba-trigger，否则点击后管线失败（stderr/前端日志可见原因）。
-- 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素（CGWindowListCreateImage 一类后续打磨）。
-- 按钮为方形小窗；圆角图标观感需平台 window shaping（color-key / transparent NSWindow），后续打磨。
+v2 架构（macOS 已落地）：**进程内 NSPanel 气泡 + 点击/键盘触发无头采集**，激活路径零跨进程。
+1. session 激活且 `float_button_enable = true`（默认关；密码类安全输入字段不弹）→ IME 进程内创建/复用 NSPanel（`Borderless | NonactivatingPanel` styleMask，**NSPanel 本体**——AppKit 对普通 NSWindow 忽略 Nonactivating 位；`NSFloatingWindowLevel`、透明背景、shadow），与候选窗同址生命周期：激活显、失活隐。锚点 = 光标右下（间隙 8pt，贴边翻转到光标上/左）最终 **clamp 收进前台窗口 bounds**（`client_window_bounds`：CGWindowList 取客户端 pid 的 layer-0 窗口，光标包含优先、z 序最前兜底）；光标矩形无效（终端类客户端）退窗口右上内缩。v1 激活瞬间的垃圾光标矩形（D1）由「收进窗口」语义接管：任何方向 clamp 后都不可能画到屏幕外。
+2. 点击气泡或 **`//`+TAB**（裸 `//` 空提示词 Tab，`Action::StartCapture`，与点击同一入口）→ busy 守卫（在途忽略）→ 后台 spawn **无头** `verba-trigger float-run`（截前台窗口 → daemon `OcrRecognize` → 识别文本写 stdout，**点击频率级 spawn**，同 /// 旧模式不在激活频率级 spawn）→ 文本落 `float_ocr_slot`，drain 定时器主线程消费：按 `float_button_prompt` 模板（`{ocr}` 占位，缺占位记日志拒绝）拼 prompt → **IME 进程内 `start_llm` 流式预览**（与 `//` 改写同通道，Enter 上屏/Esc 取消），helper 不再持有模板/会话。
+3. `///` 选区 OCR 绑定**随 v2 下线**（machine 第三 `/` 臂删除，回落普通提示词字符；region-ocr 子命令保留为调试工具；Windows `Ctrl+Alt+O` 热键不受影响）。
+4. **v1 教训（D2，验收阻塞级）**：per-activation spawn GUI helper 进程在飞书/终端类客户端引发 IME 会话 ≥10Hz 自激抖动（activate/spawn/deactivate 刷屏，无法输入）；v2 激活路径零跨进程从根上消灭自激环，点击级 spawn 与 `///` 选区同模式已被真机验证可接受。v1 `float-button --at x,y --session-id N --session-key S` 子命令保留（`run_float_button` 全管道在 helper 内跑），Windows TSF v1 窗模式仍在用；Windows v2 跟进前，`Action::StartCapture` 在 Windows 端为显式未接线臂（按键吞掉 + `log::warn!` 告警，不静默成功）。
+
+已知限制（v2）：
+- 屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非输入法宿主 App）：macOS 首跑需在「系统设置 → 隐私与安全性 → 屏幕录制」勾选 verba-trigger，否则点击后管线失败（stderr/前端日志可见原因）。进程内 NSPanel 本身不截屏，无需权限。
+- 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素。气泡不会被自捕获误拍：`capture_active_window` 的 focused 判定 = NSWorkspace 活动应用 pid，nonactivating panel 不改变 frontmost application。
+- 平台状态：macOS = v2 进程内 Panel（本节描述）；Windows = v1 helper 窗模式 + StartCapture 未接线告警；Linux Fcitx5 前端未就绪：共享层（capture_active_window / float-run 子命令）已平台中立落地，Fcitx5 前端就绪后按同模式接线（AGENTS.md 跨平台默认）。
 - Wayland 焦点豁免以合成器为准（X11 已 override_redirect）。
-- Linux Fcitx5 前端未就绪：共享层（capture_active_window / float-button 子命令）已平台中立落地，Fcitx5 前端就绪后按「spawn helper + 读 stdout + 预览上屏」同模式接线（AGENTS.md 跨平台默认）。
 
 **LLM 流式**
 1. AI 模式触发（`//` 前缀或快捷键）→ 前端收集 prompt → daemon → LLM provider。

@@ -37,6 +37,7 @@ impl MacIme {
 
 /// macOS 下加载 IMK 输入控制器子类。
 #[cfg(target_os = "macos")]
+pub mod float_panel;
 pub mod imk;
 
 /// 引导加载 IMK 局：非 macOS 为 no-op（仅供其它平台构建时占位）。
