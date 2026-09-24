@@ -1452,8 +1452,14 @@ pub fn apply_action(
             // 裸 `//` + Tab → 整窗捕获 → OCR → LLM 回复（v2 悬浮气泡的键盘
             // 化入口；`///` 选区 OCR 绑定随 v2 下线）。Windows 端尚未接线
             // 悬浮气泡（TSF v1 仍走 float-button 窗模式）：吞键并告警，
-            // 不得静默成功（跨平台默认：缺口显式声明）。
+            // 不得静默成功（跨平台默认：缺口显式声明）。组合照旧结束
+            // （对齐旧 TriggerOcr 臂，复审 F4：不留 `//` preedit 在 Prompt 态）。
             log::warn!("StartCapture（//+Tab 整窗捕获）在 Windows 端未接线，按键已吞");
+            hide_candidate_window(data);
+            if let Some(comp) = data.composition.borrow_mut().take() {
+                let _ = edit_session::end_composition(context, clientid, &comp, "");
+            }
+            *data.machine.borrow_mut() = CompositionMachine::new();
             Ok(())
         }
         Action::Cancel => {

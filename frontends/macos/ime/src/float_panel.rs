@@ -63,13 +63,15 @@ pub fn bubble_anchor(caret: Option<(i32, i32)>, win: (i32, i32, i32, i32)) -> (i
         Some((cx, cy)) => {
             // 偏好光标右下；贴边时翻到光标上/左（翻转只是选侧，最终的
             // clamp 才保证收进窗口——垃圾光标矩形 any 方向都出不去）。
-            let mut x = cx + BUBBLE_GAP;
-            let mut y = cy + BUBBLE_GAP;
-            if y + size > wy + wh {
-                y = cy - BUBBLE_GAP - size;
+            // 全程 saturating：CG 浮点 as-cast 已饱和到 i32 边界，加减
+            // 不得再溢出（debug panic / release 回绕，复审 F6）。
+            let mut x = cx.saturating_add(BUBBLE_GAP);
+            let mut y = cy.saturating_add(BUBBLE_GAP);
+            if y.saturating_add(size) > wy.saturating_add(wh) {
+                y = cy.saturating_sub(BUBBLE_GAP).saturating_sub(size);
             }
-            if x + size > wx + ww {
-                x = cx - BUBBLE_GAP - size;
+            if x.saturating_add(size) > wx.saturating_add(ww) {
+                x = cx.saturating_sub(BUBBLE_GAP).saturating_sub(size);
             }
             (
                 clamp_into(x, wx, wx + ww - size),
@@ -77,9 +79,16 @@ pub fn bubble_anchor(caret: Option<(i32, i32)>, win: (i32, i32, i32, i32)) -> (i
             )
         }
         None => {
-            // 光标矩形无效（终端类客户端）→ 窗口右上内缩。
-            let x = (wx + ww - size - BUBBLE_MARGIN).max(wx);
-            (x, wy + BUBBLE_MARGIN)
+            // 光标矩形无效（终端类客户端）→ 窗口右上内缩；两轴都 clamp
+            // （< 气泡高的窗口不探出底边，复审 F5）。
+            let x = wx
+                .saturating_add(ww)
+                .saturating_sub(size)
+                .saturating_sub(BUBBLE_MARGIN);
+            (
+                clamp_into(x, wx, wx + ww - size),
+                clamp_into(wy.saturating_add(BUBBLE_MARGIN), wy, wy + wh - size),
+            )
         }
     }
 }
@@ -215,14 +224,20 @@ fn ensure_panel(mtm: MainThreadMarker) {
 }
 
 /// 摆位并显示气泡（IME 主线程；session 激活路径调用）。
-pub fn show_bubble(at: (i32, i32)) {
+///
+/// 坐标系 = **Cocoa 底左全局点**（NSWindow frame 语义，主屏左下原点）——
+/// 锚点纯函数 `bubble_anchor` 与 `client_window_bounds` 产出 CG 顶左，
+/// 调用侧（activate_server）负责按主屏高度换算（复审 F1：CG 顶左直接喂
+/// setFrame 会让 Y 轴关于主屏高度镜像，clamp 全部失效）。f64 保留换算
+/// 精度（屏高非整点的缩放模式不引入取整误差）。
+pub fn show_bubble(at: (f64, f64)) {
     // SAFETY: 本函数仅从 IMK 主线程（activate_server）调用。
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     ensure_panel(mtm);
     let st = panel_state().0.borrow();
     let Some(st) = st.as_ref() else { return };
     let frame = NSRect::new(
-        NSPoint::new(at.0 as f64, at.1 as f64),
+        NSPoint::new(at.0, at.1),
         NSSize::new(BUBBLE_SIZE, BUBBLE_SIZE),
     );
     st.panel.setFrame_display(frame, true);
@@ -242,7 +257,12 @@ pub fn hide_bubble() {
 
 fn set_busy_draw(v: bool) {
     BUSY.store(v, Ordering::SeqCst);
-    // SAFETY: 仅从 IME 主线程（点击/drain 完成回调）调用。
+    // 主线程门：clear_busy 会被 float-run 的后台线程调用（失败分支），
+    // 离主线程时只复位原子量、不碰 AppKit（复审 F2）。主路径（点击/
+    // drain）都在主线程，正常触发重绘。
+    let Some(_mtm) = MainThreadMarker::new() else {
+        return;
+    };
     if let Ok(st) = panel_state().0.try_borrow() {
         if let Some(st) = st.as_ref() {
             st.view.setNeedsDisplay(true);
@@ -306,6 +326,16 @@ mod tests {
         let (x, y) = bubble_anchor(None, (100, 100, 800, 600));
         assert_eq!(x, 100 + 800 - BUBBLE_SIZE as i32 - BUBBLE_MARGIN);
         assert_eq!(y, 100 + BUBBLE_MARGIN);
+    }
+
+    #[test]
+    fn anchor_none_branch_clamps_within_short_window() {
+        // 复审 F5：窗口高 50 < margin 12 + 气泡 44 → y 收进窗口底（50-44=6），
+        // 不探出底边。
+        let (x, y) = bubble_anchor(None, (0, 0, 400, 50));
+        assert_eq!(y, 6);
+        assert!(y + BUBBLE_SIZE as i32 <= 50);
+        assert!(x >= 0 && x + BUBBLE_SIZE as i32 <= 400);
     }
 
     #[test]

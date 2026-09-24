@@ -248,6 +248,9 @@ static SESSION_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// 窗口身份不可得时的一次性会话 token：每次强制刷新分配新值，不与其他窗口共享。
 static SESSION_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 悬浮气泡 OCR 槽位的 session 代际（deactivate 递阶，见 float_ocr_slot）。
+static FLOAT_OCR_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 /// 每进程随机盐（惰性生成一次）：daemon 是按用户单例、按 session_id 分组历史，
 /// 而本 IME 进程可独立于 daemon 重启（崩溃/重装/系统回收）——重启后
 /// SESSION_ID_SEQ 从 1 重排，会撞回 daemon 侧残留的历史槽并**继承**陈旧上下文
@@ -409,6 +412,13 @@ extern "C" {
 /// Cocoa 屏幕坐标（主屏左下原点）→ CGWindowBounds 坐标（主屏左上原点）。
 fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
     (point.0, main_display_height - point.1)
+}
+
+/// CG 顶左气泡锚点（气泡矩形左上角）→ Cocoa 底左 frame 原点（复审 F1）：
+/// `frame_y = 屏高 - cg_y - 边长`。与 `cocoa_to_cg_point` 互逆（按矩形
+/// 而非点换算），NSWindow.setFrame 只吃后者。
+fn cg_bubble_to_cocoa_frame((x, y): (i32, i32), screen_h: f64, size: f64) -> (f64, f64) {
+    (x as f64, screen_h - y as f64 - size)
 }
 
 /// 由 CG 顶左坐标的光标行（top/bottom）与所在显示器工作区计算 vision
@@ -908,9 +918,19 @@ pub(crate) fn float_button_prompt_template() -> Option<String> {
 /// 气泡管道（v2）的 OCR 文本槽：`float-run` 子进程后台线程写入，
 /// drain_stream 主线程取走 → 拼 float_button_prompt 模板 → start_llm
 /// 流式预览（与改写同通道，无新 UI 管线）。
-fn float_ocr_slot() -> &'static Mutex<Option<String>> {
-    static S: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+///
+/// 槽内带 session 代际（复审 F3）：点击时取样 `FLOAT_OCR_EPOCH`，
+/// deactivate 递阶——A 窗口点击后焦点切到 B（含密码字段），迟到结果
+/// 在 drain 侧按代际作废，不会把 A 的 OCR 灌进 B 的 start_llm
+/// （v1 F2 stale-push 守卫的 v2 等价物）。
+fn float_ocr_slot() -> &'static Mutex<Option<(u64, String)>> {
+    static S: OnceLock<Mutex<Option<(u64, String)>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
+}
+
+/// 气泡管道 session 代际：deactivate 递阶，使在途 OCR 结果作废。
+fn bump_float_ocr_epoch() {
+    FLOAT_OCR_EPOCH.fetch_add(1, Ordering::SeqCst);
 }
 
 /// v2 触发（气泡点击 / `//`+TAB 共用入口）：后台 spawn `verba-trigger
@@ -919,6 +939,9 @@ fn float_ocr_slot() -> &'static Mutex<Option<String>> {
 /// ——v1 的 per-activation spawn 在飞书/终端类客户端引发 IME 会话自激
 /// 抖动（D2，verba-float-button-d2-session-churn）。
 pub(crate) fn trigger_float_run_async() {
+    // 点击时的 session 代际：结果到达时若代际已变（deactivate 过），
+    // drain 侧丢弃（复审 F3）。
+    let epoch = FLOAT_OCR_EPOCH.load(Ordering::SeqCst);
     std::thread::spawn(move || {
         let Some(exe) = trigger_exe_path() else {
             dbg_log("float(v2): 未找到 verba-trigger");
@@ -946,7 +969,7 @@ pub(crate) fn trigger_float_run_async() {
                     return;
                 }
                 if let Ok(mut slot) = float_ocr_slot().lock() {
-                    *slot = Some(text);
+                    *slot = Some((epoch, text));
                 }
             }
             Err(e) => {
@@ -1288,7 +1311,12 @@ define_class!(
                     match win {
                         Some(bounds) => {
                             let at = crate::float_panel::bubble_anchor(caret, bounds);
-                            crate::float_panel::show_bubble(at);
+                            let origin = cg_bubble_to_cocoa_frame(
+                                at,
+                                screen_h,
+                                crate::float_panel::BUBBLE_SIZE,
+                            );
+                            crate::float_panel::show_bubble(origin);
                         }
                         None => {
                             dbg_log("float(v2): 无前台窗口 bounds，跳过");
@@ -1310,6 +1338,9 @@ define_class!(
             // 气泡生命周期 = 输入 session：失活即隐藏（v2 进程内 Panel，
             // 无跨进程 kill；v1 的 helper kill 随 per-activation spawn 一并移除）。
             crate::float_panel::hide_bubble();
+            // 作废在途气泡 OCR 结果：换 session 后迟到文本不得灌进新会话
+            // 的 start_llm（复审 F3，v1 F2 stale-push 守卫的 v2 等价物）。
+            bump_float_ocr_epoch();
             // 重入窗内积压的键属于本会话：换会话（应用/输入位置）后语义已失效
             // （原目标文本域可能已滚动/失焦），丢弃而非带入新会话。
             self.ivars().pending_keys.borrow_mut().clear();
@@ -1842,8 +1873,15 @@ define_class!(
             // float_button_prompt 模板（含 {ocr} 占位校验，缺占位即配置错误，
             // 记日志拒绝静默丢 OCR 上下文）→ start_llm 流式预览（与改写同
             // 通道：候选面板 ✨ 生成中 → 结果 Enter 上屏）。
-            if let Some(ocr_text) = float_ocr_slot().lock().ok().and_then(|mut s| s.take()) {
+            if let Some((epoch, ocr_text)) =
+                float_ocr_slot().lock().ok().and_then(|mut s| s.take())
+            {
                 crate::float_panel::clear_busy();
+                if epoch != FLOAT_OCR_EPOCH.load(Ordering::SeqCst) {
+                    // session 已切换（deactivate 递阶）：A 窗口的迟到 OCR
+                    // 不得灌进 B session 的 start_llm（复审 F3）。
+                    dbg_log("float(v2): OCR 结果迟到（session 已切换），丢弃");
+                } else {
                 // 模板/占位校验失败：记日志丢弃本次 OCR 文本（配置错误不
                 // 静默吞上下文），不 return——下方 ocr_result_slot 等消费
                 // 方同 tick 仍要跑。
@@ -1862,6 +1900,7 @@ define_class!(
                     None => {
                         dbg_log("float(v2): float_button_prompt 模板缺失或缺 {ocr} 占位符");
                     }
+                }
                 }
             }
             // 选区 OCR 结果槽位（issue #82）：与 LLM 事件同管线消费。
@@ -3516,6 +3555,23 @@ mod tests {
     fn cocoa_to_cg_point_flips_y_around_main_display() {
         assert_eq!(cocoa_to_cg_point((10.0, 20.0), 900.0), (10.0, 880.0));
         assert_eq!(cocoa_to_cg_point((0.0, 900.0), 900.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn cg_bubble_to_cocoa_frame_inverts_y_with_size() {
+        // 复审 F1：CG 顶左锚点（208,308,44×44，屏高 900）→ Cocoa frame
+        // 原点（208, 900-308-44=548）；矩形上下沿与 CG 互逆。
+        assert_eq!(
+            cg_bubble_to_cocoa_frame((208, 308), 900.0, 44.0),
+            (208.0, 548.0)
+        );
+        // 原点换算回 CG 顶左 = 自身（cocoa_to_cg 按点互逆）。
+        assert_eq!(cocoa_to_cg_point((208.0, 592.0), 900.0), (208.0, 308.0));
+        // 贴屏底（CG y 最大）：frame 原点 y 最小不越界。
+        assert_eq!(
+            cg_bubble_to_cocoa_frame((0, 900 - 44), 900.0, 44.0),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
