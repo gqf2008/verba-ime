@@ -39,7 +39,8 @@ pub const BUBBLE_SIZE: f64 = 22.0;
 const BUBBLE_GAP: i32 = 16;
 /// 退窗口右上时的内缩边距（点）。
 const BUBBLE_MARGIN: i32 = 12;
-/// 圆角半径（点，随 22pt 气泡等比缩自 v1 的 12pt）。
+/// 圆角半径（点；评审 nit 整改：非严格等比——6.5 较 12/2=6.0 对 22pt
+/// 气泡的圆角观感更稳）。
 const CORNER_RADIUS: f64 = 6.5;
 
 /// v1 品牌色（crates/verba-trigger/src/float.rs 同一组常量，前端不另起色板）。
