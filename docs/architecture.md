@@ -138,6 +138,7 @@ pub trait TtsProvider { async fn speak(&self, text: &str) -> Result<()>; }
 4. 会话透传前端 `session_id`/`session_key`，与 `//` 共用窗口级 AI 上下文——按钮生成的回复可继续 `//` 追问。
 
 已知限制（v1）：
+- **2026-09-24 真机验收不通过（阻塞级）**：per-activation spawn helper 的机制在飞书/终端等客户端引发 IME 会话高频自激抖动（activate/spawn/deactivate ≥10Hz 刷屏，无法输入、气泡不可见）；macOS 保持 `float_button_enable` 默认关。v2 重构方向（用户裁定）：气泡锚进当前激活窗口内（进程内 Panel，与候选窗同址生命周期）、`//`+TAB 触发 LLM 调用、`///` 下线；见 walgit 线程 `verba-float-button-d2-session-churn`。重构前本节其余条目视为待重新验收。
 - 屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非输入法宿主 App）：macOS 首跑需在「系统设置 → 隐私与安全性 → 屏幕录制」勾选 verba-trigger，否则点击后管线失败（stderr/前端日志可见原因）。
 - 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素（CGWindowListCreateImage 一类后续打磨）。
 - 按钮为方形小窗；圆角图标观感需平台 window shaping（color-key / transparent NSWindow），后续打磨。

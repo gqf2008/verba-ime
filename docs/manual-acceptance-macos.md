@@ -129,6 +129,8 @@
 
 ## 悬浮 AI 回复按钮（float-button，2026-09-24 批）
 
+> **⚠️ 2026-09-24 真机验收结论：不通过。** 开启 `float_button_enable` 后，在飞书 / 终端等客户端出现 IME 会话高频自激抖动（verba-mac.log 表现为 `activateServer → float-button: spawn → deactivateServer` 以 ≥10Hz 成对刷屏，光标闪烁、无法输入、气泡在抖动中反复生灭不可见）。同环境关闭开关后立即恢复平静，故判定为 **per-activation 拉 verba-trigger helper 进程的机制与部分客户端（飞书/终端类）IME 会话冲突**。macOS 侧保持默认关。
+> **v2 重构方向（用户裁定 2026-09-24）**：①气泡锚进**当前激活窗口内**（不再跟光标、不再跨进程起窗）；②`//` + **TAB** 触发 LLM 调用（键盘手势取代点击触发）；③`///` 选区 OCR 功能下线（由气泡整窗捕获取代）。见 walgit 线程 `verba-float-button-d2-session-churn`；重构后本节清单重新验收。
 > 前置：`config.toml` 加 `float_button_enable = true`（默认关；v1 设置面板不暴露，同 `eye_enabled`）；LLM provider 已配置。
 > 首跑注意：屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非 Verba.app），见 docs/privacy.md。
 
