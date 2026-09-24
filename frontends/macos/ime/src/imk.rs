@@ -400,6 +400,11 @@ extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRectF;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
     static kCGWindowNumber: CFStringRef;
     static kCGWindowLayer: CFStringRef;
     static kCGWindowBounds: CFStringRef;
@@ -409,6 +414,46 @@ extern "C" {
 /// Cocoa 屏幕坐标（主屏左下原点）→ CGWindowBounds 坐标（主屏左上原点）。
 fn cocoa_to_cg_point(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
     (point.0, main_display_height - point.1)
+}
+
+/// 在线显示器边界列表（CG 顶左全局坐标，points）。
+fn active_display_bounds() -> Vec<(f64, f64, f64, f64)> {
+    const MAX_DISPLAYS: u32 = 16;
+    let mut ids = [0u32; MAX_DISPLAYS as usize];
+    let mut count: u32 = 0;
+    let status = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &mut count) };
+    if status != 0 || count == 0 {
+        // 查询失败兜底主屏：守卫宁可放行主屏内锚点，也不误杀正常气泡。
+        let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        return vec![(b.origin.x, b.origin.y, b.size.width, b.size.height)];
+    }
+    ids[..count as usize]
+        .iter()
+        .map(|&id| {
+            let b = unsafe { CGDisplayBounds(id) };
+            (b.origin.x, b.origin.y, b.size.width, b.size.height)
+        })
+        .collect()
+}
+
+/// 锚点合理性守卫（真机验收缺陷 D1，2026-09-24）：IME 激活瞬间
+/// `firstRectForCharacterRange` 可能返回有限但荒谬的瞬时矩形（真机实测
+/// Cocoa y≈2.6e6 → 转换后 CG y≈-2.6e6，气泡被画到屏幕角落闪一下即消失），
+/// 现有有限性校验挡不住「有限但离屏」的值。要求锚点落在某台在线显示器
+/// 边界内（外扩 tolerance 容忍菜单栏上方/屏幕边缘的轻微越界），越界即
+/// 放弃本次 spawn。多显示器逐台检查，副屏上的光标不误杀。
+fn anchor_on_any_display(
+    x: f64,
+    y: f64,
+    displays: &[(f64, f64, f64, f64)],
+    tolerance: f64,
+) -> bool {
+    displays.iter().any(|&(dx, dy, dw, dh)| {
+        x >= dx - tolerance
+            && x <= dx + dw + tolerance
+            && y >= dy - tolerance
+            && y <= dy + dh + tolerance
+    })
 }
 
 /// 由 CG 顶左坐标的光标行（top/bottom）与所在显示器工作区计算 vision
@@ -1278,14 +1323,20 @@ define_class!(
                         .as_deref()
                         .and_then(client_caret_point)
                         .map(|p| cocoa_to_cg_point(p, screen_h))
-                        .map(|(x, y)| (x.round() as i32, y.round() as i32));
+                        .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                        // 守卫 D1：激活瞬间的瞬时垃圾矩形（有限但离屏）会
+                        // 把气泡画到屏幕角落闪一下——越界即放弃本次 spawn，
+                        // 等锚点正常的下一次激活再弹。
+                        .filter(|&(x, y)| {
+                            anchor_on_any_display(x as f64, y as f64, &active_display_bounds(), 64.0)
+                        });
                     match anchor {
                         Some(at) => spawn_float_button(
                             at,
                             self.ivars().session_id.get(),
                             &self.ivars().session_key.borrow(),
                         ),
-                        None => dbg_log("float-button: 无光标锚点，跳过"),
+                        None => dbg_log("float-button: 锚点不可用（无光标或越界），跳过"),
                     }
                 }
             }
@@ -3475,6 +3526,28 @@ mod tests {
     fn cocoa_to_cg_point_flips_y_around_main_display() {
         assert_eq!(cocoa_to_cg_point((10.0, 20.0), 900.0), (10.0, 880.0));
         assert_eq!(cocoa_to_cg_point((0.0, 900.0), 900.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn anchor_guard_rejects_transient_garbage_rect() {
+        // 真机 D1：激活瞬间 cocoa y≈2.6e6 → CG y≈-2.6e6，必须拒绝。
+        let displays = vec![(0.0, 0.0, 1470.0, 956.0)];
+        assert!(!anchor_on_any_display(0.0, -2_598_917.0, &displays, 64.0));
+        assert!(!anchor_on_any_display(151.0, 9_600_000.0, &displays, 64.0));
+    }
+
+    #[test]
+    fn anchor_guard_accepts_onscreen_marginal_and_secondary_display() {
+        let displays = vec![(0.0, 0.0, 1470.0, 956.0)];
+        // 正常锚点（真机 TextEdit 实测值）。
+        assert!(anchor_on_any_display(151.0, 157.0, &displays, 64.0));
+        // 菜单栏上方轻微越界在容差内放行。
+        assert!(anchor_on_any_display(100.0, -10.0, &displays, 64.0));
+        // 副屏（左侧二屏常见排布）上的光标不误杀。
+        let dual = vec![(0.0, 0.0, 1470.0, 956.0), (-1920.0, 0.0, 1920.0, 1080.0)];
+        assert!(anchor_on_any_display(-500.0, 500.0, &dual, 64.0));
+        // 副屏远侧之外的垃圾值仍拒绝。
+        assert!(!anchor_on_any_display(-500.0, 50_000.0, &dual, 64.0));
     }
 
     #[test]
