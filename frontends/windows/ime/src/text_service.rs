@@ -1448,15 +1448,18 @@ pub fn apply_action(
             log::warn!("OcrPreview 走到 apply_action（异常路径），直接上屏");
             edit_session::commit_text(context, clientid, &text)
         }
-        Action::TriggerOcr => {
-            // `///`：结束当前组合，触发选区截图 OCR（Ctrl+Alt+O 的键盘化替代）。
+        Action::StartCapture => {
+            // 裸 `//` + Tab → 整窗捕获 → OCR → LLM 回复（v2 悬浮气泡的键盘
+            // 化入口；`///` 选区 OCR 绑定随 v2 下线）。Windows 端尚未接线
+            // 悬浮气泡（TSF v1 仍走 float-button 窗模式）：吞键并告警，
+            // 不得静默成功（跨平台默认：缺口显式声明）。组合照旧结束
+            // （对齐旧 TriggerOcr 臂，复审 F4：不留 `//` preedit 在 Prompt 态）。
+            log::warn!("StartCapture（//+Tab 整窗捕获）在 Windows 端未接线，按键已吞");
             hide_candidate_window(data);
-            stash_ocr_anchor(data, context);
             if let Some(comp) = data.composition.borrow_mut().take() {
                 let _ = edit_session::end_composition(context, clientid, &comp, "");
             }
             *data.machine.borrow_mut() = CompositionMachine::new();
-            trigger_async(data, TriggerKind::Ocr);
             Ok(())
         }
         Action::Cancel => {

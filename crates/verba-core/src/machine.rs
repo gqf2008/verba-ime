@@ -233,9 +233,10 @@ pub enum Action {
     ResultReady { text: String },
     /// 确认上屏最终结果。
     CommitResult { text: String },
-    /// `///`：Prompt 态空提示词按第三个斜杠 → 触发选区截图 OCR
-    /// （Ctrl+Alt+O 的键盘化替代）。
-    TriggerOcr,
+    /// `//` + Tab（Prompt 态空提示词，即裸 `//`）→ 触发前台窗口截图 →
+    /// OCR → LLM 生成回复（悬浮气泡的键盘化入口；v2 起取代 `///` 的
+    /// 选区截图 OCR 绑定——用户裁定「有了气泡功能三斜杠不需要了」）。
+    StartCapture,
     /// OCR 结果到达 → 进候选窗预览（首条=识别文本，Enter/空格/数字上屏；
     /// Esc 取消）。不直接插光标——用户看到了再决定。
     OcrPreview { text: String },
@@ -782,7 +783,8 @@ impl CompositionMachine {
         // 未组合：Tab = 改写管道（提示词内容非空）；字母开始拼音；其它字符直接入提示词
         if c == '\t' {
             if self.prompt.is_empty() {
-                return Action::None; // 空内容无改写对象
+                // 裸 `//` + Tab → 整窗捕获管道（改写管道无对象，走悬浮气泡入口）
+                return Action::StartCapture;
             }
             let content = std::mem::take(&mut self.prompt);
             self.state = MachineState::Streaming;
@@ -798,10 +800,6 @@ impl CompositionMachine {
                 phase: ResultPhase::Streaming,
             });
             return Action::StartRewrite { content };
-        }
-        if c == '/' && self.prompt.is_empty() {
-            // `///`：第三个斜杠（提示词空）→ 选区截图 OCR
-            return Action::TriggerOcr;
         }
         if c.is_ascii_uppercase() {
             // 大写 ASCII 直接入提示词（保 `//translate Hello` 这类英文提示词）
@@ -3860,11 +3858,12 @@ mod tests {
             Action::StartRewrite { content } if content == "明天发烧请假条"
         ));
         assert!(matches!(m.state(), MachineState::Streaming));
-        // 空内容 Tab → None（无改写对象）
+        // 空内容（裸 `//`）Tab → StartCapture（整窗捕获管道，v2 悬浮气泡
+        // 的键盘化入口）；状态机本身不变态，前端结束组合后走气泡入口。
         let mut m2 = CompositionMachine::new();
         m2.feed_char('/');
         m2.feed_char('/');
-        assert_eq!(m2.feed_char('\t'), Action::None);
+        assert_eq!(m2.feed_char('\t'), Action::StartCapture);
         assert!(matches!(m2.state(), MachineState::Prompt));
     }
 
@@ -3977,15 +3976,23 @@ mod tests {
         assert!(!m.ocr_preview_ttl_expired());
     }
 
-    /// `///`：Prompt 态空提示词按第三个斜杠 → TriggerOcr（选区截图）。
+    /// 裸 `//` + Tab（Prompt 态空提示词）→ StartCapture（整窗捕获管道）；
+    /// `///` 绑定已下线（v2 气泡接管）：提示词空时第三个斜杠按字面入提示词。
     #[test]
-    fn triple_slash_triggers_ocr() {
+    fn double_slash_tab_starts_capture() {
         let mut m = CompositionMachine::new();
         m.feed_char('/');
         m.feed_char('/');
         assert_eq!(m.state(), MachineState::Prompt);
-        // 提示词空时第三个斜杠 → 截图
-        assert_eq!(m.feed_char('/'), Action::TriggerOcr);
+        assert_eq!(m.feed_char('\t'), Action::StartCapture);
+        // v2 起 /// 无特殊语义：第三个斜杠按字面入提示词
+        let mut m = CompositionMachine::new();
+        m.feed_char('/');
+        m.feed_char('/');
+        assert!(
+            matches!(m.feed_char('/'), Action::UpdatePrompt { .. }),
+            "/// 下线后提示词空时 / 字面入提示词"
+        );
         // 提示词非空时斜杠按字面入提示词（不触发）
         let mut m2 = CompositionMachine::new();
         m2.feed_char('/');

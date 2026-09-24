@@ -169,6 +169,29 @@ fn float_button_prompt(client: &mut VerbaClient) -> Result<String, TriggerError>
         .unwrap_or_else(|| verba_config::Config::default().float_button_prompt))
 }
 
+/// v2 无头管道（float-run 子命令）：截前台窗口 → daemon OCR → 返回识别
+/// 文本，stdout 由 bin 打印；LLM 生成移回 IME 进程内（start_llm 流式
+/// 预览，与改写同一通道），helper 不再持有模板与会话。
+///
+/// 相比 v1 窗模式的两处刻意收窄：①只在用户点击/`//`+TAB 时 spawn
+/// （与 `///` 选区同频率级），不在 IME 激活时 spawn——v1 的
+/// per-activation spawn 在飞书/终端类客户端引发 IME 会话自激抖动
+/// （D2，见 walgit 线程 verba-float-button-d2-session-churn）；
+/// ②不建窗、不常驻，从根上回避跨进程窗口与宿主焦点的相互激发。
+pub fn run_capture_ocr() -> Result<String, TriggerError> {
+    let shot = capture_active_window()?;
+    let mut client = connect_daemon()?;
+    let ocr = client
+        .ocr_recognize(&shot.bmp)
+        .map_err(|e| TriggerError::Daemon(format!("OCR 失败: {e}")))?;
+    if ocr.trim().is_empty() {
+        return Err(TriggerError::Capture(
+            "前台窗口未识别到文字（窗口可能无文本内容或缺屏幕录制权限）".into(),
+        ));
+    }
+    Ok(ocr)
+}
+
 /// 按钮视觉态（渲染与事件共用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Visual {

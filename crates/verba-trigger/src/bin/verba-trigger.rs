@@ -44,6 +44,7 @@ fn main() {
         Some("tts") => cmd_tts(&args),
         Some("speak") => cmd_speak(&args),
         Some("float-button") => cmd_float_button(&args),
+        Some("float-run") => cmd_float_run(),
         Some(other) => {
             eprintln!("未知命令: {other}（--help 查看用法）");
             1
@@ -66,7 +67,8 @@ fn print_help() {
          verba-trigger tts <文本> [输出.mp3] [语音]  TTS 合成存文件\n  \
          verba-trigger speak <文本> [语音]      TTS 合成并播放\n  \
          verba-trigger float-button --at x,y [--session-id N] [--session-key S]\n  \
-         \x20 悬浮 AI 回复按钮（点击后截前台窗口→OCR→LLM 生成回复，文本写 stdout）\n  \
+         \x20 悬浮 AI 回复按钮（v1 窗模式；点击后截前台窗口→OCR→LLM 生成回复，文本写 stdout）\n  \
+         verba-trigger float-run                 截前台窗口 → daemon OCR → 文本写 stdout（v2 无头，LLM 在 IME 进程内）\n  \
          verba-trigger --version              版本\n"
     );
 }
@@ -245,6 +247,9 @@ fn cmd_speak(args: &[String]) -> i32 {
 /// 管线失败/空回复（`FloatOutcome::Failed`）→ stderr 带原因 + 退出 1
 /// （前端捕获 stderr 记日志，首跑缺屏幕录制权限不再无声消失）；超时 →
 /// 退出 3。前端按「stdout 非空 = 有结果」消费（与 region-ocr 同一契约）。
+///
+/// ⚠ v1 窗模式：macOS 已改进程内 Panel（v2，见 float-run），保留本子命令
+/// 供 Windows TSF v1 接线使用；Windows v2 跟进后下线。
 fn cmd_float_button(args: &[String]) -> i32 {
     let Some(at) = parse_pair(args, "--at") else {
         eprintln!("用法: verba-trigger float-button --at x,y [--session-id N] [--session-key S]");
@@ -282,6 +287,25 @@ fn cmd_float_button(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("悬浮按钮失败: {e}");
+            1
+        }
+    }
+}
+
+/// `float-run`：v2 无头管道——截前台窗口 → daemon OCR → 识别文本写
+/// stdout、退出 0（LLM 生成在 IME 进程内做，helper 只出 OCR 文本）。
+/// 失败（无屏录权限/前台窗无文字/OCR/daemon 异常）→ stderr 带原因 +
+/// 退出 1。由 IME 在用户点击气泡或 `//`+TAB 时 spawn（点击频率级，
+/// 非激活频率级——v1 的 per-activation spawn 在飞书/终端类客户端引发
+/// IME 会话自激抖动，见 walgit verba-float-button-d2-session-churn）。
+fn cmd_float_run() -> i32 {
+    match verba_trigger::float::run_capture_ocr() {
+        Ok(text) => {
+            println!("{text}");
+            0
+        }
+        Err(e) => {
+            eprintln!("float-run 失败: {e}");
             1
         }
     }
