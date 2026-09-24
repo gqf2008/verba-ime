@@ -1289,19 +1289,29 @@ define_class!(
                     dbg_log("float(v2): 安全输入字段，跳过");
                     crate::float_panel::hide_bubble();
                 } else {
-                    // 锚点：光标右下收进前台窗口 bounds（CG 顶左全局点）；
-                    // 光标矩形无效（终端类客户端的瞬时垃圾矩形）退窗口右上。
-                    // D1 的几何守卫由「收进窗口」语义接管：垃圾坐标最多
-                    // 退化为角落定位，不再可能画到屏幕外闪一下。
+                    // 锚点：光标所在行正下方（行底 + 8pt，左对齐光标右缘）
+                    // 收进前台窗口 bounds（CG 顶左全局点；真机验收：原右下
+                    // 压插入列遮挡光标；独立评审 minor：client_caret_point
+                    // 的 CG y 是行顶，行顶+间隙仍压行下部/I-beam 底部——
+                    // 故取原始矩形算行底 = 行顶 + 行高）；下方放不下翻行上
+                    // 方；光标矩形无效（终端类客户端的瞬时垃圾矩形）退窗口
+                    // 右上。D1 的几何守卫由「收进窗口」语义接管：垃圾坐标
+                    // 最多退化为角落定位，不再可能画到屏幕外闪一下。
                     let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
                     let caret = self
                         .ivars()
                         .client
                         .borrow()
                         .as_deref()
-                        .and_then(client_caret_point)
-                        .map(|p| cocoa_to_cg_point(p, screen_h))
-                        .map(|(x, y)| (x.round() as i32, y.round() as i32));
+                        .and_then(client_caret_rect)
+                        .map(|(x, y, w, h)| {
+                            // 右缘 = x + max(w,0)；width 非有限时按 0 防御
+                            // （client_caret_rect 不拒 NaN width）。行顶 CG y
+                            // = 屏高 − cocoa_y − h（cocoa_to_cg 的矩形版）。
+                            let dx = if w.is_finite() { w.max(0.0) } else { 0.0 };
+                            (x + dx, screen_h - y - h, h)
+                        })
+                        .map(|(x, y, h)| (x.round() as i32, y.round() as i32, h.round() as i32));
                     let win = self
                         .ivars()
                         .client
@@ -3559,14 +3569,14 @@ mod tests {
 
     #[test]
     fn cg_bubble_to_cocoa_frame_inverts_y_with_size() {
-        // 复审 F1：CG 顶左锚点（208,308,44×44，屏高 900）→ Cocoa frame
-        // 原点（208, 900-308-44=548）；矩形上下沿与 CG 互逆。
+        // 复审 F1：CG 顶左锚点（200,308,44×44，屏高 900）→ Cocoa frame
+        // 原点（200, 900-308-44=548）；矩形上下沿与 CG 互逆。
         assert_eq!(
-            cg_bubble_to_cocoa_frame((208, 308), 900.0, 44.0),
-            (208.0, 548.0)
+            cg_bubble_to_cocoa_frame((200, 308), 900.0, 44.0),
+            (200.0, 548.0)
         );
         // 原点换算回 CG 顶左 = 自身（cocoa_to_cg 按点互逆）。
-        assert_eq!(cocoa_to_cg_point((208.0, 592.0), 900.0), (208.0, 308.0));
+        assert_eq!(cocoa_to_cg_point((200.0, 592.0), 900.0), (200.0, 308.0));
         // 贴屏底（CG y 最大）：frame 原点 y 最小不越界。
         assert_eq!(
             cg_bubble_to_cocoa_frame((0, 900 - 44), 900.0, 44.0),
