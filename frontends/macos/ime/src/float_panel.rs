@@ -169,10 +169,12 @@ struct PanelState {
 /// dispatch2 才有；此处自管）。
 struct PanelStore(RefCell<Option<PanelState>>);
 
-// SAFETY: PanelState（NSPanel/BubbleView）仅经 panel_state() 访问，
-// 全部调用点（ensure_panel/show_bubble/hide_bubble/set_busy_draw）都在
-// IME 主线程（见各函数 SAFETY 注），不存在跨线程访问；OnceLock 的 Sync
-// 另要求 T: Send，此处一并标注（存储一旦初始化即不移动）。
+// SAFETY: PanelState（NSPanel/BubbleView）仅经 panel_state() 访问。
+// AppKit 触点（ensure_panel/show_bubble/hide_bubble 的 orderOut/setFrame/
+// setNeedsDisplay）都在 IME 主线程（见各函数 SAFETY 注）；唯一可被后台
+// 线程触达的 set_busy_draw 已用 MainThreadMarker::new() 门住 AppKit 部分
+// （复审 F2），跨线程只剩原子量写。OnceLock 的 Sync 另要求 T: Send，
+// 此处一并标注（存储一旦初始化即不移动）。
 unsafe impl Sync for PanelStore {}
 unsafe impl Send for PanelStore {}
 
