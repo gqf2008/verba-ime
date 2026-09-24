@@ -126,3 +126,18 @@
 - [ ] daemon 未运行时打开设置面板：能自行拉起 daemon 并显示「已连接 daemon」
 - [ ] 输入法未安装时打开设置面板：状态栏给出明确提示（不是空白/假成功）
 - [ ] `卸载.command` 同时清掉 `~/Library/Input Methods/Verba.app` 与两处设置 app
+
+## 悬浮 AI 回复按钮（float-button，2026-09-24 批）
+
+> 前置：`config.toml` 加 `float_button_enable = true`（默认关；v1 设置面板不暴露，同 `eye_enabled`）；LLM provider 已配置。
+> 首跑注意：屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非 Verba.app），见 docs/privacy.md。
+
+- [ ] 激活输入框 → 光标右下出现气泡按钮（不遮挡光标）；点击按钮前后编辑器焦点不丢（按钮窗不抢焦点）
+- [ ] 密码类输入框（浏览器/Safari 登录密码框）激活 → 不弹按钮
+- [ ] 首跑点击按钮 → 系统弹「屏幕录制」授权（verba-trigger）→ 系统设置勾选后**再点一次** → 按钮转忙 → 回复进 OCR 预览（Enter/1 上屏，Esc 取消）
+- [ ] 重复点击：截的是**前台窗口在屏幕上的可见区域**（被遮挡部分带遮挡内容，v1 已知限制）
+- [ ] 右键按钮 = 取消；切走输入法/失焦 → 按钮消失（会话边界 = 按钮生命周期，30 分钟 TTL 兜底）
+- [ ] 点击后立刻失活（切输入法）→ 上一 session 的回复**不**出现在下一个输入框（世代守卫）
+- [ ] 断网/LLM 未配置时点击 → 按钮消失但日志可见原因（`~/Library/Application Support/dev.verba.Verba/logs/verba-mac.log` 搜 `float-button`：IMK 日志经 env_logger 只写文件不进控制台，helper stderr 已捕获，「悬浮按钮管线失败: …」），不再无声消失
+- [ ] 按钮回复上屏后输入 `//` 追问 → 上下文连续（与按钮同窗口级 AI 会话，session_key 相同）
+- [ ] 多显示器（可选）：副屏光标激活时按钮出现在光标所在屏的正确位置（Cocoa→CG 顶左坐标口径，评审 F1 修复项）

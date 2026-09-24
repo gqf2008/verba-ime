@@ -293,3 +293,16 @@
 - [ ] 改写管道（`//内容` + Tab）发送即占位，首块覆盖后仍走对照预览（1/2 不回归）
 - [ ] `//看图` 发送同样立刻出占位；DPI >100% 屏上占位文字/圆角正常（行数按实测
       回填，不裁末行）
+
+## 悬浮 AI 回复按钮（float-button，2026-09-24 批）
+
+> 前置：`config.toml` 加 `float_button_enable = true`（默认关；v1 设置面板不暴露）；verba-trigger.exe 与 TSF DLL 同目录（安装布局）；LLM provider 已配置。
+> 状态：共享层平台中立 + MSVC 交叉 check 绿；本节为 Windows 真机首验。
+
+- [ ] 激活输入框 → 活动视图左上旁出现气泡按钮（不抢焦点、无控制台窗口，`CREATE_NO_WINDOW`）
+- [ ] 密码字段（TSF `IS_PASSWORD`）激活 → 不弹按钮
+- [ ] 点击 → 截前台窗口可见区域 → OCR → LLM 回复进 OCR 预览（Enter/1 上屏，Esc 取消）
+- [ ] 右键按钮 = 取消；Deactivate（切走输入法）→ 按钮消失
+- [ ] 点击后立刻 Deactivate → 上一激活期的迟到回复**不**投递进下一激活期（世代守卫）
+- [ ] LLM 未配置/断网时点击 → 日志可见 `float-button: helper stderr: 悬浮按钮管线失败: …`，不再无声消失
+- [ ] 按钮回复上屏后输入 `//` 追问 → 同窗口级 AI 会话连续
