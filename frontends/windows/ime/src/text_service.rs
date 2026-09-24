@@ -187,6 +187,9 @@ pub struct TextServiceData {
     /// 生命周期 = 本 TSF 激活期，Deactivate 时 kill。DLL 进程不承载
     /// 按钮 UI（winit 事件循环在 helper 进程，issue #82 既定模式）。
     float_child: RefCell<Option<std::process::Child>>,
+    /// 悬浮按钮世代：kill/重 spawn 推进；读线程投递前校验，丢弃失活后
+    /// 迟到的结果（防 stale push 进下一激活期）。
+    float_epoch: Arc<AtomicU64>,
 }
 
 impl TextServiceData {
@@ -232,6 +235,7 @@ impl TextServiceData {
             // 悬浮 AI 回复按钮 helper（float-button 子命令；生命周期 = 本
             // TSF 激活期，Deactivate 时 kill）。
             float_child: RefCell::new(None),
+            float_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -380,8 +384,9 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
     unsafe {
         log::info!("Verba TSF 停用, tid={}", GetCurrentThreadId());
     }
-    // 悬浮按钮生命周期 = 本激活期：先杀 helper（其 stdout 管道随之 EOF，
-    // 读线程自然退出，不会在停用后向 trigger_results 投递）。
+    // 悬浮按钮生命周期 = 本激活期：先杀 helper 并推进世代——读线程即便
+    // 读到 kill 前已写入管道的迟到结果，也因世代不符丢弃，不会投递进
+    // 下一个激活期的 trigger_results。
     kill_float_button(data);
     if let Some(hwnd) = data.timer_hwnd.take() {
         unsafe {
@@ -2329,7 +2334,9 @@ fn trigger_exe_path() -> Option<std::path::PathBuf> {
 /// helper 进程持有 winit 非激活小窗（点击不抢编辑器焦点）；锚点取活动视图
 /// 屏幕矩形左上（激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
 /// 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落到
-/// trigger_results → OCR 预览上屏（与 /// 选区同一管线，无新通道）。
+/// trigger_results → OCR 预览上屏（与 /// 选区同一管线，无新通道）；管线
+/// 失败原因经 stderr 捕获记日志。世代守卫：Deactivate/重 spawn 推进世代，
+/// 旧读线程迟到结果丢弃，不会投递进下一激活期。
 /// 生命周期 = 本 TSF 激活期：Deactivate 时 kill。
 /// 密码类输入字段不弹按钮（屏幕内容出网链路与 // 同一收口标准）。
 fn spawn_float_button(data: &Rc<TextServiceData>) {
@@ -2355,11 +2362,13 @@ fn spawn_float_button(data: &Rc<TextServiceData>) {
         log::warn!("float-button: 未找到 verba-trigger.exe");
         return;
     };
-    // 单实例守卫：换激活期先杀旧的（防按钮叠加）。
+    // 单实例守卫：换激活期先杀旧的（防按钮叠加）；推进世代，作废旧读
+    // 线程的迟到投递（kill 时回复已在管道里的竞态）。
     if let Some(mut old) = data.float_child.borrow_mut().take() {
         let _ = old.kill();
         let _ = old.wait();
     }
+    data.float_epoch.fetch_add(1, Ordering::SeqCst);
     let session_id = data.session_id.get();
     let session_key = session_key_for_use(data);
     let mut cmd = std::process::Command::new(&exe);
@@ -2373,24 +2382,45 @@ fn spawn_float_button(data: &Rc<TextServiceData>) {
         // CREATE_NO_WINDOW：隐藏控制台窗口，按钮 GUI 照常显示。
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        // stderr 捕获（评审 F2）：管线失败原因（首跑缺屏幕录制权限、
+        // OCR/LLM 错误、模板缺占位）由 bin 写 stderr，此处读空记日志。
+        .stderr(std::process::Stdio::piped());
     match cmd.spawn() {
         Ok(mut child) => {
             log::info!("float-button: spawn at=({},{})", anchor.0, anchor.1);
             let results = Arc::clone(&data.trigger_results);
+            let float_epoch = Arc::clone(&data.float_epoch);
             let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
             *data.float_child.borrow_mut() = Some(child);
             std::thread::spawn(move || {
+                use std::io::Read as _;
+                let epoch = float_epoch.load(Ordering::SeqCst);
                 let mut text = String::new();
                 if let Some(mut s) = stdout {
-                    use std::io::Read as _;
                     let _ = s.read_to_string(&mut text);
+                }
+                // stdout EOF 即进程已退出，stderr 同步 EOF，可直接读空。
+                let mut err_text = String::new();
+                if let Some(mut e) = stderr {
+                    let _ = e.read_to_string(&mut err_text);
+                }
+                let err_text = err_text.trim();
+                if !err_text.is_empty() {
+                    log::warn!("float-button: helper stderr: {err_text}");
                 }
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     return; // 取消/无结果
                 }
-                results.lock().unwrap().push_back(TriggerResult::Text(text));
+                // 世代校验 + 投递在同一 results 锁内进行：校验通过 ⇒ 本次
+                // kill/spawn 的世代推进尚未发生，投递属于当前激活期。
+                let mut q = results.lock().unwrap();
+                if float_epoch.load(Ordering::SeqCst) != epoch {
+                    log::info!("float-button: 失活后迟到结果，丢弃");
+                    return;
+                }
+                q.push_back(TriggerResult::Text(text));
             });
         }
         Err(e) => log::warn!("float-button: 启动 verba-trigger 失败: {e}"),
@@ -2399,6 +2429,8 @@ fn spawn_float_button(data: &Rc<TextServiceData>) {
 
 /// 失活时 kill 悬浮按钮 helper（会话边界 = 按钮生命周期）。
 fn kill_float_button(data: &Rc<TextServiceData>) {
+    // 推进世代：kill 瞬间回复已在管道里的迟到投递就此作废。
+    data.float_epoch.fetch_add(1, Ordering::SeqCst);
     if let Some(mut child) = data.float_child.borrow_mut().take() {
         let _ = child.kill();
         let _ = child.wait();

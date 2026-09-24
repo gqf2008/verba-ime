@@ -241,9 +241,10 @@ fn cmd_speak(args: &[String]) -> i32 {
 
 /// `float-button --at x,y [--session-id N] [--session-key S]`：悬浮 AI 回复
 /// 按钮（winit 非激活小窗，等点击）；点击后截前台窗口 → OCR → LLM 生成
-/// 回复，文本写 stdout。取消（右键/失活被 kill）→ stdout 空、退出 0；
-/// 管线错误 → stderr + 退出 1；超时 → 退出 3。前端按「stdout 非空 = 有
-/// 结果」消费（与 region-ocr 同一契约）。
+/// 回复写 stdout、退出 0。取消（右键/失活被 kill）→ stdout 空、退出 0；
+/// 管线失败/空回复（`FloatOutcome::Failed`）→ stderr 带原因 + 退出 1
+/// （前端捕获 stderr 记日志，首跑缺屏幕录制权限不再无声消失）；超时 →
+/// 退出 3。前端按「stdout 非空 = 有结果」消费（与 region-ocr 同一契约）。
 fn cmd_float_button(args: &[String]) -> i32 {
     let Some(at) = parse_pair(args, "--at") else {
         eprintln!("用法: verba-trigger float-button --at x,y [--session-id N] [--session-key S]");
@@ -271,6 +272,10 @@ fn cmd_float_button(args: &[String]) -> i32 {
             0
         }
         Ok(FloatOutcome::Cancelled) => 0,
+        Ok(FloatOutcome::Failed(msg)) => {
+            eprintln!("悬浮按钮管线失败: {msg}");
+            1
+        }
         Ok(FloatOutcome::Expired) => {
             eprintln!("悬浮按钮超时（等待点击或管线执行超过上限）");
             3

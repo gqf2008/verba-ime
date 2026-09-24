@@ -60,12 +60,25 @@ pub struct FloatArgs {
     pub session_key: String,
 }
 
-/// 按钮结束态：回复文本 / 用户取消 / 超时。
+/// 按钮结束态：回复文本 / 用户取消 / 超时 / 管线失败（携带原因）。
+/// Failed 由 bin 映射为 stderr + 退出 1——取消语义只留给真正的用户取消/
+/// 超时，管线错误不再被静默吞掉（独立评审 F2）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum FloatOutcome {
     Reply(String),
     Cancelled,
     Expired,
+    Failed(String),
+}
+
+/// worker 结果 → 结束态：非空回复原样带；空回复与管线错误归 Failed
+/// （携带原因）。纯函数以便单测钉住映射语义。
+fn outcome_from_result(result: Result<String, TriggerError>) -> FloatOutcome {
+    match result {
+        Ok(text) if !text.trim().is_empty() => FloatOutcome::Reply(text),
+        Ok(_) => FloatOutcome::Failed("LLM 返回空文本".into()),
+        Err(e) => FloatOutcome::Failed(e.to_string()),
+    }
 }
 
 /// 计算按钮左上角：默认锚点右下（gap 间隙）；下方放不下翻转到上方；
@@ -312,8 +325,10 @@ impl ApplicationHandler for FloatApp {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => std::rc::Rc::new(w),
             Err(e) => {
-                log::warn!("创建悬浮按钮窗失败: {e}");
-                self.finish(event_loop, FloatOutcome::Cancelled);
+                self.finish(
+                    event_loop,
+                    FloatOutcome::Failed(format!("创建悬浮按钮窗失败: {e}")),
+                );
                 return;
             }
         };
@@ -337,16 +352,20 @@ impl ApplicationHandler for FloatApp {
         let context = match softbuffer::Context::new(window.clone()) {
             Ok(c) => std::rc::Rc::new(c),
             Err(e) => {
-                log::warn!("softbuffer Context 失败: {e}");
-                self.finish(event_loop, FloatOutcome::Cancelled);
+                self.finish(
+                    event_loop,
+                    FloatOutcome::Failed(format!("softbuffer Context 失败: {e}")),
+                );
                 return;
             }
         };
         let surface = match softbuffer::Surface::new(&context, window.clone()) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("softbuffer Surface 失败: {e}");
-                self.finish(event_loop, FloatOutcome::Cancelled);
+                self.finish(
+                    event_loop,
+                    FloatOutcome::Failed(format!("softbuffer Surface 失败: {e}")),
+                );
                 return;
             }
         };
@@ -418,19 +437,16 @@ impl ApplicationHandler for FloatApp {
         if let Some(rx) = state.worker.as_ref() {
             match rx.try_recv() {
                 Ok(result) => {
-                    let outcome = match result {
-                        Ok(text) if !text.trim().is_empty() => FloatOutcome::Reply(text),
-                        // 管线失败/空回复：按取消处理（stderr 已由 bin 侧打日志
-                        // 的面没了——错误经 outcome 带不出，此处保守取消；
-                        // bin 对 Cancelled 不打错，失败原因在 helper stderr）。
-                        _ => FloatOutcome::Cancelled,
-                    };
-                    self.finish(event_loop, outcome);
+                    self.finish(event_loop, outcome_from_result(result));
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.finish(event_loop, FloatOutcome::Cancelled);
+                    // worker 在 send 前异常终止：不是用户取消，按失败带出。
+                    self.finish(
+                        event_loop,
+                        FloatOutcome::Failed("管线 worker 异常终止".into()),
+                    );
                     return;
                 }
             }
@@ -582,5 +598,22 @@ mod tests {
         assert!(!in_rounded_rect(9.0, 20.0, 10.0, 12.0, 24.0, 16.0, 7.0));
         // 角落在半径外。
         assert!(!in_rounded_rect(10.5, 12.5, 10.0, 12.0, 24.0, 16.0, 2.0));
+    }
+
+    #[test]
+    fn outcome_mapping_distinguishes_reply_empty_error() {
+        assert_eq!(
+            outcome_from_result(Ok("你好".into())),
+            FloatOutcome::Reply("你好".into())
+        );
+        // 空白回复按失败带原因（点了按钮却无声消失 = 评审 F2 报的问题）。
+        match outcome_from_result(Ok("  \n ".into())) {
+            FloatOutcome::Failed(m) => assert!(m.contains("空文本"), "实际: {m}"),
+            other => panic!("期望 Failed，得 {other:?}"),
+        }
+        match outcome_from_result(Err(TriggerError::Config("模板缺 {ocr} 占位".into()))) {
+            FloatOutcome::Failed(m) => assert!(m.contains("占位"), "实际: {m}"),
+            other => panic!("期望 Failed，得 {other:?}"),
+        }
     }
 }

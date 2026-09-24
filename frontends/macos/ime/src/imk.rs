@@ -846,6 +846,14 @@ fn float_button_child() -> &'static Mutex<Option<std::process::Child>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
+/// 悬浮按钮世代计数：deactivate kill / 重新 spawn 都会推进；读线程投递
+/// OCR 结果前校验——kill 瞬间回复已在管道里的迟到结果不会落入下一个
+/// 输入 session（自审 stale-push 竞态，随评审 F2 一并修复）。
+fn float_button_epoch() -> &'static std::sync::atomic::AtomicU64 {
+    static E: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &E
+}
+
 /// 读悬浮按钮开关（config 文件；默认关 = 隐私默认最小出网）。
 fn float_button_enabled() -> bool {
     let Ok(dirs) = verba_config::VerbaDirs::locate() else {
@@ -859,11 +867,16 @@ fn float_button_enabled() -> bool {
 
 /// session 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable）：
 /// 同目录 verba-trigger float-button（winit 事件循环在 helper 进程，IME
-/// 进程不承载 UI，同 /// 选区模式）；锚点为光标点（xcap 全局单位=点）。
+/// 进程不承载 UI，同 /// 选区模式）；锚点为光标点，调用侧已按 vision 同
+/// 口径转成 CG 顶左全局单位（xcap 单位=点）。
 /// 点击后 helper 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落
-/// 到 ocr_result_slot → OCR 预览 → 用户确认上屏（与 /// 同一管线，无新通道）。
+/// 到 ocr_result_slot → OCR 预览 → 用户确认上屏（与 /// 同一管线，无新通道）；
+/// 管线失败原因经 stderr 捕获记日志。世代守卫：失活/重 spawn 后旧读线程的
+/// 迟到结果丢弃，不会落进下一个输入 session。
 /// 生命周期 = 输入 session：deactivateServer 侧 kill。
 fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
+    // 杀旧实例并推进世代（旧读线程的迟到投递就此作废）。
+    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut slot) = float_button_child().lock() {
         if let Some(mut old) = slot.take() {
             let _ = old.kill();
@@ -884,11 +897,15 @@ fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
     if !session_key.is_empty() {
         cmd.arg("--session-key").arg(session_key);
     }
+    // stderr 捕获（评审 F2）：管线失败原因（首跑缺屏幕录制权限、OCR/
+    // LLM 错误、模板缺占位）由 bin 写 stderr，此处读空记日志，不再丢空。
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     match cmd.spawn() {
         Ok(mut child) => {
+            let epoch = float_button_epoch().load(std::sync::atomic::Ordering::SeqCst);
             let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
             if let Ok(mut slot) = float_button_child().lock() {
                 *slot = Some(child);
             }
@@ -897,13 +914,31 @@ fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
                 if let Some(mut s) = stdout {
                     let _ = s.read_to_string(&mut text);
                 }
+                // stdout EOF 即进程已退出，stderr 同步 EOF，可直接读空。
+                let mut err_text = String::new();
+                if let Some(mut e) = stderr {
+                    let _ = e.read_to_string(&mut err_text);
+                }
+                let err_text = err_text.trim();
+                if !err_text.is_empty() {
+                    dbg_log(&format!("float-button: helper stderr: {err_text}"));
+                }
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     return; // 取消/无结果
                 }
-                dbg_log(&format!("float-button: 回复 {} 字", text.chars().count()));
-                if let Ok(mut slot) = ocr_result_slot().lock() {
-                    *slot = Some(text);
+                // 世代校验 + 投递在同一 child 锁内进行：校验通过 ⇒ 本次
+                // kill/spawn 的世代推进尚未发生，投递属于当前 session。
+                if let Ok(slot) = float_button_child().lock() {
+                    if float_button_epoch().load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                        dbg_log("float-button: 失活后迟到结果，丢弃");
+                        return;
+                    }
+                    dbg_log(&format!("float-button: 回复 {} 字", text.chars().count()));
+                    if let Ok(mut ocr) = ocr_result_slot().lock() {
+                        *ocr = Some(text);
+                    }
+                    drop(slot);
                 }
             });
         }
@@ -913,6 +948,8 @@ fn spawn_float_button(at: (i32, i32), session_id: u64, session_key: &str) {
 
 /// session 失活：kill 悬浮按钮 helper（会话边界 = 按钮生命周期）。
 fn kill_float_button() {
+    // 推进世代：kill 瞬间回复已在管道里的迟到投递就此作废。
+    float_button_epoch().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut slot) = float_button_child().lock() {
         if let Some(mut child) = slot.take() {
             let _ = child.kill();
@@ -1229,12 +1266,18 @@ define_class!(
                 if secure {
                     dbg_log("float-button: 安全输入字段，跳过");
                 } else {
+                    // 锚点坐标系：client_caret_point 是 Cocoa 底左原点，
+                    // helper（xcap/CGDisplayBounds）是顶左原点——必须经
+                    // cocoa_to_cg_point 转换（与 vision 路径 imk.rs:581
+                    // 同口径；评审 F1：直传会把按钮 Y 镜像到屏幕另一侧）。
+                    let screen_h = unsafe { CGDisplayBounds(CGMainDisplayID()).size.height };
                     let anchor = self
                         .ivars()
                         .client
                         .borrow()
                         .as_deref()
                         .and_then(client_caret_point)
+                        .map(|p| cocoa_to_cg_point(p, screen_h))
                         .map(|(x, y)| (x.round() as i32, y.round() as i32));
                     match anchor {
                         Some(at) => spawn_float_button(
