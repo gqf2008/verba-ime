@@ -9,7 +9,7 @@
 //!   NSPanel 本体才有意义——AppKit 对普通 NSWindow 忽略该位），与候选窗
 //!   同址生命周期：session 激活显、失活隐——激活路径零跨进程，
 //!   从根上消灭自激环；
-//! - 锚点 = **光标所在行正下方（左对齐光标右缘，行底 + 8pt 间隙）**、收
+//! - 锚点 = **光标所在行正下方（左对齐光标右缘，行底 + 16pt 间隙）**、收
 //!   进**前台窗口 bounds**（越界翻转到窗口内），光标矩形无效时退窗口右上
 //!   内缩——不再依赖裸屏幕坐标，垃圾光标矩形最多退化为角落定位，不会把气
 //!   泡画到屏幕外（D1 几何守卫由收进语义接管）。行正下方而非右下方：整行
@@ -33,14 +33,14 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-/// 气泡边长（点，与 v1 BUTTON_SIZE 同观感）。
-pub const BUBBLE_SIZE: f64 = 44.0;
-/// 光标与气泡的间隙（点）。
-const BUBBLE_GAP: i32 = 8;
+/// 气泡边长（点）。真机验收用户裁定：v1 的 44pt 太大，小一半取 22。
+pub const BUBBLE_SIZE: f64 = 22.0;
+/// 光标行与气泡的间隙（点，纵向）。真机验收：8pt 偏贴，16pt 离光标更远。
+const BUBBLE_GAP: i32 = 16;
 /// 退窗口右上时的内缩边距（点）。
 const BUBBLE_MARGIN: i32 = 12;
-/// 圆角半径（点）。
-const CORNER_RADIUS: f64 = 12.0;
+/// 圆角半径（点，随 22pt 气泡等比缩自 v1 的 12pt）。
+const CORNER_RADIUS: f64 = 6.5;
 
 /// v1 品牌色（crates/verba-trigger/src/float.rs 同一组常量，前端不另起色板）。
 const COLOR_BG: (f64, f64, f64) = (
@@ -150,9 +150,10 @@ fn draw_bubble(rect: NSRect, busy: bool) {
     NSColor::colorWithRed_green_blue_alpha(bg.0, bg.1, bg.2, 1.0).setFill();
     path.fill();
 
-    // 三个白点：水平居中排布，busy 时略收拢（视觉降噪）。
-    let dot_r = 3.0_f64;
-    let gap = if busy { 7.0 } else { 9.0 };
+    // 三个白点：水平居中排布，busy 时略收拢（视觉降噪）。22pt 气泡内
+    // 三点外缘不得越界：点半径 2、中心间距 7（busy 5），最外缘 ±9 < 11。
+    let dot_r = 2.0_f64;
+    let gap = if busy { 2.5 } else { 3.5 };
     let cy = rect.origin.y + rect.size.height / 2.0;
     let cx = rect.origin.x + rect.size.width / 2.0;
     for i in -1..=1 {
@@ -310,11 +311,11 @@ mod tests {
     #[test]
     fn anchor_places_below_caret_left_aligned() {
         // 窗口 100,100 到 900,700；光标 (200,300) 行高 15 → 行底 315 + 间隙
-        // 8 = 323，x 左对齐光标右缘（真机验收改锚：原右下 (208,308) 遮挡
-        // 光标列；评审 minor：行顶+间隙会压行下部，故锚行底）。
+        // 16 = 331，x 左对齐光标右缘（真机验收改锚：原右下遮挡光标列；评
+        // 审 minor：行顶+间隙会压行下部，故锚行底；用户裁定间隙 8→16）。
         assert_eq!(
             bubble_anchor(Some((200, 300, 15)), (100, 100, 800, 600)),
-            (200, 323)
+            (200, 331)
         );
     }
 
@@ -328,10 +329,10 @@ mod tests {
 
     #[test]
     fn anchor_flips_left_at_window_right_edge() {
-        // 光标右缘贴窗口右缘：右侧放不下 → 翻到光标左侧（贴右缘 − 间隙），
-        // y 行下不受影响（评审 nit：右缘翻转此前无精确值断言）。
-        let (x, y) = bubble_anchor(Some((870, 300, 15)), (100, 100, 800, 600));
-        assert_eq!(x, 870 - BUBBLE_GAP - BUBBLE_SIZE as i32);
+        // 光标右缘贴窗口右缘（880+22 > 900 触发翻转）→ 翻到光标左侧（贴
+        // 右缘 − 间隙），y 行下不受影响（评审 nit：右缘翻转精确值断言）。
+        let (x, y) = bubble_anchor(Some((880, 300, 15)), (100, 100, 800, 600));
+        assert_eq!(x, 880 - BUBBLE_GAP - BUBBLE_SIZE as i32);
         assert_eq!(y, 300 + 15 + BUBBLE_GAP);
     }
 
@@ -353,11 +354,11 @@ mod tests {
 
     #[test]
     fn anchor_none_branch_clamps_within_short_window() {
-        // 复审 F5：窗口高 50 < margin 12 + 气泡 44 → y 收进窗口底（50-44=6），
-        // 不探出底边。
-        let (x, y) = bubble_anchor(None, (0, 0, 400, 50));
-        assert_eq!(y, 6);
-        assert!(y + BUBBLE_SIZE as i32 <= 50);
+        // 复审 F5：窗口高 30 < margin 12 + 气泡 22 = 34 → y 收进窗口底
+        // （30-22=8），不探出底边。
+        let (x, y) = bubble_anchor(None, (0, 0, 400, 30));
+        assert_eq!(y, 8);
+        assert!(y + BUBBLE_SIZE as i32 <= 30);
         assert!(x >= 0 && x + BUBBLE_SIZE as i32 <= 400);
     }
 
