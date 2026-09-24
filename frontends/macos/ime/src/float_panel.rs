@@ -9,9 +9,12 @@
 //!   NSPanel 本体才有意义——AppKit 对普通 NSWindow 忽略该位），与候选窗
 //!   同址生命周期：session 激活显、失活隐——激活路径零跨进程，
 //!   从根上消灭自激环；
-//! - 锚点 = 光标右下、收进**前台窗口 bounds**（越界翻转到窗口内），光标
-//!   矩形无效时退窗口右上内缩——不再依赖裸屏幕坐标，垃圾光标矩形最多
-//!   退化为角落定位，不会把气泡画到屏幕外（D1 几何守卫由收进语义接管）；
+//! - 锚点 = **光标正下方（左对齐光标）**、收进**前台窗口 bounds**（越界
+//!   翻转到窗口内），光标矩形无效时退窗口右上内缩——不再依赖裸屏幕坐标，
+//!   垃圾光标矩形最多退化为角落定位，不会把气泡画到屏幕外（D1 几何守卫
+//!   由收进语义接管）。正下方而非右下方：插入列完全让开（横排文本可读
+//!   方向由左向右，光标紧右侧必然压字），且符合输入法辅助 UI 居下惯例；
+//!   下方放不下时翻转到光标上方（真机验收：用户反馈右下遮挡光标）。
 //! - 点击（或 `//`+TAB，同一入口）只 spawn **无头** `verba-trigger
 //!   float-run`（截前台窗口 → daemon OCR → stdout）——点击频率级，
 //!   不在激活频率级 spawn；LLM 生成在 IME 进程内走 start_llm 流式预览
@@ -52,8 +55,9 @@ const COLOR_BG_BUSY: (f64, f64, f64) = (
 const COLOR_WHITE: (f64, f64, f64) = (1.0, 1.0, 1.0);
 
 /// 锚点纯函数（CG 顶左全局点，可测）：
-/// - `caret = Some`：光标右下（间隙 BUBBLE_GAP），下方/右方放不下时翻到
-///   光标上/左，最终收进窗口 bounds；
+/// - `caret = Some`：光标正下方、左对齐（x=cx 不留横向间隙，y 留
+///   BUBBLE_GAP 间隙），下方/右方放不下时翻到光标上/左，最终收进窗口
+///   bounds；
 /// - `caret = None`（光标矩形无效/缺省）：窗口右上内缩 BUBBLE_MARGIN
 ///   （用户裁定：垃圾光标矩形场景退窗口右上，见 v2 线程锚位选择）。
 pub fn bubble_anchor(caret: Option<(i32, i32)>, win: (i32, i32, i32, i32)) -> (i32, i32) {
@@ -61,11 +65,12 @@ pub fn bubble_anchor(caret: Option<(i32, i32)>, win: (i32, i32, i32, i32)) -> (i
     let size = BUBBLE_SIZE as i32;
     match caret {
         Some((cx, cy)) => {
-            // 偏好光标右下；贴边时翻到光标上/左（翻转只是选侧，最终的
-            // clamp 才保证收进窗口——垃圾光标矩形 any 方向都出不去）。
-            // 全程 saturating：CG 浮点 as-cast 已饱和到 i32 边界，加减
-            // 不得再溢出（debug panic / release 回绕，复审 F6）。
-            let mut x = cx.saturating_add(BUBBLE_GAP);
+            // 偏好光标正下方（左对齐光标；真机验收：右下压插入列遮挡光
+            // 标）。贴边时翻到光标上/左（翻转只是选侧，最终的 clamp 才保
+            // 证收进窗口——垃圾光标矩形 any 方向都出不去）。全程
+            // saturating：CG 浮点 as-cast 已饱和到 i32 边界，加减不得再
+            // 溢出（debug panic / release 回绕，复审 F6）。
+            let mut x = cx;
             let mut y = cy.saturating_add(BUBBLE_GAP);
             if y.saturating_add(size) > wy.saturating_add(wh) {
                 y = cy.saturating_sub(BUBBLE_GAP).saturating_sub(size);
@@ -298,11 +303,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn anchor_places_right_below_caret() {
-        // 窗口 100,100 到 900,700；光标 (200,300) → 右下偏移，收进窗口。
+    fn anchor_places_below_caret_left_aligned() {
+        // 窗口 100,100 到 900,700；光标 (200,300) → 正下方左对齐（x 不变，
+        // y 留间隙），收进窗口（真机验收改锚：原右下 208,308 遮挡光标列）。
         assert_eq!(
             bubble_anchor(Some((200, 300)), (100, 100, 800, 600)),
-            (208, 308)
+            (200, 308)
         );
     }
 
@@ -310,7 +316,7 @@ mod tests {
     fn anchor_flips_above_at_window_bottom() {
         // 光标贴窗口底：下方放不下 → 翻到上方，仍收进窗口。
         let (x, y) = bubble_anchor(Some((400, 780)), (100, 100, 800, 700));
-        assert_eq!(x, 408);
+        assert_eq!(x, 400);
         assert_eq!(y + BUBBLE_SIZE as i32, 780 - BUBBLE_GAP);
     }
 
