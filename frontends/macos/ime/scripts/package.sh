@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 打包 macOS IMK .app：构建输入法本体（verba-mac）与 daemon（verba-daemon），
-# 组装 Verba.app 目录并做 ad-hoc 签名。
+# 组装 Verba.app 目录并签名（默认 Developer ID，详见文末签名段）。
 #
 # 用法：scripts/package.sh
 # 产物：dist/Verba.app
@@ -81,9 +81,20 @@ else
     echo "未找到 vendor/rime（librime.dylib + data/），跳过 Rime 捆绑；发布构建须先跑 scripts/fetch-rime-vendor.sh"
 fi
 
-# ad-hoc 签名（本地安装足够；正式发布需 Developer ID + 公证）。
+# 签名身份：默认探测本机钥匙串的 Developer ID Application（TCC 授权按
+# Team ID 稳定——屏幕录制等权限跨重建保留；ad-hoc 每次构建 cdhash 都变，
+# 系统视为新应用，每次重装都需重授，2026-09-25 真机验收实测踩过）。
+# 可用 VERBA_CODESIGN_IDENTITY 显式覆盖；探测不到则回退 ad-hoc（本地
+# 安装可用，但每次重装后 TCC 授权清零）。
 # 失败不吞：CI 与本地都应看到签名错误。
-codesign --force --deep --sign - "$APP"
+IDENTITY="${VERBA_CODESIGN_IDENTITY-}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+  [ -z "$IDENTITY" ] && IDENTITY="-"
+fi
+echo "签名身份: $IDENTITY"
+codesign --force --deep --sign "$IDENTITY" --timestamp=none "$APP"
 codesign --verify "$APP" 
 
 echo "打包完成: $APP"
