@@ -178,7 +178,7 @@ bash scripts/ensure-ort-dist.sh --print-cache-root
   dlclose 会 SIGSEGV（Squirrel/Weasel 同样从不卸载）；`finalize()` 在 drop 时调用。
 
 - **Windows**：`cargo build -p verba-ime-windows`（TSF DLL）→ 注册脚本（regsvr32 / 安装器）→ Inno Setup 打包。
-- **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` / `verba-daemon` / `verba-register`；签名身份默认探测钥匙串 Developer ID Application——TCC 授权按 Team ID 跨重建保留，ad-hoc 每次构建 cdhash 都变、每次重装需重授屏幕录制等权限（可用 `VERBA_CODESIGN_IDENTITY` 覆盖，探测不到回退 ad-hoc）。）。
+- **macOS**：`frontends/macos/ime/scripts/package.sh` 构建全 Rust IMK `.app`（`dist/Verba.app`，含 `verba-mac` / `verba-daemon` / `verba-register`；签名身份默认探测钥匙串 Developer ID Application——TCC 授权按 Team ID 跨重建保留，ad-hoc 每次构建 cdhash 都变、每次重装需重授屏幕录制等权限（可用 `VERBA_CODESIGN_IDENTITY` 覆盖，探测不到回退 ad-hoc）。
   - **发布 DMG 一键安装**：DMG 不提供 `/Applications` 快捷方式（输入法不是普通应用）；双击「安装.command」→ 拷贝到 `~/Library/Input Methods`（用户级，无需管理员）→ `verba-register` 写 `com.apple.inputsources` 第三方输入源白名单并刷新 TextInputMenuAgent，自动启用输入源（无需手动添加）。卸载 = 双击「卸载.command」。
   - **手动安装**：`cp -R dist/Verba.app "$HOME/Library/Input Methods/"` → 运行 `Verba.app/Contents/MacOS/verba-register`（自动写白名单并启用）；`verba-register --list` 可只读查看已注册输入源（CI 冒烟同款）。
   - **PKG 安装包（系统级）**：`scripts/package-pkg.sh` 把已组装的 `dist/Verba.app` 打成

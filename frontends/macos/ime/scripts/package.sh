@@ -89,11 +89,17 @@ fi
 # 失败不吞：CI 与本地都应看到签名错误。
 IDENTITY="${VERBA_CODESIGN_IDENTITY-}"
 if [ -z "$IDENTITY" ]; then
-  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+  # 不吞错：security 硬失败时让报错上屏（pipefail + set -e 中止），而非
+  # 静默落 ad-hoc。显示名签名在多份同名字证书时会 ambiguous identity，
+  # 用 VERBA_CODESIGN_IDENTITY 消歧（与 release.yml 同模式）。
+  IDENTITY=$(security find-identity -v -p codesigning \
     | awk -F'"' '/Developer ID Application/ {print $2; exit}')
   [ -z "$IDENTITY" ] && IDENTITY="-"
 fi
 echo "签名身份: $IDENTITY"
+# 注意：--deep 不签 Contents/Library 下的嵌套 bundle（如 Verba Settings
+# .app，Darwin 25 实测）——发布链路 release.yml 逐组件补签兜底；本地
+# 若单独分发嵌套面板需先签嵌套再签外层。
 codesign --force --deep --sign "$IDENTITY" --timestamp=none "$APP"
 codesign --verify "$APP" 
 
