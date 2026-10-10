@@ -28,12 +28,53 @@ Verba · 拾言输入法：开源跨平台多模态 AI 输入法（OCR / ASR / L
 - 关键决策（架构、协议、provider）先更新对应文档再写代码，契约不漂移
 
 ## 协作与记账（walgit 协同层）
-本仓库 origin 为本机 walgit（`http://127.0.0.1:8081/gqf2008/verba-ime.git`）。开发协作的 issue / PR / 评审 / 合并 / 收尾一律走 walgit 的 D1 协同层（`refs/collab/*` 追加式签名条目），**不使用 GitHub / `gh`**：
 
-- 开线程 `issue`（`--parent ""`）→ 认领 `comment`（owner/worktree/branch）+ `status: in-progress` → 交补丁 `patch --base refs/heads/main --head refs/heads/<branch>` → 评审 `review`（decision/agent/note）→ 合并 `merge_result` → 收尾 `status: closed`。
+开发协作的 issue / 评审 / 合并 / 收尾一律走 walgit 的 D1 协同层（`refs/collab/*` 追加式签名条目），
+**不使用 GitHub issue / `gh`**（GitHub 只作代码镜像）；本机 walgit 主机是**事实源**。
+
+**远端名以 `git remote -v` 为准，不要写死 `origin`**：本仓 `walgit` = 本机主机
+（`http://127.0.0.1:8081/gqf2008/verba-ime.git`），`origin` = GitHub 镜像
+（`https://github.com/gqf2008/verba-ime.git`）。所以：
+
+- 协作条目一律 `--push walgit`；分支按需推 walgit，GitHub 侧只在发版时推 tag / main。
+- 拉协作视图：`git fetch walgit '+refs/collab/inbox/*:refs/collab/inbox/*' '+refs/collab/meta/*:refs/collab/meta/*'`。
+
+**契约**（缺一不可）：
+
+- 开线程 `issue`（`--parent ""`）→ 认领 `status: in-progress`（owner / worktree / branch / work）
+  → 交补丁 `patch --base refs/heads/main --head refs/heads/<branch>` → 评审 `review` → 合并 `merge_result` → 收尾 `status: closed`。
 - `--parent` 必须取上一条命令返回的 oid；`--key` 传路径不传内容；**不得用别人的 key 代签**。
-- 查重/看板用 `walgit collab board` / `collab thread <id>`，不用 `gh issue list`。
-- 命令形态与 principal/key 约定见 `~/.agents/rules/RULE_walgit协同记账.md`。
+- `review` 的 `decision` 只有两个机器值：**`approve` / `request_changes`**。`needs-changes`、`request-changes`
+  都不是——`merge_rule_eval` 认不出，只等于一条普通评论。`request_changes` 之后由实现者改分支并回
+  `status: in-progress`，复审通过才 `approve`。
+- `status` 用规范里的六个值：`in-progress` / `needs-review` / `blocked` / `needs-human` / `done` / `closed`；
+  **不要自造 `open`**（它只是「还没写 status 条目」的隐含初态，开卡后直接认领即可）。
+- 审查者必须是**与补丁作者不同的 principal**；作者自审的 approve 无效，不能作为合并依据。
+- 看板卡片只能靠追加签名 `status` 条目移动，**不要编辑 `.walgit/board.toml`**；条目 append-only，不回改历史。
+- 查重 / 看板用 `walgit collab board` / `collab thread <id>`，不用 `gh issue list`。
+
+**身份与 key**（主机规范 §0：一个 worktree 一个身份）：
+
+- 新 worktree 用 `walgit collab join --repo <checkout> --principal <role> --push walgit` 落地 worktree-local
+  身份：key 在 `<git-dir>/walgit/keys/<principal>.ed25519`，身份记在 `<git-dir>/walgit/identity`。
+  **一个 principal 一把 key，不共用、不堆在同一个目录**。
+- 既有 principal 的 key 仍在 `~/.walgit/keys/<principal>.ed25519`（历史遗留的统一 key 目录），
+  过渡期用显式 `--key <路径>`；新角色不要再往那里加。
+
+**命令形态**（下面 `$WALGIT` 指探测到的 walgit 可执行路径）：
+
+```sh
+"$WALGIT" --config ~/.walgit/walgit.toml collab entry --repo . \
+  --kind patch --id <线程> --actor <principal> --parent <上一条 oid> \
+  --body "$(cat body.json)" --base refs/heads/main --head refs/heads/<branch> \
+  --key ~/.walgit/keys/<principal>.ed25519 --push walgit
+```
+
+中文 body 用 python3 生成 JSON 再 `--body "$(cat f)"`，不要在 shell 里手写转义；`--body` 是
+**条目 body 本身**（顶层就是 `status` / `owner` / `decision` 这些字段），不要再包一层 `body`——
+包了之后投影器读不到 `status`，卡片会退回默认态。
+
+主机操作与协作标准见 `http://walgit.localhost:8081/SKILL.md`。
 
 ## 提交
 按通用规则：单职责提交、禁止临时文件/密钥/构建产物、提交前自跑最小验证。
