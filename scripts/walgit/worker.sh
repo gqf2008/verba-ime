@@ -45,6 +45,27 @@ reset_worktree() { git -C "$REPO" worktree remove --force "$1" 2>/dev/null || tr
 # 可移植超时（macOS 无 timeout）：perl alarm + exec
 with_timeout() { local secs="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$secs" "$@"; }
 
+# seen 水位：`seen` 行格式 <key>=<last_ts>；线程 last_ts 未变则跳过，变了则重新分诊。
+seen_has() { [ -f "$WG/seen" ] && grep -qxF "$1=$2" "$WG/seen" 2>/dev/null; }
+seen_set() {
+  local k="$1" ts="$2" esc
+  [ -n "$ts" ] || return 0
+  esc="$(printf '%s' "$k" | sed 's/[][\.*^$/]/\\&/g')"
+  if [ -f "$WG/seen" ]; then grep -v "^${esc}=" "$WG/seen" > "$WG/seen.tmp" 2>/dev/null || true; else : > "$WG/seen.tmp"; fi
+  printf '%s=%s\n' "$k" "$ts" >> "$WG/seen.tmp"
+  mv "$WG/seen.tmp" "$WG/seen"
+}
+board_ts() { W collab board --format json 2>/dev/null | python3 -c '
+import sys, json
+tid = sys.argv[1]
+try: d = json.load(sys.stdin)
+except Exception: print(""); sys.exit(0)
+for col in d.get("columns", []):
+    for card in col.get("cards", []):
+        if card.get("id") == tid:
+            print(card.get("last_ts", "")); sys.exit(0)
+print("")' "$1"; }
+
 # emit <kind> <id> <actor> <parent> <body-json> [extra args…] → stdout: entry oid
 emit() {
   local kind="$1" id="$2" actor="$3" parent="$4" body="$5" out
@@ -281,7 +302,7 @@ print(1 if any(r.get("decision") == "approve" and r.get("actor") not in authors 
     log "review emitted $thread decision=$decision"
   fi
 
-  [ "$decision" = "approve" ] || { log "review $thread: $decision，不合并"; return; }
+  [ "$decision" = "approve" ] || { log "review $thread: ${decision}，不合并"; return; }
   [ "$allowed" = "True" ] || { log "review $thread: merge rule 不通过，不合并"; return; }
   [ "$base" = "refs/heads/main" ] || { log "review $thread: base=$base 非 main，留人工合并"; return; }
   if [ "$DRY_RUN" != "0" ] || [ "$ALLOW_AUTO_MERGE" != "1" ]; then log "review $thread: merge skipped (gates)"; return; fi
@@ -315,15 +336,14 @@ for col in d.get("columns", []):
         if not tid: continue
         title = (c.get("title","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:200]
         prose = (c.get("prose","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:800]
-        print(f"{tid}\t{title}\t{prose}")
-' | while IFS=$'\t' read -r tid title prose; do
+        print("%s\t%s\t%s\t%s" % (tid, title, prose, c.get("last_ts", "")))
+' | while IFS=$'\t' read -r tid title prose ts; do
     [ -n "$tid" ] || continue
     key="open:$tid"
-    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
-    echo "$key" >> "$WG/seen"
+    seen_has "$key" "$ts" && continue
     python3 -c 'import json,sys;print(json.dumps({"body":{"title":sys.argv[1],"body":sys.argv[2]}}))' "$title" "$prose" > "$QUEUE/$(safe_key "$key").json"
     printf '%s|%s|%s|%s\n' "$key" "$tid" "scan" "issue" >> "$QUEUE/todo"
-    log "scan enqueued open thread=$tid"
+    log "scan enqueued open thread=$tid ts=$ts"
   done
 }
 
@@ -339,15 +359,14 @@ for col in d.get("columns", []):
         if not tid: continue
         title = (c.get("title","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:200]
         branch = (c.get("branch","") or "").replace("\t"," ").strip()
-        print(f"{tid}\t{title}\t{branch}")
-' | while IFS=$'\t' read -r tid title branch; do
+        print("%s\t%s\t%s\t%s" % (tid, title, branch, c.get("last_ts", "")))
+' | while IFS=$'\t' read -r tid title branch ts; do
     [ -n "$tid" ] || continue
     key="review:$tid"
-    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
-    echo "$key" >> "$WG/seen"
+    seen_has "$key" "$ts" && continue
     python3 -c 'import json,sys;print(json.dumps({"title":sys.argv[1],"branch":sys.argv[2]}))' "$title" "$branch" > "$QUEUE/$(safe_key "$key").json"
     printf '%s|%s|%s|%s\n' "$key" "$tid" "" "review" >> "$QUEUE/todo"
-    log "scan enqueued needs-review thread=$tid"
+    log "scan enqueued needs-review thread=$tid ts=$ts"
   done
 }
 
@@ -391,6 +410,8 @@ task() { # <key> <thread> <actor> <jobtype>
   else
     process "$key" "$thread" "$actor"
   fi
+  # 封口：写入后线程当前 last_ts，吸收 worker 自写条目，避免自触发循环
+  seen_set "$key" "$(board_ts "$thread")"
   log "task done key=$key pid=$$"
 }
 
