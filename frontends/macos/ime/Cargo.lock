@@ -2442,6 +2442,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-input-method-kit",
  "plist",
+ "verba-candidate",
  "verba-config",
  "verba-core",
  "verba-ipc",

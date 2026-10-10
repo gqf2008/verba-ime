@@ -22,19 +22,12 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
     MainThreadOnly,
 };
-use objc2_app_kit::{
-    NSApplication, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSMenu, NSMenuItem,
-    NSScreen,
-};
+use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSScreen};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSDictionary, NSInteger,
-    NSNotFound, NSNumber, NSObject, NSObjectProtocol, NSRange, NSRect, NSRunLoop, NSString,
-    NSTimer, NSUInteger,
+    NSArray, NSAttributedString, NSBundle, NSDefaultRunLoopMode, NSInteger, NSNotFound,
+    NSObjectProtocol, NSRange, NSRect, NSRunLoop, NSString, NSTimer, NSUInteger,
 };
-use objc2_input_method_kit::{
-    kIMKLocateCandidatesBelowHint, kIMKSingleColumnScrollingCandidatePanel, IMKCandidates,
-    IMKCandidatesSendServerKeyEventFirst, IMKInputController, IMKServer, IMKStateSetting,
-};
+use objc2_input_method_kit::{IMKInputController, IMKServer, IMKStateSetting};
 
 use verba_core::machine::{
     failure_overlay_body, result_hint, Action, CompositionMachine, LlmCandidateRequest,
@@ -144,33 +137,13 @@ fn catch_void(label: &str, f: impl FnOnce()) {
     }
 }
 
-/// 候选面板（IMK 私有 IMKUIPanel 窗口）外观校正：默认圆角过大（真机反馈）。
-/// 面板窗口不在 IMKCandidates API 暴露范围，经 [NSApp windows] 找到后把
-/// contentView 层的圆角收敛到 6pt 并裁剪。首个展示周期执行一次。
-fn style_candidate_panel(mtm: MainThreadMarker) {
-    let app = NSApplication::sharedApplication(mtm);
-    for win in app.windows().iter() {
-        // SAFETY: class 为 NSObject 方法，win 恒有效。
-        let cls: *const AnyClass = unsafe { msg_send![&*win, class] };
-        // SAFETY: cls 来自上一行对 win 的合法 msg_send（NSObject class），
-        // 指向的元类在进程生命周期内恒有效。
-        let name = unsafe { (*cls).name() }.to_string_lossy().into_owned();
-        if name.contains("IMKUIPanel") {
-            // SAFETY: contentView/setWantsLayer 为 NSView 公开方法，layer 经
-            // msg_send 读取 CALayer 公开属性；win 是当前应用窗口列表中的存活对象，
-            // 消息仅操作 layer 视觉参数。ObjC 异常由 catch_void 兜底。
-            catch_void("panel.style", || unsafe {
-                let Some(cv) = win.contentView() else { return };
-                cv.setWantsLayer(true);
-                let layer: Option<Retained<AnyObject>> = msg_send![&cv, layer];
-                if let Some(layer) = layer {
-                    let _: () = msg_send![&layer, setCornerRadius: 6.0f64];
-                    let _: () = msg_send![&layer, setMasksToBounds: true];
-                    log::debug!("[Verba] 候选面板圆角校正完成");
-                }
-            });
-        }
-    }
+/// 候选主题（配置热更新：每次刷新读一次；失败用默认）。
+fn load_candidate_theme() -> verba_candidate::Theme {
+    verba_config::VerbaDirs::locate()
+        .ok()
+        .and_then(|d| verba_config::ConfigManager::new(d).load().ok())
+        .map(|c| c.theme.to_candidate_theme())
+        .unwrap_or_default()
 }
 
 /// 现代 macOS 的 IMK 连接名约定：`<CFBundleIdentifier>_Connection`。
@@ -1174,10 +1147,6 @@ struct Ivars {
     candidate_rime_schema: RefCell<String>,
     /// 配置 mtime（用于 Rime 方案热更新检测）。
     candidate_config_mtime: Cell<Option<std::time::SystemTime>>,
-    /// IMK 候选窗（惰性创建；updateCandidates/show 驱动显示）。
-    candidates_ui: RefCell<Option<Retained<IMKCandidates>>>,
-    /// 候选面板外观校正是否已执行（仅首次展示时探针 + 设圆角）。
-    panel_probe_done: Cell<bool>,
     /// 宿主调用深度（>0 表示正处于会泵运行循环的同步客户端/面板调用段）。
     host_call_depth: Cell<usize>,
     /// 重入窗内积压的待补放按键（见 `PendingKey` 与 drain 顶部的补放循环）。
@@ -1215,8 +1184,6 @@ impl Default for Ivars {
             session_key_refreshing: Cell::new(false),
             candidate_rime_schema: RefCell::new("luna_pinyin_simp".to_owned()),
             candidate_config_mtime: Cell::new(None),
-            candidates_ui: RefCell::new(None),
-            panel_probe_done: Cell::new(false),
             host_call_depth: Cell::new(0),
             pending_keys: RefCell::new(VecDeque::new()),
             caps_host_cleanup: Cell::new(0),
@@ -1523,14 +1490,7 @@ define_class!(
             if self.handle_ocr_preview_key(classify_key(string, key_code)) {
                 return Bool::new(true);
             }
-            let panel_visible = self
-                .ivars()
-                .candidates_ui
-                .borrow()
-                .as_ref()
-                // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法，ui 仅在主线程访问。
-                .map(|ui| unsafe { ui.isVisible() })
-                .unwrap_or(false);
+            let panel_visible = crate::candidate_panel::is_visible();
             // 调试日志：sender 类名辅助区分真宿主 client 与包装器（会话切
             // 换排查时 sender 指针变化是关键线索）。
             let sender_cls = sender.map(|s| {
@@ -2780,114 +2740,54 @@ impl VerbaIMKController {
         }
     }
 
-    /// 刷新候选窗：首次惰性创建 IMKCandidates，之后 update + show。
+    /// 刷新候选窗：自绘 `NSPanel`（`candidate_panel`，与 Windows 同款 tiny-skia
+    /// 渲染器）——组控制器（候选 / preedit / 页码）→ 取光标锚点 → 渲染贴图。
     /// 候选为空时不隐藏、保持原状：击键同步态 candidates 恒为空（Rime 查询
     /// 在途），若每击键都隐藏、结果到达再显示，候选窗会一闪一闪；真正的
     /// 收起只发生在提交/清空组合/会话切换（见 commit/clear_composition/
     /// deactivate_server）与「当前拼音查询终结且无候选」（feed_candidates_event）。
-    /// IMK 候选窗需要控制器显式驱动（updateComposition 只推标记文本，
-    /// 不会自动弹候选窗）。
     fn refresh_candidate_window(&self) {
-        if self.ivars().candidates.borrow().is_empty() {
+        let candidates = self.ivars().candidates.borrow().clone();
+        if candidates.is_empty() {
             return;
         }
         // SAFETY: drain 定时器 / 输入回调均在主线程。
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let mut ui = self.ivars().candidates_ui.borrow_mut();
-        if ui.is_none() {
-            // SAFETY: server 为 IMKInputController 的只读访问器。
-            let server: Option<Retained<IMKServer>> = unsafe { msg_send![self, server] };
-            let Some(server) = server else {
-                log::warn!("[VerbaIMK] 无法获取 IMKServer，候选窗不可用");
-                return;
-            };
-            // SAFETY: initWithServer:panelType: 的 server 必填（已判空）。
-            let created = unsafe {
-                IMKCandidates::initWithServer_panelType(
-                    IMKCandidates::alloc(mtm),
-                    Some(&server),
-                    kIMKSingleColumnScrollingCandidatePanel as NSUInteger,
-                )
-            };
-            let Some(c) = created else {
-                log::warn!("[VerbaIMK] IMKCandidates 创建失败");
-                return;
-            };
-            // 属性：按键先送控制器（默认面板优先——数字/退格被面板吞掉且不回调
-            // candidateSelected:，导致选词失效）；字体加大、近不透明，改善默认样式。
-            let font = NSFont::systemFontOfSize(17.0);
-            let yes: Retained<NSNumber> =
-                unsafe { msg_send![NSNumber::class(), numberWithBool: true] };
-            let font_obj: &NSObject = &font;
-            let yes_obj: &NSObject = &yes;
-            // SAFETY: extern static 常量由系统框架提供，只读访问。
-            let font_key: &NSObject = unsafe { NSFontAttributeName };
-            let first_key: &NSObject = unsafe { IMKCandidatesSendServerKeyEventFirst };
-            let obj_arr: [&NSObject; 2] = [font_obj, yes_obj];
-            let key_arr: [&NSObject; 2] = [font_key, first_key];
-            // SAFETY: arrayWithObjects:count: 指针指向有效对象数组，count=2。
-            let objs: Retained<NSArray<NSObject>> = unsafe {
-                msg_send![NSArray::<NSObject>::class(), arrayWithObjects: obj_arr.as_ptr(), count: 2]
-            };
-            let keys: Retained<NSArray<NSObject>> = unsafe {
-                msg_send![NSArray::<NSObject>::class(), arrayWithObjects: key_arr.as_ptr(), count: 2]
-            };
-            // SAFETY: dictionaryWithObjects:forKeys: 两数组等长且键实现 NSCopying。
-            let dict: Retained<NSDictionary> = unsafe {
-                msg_send![
-                    NSDictionary::<AnyObject, AnyObject>::class(),
-                    dictionaryWithObjects: &*objs,
-                    forKeys: &*keys
-                ]
-            };
-            // SAFETY: 属性字典由本函数构造，键值类型正确。
-            unsafe { c.setAttributes(Some(&dict)) };
-            *ui = Some(c);
-        }
-        // 关键：把面板句柄 clone 出来后**立即释放 RefCell 借用**。下面的
-        // host_call（updateCandidates / show）会**同步泵运行循环**——show 要向
-        // 客户端查 markedRange；泵期间到达的按键会重入 input_text，而它开头就取
-        // `candidates_ui.borrow()`。借用若跨过那次泵，就是
-        // `already mutably borrowed` panic；该 panic 穿出 objc2 的 ObjC 异常
-        // shim 会二次 panic（rust_drop_panic）→ **abort**。真机 2026-09-17 12:22
-        // 的 SIGABRT 正是这个形状：打完第 1 个字母候选窗弹出、第 2 个字母必崩。
-        let ui_ref = ui.as_ref().expect("刚创建").clone();
-        drop(ui);
-        // SAFETY: updateCandidates/show 为无前置条件的 UI 方法；候选数据源
-        // 由本控制器实现（candidates / candidates:）。
-        self.host_call("refresh.updateCandidates", || unsafe {
-            ui_ref.updateCandidates()
-        });
-        // show 会向客户端同步查询面板定位（attributesForCharacterIndex，
-        // XPC 泵运行循环）：已在展示则跳过——此前每击键 show 两次，嵌套
-        // XPC 往返既拖慢长句刷新又放大重入窗口（见 host_call）。
-        // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（同上，主线程访问）。
-        if !unsafe { ui_ref.isVisible() } {
-            self.host_call("refresh.show", || unsafe {
-                ui_ref.show(kIMKLocateCandidatesBelowHint as NSUInteger)
+
+        let mut ctrl = verba_candidate::CandidateWindowController::new(load_candidate_theme());
+        ctrl.set_candidates(candidates);
+        ctrl.set_page(self.ivars().page.get());
+        let preedit = self.ivars().composed.borrow().clone();
+        ctrl.set_preedit(&preedit);
+        ctrl.show();
+
+        // 光标锚点（CG 顶左）：client_caret_rect 走 XPC，必在 host_call 内。
+        let client = self.ivars().client.borrow().clone();
+        let mut caret_rect = None;
+        if let Some(client) = client.as_ref() {
+            self.host_call("refresh.caret_rect", || {
+                caret_rect = client_caret_rect(client);
             });
-            // 面板窗口圆角校正：首个展示周期探针一次（IMKUIPanel 不在
-            // IMKCandidates API 暴露范围，只能经 [NSApp windows] 找到）。
-            if !self.ivars().panel_probe_done.replace(true) {
-                style_candidate_panel(mtm);
-            }
         }
+        // SAFETY: CGDisplayBounds 为只读查询，主线程。
+        let main_h = unsafe { CGDisplayBounds(CGMainDisplayID()) }.size.height;
+        let caret_cg = caret_rect.map(|(x, y, _w, h)| {
+            let top = main_h - (y + h);
+            let bottom = main_h - y;
+            (x.round() as i32, top.round() as i32, bottom.round() as i32)
+        });
+        let work = caret_cg
+            .and_then(|(x, top, _)| display_work_area_containing((x as f64, top as f64), main_h))
+            .unwrap_or_else(|| cg_bounds_work(unsafe { CGDisplayBounds(CGMainDisplayID()) }));
+        let scale = NSScreen::mainScreen(mtm)
+            .map(|s| s.backingScaleFactor())
+            .unwrap_or(1.0);
+        crate::candidate_panel::show(&ctrl, caret_cg, work, main_h, scale);
     }
 
-    /// 隐藏候选窗（提交/清空组合/会话切换时调用；无窗则空操作）。
+    /// 隐藏候选窗（提交/清空组合/会话切换时调用）。
     fn hide_candidate_window(&self) {
-        // 同 refresh：先把句柄 clone 出来释放借用，再调会泵运行循环的 hide。
-        let ui = self.ivars().candidates_ui.borrow().clone();
-        if let Some(ui) = ui.as_ref() {
-            // SAFETY: hide 为无前置条件的 UI 方法。
-            self.host_call("hide", || unsafe { ui.hide() });
-            // SAFETY: isVisible 为 NSPanel/NSWindow 公开方法（主线程）。
-            let still = unsafe { ui.isVisible() };
-            dbg_log(&format!(
-                "hide_candidate_window after-hide isVisible={}",
-                still
-            ));
-        }
+        crate::candidate_panel::hide();
     }
 
     // ---- LLM 流式 ----

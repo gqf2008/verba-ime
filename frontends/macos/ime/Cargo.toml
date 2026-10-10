@@ -19,6 +19,7 @@ verba-core = { path = "../../../crates/verba-core" }
 verba-ipc = { path = "../../../crates/verba-ipc" }
 verba-protos = { path = "../../../crates/verba-protos" }
 verba-config = { path = "../../../crates/verba-config" }
+verba-candidate = { path = "../../../crates/verba-candidate" }
 log = { version = "0.4", features = ["std"] }
 env_logger = "0.11"
 plist = "1"

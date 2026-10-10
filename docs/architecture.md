@@ -68,7 +68,7 @@
 | `verba-config` | 配置读写（TOML）、默认值、密钥库（keyring） |
 | `verba-daemon` | 后台进程：启动核心、任务队列、事件分发、健康检查、自动重启 |
 | `verba-cli` | 调试 CLI：直接驱动 core，模拟按键 / 命令，预览候选 |
-| `verba-candidate` | 候选窗共享逻辑与 CPU 渲染器（tiny-skia：分页 / 主题；`render_png` example 无窗口渲染验证；光标避让在 Windows 前端实现） |
+| `verba-candidate` | 候选窗共享逻辑与 CPU 渲染器（tiny-skia：分页 / 主题；`render_png` example 无窗口渲染验证；光标避让在各平台前端实现——Windows 裸 Win32 / macOS NSPanel） |
 | `frontends/*` | 平台前端（独立于 workspace，各自构建） |
 
 ## 4. 平台前端
@@ -83,6 +83,7 @@
 ### macOS — IMK（Input Method Kit）
 - `IMKInputController` 子类，`.app`（单进程托管全部控制器）装入 `~/Library/Input Methods`，用户需在系统设置中启用。
 - 实现：纯 Rust `objc2-input-method-kit`（`frontends/macos/ime`），经 Unix Socket 连 daemon。
+- 候选窗口：**自绘置顶 `NSPanel`**（`Borderless | NonactivatingPanel`）+ `verba-candidate` tiny-skia 渲染贴图（`frontends/macos/ime/src/candidate_panel.rs`）——与 Windows 同一渲染器，取代原生 `IMKCandidates`（2026-10-10）。
 - 权限：基础输入无需辅助功能权限；麦克风需 `NSMicrophoneUsageDescription`（TCC 弹窗）；截图 OCR 需屏幕录制权限（ScreenCaptureKit）。
 - 打包：`.app`，Developer ID 签名 + 公证（发布必需）。
 
@@ -243,6 +244,7 @@ v2 架构（macOS 已落地）：**进程内 NSPanel 气泡 + 点击/键盘触�
 1. 中文拼音引擎：**单引擎 = Rime（librime）**（daemon 内，启动预热）；此前内置 `verba-pinyin` 已移除。
 2. ~~TSF 候选窗口：原生 `ITfCandidateListUIElement` vs 自绘 overlay~~ → **已定：自绘置顶弹窗 + tiny-skia CPU 光栅化**（2026-08-23 落地，实机验收）。
    - 弃用系统候选 UI：TSF `ITfCandidateListUIElement` 样式受限、生命周期与焦点管理复杂；macOS `IMKCandidates` 是老 AppKit 面板，主题/分页/光标避让接不上，且两端 UX 分叉——自绘对齐微软拼音/搜狗的可主题化路线。
+   - **2026-10-10 补记：macOS 迁移落地**——弃用 `IMKCandidates`，改 `NSPanel` 自绘贴图（`frontends/macos/ime/src/candidate_panel.rs`），两端自此共用同一渲染器；macOS 真机视觉验收仍待（见 `three-platform-acceptance-matrix.md`）。
    - 渲染器选 tiny-skia 而非：① 系统绘制 API（CoreGraphics / Direct2D 要写两套实现，且无法跨平台无头验证）；② Slint/femtovg（候选窗运行在注入宿主进程的 TSF DLL 内——Slint 自带 winit 事件循环会与宿主消息循环冲突，femtovg 面向 OpenGL 上下文、宿主进程内起 GL 上下文代价高；候选窗只要光栅化器，不要 UI 框架）。
    - tiny-skia：纯 Rust、CPU 光栅化、无上下文、像素确定性，`render_png` example 可在无窗口环境（含 CI）渲染验证；前端用裸 Win32 置顶弹窗（`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`）贴图，不抢焦点、不激活宿主应用。
    - Slint 用于独立进程的设置面板（apps/settings，默认 femtovg 渲染）——两者运行环境不同，各取所需。
