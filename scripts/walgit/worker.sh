@@ -39,6 +39,7 @@ W() { walgit --config ~/.walgit/walgit.toml "$@"; }
 TS() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 log() { printf '%s [worker] %s\n' "$(TS)" "$*" >> "$LOGDIR/worker.log"; }
 safe_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+reset_worktree() { git -C "$REPO" worktree remove --force "$1" 2>/dev/null || true; git -C "$REPO" worktree prune 2>/dev/null || true; rm -rf "$1"; }
 
 # emit <kind> <id> <actor> <parent> <body-json> [extra args…] → stdout: entry oid
 emit() {
@@ -130,6 +131,7 @@ dispatch() { # <thread> <title> <body>
     log "DRY git worktree add -b $branch $wt origin/main"
   else
     git -C "$REPO" fetch origin -q
+    reset_worktree "$wt"
     git -C "$REPO" worktree add -b "$branch" "$wt" origin/main >>"$LOGDIR/worker.log" 2>&1 || {
       log "worktree add FAILED thread=$thread"
       emit comment "$thread" "$COORD" "$(thread_tip "$thread")" "{\"note\":\"自动实现中止：worktree 创建失败\"}" >/dev/null
@@ -180,6 +182,7 @@ except Exception: print(False)')"
 
   git -C "$REPO" fetch origin -q
   local mwt="$WORKTREES/.merge-$thread"
+  reset_worktree "$mwt"
   git -C "$REPO" worktree add --detach "$mwt" origin/main >>"$LOGDIR/worker.log" 2>&1 || { log "merge worktree FAILED"; return 1; }
   if git -C "$mwt" merge --no-ff "$branch" -m "merge: $thread" >>"$LOGDIR/worker.log" 2>&1; then
     local moid; moid="$(git -C "$mwt" rev-parse HEAD)"
@@ -263,6 +266,7 @@ print(1 if any(r.get("decision") == "approve" and r.get("actor") not in authors 
       log "DRY review worktree+pi for $thread (base=$base_branch)"; decision="approve"; note="dry-run"
     else
       git -C "$REPO" fetch origin -q
+      reset_worktree "$wt"
       git -C "$REPO" worktree add --detach "$wt" "origin/$branch" >>"$LOGDIR/worker.log" 2>&1 || { log "review worktree FAILED $thread"; return; }
       rev="$(run_review "$wt" "$thread" "$title" "$base_branch")"
       decision="$(printf '%s' "$rev" | parse_decision)"; [ -n "$decision" ] || decision="request_changes"
@@ -280,6 +284,7 @@ print(1 if any(r.get("decision") == "approve" and r.get("actor") not in authors 
 
   git -C "$REPO" fetch origin -q
   mwt="$WORKTREES/.merge-$thread"
+  reset_worktree "$mwt"
   git -C "$REPO" worktree add --detach "$mwt" origin/main >>"$LOGDIR/worker.log" 2>&1 || { log "review merge wt FAILED $thread"; return; }
   if git -C "$mwt" merge --no-ff "origin/$branch" -m "merge: $thread" >>"$LOGDIR/worker.log" 2>&1; then
     moid="$(git -C "$mwt" rev-parse HEAD)"
