@@ -214,7 +214,10 @@ except Exception: print(False)')"
     git -C "$mwt" push origin "HEAD:main" >>"$LOGDIR/worker.log" 2>&1 || { log "merge push FAILED thread=$thread"; return 1; }
     emit merge_result "$thread" "$COORD" "$(thread_tip "$thread")" \
       "{\"merged\":true,\"oid\":\"$moid\",\"result\":\"merged\",\"note\":\"自动合并（${COORD}）\"}" >/dev/null
-    log "MERGED thread=$thread oid=$moid"
+    # 已合入 main → 删掉本轮自建分支（只删 auto/*）
+    git -C "$REPO" push origin --delete "$branch" >>"$LOGDIR/worker.log" 2>&1 || true
+    git -C "$REPO" branch -D "$branch" >>"$LOGDIR/worker.log" 2>&1 || true
+    log "MERGED thread=$thread oid=$moid (branch $branch deleted)"
   else
     log "merge conflict thread=$thread"
     emit comment "$thread" "$COORD" "$(thread_tip "$thread")" "{\"note\":\"自动合并冲突，需人工处理\"}" >/dev/null
@@ -410,6 +413,10 @@ task() { # <key> <thread> <actor> <jobtype>
   else
     process "$key" "$thread" "$actor"
   fi
+  # 清理本线程的 worktree（幂等），避免残留
+  reset_worktree "$WORKTREES/review-$thread"
+  reset_worktree "$WORKTREES/$thread"
+  reset_worktree "$WORKTREES/.merge-$thread"
   # 封口：写入后线程当前 last_ts，吸收 worker 自写条目，避免自触发循环
   seen_set "$key" "$(board_ts "$thread")"
   log "task done key=$key pid=$$"
