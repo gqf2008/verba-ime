@@ -207,20 +207,31 @@ process() { # <oid> <thread> <actor>
   title="$(title_of "$f")"; body="$(body_of "$f")"; blob="$(cat "$f")"
   decision="$("$JEV" choice "仓库 verba-ime（Rust 跨平台 AI 输入法；主分支 main）。
 issue 线程根内容（JSON）：$blob" \
-    "这个 issue 是否该由 $COORD 自动接单并进入实现？" \
-    accept="接单并实现" reject="不接，仅记录理由" 2>>"$LOGDIR/worker.log" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("choice","reject"))' 2>/dev/null)"
-  [ -n "$decision" ] || decision="reject"
+    "这个 issue 该如何处理？$COORD 是自动接单方，目标是及时推进；合理就接。" \
+    accept="合理、可自动推进：接单并实施" \
+    needs-human="信息不足 / 需人工决策 / 超出自动能力：标记交给人类" \
+    skip="明确无需处理（重复 / 已废弃 / 非本仓）" 2>>"$LOGDIR/worker.log" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("choice",""))' 2>/dev/null)"
   [ -n "${WALGIT_WORKER_FORCE_DECISION:-}" ] && decision="$WALGIT_WORKER_FORCE_DECISION"
+  case "$decision" in
+    accept|needs-human|skip) ;;
+    *) decision="needs-human" ;;   # 拿不准 → 交人类，不静默丢
+  esac
   log "issue thread=$thread title=$title decision=$decision"
 
   local parent; parent="$(thread_tip "$thread")"
-  if [ "$decision" != "accept" ]; then
+  if [ "$decision" = "needs-human" ]; then
+    emit status "$thread" "$COORD" "$parent" \
+      "{\"status\":\"needs-human\",\"owner\":\"\",\"note\":\"自动分诊（jev）：需人工判断后处理\"}" >/dev/null
+    return
+  fi
+  if [ "$decision" = "skip" ]; then
     emit comment "$thread" "$COORD" "$parent" \
-      "{\"note\":\"自动分诊（jev）：不接本 issue，需人工处理时请直接评论。\"}" >/dev/null
+      "{\"note\":\"自动分诊（jev）：判为无需处理（重复/已废弃/非本仓）；如需处理请直接评论。\"}" >/dev/null
     return
   fi
 
+  # accept
   parent="$(emit status "$thread" "$COORD" "$parent" \
     "{\"status\":\"in-progress\",\"owner\":\"$COORD\",\"work\":\"auto-dispatch\",\"note\":\"由 $COORD 自动认领（jev 判定接单）\"}")"
   log "claimed thread=$thread parent=$parent"
