@@ -83,11 +83,11 @@ ${body}
   ( cd "$wt" && "$PI" -p "$prompt" --approve ) >>"$LOGDIR/impl-$thread.log" 2>&1
 }
 
-run_review() { # <worktree> <thread> <title> → stdout: {"decision","note"}
-  local wt="$1" thread="$2" title="$3"
-  local prompt="你是独立评审者（不得是作者）。工作目录是本 issue 的分支 worktree。
-用 \`git diff origin/main...HEAD\` 与 \`git log origin/main..HEAD\` 审查改动，对照任务：${title}。
-判断能否合并进 main。只输出一行 JSON（不要解释、不要代码块）：{\"decision\":\"approve\"或\"request_changes\",\"note\":\"理由\"}"
+run_review() { # <worktree> <thread> <title> [base_branch=main] → stdout: {"decision","note"}
+  local wt="$1" thread="$2" title="$3" base="${4:-main}"
+  local prompt="你是独立评审者（不得是作者）。工作目录是该 patch 的 head worktree。
+用 \`git diff origin/${base}...HEAD\` 与 \`git log origin/${base}..HEAD\` 审查改动，对照任务：${title}。
+判断能否合并进 ${base}。只输出一行 JSON（不要解释、不要代码块）：{\"decision\":\"approve\"或\"request_changes\",\"note\":\"理由\"}"
   if [ "$DRY_RUN" = "1" ]; then echo '{"decision":"approve","note":"dry-run"}'; return 0; fi
   ( cd "$wt" && "$PI" -p "$prompt" --approve ) 2>>"$LOGDIR/review-$thread.log"
 }
@@ -265,6 +265,88 @@ for col in d.get("columns", []):
   done
 }
 
+# needs-review 处理：独立评审（
+# 已批则跳过）→ 门禁通过且 base=main 时合并。
+do_review_merge() { # <thread> <title> [branch]
+  local thread="$1" title="$2" branch_hint="${3:-}"
+  local pr head base allowed approved branch base_branch wt rev decision note p mwt moid
+  pr="$(W collab pr "$thread" 2>/dev/null)"
+  [ -n "$pr" ] || { log "review: no pr for $thread"; return; }
+  head="$(printf '%s' "$pr" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("pr") or {}).get("head") or "")' 2>/dev/null)"
+  base="$(printf '%s' "$pr" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("pr") or {}).get("base") or "")' 2>/dev/null)"
+  allowed="$(printf '%s' "$pr" | python3 -c 'import sys,json;print(bool((json.load(sys.stdin).get("merge") or {}).get("allowed")))' 2>/dev/null)"
+  approved="$(printf '%s' "$pr" | python3 -c '
+import sys, json
+d = json.load(sys.stdin); pr = d.get("pr", {})
+authors = set(pr.get("authors", []))
+revs = list(pr.get("reviews", [])) + list(pr.get("human_approvals", []))
+print(1 if any(r.get("decision") == "approve" and r.get("actor") not in authors for r in revs) else 0)' 2>/dev/null)"
+  [ -n "$head" ] || head="refs/heads/$branch_hint"
+  [ -n "$base" ] || base="refs/heads/main"
+  branch="${head#refs/heads/}"; base_branch="${base#refs/heads/}"
+  [ -n "$branch" ] || { log "review: no head/branch for $thread"; return; }
+
+  if [ "$approved" = "1" ]; then
+    decision="approve"; log "review $thread: 已有非作者 approve，跳过评审"
+  else
+    wt="$WORKTREES/review-$thread"
+    if [ "$DRY_RUN" = "1" ]; then
+      log "DRY review worktree+pi for $thread (base=$base_branch)"; decision="approve"; note="dry-run"
+    else
+      git -C "$REPO" fetch origin -q
+      git -C "$REPO" worktree add --detach "$wt" "origin/$branch" >>"$LOGDIR/worker.log" 2>&1 || { log "review worktree FAILED $thread"; return; }
+      rev="$(run_review "$wt" "$thread" "$title" "$base_branch")"
+      decision="$(printf '%s' "$rev" | parse_decision)"; [ -n "$decision" ] || decision="request_changes"
+      note="$(printf '%s' "$rev" | parse_note)"
+    fi
+    p="$(thread_tip "$thread")"
+    emit review "$thread" "$REVIEWER" "$p" "{\"decision\":\"$decision\",\"agent\":\"$REVIEWER\",\"note\":\"${note:-独立评审}\"}" >/dev/null
+    log "review emitted $thread decision=$decision"
+  fi
+
+  [ "$decision" = "approve" ] || { log "review $thread: $decision，不合并"; return; }
+  [ "$allowed" = "True" ] || { log "review $thread: merge rule 不通过，不合并"; return; }
+  [ "$base" = "refs/heads/main" ] || { log "review $thread: base=$base 非 main，留人工合并"; return; }
+  if [ "$DRY_RUN" != "0" ] || [ "$ALLOW_AUTO_MERGE" != "1" ]; then log "review $thread: merge skipped (gates)"; return; fi
+
+  git -C "$REPO" fetch origin -q
+  mwt="$WORKTREES/.merge-$thread"
+  git -C "$REPO" worktree add --detach "$mwt" origin/main >>"$LOGDIR/worker.log" 2>&1 || { log "review merge wt FAILED $thread"; return; }
+  if git -C "$mwt" merge --no-ff "origin/$branch" -m "merge: $thread" >>"$LOGDIR/worker.log" 2>&1; then
+    moid="$(git -C "$mwt" rev-parse HEAD)"
+    git -C "$mwt" push origin "HEAD:main" >>"$LOGDIR/worker.log" 2>&1 || { log "review merge push FAILED $thread"; return; }
+    emit merge_result "$thread" "$COORD" "$(thread_tip "$thread")" \
+      "{\"merged\":true,\"oid\":\"$moid\",\"result\":\"merged\",\"note\":\"自动评审+合并（${COORD}）\"}" >/dev/null
+    log "MERGED(review) $thread oid=$moid"
+  else
+    log "review merge conflict $thread"
+    emit comment "$thread" "$COORD" "$(thread_tip "$thread")" "{\"note\":\"自动合并冲突，需人工处理\"}" >/dev/null
+  fi
+}
+
+scan_needs_review() {
+  W collab board --format json 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for col in d.get("columns", []):
+    if col.get("name") != "needs-review": continue
+    for c in col.get("cards", []):
+        tid = c.get("id", "")
+        if not tid: continue
+        title = (c.get("title", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:200]
+        branch = (c.get("branch", "") or "").replace("\t", " ").strip()
+        print(f"{tid}\t{title}\t{branch}")
+' | while IFS=$'\t' read -r tid title branch; do
+    [ -n "$tid" ] || continue
+    key="review:$tid"
+    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
+    echo "$key" >> "$WG/seen"
+    log "review scan: $tid"
+    do_review_merge "$tid" "$title" "$branch"
+  done
+}
+
 drain() {
   while [ -s "$QUEUE/todo" ]; do
     local line oid thread actor
@@ -278,10 +360,10 @@ drain() {
 main() {
   log "worker start pid=$$ DRY_RUN=$DRY_RUN ALLOW_AUTO_MERGE=$ALLOW_AUTO_MERGE once=${1:-}"
   LAST_SCAN=0
-  if [ "${1:-}" = "--once" ]; then scan_open; drain; log "worker --once done"; exit 0; fi
+  if [ "${1:-}" = "--once" ]; then scan_open; scan_needs_review; drain; log "worker --once done"; exit 0; fi
   while :; do
     local now; now="$(date +%s)"
-    if [ $((now - LAST_SCAN)) -ge 30 ]; then scan_open; LAST_SCAN="$now"; fi
+    if [ $((now - LAST_SCAN)) -ge 30 ]; then scan_open; scan_needs_review; LAST_SCAN="$now"; fi
     drain
     sleep 5
   done
