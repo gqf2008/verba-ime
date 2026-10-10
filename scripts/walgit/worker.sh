@@ -212,7 +212,7 @@ issue 线程根内容（JSON）：$blob" \
     | python3 -c 'import sys,json;print(json.load(sys.stdin).get("choice","reject"))' 2>/dev/null)"
   [ -n "$decision" ] || decision="reject"
   [ -n "${WALGIT_WORKER_FORCE_DECISION:-}" ] && decision="$WALGIT_WORKER_FORCE_DECISION"
-  log "issue thread=$thread title=$(printf '%s' "$title" | head -c 80) decision=$decision"
+  log "issue thread=$thread title=$title decision=$decision"
 
   local parent; parent="$(thread_tip "$thread")"
   if [ "$decision" != "accept" ]; then
@@ -228,6 +228,32 @@ issue 线程根内容（JSON）：$blob" \
   dispatch "$thread" "$title" "$body"
 }
 
+# 主动拉取：扫看板 `open` 泳道（status=open、未认领），入队。
+# 这是对「只被动等新 ref」的补齐：已存在的 open issue 不会再来 ref 事件，必须主动拉。
+scan_open() {
+  W collab board --format json 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for col in d.get("columns", []):
+    if col.get("name") != "open": continue
+    for c in col.get("cards", []):
+        tid = c.get("id", "")
+        if not tid: continue
+        title = (c.get("title", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:200]
+        prose = (c.get("prose", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:800]
+        print(f"{tid}\t{title}\t{prose}")
+' | while IFS=$'\t' read -r tid title prose; do
+    [ -n "$tid" ] || continue
+    key="open:$tid"
+    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
+    echo "$key" >> "$WG/seen"
+    python3 -c 'import json,sys;print(json.dumps({"body":{"title":sys.argv[1],"body":sys.argv[2]}}))' "$title" "$prose" > "$QUEUE/$key.json"
+    printf '%s\t%s\t%s\n' "$key" "$tid" "scan" >> "$QUEUE/todo"
+    log "scan enqueued open thread=$tid"
+  done
+}
+
 drain() {
   while [ -s "$QUEUE/todo" ]; do
     local line oid thread actor
@@ -240,7 +266,13 @@ drain() {
 
 main() {
   log "worker start pid=$$ DRY_RUN=$DRY_RUN ALLOW_AUTO_MERGE=$ALLOW_AUTO_MERGE once=${1:-}"
-  if [ "${1:-}" = "--once" ]; then drain; log "worker --once done"; exit 0; fi
-  while :; do drain; sleep 5; done
+  LAST_SCAN=0
+  if [ "${1:-}" = "--once" ]; then scan_open; drain; log "worker --once done"; exit 0; fi
+  while :; do
+    local now; now="$(date +%s)"
+    if [ $((now - LAST_SCAN)) -ge 30 ]; then scan_open; LAST_SCAN="$now"; fi
+    drain
+    sleep 5
+  done
 }
 main "${1:-}"
