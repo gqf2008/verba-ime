@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
-# 自动接单 worker：消费 .git/walgit/queue/todo，做「分诊→认领→实现→评审→合并」编排。
+# 自动接单 worker（并发版）：主循环只做「扫描 + 派发」，每个任务跑在独立子进程里，
+# 互不阻塞；带并发上限与运行锁（线程级去重、崩溃后回收）。
 #
 #   身份：verba-coordinator（接单/合并）、verba-worker-3（实现）、verba-reviewer-3（评审）
 #   key ：$REPO/.git/walgit/keys/<principal>.ed25519（0600，项目内、不入库）
 #
-# 闸门（默认全关，逐级放开）：
-#   DRY_RUN=1（默认）         只记日志、不写仓库、不发条目
-#   DRY_RUN=0                 真发签名条目 / 起子代理 / 建 worktree
-#   ALLOW_AUTO_MERGE=1        在 DRY_RUN=0 且评审 approve 且 merge rule 通过时，才自动合并到 origin/main
-# 由 hook.sh 依 .git/walgit/ENABLE_AUTO、ENABLE_MERGE 标志导出上述变量；也可手工：
-#   DRY_RUN=0 ALLOW_AUTO_MERGE=1 scripts/walgit/worker.sh
+# 任务链：
+#   issue  → jev 三分类(accept/needs-human/skip) → 认领 → worktree 实现 → patch → 评审 → 门禁合并
+#   review → 独立评审（非作者）→ 门禁合并（base=main）
+#
+# 闸门（默认全关）：
+#   DRY_RUN=1（默认）        只记日志、不写仓库、不发条目
+#   DRY_RUN=0                真发签名条目 / 起子代理 / 建 worktree
+#   ALLOW_AUTO_MERGE=1       门禁全过才自动合并到 origin/main
+#   MAX_CONCURRENCY=3        同时运行的任务上限
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SELF="$REPO/scripts/walgit/worker.sh"
 WG="$REPO/.git/walgit"
 QUEUE="$WG/queue"
 LOGDIR="$WG/logs"
 KEYS="$WG/keys"
 WORKTREES="$WG/worktrees"
+RUNNING="$WG/running"
 JEV="${JEV:-$HOME/.agents/skills/jev-decision/scripts/jev.py}"
 PI="$(command -v pi || echo pi)"
 COORD="verba-coordinator"
@@ -25,12 +31,14 @@ WORKER="verba-worker-3"
 REVIEWER="verba-reviewer-3"
 DRY_RUN="${DRY_RUN:-1}"
 ALLOW_AUTO_MERGE="${ALLOW_AUTO_MERGE:-0}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-3}"
 cd "$REPO" || exit 1
-mkdir -p "$LOGDIR" "$QUEUE" "$WORKTREES"
+mkdir -p "$LOGDIR" "$QUEUE" "$WORKTREES" "$RUNNING"
 
 W() { walgit --config ~/.walgit/walgit.toml "$@"; }
 TS() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 log() { printf '%s [worker] %s\n' "$(TS)" "$*" >> "$LOGDIR/worker.log"; }
+safe_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
 # emit <kind> <id> <actor> <parent> <body-json> [extra args…] → stdout: entry oid
 emit() {
@@ -66,6 +74,7 @@ sys.exit(0)'
 
 title_of() { python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));b=d.get("body",{}) if isinstance(d.get("body"),dict) else {};print(b.get("title",""))' "$1" 2>/dev/null; }
 body_of()  { python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));b=d.get("body",{}) if isinstance(d.get("body"),dict) else {};print(b.get("body",""))' "$1" 2>/dev/null; }
+field_of() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],"") or "")' "$1" "$2" 2>/dev/null; }
 
 # ── 子代理 ────────────────────────────────────────────────────────────────────
 run_impl() { # <worktree> <thread> <title> <body>
@@ -101,7 +110,6 @@ if not m: print("request_changes"); sys.exit(0)
 try: print(json.loads(m.group(0)).get("decision", "request_changes"))
 except Exception: print("request_changes")' 2>/dev/null
 }
-
 parse_note() {
   python3 -c '
 import sys, json, re
@@ -112,13 +120,12 @@ try: print(json.loads(m.group(0)).get("note", "")[:500])
 except Exception: print("")' 2>/dev/null
 }
 
-# ── 编排 ──────────────────────────────────────────────────────────────────────
+# ── issue 编排 ────────────────────────────────────────────────────────────────
 dispatch() { # <thread> <title> <body>
   local thread="$1" title="$2" body="$3"
   local branch="auto/$thread"
   local wt="$WORKTREES/$thread"
 
-  # 1) worktree + 分支（基于 origin/main）
   if [ "$DRY_RUN" = "1" ]; then
     log "DRY git worktree add -b $branch $wt origin/main"
   else
@@ -129,36 +136,29 @@ dispatch() { # <thread> <title> <body>
       return 1; }
   fi
 
-  # 2) 实现子代理
   run_impl "$wt" "$thread" "$title" "$body"
 
-  # 3) 是否有提交
   local ncommits=1
-  if [ "$DRY_RUN" = "0" ]; then
-    ncommits="$(git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
-  fi
+  [ "$DRY_RUN" = "0" ] && ncommits="$(git -C "$wt" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
   if [ "${ncommits:-0}" -eq 0 ]; then
     log "impl produced no commit thread=$thread"
     emit comment "$thread" "$COORD" "$(thread_tip "$thread")" "{\"note\":\"实现子代理未产出提交，已中止（见 .git/walgit/logs/impl-$thread.log）\"}" >/dev/null
     return 1
   fi
 
-  # 4) 推分支
   if [ "$DRY_RUN" = "0" ]; then
     git -C "$wt" push -u origin "$branch" >>"$LOGDIR/worker.log" 2>&1 || { log "push FAILED thread=$thread"; return 1; }
   else
     log "DRY git push -u origin $branch"
   fi
 
-  # 5) patch 条目（verba-worker-3）
   local p; p="$(thread_tip "$thread")"
   p="$(emit patch "$thread" "$WORKER" "$p" \
         "{\"title\":\"$title\",\"message\":\"自动实现（${WORKER}）\"}" \
         --base refs/heads/main --head "refs/heads/$branch")"
   log "patch emitted thread=$thread oid=$p"
 
-  # 6) 独立评审（verba-reviewer-3）
-  local rev; rev="$(run_review "$wt" "$thread" "$title")"
+  local rev; rev="$(run_review "$wt" "$thread" "$title" main)"
   local decision note
   decision="$(printf '%s' "$rev" | parse_decision)"; [ -n "$decision" ] || decision="request_changes"
   note="$(printf '%s' "$rev" | parse_note)"
@@ -167,17 +167,16 @@ dispatch() { # <thread> <title> <body>
         "{\"decision\":\"$decision\",\"agent\":\"$REVIEWER\",\"note\":\"$note\"}")"
   log "review emitted thread=$thread decision=$decision oid=$p"
 
-  # 7) 合并（门禁：DRY_RUN=0 + approve + merge rule 通过 + ALLOW_AUTO_MERGE=1）
   if [ "$decision" != "approve" ]; then log "no merge：review=$decision"; return 0; fi
-  if [ "$DRY_RUN" != "0" ] || [ "$ALLOW_AUTO_MERGE" != "1" ]; then log "merge skipped (gates: DRY_RUN=$DRY_RUN ALLOW_AUTO_MERGE=$ALLOW_AUTO_MERGE)"; return 0; fi
+  if [ "$DRY_RUN" != "0" ] || [ "$ALLOW_AUTO_MERGE" != "1" ]; then log "merge skipped (gates)"; return 0; fi
 
   local ok
   ok="$(W collab pr "$thread" 2>/dev/null | python3 -c 'import sys,json
 try:
   d=json.load(sys.stdin); m=d.get("merge") or {}
-  print(m.get("ok", m.get("mergeable", False)))
+  print(bool(m.get("allowed")))
 except Exception: print(False)')"
-  if [ "$ok" != "True" ]; then log "merge rule not ok thread=$thread → stop"; return 0; fi
+  [ "$ok" = "True" ] || { log "merge rule not ok thread=$thread → stop"; return 0; }
 
   git -C "$REPO" fetch origin -q
   local mwt="$WORKTREES/.merge-$thread"
@@ -194,13 +193,12 @@ except Exception: print(False)')"
   fi
 }
 
-process() { # <oid> <thread> <actor>
-  local oid="$1" thread="$2" actor="$3" f="$QUEUE/$oid.json"
+process() { # <key> <thread> <actor>
+  local key="$1" thread="$2" actor="$3" f="$QUEUE/$(safe_key "$key").json"
+  [ -f "$f" ] || f="$QUEUE/$key.json"
   [ -f "$f" ] || { log "missing entry $f"; return; }
   if [ "${WALGIT_WORKER_FORCE:-0}" != "1" ]; then
     thread_free "$thread" || { log "skip $thread: already claimed/terminal"; return; }
-  else
-    log "FORCE: skip thread_free check for $thread"
   fi
 
   local title body blob decision
@@ -215,9 +213,9 @@ issue 线程根内容（JSON）：$blob" \
   [ -n "${WALGIT_WORKER_FORCE_DECISION:-}" ] && decision="$WALGIT_WORKER_FORCE_DECISION"
   case "$decision" in
     accept|needs-human|skip) ;;
-    *) decision="needs-human" ;;   # 拿不准 → 交人类，不静默丢
+    *) decision="needs-human" ;;
   esac
-  log "issue thread=$thread title=$title decision=$decision"
+  log "issue thread=$thread decision=$decision"
 
   local parent; parent="$(thread_tip "$thread")"
   if [ "$decision" = "needs-human" ]; then
@@ -231,42 +229,13 @@ issue 线程根内容（JSON）：$blob" \
     return
   fi
 
-  # accept
   parent="$(emit status "$thread" "$COORD" "$parent" \
     "{\"status\":\"in-progress\",\"owner\":\"$COORD\",\"work\":\"auto-dispatch\",\"note\":\"由 $COORD 自动认领（jev 判定接单）\"}")"
   log "claimed thread=$thread parent=$parent"
-
   dispatch "$thread" "$title" "$body"
 }
 
-# 主动拉取：扫看板 `open` 泳道（status=open、未认领），入队。
-# 这是对「只被动等新 ref」的补齐：已存在的 open issue 不会再来 ref 事件，必须主动拉。
-scan_open() {
-  W collab board --format json 2>/dev/null | python3 -c '
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: sys.exit(0)
-for col in d.get("columns", []):
-    if col.get("name") != "open": continue
-    for c in col.get("cards", []):
-        tid = c.get("id", "")
-        if not tid: continue
-        title = (c.get("title", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:200]
-        prose = (c.get("prose", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:800]
-        print(f"{tid}\t{title}\t{prose}")
-' | while IFS=$'\t' read -r tid title prose; do
-    [ -n "$tid" ] || continue
-    key="open:$tid"
-    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
-    echo "$key" >> "$WG/seen"
-    python3 -c 'import json,sys;print(json.dumps({"body":{"title":sys.argv[1],"body":sys.argv[2]}}))' "$title" "$prose" > "$QUEUE/$key.json"
-    printf '%s\t%s\t%s\n' "$key" "$tid" "scan" >> "$QUEUE/todo"
-    log "scan enqueued open thread=$tid"
-  done
-}
-
-# needs-review 处理：独立评审（
-# 已批则跳过）→ 门禁通过且 base=main 时合并。
+# ── needs-review 编排 ─────────────────────────────────────────────────────────
 do_review_merge() { # <thread> <title> [branch]
   local thread="$1" title="$2" branch_hint="${3:-}"
   local pr head base allowed approved branch base_branch wt rev decision note p mwt moid
@@ -324,6 +293,31 @@ print(1 if any(r.get("decision") == "approve" and r.get("actor") not in authors 
   fi
 }
 
+# ── 主动扫描（只入队，不阻塞主循环）─────────────────────────────────────────
+scan_open() {
+  W collab board --format json 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for col in d.get("columns", []):
+    if col.get("name") != "open": continue
+    for c in col.get("cards", []):
+        tid = c.get("id", "")
+        if not tid: continue
+        title = (c.get("title","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:200]
+        prose = (c.get("prose","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:800]
+        print(f"{tid}\t{title}\t{prose}")
+' | while IFS=$'\t' read -r tid title prose; do
+    [ -n "$tid" ] || continue
+    key="open:$tid"
+    grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
+    echo "$key" >> "$WG/seen"
+    python3 -c 'import json,sys;print(json.dumps({"body":{"title":sys.argv[1],"body":sys.argv[2]}}))' "$title" "$prose" > "$QUEUE/$(safe_key "$key").json"
+    printf '%s|%s|%s|%s\n' "$key" "$tid" "scan" "issue" >> "$QUEUE/todo"
+    log "scan enqueued open thread=$tid"
+  done
+}
+
 scan_needs_review() {
   W collab board --format json 2>/dev/null | python3 -c '
 import sys, json
@@ -334,33 +328,74 @@ for col in d.get("columns", []):
     for c in col.get("cards", []):
         tid = c.get("id", "")
         if not tid: continue
-        title = (c.get("title", "") or "").replace("\t", " ").replace("\n", " ").replace("\r", " ")[:200]
-        branch = (c.get("branch", "") or "").replace("\t", " ").strip()
+        title = (c.get("title","") or "").replace("\t"," ").replace("\n"," ").replace("\r"," ")[:200]
+        branch = (c.get("branch","") or "").replace("\t"," ").strip()
         print(f"{tid}\t{title}\t{branch}")
 ' | while IFS=$'\t' read -r tid title branch; do
     [ -n "$tid" ] || continue
     key="review:$tid"
     grep -qxF "$key" "$WG/seen" 2>/dev/null && continue
     echo "$key" >> "$WG/seen"
-    log "review scan: $tid"
-    do_review_merge "$tid" "$title" "$branch"
+    python3 -c 'import json,sys;print(json.dumps({"title":sys.argv[1],"branch":sys.argv[2]}))' "$title" "$branch" > "$QUEUE/$(safe_key "$key").json"
+    printf '%s|%s|%s|%s\n' "$key" "$tid" "" "review" >> "$QUEUE/todo"
+    log "scan enqueued needs-review thread=$tid"
+  done
+}
+
+# ── 派发（不阻塞）────────────────────────────────────────────────────────────
+running_count() { find "$RUNNING" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '; }
+
+cleanup_locks() {
+  local d pid
+  for d in "$RUNNING"/*; do
+    [ -d "$d" ] || continue
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then rm -rf "$d"; fi
   done
 }
 
 drain() {
+  cleanup_locks
   while [ -s "$QUEUE/todo" ]; do
-    local line oid thread actor
+    local line key thread actor jobtype lock
     line="$(head -1 "$QUEUE/todo")"
     tail -n +2 "$QUEUE/todo" > "$QUEUE/todo.tmp" 2>/dev/null && mv "$QUEUE/todo.tmp" "$QUEUE/todo"
-    IFS=$'\t' read -r oid thread actor <<<"$line"
-    [ -n "${oid:-}" ] && process "$oid" "$thread" "${actor:-}"
+    IFS='|' read -r key thread actor jobtype <<<"$line"
+    [ -n "${key:-}" ] || continue
+    while [ "$(running_count)" -ge "$MAX_CONCURRENCY" ]; do cleanup_locks; sleep 2; done
+    lock="$RUNNING/$(safe_key "$key")"
+    mkdir "$lock" 2>/dev/null || continue   # 已有同名任务在跑 → 跳过
+    nohup "$SELF" --task "$key" "$thread" "${actor:-}" "${jobtype:-issue}" >>"$LOGDIR/worker.log" 2>&1 &
+    echo $! > "$lock/pid"
+    log "dispatched key=$key thread=$thread job=${jobtype:-issue} pid=$(cat "$lock/pid")"
   done
 }
 
+task() { # <key> <thread> <actor> <jobtype>
+  local key="$1" thread="$2" actor="$3" jobtype="$4"
+  local lock="$RUNNING/$(safe_key "$key")"
+  trap "rm -rf '$lock'" EXIT
+  log "task start key=$key thread=$thread job=$jobtype pid=$$"
+  if [ "$jobtype" = "review" ]; then
+    local f="$QUEUE/$(safe_key "$key").json"
+    do_review_merge "$thread" "$(field_of "$f" title)" "$(field_of "$f" branch)"
+  else
+    process "$key" "$thread" "$actor"
+  fi
+  log "task done key=$key pid=$$"
+}
+
 main() {
-  log "worker start pid=$$ DRY_RUN=$DRY_RUN ALLOW_AUTO_MERGE=$ALLOW_AUTO_MERGE once=${1:-}"
+  if [ "${1:-}" = "--task" ]; then shift; task "$@"; exit $?; fi
+  log "worker start pid=$$ DRY_RUN=$DRY_RUN ALLOW_AUTO_MERGE=$ALLOW_AUTO_MERGE MAX_CONCURRENCY=$MAX_CONCURRENCY once=${1:-}"
   LAST_SCAN=0
-  if [ "${1:-}" = "--once" ]; then scan_open; scan_needs_review; drain; log "worker --once done"; exit 0; fi
+  if [ "${1:-}" = "--once" ]; then
+    scan_open; scan_needs_review
+    drain
+    # --once：等所有派发任务结束
+    while [ "$(running_count)" -gt 0 ]; do cleanup_locks; sleep 2; done
+    log "worker --once done"; exit 0
+  fi
   while :; do
     local now; now="$(date +%s)"
     if [ $((now - LAST_SCAN)) -ge 30 ]; then scan_open; scan_needs_review; LAST_SCAN="$now"; fi
@@ -368,4 +403,4 @@ main() {
     sleep 5
   done
 }
-main "${1:-}"
+main "$@"

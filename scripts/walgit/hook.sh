@@ -43,7 +43,7 @@ if grep -qxF "$oid" "$SEEN" 2>/dev/null; then exit 0; fi
 echo "$oid" >> "$SEEN"
 
 printf '%s' "$ENTRY" > "$QUEUE/$oid.json"
-printf '%s\t%s\t%s\n' "$oid" "$thread" "$actor" >> "$QUEUE/todo"
+printf '%s|%s|%s|%s\n' "$oid" "$thread" "$actor" "issue" >> "$QUEUE/todo"
 log "queued oid=$oid thread=$thread"
 
 # 幂等拉起 worker（pid 文件存活则不重复起）。
