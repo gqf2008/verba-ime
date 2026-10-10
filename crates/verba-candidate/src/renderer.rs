@@ -473,7 +473,7 @@ impl CpuCandidateRenderer {
         buffer.set_text(&mut self.font_system, text, Attrs::new(), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         let runs: Vec<_> = buffer.layout_runs().collect();
-        let first_line_y = runs.first().map(|run| run.line_y).unwrap_or(0.0);
+        let first_line_top = runs.first().map(|run| run.line_top).unwrap_or(0.0);
         for run in &runs {
             for glyph in run.glyphs {
                 let pg = glyph.physical((0.0, 0.0), 1.0);
@@ -506,8 +506,8 @@ impl CpuCandidateRenderer {
                     .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
                 }
                 let gx = (x + pg.x as f32 + img.placement.left as f32).round() as i32;
-                let gy = (y + (run.line_y - first_line_y) + pg.y as f32 + img.placement.top as f32
-                    - size * 0.5)
+                let gy = (y + (run.line_y - first_line_top) + pg.y as f32
+                    - img.placement.top as f32)
                     .round() as i32;
                 let paint = PixmapPaint {
                     opacity: color.alpha(),
