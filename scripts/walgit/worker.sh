@@ -32,6 +32,8 @@ REVIEWER="verba-reviewer-3"
 DRY_RUN="${DRY_RUN:-1}"
 ALLOW_AUTO_MERGE="${ALLOW_AUTO_MERGE:-0}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-3}"
+IMPL_TIMEOUT="${IMPL_TIMEOUT:-1800}"     # 实现子代理单任务超时（秒）
+REVIEW_TIMEOUT="${REVIEW_TIMEOUT:-1200}"  # 评审子代理单任务超时（秒）
 cd "$REPO" || exit 1
 mkdir -p "$LOGDIR" "$QUEUE" "$WORKTREES" "$RUNNING"
 
@@ -40,6 +42,8 @@ TS() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 log() { printf '%s [worker] %s\n' "$(TS)" "$*" >> "$LOGDIR/worker.log"; }
 safe_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 reset_worktree() { git -C "$REPO" worktree remove --force "$1" 2>/dev/null || true; git -C "$REPO" worktree prune 2>/dev/null || true; rm -rf "$1"; }
+# 可移植超时（macOS 无 timeout）：perl alarm + exec
+with_timeout() { local secs="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$secs" "$@"; }
 
 # emit <kind> <id> <actor> <parent> <body-json> [extra args…] → stdout: entry oid
 emit() {
@@ -90,7 +94,7 @@ ${body}
 - 不要 push、不要切换/创建其它分支、不要动 main。
 最后用一句话总结改动与验证结果。"
   if [ "$DRY_RUN" = "1" ]; then log "DRY pi -p (impl) wt=$wt"; return 0; fi
-  ( cd "$wt" && "$PI" -p "$prompt" --approve ) >>"$LOGDIR/impl-$thread.log" 2>&1
+  ( cd "$wt" && with_timeout "$IMPL_TIMEOUT" "$PI" -p "$prompt" --approve ) >>"$LOGDIR/impl-$thread.log" 2>&1
 }
 
 run_review() { # <worktree> <thread> <title> [base_branch=main] → stdout: {"decision","note"}
@@ -99,7 +103,7 @@ run_review() { # <worktree> <thread> <title> [base_branch=main] → stdout: {"de
 用 \`git diff origin/${base}...HEAD\` 与 \`git log origin/${base}..HEAD\` 审查改动，对照任务：${title}。
 判断能否合并进 ${base}。只输出一行 JSON（不要解释、不要代码块）：{\"decision\":\"approve\"或\"request_changes\",\"note\":\"理由\"}"
   if [ "$DRY_RUN" = "1" ]; then echo '{"decision":"approve","note":"dry-run"}'; return 0; fi
-  ( cd "$wt" && "$PI" -p "$prompt" --approve ) 2>>"$LOGDIR/review-$thread.log"
+  ( cd "$wt" && with_timeout "$REVIEW_TIMEOUT" "$PI" -p "$prompt" --approve ) 2>>"$LOGDIR/review-$thread.log"
 }
 
 parse_decision() {
