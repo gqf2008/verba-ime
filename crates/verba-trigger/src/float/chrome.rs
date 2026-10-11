@@ -113,3 +113,79 @@ fn make_nonactivating_impl(_window: &Window) {
 fn make_nonactivating_impl(_window: &Window) {
     log::warn!("当前平台无悬浮按钮非激活修饰实现（已知限制）");
 }
+
+// ── 悬浮按钮 owner 跟随（Windows）────────────────────────────────────────
+// helper 进程用这些函数判断「前台窗口是否还是锚定的那个」并跟随其移动；
+// 非 Windows 返回 0/None，调用方据此 no-op，不影响 macOS/Linux 行为。
+
+/// 当前前台顶层窗口句柄（`GA_ROOT` 归一）；取不到或非 Windows 返回 0。
+#[cfg(target_os = "windows")]
+pub(crate) fn foreground_root() -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+    // SAFETY: 只读的前台窗口查询；返回值仅作句柄比较/传参，不向窗口发消息。
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return 0;
+        }
+        let root = GetAncestor(fg, GA_ROOT);
+        if root.is_invalid() {
+            fg.0 as isize
+        } else {
+            root.0 as isize
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn foreground_root() -> isize {
+    0
+}
+
+/// HWND 客户区原点（屏幕物理像素）；取不到或非 Windows 返回 None。
+#[cfg(target_os = "windows")]
+pub(crate) fn client_origin(hwnd: isize) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    if hwnd == 0 {
+        return None;
+    }
+    // SAFETY: hwnd 来自前端传入的锚定窗口；只读查询，不向其发消息。
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        if h.is_invalid() {
+            return None;
+        }
+        let mut rc = RECT::default();
+        GetClientRect(h, &mut rc).ok()?;
+        if rc.right <= rc.left || rc.bottom <= rc.top {
+            return None;
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        ClientToScreen(h, &mut origin)
+            .as_bool()
+            .then_some((origin.x, origin.y))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn client_origin(_hwnd: isize) -> Option<(i32, i32)> {
+    None
+}
+
+/// 某个 winit 窗口自身的 HWND（把「前台窗口 == 本 helper 窗」也算作未失焦）；
+/// 取不到或非 Windows 返回 0。
+#[cfg(target_os = "windows")]
+pub(crate) fn window_hwnd(window: &Window) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(win32)) => win32.hwnd.get(),
+        _ => 0,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn window_hwnd(_window: &Window) -> isize {
+    0
+}

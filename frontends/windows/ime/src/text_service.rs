@@ -46,10 +46,10 @@ use windows::Win32::UI::TextServices::{
     TF_INVALID_COOKIE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW,
-    RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClientRect,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
+    KillTimer, PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GA_ROOT,
+    GWLP_USERDATA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
 };
 
 use crate::dll;
@@ -1655,7 +1655,7 @@ fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32, i32)> {
 /// HWND 客户区 → 其窗口框 → 校验通过的视图屏幕矩形 → 非本进程前台窗口
 /// 客户区/窗口框（部分应用 TSF DLL 与可见窗口不同进程）。只要存在有效前台
 /// 窗口就不再返回 None——拿不到完美锚点交给定时器重试，不再整个不弹。
-fn input_window_anchor(context: &ITfContext) -> Option<(i32, i32)> {
+fn input_window_anchor(context: &ITfContext) -> Option<(i32, i32, isize)> {
     // SAFETY: 全部为只读的 Win32 窗口查询；HWND 来自前台窗口或 TSF 活动
     // 视图，调用期间有效，不向宿主窗口发消息、不改其状态。
     unsafe {
@@ -1663,45 +1663,68 @@ fn input_window_anchor(context: &ITfContext) -> Option<(i32, i32)> {
         // 的 TSF DLL 与可见窗口不同进程（渲染子进程/输入宿主），此时它仍是
         // 「当前输入窗口」——宁可退到这里，也不要因拿不到完美锚点整个不弹
         // （真机回归：加固后偶发气泡消失）。
-        let mut foreign: Option<(i32, i32)> = None;
+        let mut foreign: Option<(i32, i32, isize)> = None;
         let foreground = GetForegroundWindow();
         if !foreground.is_invalid() {
             let mut pid = 0u32;
             GetWindowThreadProcessId(foreground, Some(&mut pid));
             let ours = pid == GetCurrentProcessId();
-            let origin = client_origin(foreground).or_else(|| window_origin(foreground));
-            if let Some(origin) = origin {
+            let owner = root_hwnd(foreground);
+            if let Some((x, y)) = client_origin(foreground).or_else(|| window_origin(foreground)) {
                 if ours {
-                    return Some(origin);
+                    return Some((x, y, owner));
                 }
-                foreign = Some(origin);
+                foreign = Some((x, y, owner));
             }
         }
         if let Ok(view) = context.GetActiveView() {
             if let Ok(hwnd) = view.GetWnd() {
-                if let Some(origin) = client_origin(hwnd) {
-                    return Some(origin);
-                }
-                if let Some(origin) = window_origin(hwnd) {
-                    return Some(origin);
+                // 与 owner 跟随同口径：统一取根顶层窗的客户区原点，避免
+                // 初摆用子窗客户区、首拍跟随又跳回根窗口（偏差 ≤ gap）。
+                let owner_hwnd = root_of(hwnd);
+                let owner = owner_hwnd.0 as isize;
+                if let Some((x, y)) = client_origin(owner_hwnd)
+                    .or_else(|| window_origin(owner_hwnd))
+                    .or_else(|| client_origin(hwnd))
+                    .or_else(|| window_origin(hwnd))
+                {
+                    return Some((x, y, owner));
                 }
             }
             if let Ok(rc) = view.GetScreenExt() {
                 // 校验：未初始化矩形（多为 (-10,0)、尺寸 0）一律丢弃。
                 if view_rect_is_usable(rc.left, rc.top, rc.right, rc.bottom) {
-                    return Some((rc.left, rc.top));
+                    let owner = view.GetWnd().map(|h| root_hwnd(h)).unwrap_or(0);
+                    return Some((rc.left, rc.top, owner));
                 }
             }
         }
-        if let Some(origin) = foreign {
-            log::info!(
-                "float-button: 锚点退到非本进程前台窗口 ({},{})",
-                origin.0,
-                origin.1
-            );
+        if let Some((x, y, _)) = foreign {
+            log::info!("float-button: 锚点退到非本进程前台窗口 ({x},{y})");
         }
         foreign
     }
+}
+
+/// HWND 的根祖先窗口（把 owner 与前台顶层窗口归一比较）；取不到返回自身。
+///
+/// # Safety
+/// `hwnd` 必须是调用期间有效的窗口句柄。
+unsafe fn root_of(hwnd: HWND) -> HWND {
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if root.is_invalid() {
+        hwnd
+    } else {
+        root
+    }
+}
+
+/// `root_of` 的 isize 形式（供 `--owner` 传参）。
+///
+/// # Safety
+/// `hwnd` 必须是调用期间有效的窗口句柄。
+unsafe fn root_hwnd(hwnd: HWND) -> isize {
+    unsafe { root_of(hwnd).0 as isize }
 }
 
 /// 窗口框左上（含标题栏/边框）；矩形退化返回 None。
@@ -2478,7 +2501,7 @@ fn spawn_float_button(data: &Rc<TextServiceData>) -> bool {
         log::info!("float-button: 密码字段，跳过");
         return true;
     }
-    let Some(anchor) = input_window_anchor(&context) else {
+    let Some((anchor_x, anchor_y, owner)) = input_window_anchor(&context) else {
         log::warn!("float-button: 无输入窗口锚点，等待定时器重试");
         return false;
     };
@@ -2498,7 +2521,11 @@ fn spawn_float_button(data: &Rc<TextServiceData>) -> bool {
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("float-button")
         .arg("--at")
-        .arg(format!("{},{}", anchor.0, anchor.1))
+        .arg(format!("{anchor_x},{anchor_y}"))
+        // owner 句柄：helper 轮询前台窗口是否为它并跟随其移动，失焦即自退
+        // （修「切窗口后气泡留在原窗口左上角」）。
+        .arg("--owner")
+        .arg(owner.to_string())
         .arg("--session-id")
         .arg(session_id.to_string())
         .arg("--session-key")
@@ -2511,7 +2538,7 @@ fn spawn_float_button(data: &Rc<TextServiceData>) -> bool {
         .stderr(std::process::Stdio::piped());
     match cmd.spawn() {
         Ok(mut child) => {
-            log::info!("float-button: spawn at=({},{})", anchor.0, anchor.1);
+            log::info!("float-button: spawn at=({anchor_x},{anchor_y}) owner={owner}");
             let results = Arc::clone(&data.trigger_results);
             let float_epoch = Arc::clone(&data.float_epoch);
             let stdout = child.stdout.take();

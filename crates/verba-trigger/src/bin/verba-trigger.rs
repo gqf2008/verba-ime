@@ -252,7 +252,7 @@ fn cmd_speak(args: &[String]) -> i32 {
 /// 供 Windows TSF v1 接线使用；Windows v2 跟进后下线。
 fn cmd_float_button(args: &[String]) -> i32 {
     let Some(at) = parse_pair(args, "--at") else {
-        eprintln!("用法: verba-trigger float-button --at x,y [--session-id N] [--session-key S]");
+        eprintln!("用法: verba-trigger float-button --at x,y [--owner HWND] [--session-id N] [--session-key S]");
         return 1;
     };
     let session_id = args
@@ -267,10 +267,18 @@ fn cmd_float_button(args: &[String]) -> i32 {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
+    // 锚定窗口顶层句柄（Windows 前端传；0/缺省 = 不跟随）。
+    let owner = args
+        .iter()
+        .position(|a| a == "--owner")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     match run_float_button(FloatArgs {
         at,
         session_id,
         session_key,
+        owner,
     }) {
         Ok(FloatOutcome::Reply(text)) => {
             println!("{text}");

@@ -144,7 +144,7 @@ v2 架构（macOS 已落地）：**进程内 NSPanel 气泡 + 点击/键盘触�
 - 屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非输入法宿主 App）：macOS 首跑需在「系统设置 → 隐私与安全性 → 屏幕录制」勾选 verba-trigger，否则点击后管线失败（stderr/前端日志可见原因）。进程内 NSPanel 本身不截屏，无需权限。
 - 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素。气泡不会被自捕获误拍：`capture_active_window` 的 focused 判定 = NSWorkspace 活动应用 pid，nonactivating panel 不改变 frontmost application。
 - 平台状态：macOS = v2 进程内 Panel（本节描述）；Windows = v1 helper 窗模式 + StartCapture 未接线告警；Linux Fcitx5 前端未就绪：共享层（capture_active_window / float-run 子命令）已平台中立落地，Fcitx5 前端就绪后按同模式接线（AGENTS.md 跨平台默认）。
-- Windows v1 锚点 = **当前输入窗口左上**：前台窗口（同进程优先）客户区/窗口框 → 活动视图 HWND 客户区/窗口框 → 校验通过的 `GetScreenExt` → 非本进程前台窗口客户区/窗口框兜底（部分应用 TSF DLL 与可见窗口不同进程）。TSF 激活瞬间 `GetScreenExt` 常回未初始化矩形（真机日志见 `(-10,0)`），旧实现会被 clamp 到屏幕左上角而不是输入窗口；现在**有有效前台窗口就不再返回 None**，且无 context/锚点时记重试、由 TSF 80ms 定时器在 ~2.4s（`FLOAT_RETRY_TICKS`）内补试，不再偶发整个不弹。helper 窗非激活修饰除 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 外还须**清掉 winit 因无 owner 置上的 `WS_EX_APPWINDOW`**，否则任务栏会挂出「VerbaFloat」。
+- Windows v1 锚点 = **当前输入窗口左上**：前台窗口（同进程优先）客户区/窗口框 → 活动视图 HWND 客户区/窗口框 → 校验通过的 `GetScreenExt` → 非本进程前台窗口客户区/窗口框兜底（部分应用 TSF DLL 与可见窗口不同进程）。TSF 激活瞬间 `GetScreenExt` 常回未初始化矩形（真机日志见 `(-10,0)`），旧实现会被 clamp 到屏幕左上角而不是输入窗口；现在**有有效前台窗口就不再返回 None**，且无 context/锚点时记重试、由 TSF 80ms 定时器在 ~2.4s（`FLOAT_RETRY_TICKS`）内补试，不再偶发整个不弹。helper 窗非激活修饰除 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 外还须**清掉 winit 因无 owner 置上的 `WS_EX_APPWINDOW`**，否则任务栏会挂出「VerbaFloat」。 helper 另收锚定窗口句柄（`--owner`）：按 `OWNER_POLL`(300ms) 轮询前台窗口——不是它就自退（`OWNER_LOST_GRACE` 600ms 宽限）、是它就跟随该窗口客户区原点移动，修「切窗口后气泡仍留在原窗口左上角」。
 - Wayland 焦点豁免以合成器为准（X11 已 override_redirect）。
 
 **LLM 流式**

@@ -40,6 +40,11 @@ pub const BUTTON_GAP: i32 = 8;
 pub const IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// 点击后整条「截窗 + OCR + LLM」管线的超时。
 pub const PIPELINE_TIMEOUT: Duration = Duration::from_secs(120);
+/// owner 跟随/失焦检查周期（仅 Windows、owner 非 0 时启用）。
+const OWNER_POLL: Duration = Duration::from_millis(300);
+/// 持续失焦超过该时长才自退（防切换瞬间抖动误退；按墙钟而非拍数，
+/// `about_to_wait` 可能在启动期被高频调用）。
+const OWNER_LOST_GRACE: Duration = Duration::from_millis(600);
 
 /// 品牌深空蓝（assets/branding 参考图同族；方形底）。
 const COLOR_BG: u32 = 0x4A6CF7;
@@ -58,6 +63,10 @@ pub struct FloatArgs {
     /// LLM 窗口会话标识（与 `//` 同会话，可追问；空 key = legacy 槽）。
     pub session_id: u64,
     pub session_key: String,
+    /// 锚定窗口的顶层句柄（Windows；0 = 不做 owner 跟随/失焦自退）。
+    /// helper 轮询前台窗口：不是它就自退（修「切窗口后气泡留在原窗口」），
+    /// 是它就跟随其客户区原点移动。
+    pub owner: isize,
 }
 
 /// 按钮结束态：回复文本 / 用户取消 / 超时 / 管线失败（携带原因）。
@@ -274,6 +283,11 @@ struct FloatState {
     /// 当前阶段的截止时间：等待点击 = 启动 + IDLE_TTL；点击后 = 点击 + PIPELINE_TIMEOUT。
     deadline: Instant,
     outcome: Option<FloatOutcome>,
+    /// 「前台窗口不是 owner」的起始时刻；持续超过 OWNER_LOST_GRACE 即自退。
+    focus_lost_since: Option<Instant>,
+    /// 启动时缓存的虚拟屏幕工作区 (x,y,w,h)，供 owner 跟随复用 clamp；
+    /// w/h 为 0 表示未知（不 clamp）。
+    work: (i32, i32, i32, i32),
 }
 
 /// 运行按钮窗事件循环，直到点击出结果 / 取消 / 超时。
@@ -286,6 +300,8 @@ pub fn run_float_button(args: FloatArgs) -> Result<FloatOutcome, TriggerError> {
         worker: None,
         deadline: Instant::now() + IDLE_TTL,
         outcome: None,
+        focus_lost_since: None,
+        work: (0, 0, 0, 0),
     };
     let mut app = FloatApp { state: Some(state) };
     let mut builder = EventLoop::builder();
@@ -360,12 +376,15 @@ impl ApplicationHandler for FloatApp {
         // 摆位：全局单位 → macOS 逻辑（点），其它物理（scale=1 路径，
         // 与 selection.rs 的「薄单位适配层」同一口径）。
         let origin = match virtual_screen() {
-            Ok(vs) => button_origin(
-                state.args.at,
-                (BUTTON_SIZE, BUTTON_SIZE),
-                BUTTON_GAP,
-                (vs.x, vs.y, vs.width, vs.height),
-            ),
+            Ok(vs) => {
+                state.work = (vs.x, vs.y, vs.width, vs.height);
+                button_origin(
+                    state.args.at,
+                    (BUTTON_SIZE, BUTTON_SIZE),
+                    BUTTON_GAP,
+                    state.work,
+                )
+            }
             Err(e) => {
                 log::warn!("取虚拟屏幕失败，用锚点直接摆位: {e}");
                 (state.args.at.0 + BUTTON_GAP, state.args.at.1 + BUTTON_GAP)
@@ -479,9 +498,26 @@ impl ApplicationHandler for FloatApp {
             self.finish(event_loop, FloatOutcome::Expired);
             return;
         }
-        // 忙碌期 100ms 轮询 worker 结果；等待点击期睡到 deadline（TTL）。
+        // owner 跟随 / 失焦自退（Windows；owner=0 时 no-op）。按墙钟宽限，
+        // 避免启动期 about_to_wait 高频调用把「拍数」瞬间耗光。
+        if poll_owner(state) == OwnerStep::Lost {
+            match state.focus_lost_since {
+                Some(t) if now.duration_since(t) >= OWNER_LOST_GRACE => {
+                    self.finish(event_loop, FloatOutcome::Cancelled);
+                    return;
+                }
+                Some(_) => {}
+                None => state.focus_lost_since = Some(now),
+            }
+        } else {
+            state.focus_lost_since = None;
+        }
+        // 忙碌期 100ms 轮询 worker 结果；有 owner 时每 OWNER_POLL 检查一次
+        // 跟随/失焦；等待点击期睡到 deadline（TTL）。
         let wake = if state.worker.is_some() {
             now + Duration::from_millis(100)
+        } else if state.args.owner != 0 {
+            (now + OWNER_POLL).min(state.deadline)
         } else {
             state.deadline
         };
@@ -500,6 +536,52 @@ fn place_window(window: &Window, x: i32, y: i32) {
 #[cfg(not(target_os = "macos"))]
 fn place_window(window: &Window, x: i32, y: i32) {
     window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+}
+
+/// owner 跟随结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerStep {
+    Ok,
+    Lost,
+}
+
+/// 检查锚定窗口是否仍是前台窗口；是则把按钮跟随其客户区原点移动。
+/// owner=0（非 Windows 或未传）时恒 Ok。放在事件循环节拍上（`OWNER_POLL`）。
+fn poll_owner(state: &mut FloatState) -> OwnerStep {
+    if state.args.owner == 0 {
+        return OwnerStep::Ok;
+    }
+    let Some(window) = state.window.as_ref() else {
+        return OwnerStep::Ok;
+    };
+    let fg = chrome::foreground_root();
+    if fg == 0 {
+        return OwnerStep::Ok; // 取不到前台窗口：不误判失焦
+    }
+    if fg != state.args.owner && fg != chrome::window_hwnd(window) {
+        return OwnerStep::Lost;
+    }
+    // 跟随：owner 客户区原点 + gap（窗口被移动/缩放时气泡跟着走）。
+    // 复用启动缓存的虚拟屏工作区做与初摆同一套 clamp/flip，多屏边缘不越屏。
+    if let Some(anchor) = chrome::client_origin(state.args.owner) {
+        let (wx, wy, ww, wh) = state.work;
+        let target = if ww > 0 && wh > 0 {
+            button_origin(
+                anchor,
+                (BUTTON_SIZE, BUTTON_SIZE),
+                BUTTON_GAP,
+                (wx, wy, ww, wh),
+            )
+        } else {
+            (anchor.0 + BUTTON_GAP, anchor.1 + BUTTON_GAP)
+        };
+        if let Ok(pos) = window.outer_position() {
+            if (pos.x - target.0).abs() > 2 || (pos.y - target.1).abs() > 2 {
+                place_window(window, target.0, target.1);
+            }
+        }
+    }
+    OwnerStep::Ok
 }
 
 /// 重绘按钮：缓冲取窗口**物理**尺寸（Retina 下不裁角，同 selection.rs）。
