@@ -299,7 +299,7 @@
 > 前置：`config.toml` 加 `float_button_enable = true`（默认关；v1 设置面板不暴露）；verba-trigger.exe 与 TSF DLL 同目录（安装布局）；LLM provider 已配置。
 > 状态：共享层平台中立 + MSVC 交叉 check 绿；本节为 Windows 真机首验。
 
-- [ ] 激活输入框 → 活动视图左上旁出现气泡按钮（不抢焦点、无控制台窗口，`CREATE_NO_WINDOW`）
+- [ ] 激活输入框 → **当前输入窗口客户区左上**出现气泡按钮（不抢焦点、无控制台窗口，`CREATE_NO_WINDOW`）；**任务栏/Alt-Tab 不得出现「VerbaFloat」**（`WS_EX_APPWINDOW` 必须清掉，仅 `WS_EX_TOOLWINDOW` 不够）
 - [ ] 密码字段（TSF `IS_PASSWORD`）激活 → 不弹按钮
 - [ ] 点击 → 截前台窗口可见区域 → OCR → LLM 回复进 OCR 预览（Enter/1 上屏，Esc 取消）
 - [ ] 右键按钮 = 取消；Deactivate（切走输入法）→ 按钮消失

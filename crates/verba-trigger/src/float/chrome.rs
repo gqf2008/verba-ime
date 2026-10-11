@@ -7,9 +7,11 @@
 //! - macOS：`NSWindowStyleMask::NonactivatingPanel`（styleMask 位），
 //!   配合事件循环的 Accessory 激活策略，点击不激活 helper 应用、
 //!   不带走编辑器焦点。
-//! - Windows：`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 扩展样式：
-//!   鼠标消息正常投递但不激活本窗；TOOLWINDOW 让 Alt-Tab 与任务栏
-//!   忽略 helper 窗。
+//! - Windows：`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 扩展样式，并**清掉
+//!   `WS_EX_APPWINDOW`**：鼠标消息正常投递但不激活本窗；TOOLWINDOW 让
+//!   Alt-Tab 与任务栏忽略 helper 窗。winit 因 helper 窗无 owner 会加
+//!   APPWINDOW（任务栏强制可见），且它与 TOOLWINDOW 并存时 APPWINDOW
+//!   生效——必须显式清除，否则任务栏一直挂着「VerbaFloat」。
 //! - X11/Linux：无本阶段修饰——`override_redirect` 在窗口创建属性上
 //!   设置（float.rs），WM 不参与管理即不焦点抢占。
 //! - 其余平台（Wayland 等）：no-op 并告警（窗口表现为普通置顶小窗，
@@ -54,7 +56,8 @@ fn make_nonactivating_impl(window: &Window) {
 fn make_nonactivating_impl(window: &Window) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
     };
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -72,10 +75,11 @@ fn make_nonactivating_impl(window: &Window) {
     // SAFETY: hwnd 来自 winit 活动窗口，生命周期覆盖本函数调用；
     // GWL_EXSTYLE 读写只影响扩展样式位，窗口过程不变。NOACTIVATE 使
     // 鼠标点击不激活本窗（编辑器保持焦点），TOOLWINDOW 让系统任务切换
-    // 忽略本窗。
+    // 忽略本窗；APPWINDOW 必须清掉（winit 因无 owner 会置位，它压过
+    // TOOLWINDOW，任务栏会出现「VerbaFloat」）。
     unsafe {
         let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
-        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & !(WS_EX_APPWINDOW.0 as isize);
         SetWindowLongPtrW(
             hwnd,
             GWL_EXSTYLE,

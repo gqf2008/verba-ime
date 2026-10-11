@@ -144,6 +144,7 @@ v2 架构（macOS 已落地）：**进程内 NSPanel 气泡 + 点击/键盘触�
 - 屏幕录制权限的授予对象是 **verba-trigger helper 本体**（非输入法宿主 App）：macOS 首跑需在「系统设置 → 隐私与安全性 → 屏幕录制」勾选 verba-trigger，否则点击后管线失败（stderr/前端日志可见原因）。进程内 NSPanel 本身不截屏，无需权限。
 - 截「前台窗口在屏幕上的可见区域」，被遮挡部分会带遮挡内容；不追求离屏窗口像素。气泡不会被自捕获误拍：`capture_active_window` 的 focused 判定 = NSWorkspace 活动应用 pid，nonactivating panel 不改变 frontmost application。
 - 平台状态：macOS = v2 进程内 Panel（本节描述）；Windows = v1 helper 窗模式 + StartCapture 未接线告警；Linux Fcitx5 前端未就绪：共享层（capture_active_window / float-run 子命令）已平台中立落地，Fcitx5 前端就绪后按同模式接线（AGENTS.md 跨平台默认）。
+- Windows v1 锚点 = **当前输入窗口客户区左上**（前台窗口须属宿主进程，退活动视图 HWND，最后退校验通过的 `GetScreenExt`）：TSF 激活瞬间 `GetScreenExt` 常回未初始化矩形（真机日志见 `(-10,0)`），旧实现会被 clamp 到屏幕左上角而不是输入窗口；矩形不可用即不弹。helper 窗非激活修饰除 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 外还须**清掉 winit 因无 owner 置上的 `WS_EX_APPWINDOW`**，否则任务栏会挂出「VerbaFloat」。
 - Wayland 焦点豁免以合成器为准（X11 已 override_redirect）。
 
 **LLM 流式**

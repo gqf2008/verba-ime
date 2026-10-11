@@ -22,9 +22,12 @@ use verba_core::{parse_ai_command, AiCommand};
 use verba_ipc::{CommitForwarder, LlmSession};
 use verba_protos::{stream_event, StreamEvent};
 use windows::core::{implement, w, Interface, Ref, Result, PCWSTR};
-use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    FALSE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_BACK, VK_CONTROL,
     VK_DOWN, VK_ESCAPE, VK_MENU, VK_NEXT, VK_O, VK_PRIOR, VK_RETURN, VK_S, VK_SHIFT, VK_UP,
@@ -43,9 +46,10 @@ use windows::Win32::UI::TextServices::{
     TF_INVALID_COOKIE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindow, KillTimer,
-    PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW, RegisterClassW,
+    SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
 };
 
 use crate::dll;
@@ -1624,6 +1628,67 @@ fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32, i32)> {
     }
 }
 
+/// 悬浮按钮锚点：当前输入窗口左上（屏幕物理像素）。
+///
+/// 不用 `view_screen_pos`（`GetScreenExt`）：TSF 激活瞬间它常返回未初始化
+/// 矩形（真机日志见 `(-10,0)`），按钮被 clamp 到屏幕左上角而不是输入窗口；
+/// 对终端/分栏类视图它返回的又是视图内部文本区左上，不是窗口左上。这里取
+/// 「前台窗口（须属本进程，防锚到别的窗口）客户区左上」，再退活动视图 HWND
+/// 客户区左上，最后退校验通过的视图屏幕矩形；全不可用返回 None——宁可不弹，
+/// 也不把气泡丢到屏幕角上。
+fn input_window_anchor(context: &ITfContext) -> Option<(i32, i32)> {
+    // SAFETY: 全部为只读的 Win32 窗口查询；HWND 来自本进程前台窗口或 TSF
+    // 活动视图，调用期间有效，不向宿主窗口发消息、不改其状态。
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if !foreground.is_invalid() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(foreground, Some(&mut pid));
+            if pid == GetCurrentProcessId() {
+                if let Some(origin) = client_origin(foreground) {
+                    return Some(origin);
+                }
+            }
+        }
+        let view: ITfContextView = context.GetActiveView().ok()?;
+        if let Ok(hwnd) = view.GetWnd() {
+            if let Some(origin) = client_origin(hwnd) {
+                return Some(origin);
+            }
+        }
+        let rc = view.GetScreenExt().ok()?;
+        // 校验：未初始化矩形（多为 (-10,0)、尺寸 0）一律丢弃。
+        if view_rect_is_usable(rc.left, rc.top, rc.right, rc.bottom) {
+            return Some((rc.left, rc.top));
+        }
+        None
+    }
+}
+
+/// 视图屏幕矩形是否可用于定位：正尺寸且顶点未明显越界。
+///
+/// TSF 激活瞬间 `GetScreenExt` 常返回未初始化矩形（左/上为 `-10`、尺寸 0），
+/// 直接用会把悬浮气泡 clamp 到屏幕左上角而不是输入窗口。抽成纯函数以便回护回归。
+fn view_rect_is_usable(left: i32, top: i32, right: i32, bottom: i32) -> bool {
+    right > left && bottom > top && left > -32000 && top > -32000
+}
+
+/// HWND 客户区原点（屏幕物理像素）；矩形退化或坐标转换失败返回 None。
+///
+/// # Safety
+/// `hwnd` 必须是调用期间有效的窗口句柄。
+unsafe fn client_origin(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc).ok()?;
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return None;
+    }
+    let mut origin = POINT { x: 0, y: 0 };
+    ClientToScreen(hwnd, &mut origin)
+        .as_bool()
+        .then_some((origin.x, origin.y))
+}
+
 /// 定时器重试：组合布局就绪后把候选窗精确移动到组合锚点。
 fn retry_candidate_pos(data: &Rc<TextServiceData>) {
     // 先取出重试状态（避免持有 RefMut 时再 take 造成二次可变借用）。
@@ -2334,8 +2399,9 @@ fn trigger_exe_path() -> Option<std::path::PathBuf> {
 }
 
 /// 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable，默认关）：
-/// helper 进程持有 winit 非激活小窗（点击不抢编辑器焦点）；锚点取活动视图
-/// 屏幕矩形左上（激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
+/// helper 进程持有 winit 非激活小窗（点击不抢编辑器焦点）；锚点取「当前输入
+/// 窗口客户区左上」（前台窗口须属本进程 → 活动视图 HWND → 校验通过的视图
+/// 屏幕矩形；激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
 /// 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落到
 /// trigger_results → OCR 预览上屏（与 /// 选区同一管线，无新通道）；管线
 /// 失败原因经 stderr 捕获记日志。世代守卫：Deactivate/重 spawn 推进世代，
@@ -2357,8 +2423,8 @@ fn spawn_float_button(data: &Rc<TextServiceData>) {
         log::info!("float-button: 密码字段，跳过");
         return;
     }
-    let Some(anchor) = view_screen_pos(&context) else {
-        log::warn!("float-button: 无活动视图锚点，跳过");
+    let Some(anchor) = input_window_anchor(&context) else {
+        log::warn!("float-button: 无输入窗口锚点，跳过");
         return;
     };
     let Some(exe) = trigger_exe_path() else {
@@ -2936,6 +3002,19 @@ impl TextServiceData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_anchor_rejects_uninitialized_view_rect() {
+        // TSF 激活瞬间真机日志常见矩形：左 -10、尺寸 0 → 必须拒绝，
+        // 否则悬浮气泡会被 clamp 到屏幕左上角（本回归的原始症状）。
+        assert!(!view_rect_is_usable(-10, 0, -10, 0));
+        assert!(!view_rect_is_usable(-10, 0, 0, 0));
+        assert!(!view_rect_is_usable(0, 0, 0, 0));
+        assert!(!view_rect_is_usable(-40000, 0, 100, 100));
+        // 正常视图矩形可用。
+        assert!(view_rect_is_usable(186, 72, 1600, 900));
+        assert!(view_rect_is_usable(-1920, 0, 0, 1080)); // 副屏负原点
+    }
 
     #[test]
     fn ocr_anchor_stash_consumed_once_then_falls_back() {
