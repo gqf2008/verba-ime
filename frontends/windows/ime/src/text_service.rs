@@ -47,9 +47,9 @@ use windows::Win32::UI::TextServices::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, KillTimer, PostMessageW,
+    RegisterClassW, SetTimer, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_DESTROY, WM_NCCREATE, WM_TIMER, WNDCLASSW,
 };
 
 use crate::dll;
@@ -60,6 +60,8 @@ const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 80;
 const TIMER_WINDOW_CLASS: &str = "VerbaTimerWindow";
 const CANDIDATE_POS_RETRY_TICKS: u32 = 15; // 80ms×15≈1.2s：GetTextExt 布局未就绪时锚点重试上限
+/// 悬浮按钮激活重试上限：80ms×30≈2.4s（等 context / 前台窗口就绪）。
+const FLOAT_RETRY_TICKS: u32 = 30;
 const CANDIDATE_REQ_DEBOUNCE_TICKS: u32 = 1; // 80ms：击键后短暂停顿即查 Rime（本地快）；过早的 320ms 防抖为远程 LLM 融合设计，单引擎 Rime 下导致候选框滞后于输入（不跟手）
 /// TSF context 身份映射上限：超过时逐出最旧 context→generation 绑定。
 const MAX_CONTEXT_SESSIONS: usize = 256;
@@ -98,6 +100,12 @@ fn alloc_session_id() -> u64 {
 /// 待重试的候选窗锚点（组合布局就绪后由定时器精确定位）。
 struct CandidatePosRetry {
     context: ITfContext,
+    attempts_left: u32,
+}
+
+/// 悬浮按钮激活重试：激活瞬间可能尚无 context / 锚点（与候选窗布局
+/// 未就绪同源），由定时器稍后重试，避免偶发「没有气泡」。
+struct FloatRetry {
     attempts_left: u32,
 }
 
@@ -194,6 +202,8 @@ pub struct TextServiceData {
     /// 悬浮按钮世代：kill/重 spawn 推进；读线程投递前校验，丢弃失活后
     /// 迟到的结果（防 stale push 进下一激活期）。
     float_epoch: Arc<AtomicU64>,
+    /// 悬浮按钮激活重试（无 context/锚点时由定时器补试）。
+    float_retry: RefCell<Option<FloatRetry>>,
 }
 
 impl TextServiceData {
@@ -240,6 +250,7 @@ impl TextServiceData {
             // TSF 激活期，Deactivate 时 kill）。
             float_child: RefCell::new(None),
             float_epoch: Arc::new(AtomicU64::new(0)),
+            float_retry: RefCell::new(None),
         }
     }
 }
@@ -363,7 +374,13 @@ fn tsf_activate(data: &Rc<TextServiceData>, ptim: &ITfThreadMgr, tid: u32) -> Re
     // 预拉起 daemon（daemon 启动即预热 Rime），避免首次输入等冷启动。
     prewarm_daemon(data);
     // 悬浮 AI 回复按钮（默认关）：锚定活动视图，回复走 OCR 预览上屏管线。
-    spawn_float_button(data);
+    // 激活瞬间可能尚无 context/锚点 → 记重试，由定时器在 ~2.4s 内补试。
+    *data.float_retry.borrow_mut() = Some(FloatRetry {
+        attempts_left: FLOAT_RETRY_TICKS,
+    });
+    if spawn_float_button(data) {
+        *data.float_retry.borrow_mut() = None;
+    }
     // 注册显示属性提供者（组合下划线；幂等，失败仅告警）。
     crate::display_attribute::register_provider();
     // 候选窗主题/引擎：从配置文件加载（失败保留默认，不影响激活）
@@ -413,6 +430,7 @@ fn tsf_deactivate(data: &Rc<TextServiceData>) -> Result<()> {
     *data.context.borrow_mut() = None;
     *data.composition.borrow_mut() = None;
     *data.candidate_pending_pos.borrow_mut() = None;
+    *data.float_retry.borrow_mut() = None;
     *data.machine.borrow_mut() = CompositionMachine::new();
     Ok(())
 }
@@ -1632,37 +1650,72 @@ fn view_screen_pos(context: &ITfContext) -> Option<(i32, i32, i32)> {
 ///
 /// 不用 `view_screen_pos`（`GetScreenExt`）：TSF 激活瞬间它常返回未初始化
 /// 矩形（真机日志见 `(-10,0)`），按钮被 clamp 到屏幕左上角而不是输入窗口；
-/// 对终端/分栏类视图它返回的又是视图内部文本区左上，不是窗口左上。这里取
-/// 「前台窗口（须属本进程，防锚到别的窗口）客户区左上」，再退活动视图 HWND
-/// 客户区左上，最后退校验通过的视图屏幕矩形；全不可用返回 None——宁可不弹，
-/// 也不把气泡丢到屏幕角上。
+/// 对终端/分栏类视图它返回的又是视图内部文本区左上，不是窗口左上。改逐级
+/// 兜底：前台窗口（同进程优先，防误锚）客户区左上 → 其窗口框 → 活动视图
+/// HWND 客户区 → 其窗口框 → 校验通过的视图屏幕矩形 → 非本进程前台窗口
+/// 客户区/窗口框（部分应用 TSF DLL 与可见窗口不同进程）。只要存在有效前台
+/// 窗口就不再返回 None——拿不到完美锚点交给定时器重试，不再整个不弹。
 fn input_window_anchor(context: &ITfContext) -> Option<(i32, i32)> {
-    // SAFETY: 全部为只读的 Win32 窗口查询；HWND 来自本进程前台窗口或 TSF
-    // 活动视图，调用期间有效，不向宿主窗口发消息、不改其状态。
+    // SAFETY: 全部为只读的 Win32 窗口查询；HWND 来自前台窗口或 TSF 活动
+    // 视图，调用期间有效，不向宿主窗口发消息、不改其状态。
     unsafe {
+        // 兜底（最后才用）：非本进程前台窗口的客户区/窗口左上。部分应用
+        // 的 TSF DLL 与可见窗口不同进程（渲染子进程/输入宿主），此时它仍是
+        // 「当前输入窗口」——宁可退到这里，也不要因拿不到完美锚点整个不弹
+        // （真机回归：加固后偶发气泡消失）。
+        let mut foreign: Option<(i32, i32)> = None;
         let foreground = GetForegroundWindow();
         if !foreground.is_invalid() {
             let mut pid = 0u32;
             GetWindowThreadProcessId(foreground, Some(&mut pid));
-            if pid == GetCurrentProcessId() {
-                if let Some(origin) = client_origin(foreground) {
+            let ours = pid == GetCurrentProcessId();
+            let origin = client_origin(foreground).or_else(|| window_origin(foreground));
+            if let Some(origin) = origin {
+                if ours {
+                    return Some(origin);
+                }
+                foreign = Some(origin);
+            }
+        }
+        if let Ok(view) = context.GetActiveView() {
+            if let Ok(hwnd) = view.GetWnd() {
+                if let Some(origin) = client_origin(hwnd) {
+                    return Some(origin);
+                }
+                if let Some(origin) = window_origin(hwnd) {
                     return Some(origin);
                 }
             }
-        }
-        let view: ITfContextView = context.GetActiveView().ok()?;
-        if let Ok(hwnd) = view.GetWnd() {
-            if let Some(origin) = client_origin(hwnd) {
-                return Some(origin);
+            if let Ok(rc) = view.GetScreenExt() {
+                // 校验：未初始化矩形（多为 (-10,0)、尺寸 0）一律丢弃。
+                if view_rect_is_usable(rc.left, rc.top, rc.right, rc.bottom) {
+                    return Some((rc.left, rc.top));
+                }
             }
         }
-        let rc = view.GetScreenExt().ok()?;
-        // 校验：未初始化矩形（多为 (-10,0)、尺寸 0）一律丢弃。
-        if view_rect_is_usable(rc.left, rc.top, rc.right, rc.bottom) {
-            return Some((rc.left, rc.top));
+        if let Some(origin) = foreign {
+            log::info!(
+                "float-button: 锚点退到非本进程前台窗口 ({},{})",
+                origin.0,
+                origin.1
+            );
         }
-        None
+        foreign
     }
+}
+
+/// 窗口框左上（含标题栏/边框）；矩形退化返回 None。
+///
+/// 客户区取不到时的兜底：跨进程宿主拿不到 client 信息时，窗口框左上比
+/// 「不弹」更接近「当前输入窗口左上」。
+///
+/// # Safety
+/// `hwnd` 必须是调用期间有效的窗口句柄。
+unsafe fn window_origin(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rc = RECT::default();
+    GetWindowRect(hwnd, &mut rc).ok()?;
+    // 复用与视图矩形同一门槛：拒零尺寸与 (-32000) 类最小化哨兵，避免锚到屏外。
+    view_rect_is_usable(rc.left, rc.top, rc.right, rc.bottom).then_some((rc.left, rc.top))
 }
 
 /// 视图屏幕矩形是否可用于定位：正尺寸且顶点未明显越界。
@@ -2400,36 +2453,38 @@ fn trigger_exe_path() -> Option<std::path::PathBuf> {
 
 /// 激活时按需 spawn 悬浮 AI 回复按钮（config float_button_enable，默认关）：
 /// helper 进程持有 winit 非激活小窗（点击不抢编辑器焦点）；锚点取「当前输入
-/// 窗口客户区左上」（前台窗口须属本进程 → 活动视图 HWND → 校验通过的视图
-/// 屏幕矩形；激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
+/// 窗口左上」（前台窗口同进程优先 → 其窗口框 → 活动视图 HWND 客户区/窗口框 →
+/// 校验通过的视图屏幕矩形 → 非本进程前台窗口兜底；激活期尚无组合，无 GetTextExt 光标可用）。点击后 helper
 /// 编排「截前台窗口→OCR→LLM 生成回复」，文本经 stdout 回落到
 /// trigger_results → OCR 预览上屏（与 /// 选区同一管线，无新通道）；管线
 /// 失败原因经 stderr 捕获记日志。世代守卫：Deactivate/重 spawn 推进世代，
 /// 旧读线程迟到结果丢弃，不会投递进下一激活期。
 /// 生命周期 = 本 TSF 激活期：Deactivate 时 kill。
 /// 密码类输入字段不弹按钮（屏幕内容出网链路与 // 同一收口标准）。
-fn spawn_float_button(data: &Rc<TextServiceData>) {
+/// 返回 true = 本次激活已落定（成功 spawn 或确定性跳过），false = 可重试
+/// （激活瞬间尚无 context / 锚点，由定时器在 `FLOAT_RETRY_TICKS` 内补试）。
+fn spawn_float_button(data: &Rc<TextServiceData>) -> bool {
     if !float_button_enabled() {
-        return;
+        return true;
     }
     let context = match data.context.borrow().as_ref().cloned() {
         Some(ctx) => ctx,
         None => {
-            log::warn!("float-button: 无 context，跳过");
-            return;
+            log::warn!("float-button: 无 context，等待定时器重试");
+            return false;
         }
     };
     if focused_field_is_password(&context) {
         log::info!("float-button: 密码字段，跳过");
-        return;
+        return true;
     }
     let Some(anchor) = input_window_anchor(&context) else {
-        log::warn!("float-button: 无输入窗口锚点，跳过");
-        return;
+        log::warn!("float-button: 无输入窗口锚点，等待定时器重试");
+        return false;
     };
     let Some(exe) = trigger_exe_path() else {
         log::warn!("float-button: 未找到 verba-trigger.exe");
-        return;
+        return true;
     };
     // 单实例守卫：换激活期先杀旧的（防按钮叠加）；推进世代，作废旧读
     // 线程的迟到投递（kill 时回复已在管道里的竞态）。
@@ -2493,6 +2548,23 @@ fn spawn_float_button(data: &Rc<TextServiceData>) {
             });
         }
         Err(e) => log::warn!("float-button: 启动 verba-trigger 失败: {e}"),
+    }
+    true
+}
+
+/// 定时器补试悬浮按钮激活（仅在有待重试且未落定时）。
+fn retry_float_button(data: &Rc<TextServiceData>) {
+    let Some(mut r) = data.float_retry.borrow_mut().take() else {
+        return;
+    };
+    if r.attempts_left == 0 {
+        log::warn!("float-button: 激活重试耗尽仍未落定，本次不弹");
+        return;
+    }
+    r.attempts_left -= 1;
+    *data.float_retry.borrow_mut() = Some(r);
+    if spawn_float_button(data) {
+        *data.float_retry.borrow_mut() = None;
     }
 }
 
@@ -2907,6 +2979,8 @@ impl TextServiceData {
         maybe_reload_candidate_config(&rc);
         // 候选窗：组合布局就绪后重试精确定位
         retry_candidate_pos(&rc);
+        // 悬浮按钮：激活瞬间无 context/锚点时补试
+        retry_float_button(&rc);
         // 候选融合：输入停顿后发起 LLM 候选请求
         maybe_fire_candidate_request(&rc);
         // 触发任务（截图 OCR / 录音 ASR）结果上屏
